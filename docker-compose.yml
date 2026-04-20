@@ -1,0 +1,13 @@
+services:
+  retrace:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    environment:
+      - RETRACE_CRON=0 */6 * * *
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+      - ./reports:/app/reports
+    restart: unless-stopped
