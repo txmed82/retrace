@@ -1,0 +1,18 @@
+posthog:
+  host: https://us.i.posthog.com
+  project_id: "12345"
+
+llm:
+  base_url: http://localhost:8080/v1
+  model: llama-3.1-8b-instruct
+
+run:
+  lookback_hours: 6
+  max_sessions_per_run: 50
+  output_dir: ./reports
+  data_dir: ./data
+
+detectors:
+  console_error: true
+  network_5xx: true
+  rage_click: true
