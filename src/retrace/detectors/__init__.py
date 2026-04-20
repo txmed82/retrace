@@ -3,7 +3,8 @@ from retrace.detectors.base import (
     Signal,
     all_detectors,
     get_detector,
+    iter_with_url,
     register,
 )
 
-__all__ = ["Detector", "Signal", "all_detectors", "get_detector", "register"]
+__all__ = ["Detector", "Signal", "all_detectors", "get_detector", "iter_with_url", "register"]

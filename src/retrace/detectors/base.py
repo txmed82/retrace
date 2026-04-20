@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -35,3 +36,15 @@ def all_detectors() -> list[Detector]:
 
 def get_detector(name: str) -> Detector | None:
     return _REGISTRY.get(name)
+
+
+def iter_with_url(events: list[dict[str, Any]]) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield (current_url, event) pairs, tracking the latest Meta href forward."""
+    url = ""
+    for e in events:
+        if e.get("type") == 4:
+            data = e.get("data") or {}
+            href = data.get("href")
+            if isinstance(href, str):
+                url = href
+        yield url, e

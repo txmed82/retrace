@@ -707,8 +707,9 @@ Expected: FAIL with `ModuleNotFoundError: retrace.detectors.console_error` or `I
 # src/retrace/detectors/base.py
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True)
@@ -742,6 +743,18 @@ def all_detectors() -> list[Detector]:
 
 def get_detector(name: str) -> Detector | None:
     return _REGISTRY.get(name)
+
+
+def iter_with_url(events: list[dict[str, Any]]) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield (current_url, event) pairs, tracking the latest Meta href forward."""
+    url = ""
+    for e in events:
+        if e.get("type") == 4:
+            data = e.get("data") or {}
+            href = data.get("href")
+            if isinstance(href, str):
+                url = href
+        yield url, e
 ```
 
 ```python
@@ -751,10 +764,11 @@ from retrace.detectors.base import (
     Signal,
     all_detectors,
     get_detector,
+    iter_with_url,
     register,
 )
 
-__all__ = ["Detector", "Signal", "all_detectors", "get_detector", "register"]
+__all__ = ["Detector", "Signal", "all_detectors", "get_detector", "iter_with_url", "register"]
 ```
 
 Note: individual detector modules register themselves on import. Task 5 creates the first (`console_error.py`) — until then the registry test will skip via `# noqa: F401` but fail the `in names` assertion. So run the registry test only after Task 5.
@@ -841,19 +855,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, register
+from retrace.detectors.base import Signal, iter_with_url, register
 
 
 _ERROR_LEVELS = {"error", "assert"}
-
-
-def _current_url(events: list[dict[str, Any]], idx: int) -> str:
-    # walk back to most recent Meta (type 4) event with href
-    for i in range(idx, -1, -1):
-        e = events[i]
-        if e.get("type") == 4 and "href" in (e.get("data") or {}):
-            return e["data"]["href"]
-    return ""
 
 
 @dataclass
@@ -862,7 +867,7 @@ class ConsoleErrorDetector:
 
     def detect(self, session_id: str, events: list[dict[str, Any]]) -> list[Signal]:
         out: list[Signal] = []
-        for idx, e in enumerate(events):
+        for url, e in iter_with_url(events):
             if e.get("type") != 6:
                 continue
             data = e.get("data") or {}
@@ -879,7 +884,7 @@ class ConsoleErrorDetector:
                     session_id=session_id,
                     detector=self.name,
                     timestamp_ms=int(e.get("timestamp") or 0),
-                    url=_current_url(events, idx),
+                    url=url,
                     details={"message": message, "level": level},
                 )
             )
@@ -964,8 +969,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, register
-from retrace.detectors.console_error import _current_url
+from retrace.detectors.base import Signal, iter_with_url, register
 
 
 @dataclass
@@ -974,7 +978,7 @@ class Network5xxDetector:
 
     def detect(self, session_id: str, events: list[dict[str, Any]]) -> list[Signal]:
         out: list[Signal] = []
-        for idx, e in enumerate(events):
+        for url, e in iter_with_url(events):
             if e.get("type") != 6:
                 continue
             data = e.get("data") or {}
@@ -990,7 +994,7 @@ class Network5xxDetector:
                     session_id=session_id,
                     detector=self.name,
                     timestamp_ms=int(e.get("timestamp") or 0),
-                    url=_current_url(events, idx),
+                    url=url,
                     details={
                         "status": status,
                         "request_url": payload.get("url", ""),
@@ -1087,8 +1091,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, register
-from retrace.detectors.console_error import _current_url
+from retrace.detectors.base import Signal, iter_with_url, register
 
 
 WINDOW_MS = 1000
@@ -1099,7 +1102,6 @@ def _is_click(e: dict[str, Any]) -> bool:
     if e.get("type") != 3:
         return False
     data = e.get("data") or {}
-    # source 2 = MouseInteraction; type 2 = Click in rrweb
     return data.get("source") == 2 and data.get("type") == 2
 
 
@@ -1108,20 +1110,20 @@ class RageClickDetector:
     name: str = "rage_click"
 
     def detect(self, session_id: str, events: list[dict[str, Any]]) -> list[Signal]:
+        enumerated: list[tuple[str, dict[str, Any]]] = list(iter_with_url(events))
         out: list[Signal] = []
-        # Sliding window over clicks on same target_id within WINDOW_MS
-        click_indices = [i for i, e in enumerate(events) if _is_click(e)]
+        click_indices = [i for i, (_u, e) in enumerate(enumerated) if _is_click(e)]
         emitted_indices: set[int] = set()
         for i, idx in enumerate(click_indices):
             if idx in emitted_indices:
                 continue
             window = [idx]
-            base = events[idx]
-            base_tid = (base["data"] or {}).get("id")
-            base_ts = int(base.get("timestamp") or 0)
+            base_url, base_ev = enumerated[idx]
+            base_tid = (base_ev["data"] or {}).get("id")
+            base_ts = int(base_ev.get("timestamp") or 0)
             for j in range(i + 1, len(click_indices)):
                 jdx = click_indices[j]
-                ev = events[jdx]
+                _u, ev = enumerated[jdx]
                 tid = (ev["data"] or {}).get("id")
                 ts = int(ev.get("timestamp") or 0)
                 if tid != base_tid:
@@ -1136,7 +1138,7 @@ class RageClickDetector:
                         session_id=session_id,
                         detector=self.name,
                         timestamp_ms=base_ts,
-                        url=_current_url(events, idx),
+                        url=base_url,
                         details={
                             "click_count": len(window),
                             "target_id": base_tid,

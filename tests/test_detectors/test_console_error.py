@@ -28,3 +28,20 @@ def test_console_error_ignores_non_error_levels():
         console_event(ts=200, level="info", message="hi"),
     ]
     assert detector.detect("sess-1", events) == []
+
+
+def test_console_error_ignores_non_console_plugin_at_error_level():
+    from retrace.detectors.console_error import detector
+
+    events = [
+        {"type": 4, "timestamp": 0, "data": {"href": "https://x/"}},
+        {
+            "type": 6,
+            "timestamp": 100,
+            "data": {
+                "plugin": "rrweb/network@1",  # NOT console
+                "payload": {"level": "error", "payload": ["boom"]},
+            },
+        },
+    ]
+    assert detector.detect("s", events) == []

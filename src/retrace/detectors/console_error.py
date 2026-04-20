@@ -3,18 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, register
+from retrace.detectors.base import Signal, iter_with_url, register
 
 
 _ERROR_LEVELS = {"error", "assert"}
-
-
-def _current_url(events: list[dict[str, Any]], idx: int) -> str:
-    for i in range(idx, -1, -1):
-        e = events[i]
-        if e.get("type") == 4 and "href" in (e.get("data") or {}):
-            return e["data"]["href"]
-    return ""
 
 
 @dataclass
@@ -23,7 +15,7 @@ class ConsoleErrorDetector:
 
     def detect(self, session_id: str, events: list[dict[str, Any]]) -> list[Signal]:
         out: list[Signal] = []
-        for idx, e in enumerate(events):
+        for url, e in iter_with_url(events):
             if e.get("type") != 6:
                 continue
             data = e.get("data") or {}
@@ -40,7 +32,7 @@ class ConsoleErrorDetector:
                     session_id=session_id,
                     detector=self.name,
                     timestamp_ms=int(e.get("timestamp") or 0),
-                    url=_current_url(events, idx),
+                    url=url,
                     details={"message": message, "level": level},
                 )
             )
