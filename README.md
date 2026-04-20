@@ -2,74 +2,78 @@
 
 Your real users are your QA team. Retrace finds the bugs they hit.
 
-## What it does
+Retrace pulls user session recordings from PostHog, runs eight heuristic detectors over rrweb events, clusters similar sessions, sends each cluster to an OpenAI-compatible LLM for human-readable explanation, and writes a dated markdown bug report.
 
-Pulls user session recordings from PostHog, runs lightweight heuristic detectors over the rrweb events (console errors, 5xx responses, rage clicks), sends flagged sessions to an OpenAI-compatible LLM (llama.cpp, ollama, LM Studio, OpenAI, etc.), and writes a dated markdown bug report you can paste into Slack or a PR.
+## Install (dev)
 
-This is **v0.1-alpha** — a focused vertical slice. The full roadmap (clustering, `retrace init` wizard, `retrace doctor`, Docker Compose, more detectors, notification sinks) is in `docs/superpowers/specs/2026-04-19-retrace-design.md`.
-
-## Install
-
-Requires Python 3.11+. From a fresh clone:
+Requires Python 3.11+.
 
 ```bash
 uv venv
 uv pip install -e ".[dev]"
 ```
 
-Once published to PyPI, `uv tool install retrace` will be the recommended path.
+## Set up interactively
 
-## Setup
+```bash
+retrace init
+```
 
-1. Copy the config templates:
-   ```bash
-   cp config.example.yaml config.yaml
-   cp .env.example .env
-   ```
-2. Fill in your PostHog host, project ID, and a personal API key (`phx_...`) in `.env` and `config.yaml`.
-3. Point `llm.base_url` at a running OpenAI-compatible server. For llama.cpp:
-   ```bash
-   llama-server -m ./models/llama-3.1-8b-instruct.gguf --host 0.0.0.0 --port 8080
-   ```
-4. Run it:
-   ```bash
-   retrace run
-   ```
-5. Read the report at `./reports/YYYY-MM-DD-HHMMSS.md`.
+Prompts for PostHog creds, LLM endpoint, cadence, output paths. Live-validates connections before writing. Produces `config.yaml` + `.env`.
 
-## Config
+Then run:
 
-See `config.example.yaml` for the full shape. Key knobs:
+```bash
+retrace run
+```
 
-- `run.lookback_hours` — how far back the first run goes (subsequent runs pick up from the last cursor).
-- `run.max_sessions_per_run` — per-run cap. If hit, the cursor rewinds to the oldest processed session so the next run picks up the remainder.
-- `detectors.*` — toggle individual detectors on/off.
-- `llm.base_url` / `llm.model` / `llm.api_key` — point at any OpenAI-compatible endpoint.
+Read the report at `./reports/YYYY-MM-DD-HHMMSS.md`.
+
+## Keep it running on a cron
+
+```bash
+docker compose up -d
+```
+
+Respects `RETRACE_CRON` env var (default every 6 hours). Mounts your `config.yaml`, `.env`, and writes `data/` + `reports/` to the host.
+
+## Health check
+
+```bash
+retrace doctor
+```
+
+Re-runs all the validations `init` did. Exits non-zero if anything is broken.
+
+## Detectors (v0.1)
+
+| Detector | What it catches |
+|---|---|
+| `console_error` | `console.error` or uncaught exceptions |
+| `network_4xx` | 4xx HTTP responses (ignores 401 noise) |
+| `network_5xx` | 5xx server errors |
+| `rage_click` | 3+ rapid clicks on the same target |
+| `dead_click` | Click with no DOM mutation or network followup |
+| `error_toast` | DOM nodes with `role=alert`, toast/error classes, or error-like text |
+| `blank_render` | URL dwelt ≥2s with very few DOM nodes |
+| `session_abandon_on_error` | Session ends within 5s of any of the above |
+
+Toggle any via `config.yaml`.
 
 ## How it works
 
 ```
-PostHog API ──► Ingester ──► Detectors ──► LLM Analyst ──► Markdown Sink
+PostHog API → Ingester → Detectors → Clusterer → LLM Analyst → Markdown Sink
 ```
 
-- **Ingester** — pulls new recordings since the last cursor, stores raw rrweb events atomically to `data/sessions/<sid>.json` and metadata to SQLite.
-- **Detectors** — `console_error`, `network_5xx`, `rage_click` scan events and produce signals. No LLM involvement at this stage.
-- **LLM Analyst** — only sessions with ≥1 signal reach the LLM. It sees a windowed summary of user actions around the issue and the signal payloads, and returns a structured `Finding` (title, severity, what happened, reproduction steps).
-- **Sink** — groups findings by severity and writes a dated markdown report with deep links back to the PostHog replay for each session.
-
-On each run, per-session errors are isolated (a bad session doesn't kill the batch), and the run's status is recorded in the SQLite `runs` table.
-
-## What's not in v0.1-alpha
-
-All tracked for Plan B:
-
-- Clustering (one finding per flagged session for now)
-- `retrace init` interactive wizard — edit `config.yaml` by hand
-- `retrace doctor` for config/connectivity validation
-- Docker Compose + cron-in-container deployment
-- 5 more detectors (`network_4xx`, `dead_click`, `error_toast`, `blank_render`, `session_abandon_on_error`)
+- **Ingester** follows PostHog's pagination, stores rrweb events atomically to disk + metadata to SQLite.
+- **Detectors** emit structured signals. No LLM at this stage.
+- **Clusterer** groups sessions sharing the same signal fingerprint (detector set + URL path + primary error message) so "100 users hit the same toast" becomes one finding with `affected_count: 100`.
+- **LLM Analyst** takes one representative session per cluster and returns a structured bug report.
+- **Sink** writes the report grouped by severity. One file per run.
 
 ## Design docs
 
-- `docs/superpowers/specs/2026-04-19-retrace-design.md` — full product spec
-- `docs/superpowers/plans/2026-04-19-retrace-plan-a-vertical-slice.md` — the implementation plan this repo was built from
+- `docs/superpowers/specs/2026-04-19-retrace-design.md` — product spec
+- `docs/superpowers/plans/2026-04-19-retrace-plan-a-vertical-slice.md` — Plan A (v0.1-alpha)
+- `docs/superpowers/plans/2026-04-20-retrace-plan-b-polish-and-breadth.md` — Plan B (v0.1)
