@@ -28,6 +28,8 @@ def _enabled_detector_names(cfg: RetraceConfig) -> set[str]:
         names.add("network_4xx")
     if d.rage_click:
         names.add("rage_click")
+    if d.dead_click:
+        names.add("dead_click")
     return names
 
 

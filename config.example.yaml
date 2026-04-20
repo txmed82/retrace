@@ -17,3 +17,4 @@ detectors:
   network_5xx: true
   network_4xx: true
   rage_click: true
+  dead_click: true
