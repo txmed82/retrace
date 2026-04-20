@@ -5,6 +5,7 @@ from pathlib import Path
 
 import click
 
+from retrace.commands.doctor import doctor_command
 from retrace.commands.init import init_command
 from retrace.config import load_config
 from retrace.ingester import PostHogIngester
@@ -56,3 +57,4 @@ def run(config_path: Path) -> None:
 
 
 main.add_command(init_command)
+main.add_command(doctor_command)
