@@ -13,16 +13,26 @@ _SEVERITY_EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": 
 def _render_finding(f: Finding) -> str:
     steps = "\n".join(f"  {i + 1}. {s}" for i, s in enumerate(f.reproduction_steps))
     signals = ", ".join(f.detector_signals) if f.detector_signals else "—"
-    return (
-        f"### {f.title}\n\n"
-        f"- **Session:** [{f.session_id}]({f.session_url})\n"
-        f"- **Category:** {f.category}\n"
-        f"- **Confidence:** {f.confidence}\n"
-        f"- **Signals:** {signals}\n\n"
-        f"**What happened:** {f.what_happened}\n\n"
-        f"**Likely cause:** {f.likely_cause}\n\n"
-        f"**Reproduction:**\n{steps}\n"
-    )
+    lines = [
+        f"### {f.title}\n",
+        f"- **Sample session:** [{f.session_id}]({f.session_url})",
+    ]
+    if f.affected_count > 1:
+        lines.append(f"- **Affected:** {f.affected_count} sessions")
+    lines.extend([
+        f"- **Category:** {f.category}",
+        f"- **Confidence:** {f.confidence}",
+        f"- **Signals:** {signals}",
+        "",
+        f"**What happened:** {f.what_happened}",
+        "",
+        f"**Likely cause:** {f.likely_cause}",
+        "",
+        "**Reproduction:**",
+        steps,
+        "",
+    ])
+    return "\n".join(lines)
 
 
 class MarkdownSink(Sink):

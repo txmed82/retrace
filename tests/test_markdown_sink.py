@@ -102,3 +102,33 @@ def test_markdown_sink_uniquifies_filename_on_collision(tmp_path: Path):
         "2026-04-19-140000-3.md",
         "2026-04-19-140000.md",
     ]
+
+
+def test_markdown_sink_renders_cluster_affected_count(tmp_path: Path):
+    sink = MarkdownSink(output_dir=tmp_path)
+    summary = RunSummary(
+        started_at=datetime(2026, 4, 19, 14, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 4, 19, 14, 3, tzinfo=timezone.utc),
+        sessions_scanned=100,
+        sessions_with_signals=12,
+        clusters_found=1,
+    )
+    findings = [
+        Finding(
+            session_id="s1",
+            session_url="https://posthog/replay/s1",
+            title="Toast of doom",
+            severity="high",
+            category="functional_error",
+            what_happened="...",
+            likely_cause="...",
+            reproduction_steps=[],
+            confidence="high",
+            detector_signals=["error_toast"],
+            affected_count=12,
+        )
+    ]
+    sink.write(summary, findings)
+    text = next(tmp_path.glob("*.md")).read_text()
+    assert "Affected:" in text and "12" in text
+    assert "12 flagged into 1 cluster" in text
