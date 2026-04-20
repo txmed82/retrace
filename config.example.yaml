@@ -18,3 +18,4 @@ detectors:
   network_4xx: true
   rage_click: true
   dead_click: true
+  error_toast: true

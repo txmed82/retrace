@@ -35,6 +35,7 @@ class DetectorsConfig(BaseModel):
     network_4xx: bool = True
     rage_click: bool = True
     dead_click: bool = True
+    error_toast: bool = True
 
 
 class RetraceConfig(BaseModel):

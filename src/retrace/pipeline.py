@@ -30,6 +30,8 @@ def _enabled_detector_names(cfg: RetraceConfig) -> set[str]:
         names.add("rage_click")
     if d.dead_click:
         names.add("dead_click")
+    if d.error_toast:
+        names.add("error_toast")
     return names
 
 
