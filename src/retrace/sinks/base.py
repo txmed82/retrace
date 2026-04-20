@@ -25,6 +25,8 @@ class RunSummary:
     finished_at: datetime
     sessions_scanned: int
     sessions_flagged: int
+    sessions_errored: int = 0
+    cap_hit: bool = False
 
 
 class Sink(Protocol):

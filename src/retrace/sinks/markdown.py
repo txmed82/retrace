@@ -48,10 +48,15 @@ class MarkdownSink(Sink):
 
         out: list[str] = []
         out.append(f"# Retrace report — {started_utc.strftime('%Y-%m-%d %H:%M UTC')}\n")
-        out.append(
+        summary_line = (
             f"Scanned {summary.sessions_scanned} sessions.  "
-            f"Flagged {summary.sessions_flagged}.\n"
+            f"Flagged {summary.sessions_flagged}."
         )
+        if summary.sessions_errored:
+            summary_line += f"  Errored {summary.sessions_errored}."
+        if summary.cap_hit:
+            summary_line += "  (batch cap hit — more sessions pending)"
+        out.append(summary_line + "\n")
 
         for sev in _SEVERITY_ORDER:
             items = by_sev.get(sev, [])
