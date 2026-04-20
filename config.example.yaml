@@ -21,3 +21,6 @@ detectors:
   error_toast: true
   blank_render: true
   session_abandon_on_error: true
+
+cluster:
+  min_size: 1

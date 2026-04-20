@@ -10,13 +10,30 @@ class Finding:
     session_id: str
     session_url: str
     title: str
-    severity: str            # critical | high | medium | low
-    category: str            # functional_error | visual_bug | performance | confusion
+    severity: str
+    category: str
     what_happened: str
     likely_cause: str
     reproduction_steps: list[str] = field(default_factory=list)
     confidence: str = "medium"
     detector_signals: list[str] = field(default_factory=list)
+    affected_count: int = 1
+    first_seen_ms: int = 0
+    last_seen_ms: int = 0
+
+
+@dataclass
+class Cluster:
+    fingerprint: str
+    session_ids: list[str]
+    signal_summary: dict[str, int]
+    primary_url: str
+    first_seen_ms: int
+    last_seen_ms: int
+
+    @property
+    def affected_count(self) -> int:
+        return len(self.session_ids)
 
 
 @dataclass

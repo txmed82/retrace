@@ -40,11 +40,16 @@ class DetectorsConfig(BaseModel):
     session_abandon_on_error: bool = True
 
 
+class ClusterConfig(BaseModel):
+    min_size: int = 1
+
+
 class RetraceConfig(BaseModel):
     posthog: PostHogConfig
     llm: LLMConfig
     run: RunConfig = Field(default_factory=RunConfig)
     detectors: DetectorsConfig = Field(default_factory=DetectorsConfig)
+    cluster: ClusterConfig = Field(default_factory=ClusterConfig)
 
 
 def load_config(path: Path) -> RetraceConfig:
