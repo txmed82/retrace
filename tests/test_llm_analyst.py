@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import MagicMock
 
 from retrace.detectors.base import Signal
@@ -128,3 +129,33 @@ def test_analyze_session_passes_through_list_reproduction_steps():
         ],
     )
     assert f.reproduction_steps == ["a", "b"]
+
+
+def test_analyze_session_warns_when_critical_fields_empty(caplog):
+    from unittest.mock import MagicMock
+
+    llm = MagicMock()
+    llm.chat_json.return_value = {}
+
+    with caplog.at_level(logging.WARNING, logger="retrace.llm.analyst"):
+        f = analyze_session(
+            llm_client=llm,
+            session_id="s",
+            session_url="u",
+            events=[],
+            signals=[
+                Signal(
+                    session_id="s",
+                    detector="d",
+                    timestamp_ms=0,
+                    url="u",
+                    details={},
+                )
+            ],
+        )
+
+    assert f.title == "Unclassified issue"
+    assert any(
+        "empty critical fields" in rec.message.lower() or "degraded" in rec.message.lower()
+        for rec in caplog.records
+    )

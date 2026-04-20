@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from retrace.detectors.base import Signal
 from retrace.llm.client import LLMClient
 from retrace.sinks.base import Finding
+
+log = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """You are a senior QA analyst. You review user session recordings
@@ -109,13 +112,22 @@ def analyze_session(
 ) -> Finding:
     system, user = build_prompt(session_id, events, signals)
     result = llm_client.chat_json(system=system, user=user)
+
+    title = str(result.get("title") or "").strip()
+    what_happened = str(result.get("what_happened") or "").strip()
+    if not title or not what_happened:
+        log.warning(
+            "LLM returned empty critical fields for session %s; findings degraded",
+            session_id,
+        )
+
     return Finding(
         session_id=session_id,
         session_url=session_url,
-        title=str(result.get("title", "Unclassified issue")),
+        title=title or "Unclassified issue",
         severity=str(result.get("severity", "medium")),
         category=str(result.get("category", "functional_error")),
-        what_happened=str(result.get("what_happened", "")),
+        what_happened=what_happened,
         likely_cause=str(result.get("likely_cause", "")),
         reproduction_steps=_as_string_list(result.get("reproduction_steps")),
         confidence=str(result.get("confidence", "medium")),
