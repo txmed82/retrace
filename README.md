@@ -10,13 +10,14 @@ This is **v0.1-alpha** — a focused vertical slice. The full roadmap (clusterin
 
 ## Install
 
-Requires Python 3.11+.
+Requires Python 3.11+. From a fresh clone:
 
 ```bash
-uv tool install retrace
-# or for development:
-uv venv && uv pip install -e ".[dev]"
+uv venv
+uv pip install -e ".[dev]"
 ```
+
+Once published to PyPI, `uv tool install retrace` will be the recommended path.
 
 ## Setup
 

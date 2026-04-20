@@ -12,13 +12,9 @@ from retrace.config import (
     RetraceConfig,
     RunConfig,
 )
+import retrace.detectors  # noqa: F401 - triggers detector self-registration
 from retrace.pipeline import run_pipeline
 from retrace.storage import SessionMeta, Storage
-
-# Trigger detector self-registration on import.
-import retrace.detectors.console_error  # noqa: F401
-import retrace.detectors.network_5xx  # noqa: F401
-import retrace.detectors.rage_click  # noqa: F401
 
 
 def _make_cfg(tmp_path: Path, max_sessions: int = 10) -> RetraceConfig:

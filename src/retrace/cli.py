@@ -5,11 +5,6 @@ from pathlib import Path
 
 import click
 
-# Import detectors to trigger registration.
-import retrace.detectors.console_error  # noqa: F401
-import retrace.detectors.network_5xx  # noqa: F401
-import retrace.detectors.rage_click  # noqa: F401
-
 from retrace.config import load_config
 from retrace.ingester import PostHogIngester
 from retrace.llm.client import LLMClient

@@ -768,6 +768,11 @@ from retrace.detectors.base import (
     register,
 )
 
+# Register built-in detectors on package import.
+from retrace.detectors import console_error as _console_error  # noqa: F401
+from retrace.detectors import network_5xx as _network_5xx  # noqa: F401
+from retrace.detectors import rage_click as _rage_click  # noqa: F401
+
 __all__ = ["Detector", "Signal", "all_detectors", "get_detector", "iter_with_url", "register"]
 ```
 
@@ -1316,15 +1321,18 @@ class PostHogIngester:
 
                     # Only persist metadata after the snapshot is durably on disk.
                     duration_seconds = r.get("recording_duration") or 0
+                    # PostHog's session-recordings endpoint reports click/keypress counts, not total rrweb
+                    # event count. Use their `event_count` when available (newer API), fall back to clicks.
                     meta = SessionMeta(
                         id=sid,
                         project_id=self.cfg.project_id,
                         started_at=datetime.fromisoformat(
                             str(r["start_time"]).replace("Z", "+00:00")
                         ),
+                        # PostHog's `recording_duration` is in seconds (not milliseconds).
                         duration_ms=int(float(duration_seconds) * 1000),
                         distinct_id=r.get("distinct_id"),
-                        event_count=int(r.get("click_count") or 0),
+                        event_count=int(r.get("event_count") or r.get("click_count") or 0),
                     )
                     self.store.upsert_session(meta)
                     ids.append(sid)
@@ -2010,13 +2018,9 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from retrace.config import DetectorsConfig, LLMConfig, PostHogConfig, RetraceConfig, RunConfig
+import retrace.detectors  # noqa: F401 - triggers detector self-registration
 from retrace.pipeline import run_pipeline
 from retrace.storage import Storage
-
-# Triggers detector self-registration on import.
-import retrace.detectors.console_error  # noqa: F401
-import retrace.detectors.network_5xx  # noqa: F401
-import retrace.detectors.rage_click  # noqa: F401
 
 
 def test_run_pipeline_end_to_end_with_fake_llm_and_ingester(tmp_path: Path):
@@ -2305,11 +2309,6 @@ from pathlib import Path
 
 import click
 
-# Import detectors to trigger registration.
-import retrace.detectors.console_error  # noqa: F401
-import retrace.detectors.network_5xx  # noqa: F401
-import retrace.detectors.rage_click  # noqa: F401
-
 from retrace.config import load_config
 from retrace.ingester import PostHogIngester
 from retrace.llm.client import LLMClient
@@ -2393,9 +2392,14 @@ This is a pre-release vertical slice. It:
 
 ## Install
 
+Requires Python 3.11+. From a fresh clone:
+
 ```bash
-uv tool install retrace
+uv venv
+uv pip install -e ".[dev]"
 ```
+
+Once published to PyPI, `uv tool install retrace` will be the recommended path.
 
 ## Setup
 

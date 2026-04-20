@@ -61,6 +61,10 @@ def run_pipeline(
 
         enabled = _enabled_detector_names(cfg)
         detectors = [d for d in all_detectors() if d.name in enabled]
+        if not detectors and enabled:
+            log.warning(
+                "no detectors resolved despite enabled=%s — check registration", enabled
+            )
 
         processed_started_at: list[datetime] = []
         for sid in ids:

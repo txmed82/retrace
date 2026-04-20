@@ -7,4 +7,9 @@ from retrace.detectors.base import (
     register,
 )
 
+# Register built-in detectors on package import.
+from retrace.detectors import console_error as _console_error  # noqa: F401
+from retrace.detectors import network_5xx as _network_5xx  # noqa: F401
+from retrace.detectors import rage_click as _rage_click  # noqa: F401
+
 __all__ = ["Detector", "Signal", "all_detectors", "get_detector", "iter_with_url", "register"]
