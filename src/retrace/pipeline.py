@@ -32,6 +32,8 @@ def _enabled_detector_names(cfg: RetraceConfig) -> set[str]:
         names.add("dead_click")
     if d.error_toast:
         names.add("error_toast")
+    if d.blank_render:
+        names.add("blank_render")
     return names
 
 

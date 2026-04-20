@@ -19,3 +19,4 @@ detectors:
   rage_click: true
   dead_click: true
   error_toast: true
+  blank_render: true
