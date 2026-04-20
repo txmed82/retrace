@@ -5,6 +5,7 @@ from pathlib import Path
 
 import click
 
+from retrace.commands.init import init_command
 from retrace.config import load_config
 from retrace.ingester import PostHogIngester
 from retrace.llm.client import LLMClient
@@ -52,3 +53,6 @@ def run(config_path: Path) -> None:
         f"{summary.clusters_found} cluster(s). "
         f"Report written to {cfg.run.output_dir}/"
     )
+
+
+main.add_command(init_command)
