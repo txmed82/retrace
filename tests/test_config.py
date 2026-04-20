@@ -41,3 +41,30 @@ def test_load_config_merges_yaml_and_env(tmp_path: Path, monkeypatch):
     assert cfg.llm.api_key is None
     assert cfg.run.lookback_hours == 3
     assert cfg.detectors.rage_click is False
+
+
+def test_load_config_keeps_yaml_keys_when_env_unset(tmp_path, monkeypatch):
+    import textwrap
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text(
+        textwrap.dedent(
+            """
+            posthog:
+              host: https://us.i.posthog.com
+              project_id: "1"
+              api_key: phx_from_yaml
+            llm:
+              base_url: http://localhost:8080/v1
+              model: m
+              api_key: sk_from_yaml
+            """
+        )
+    )
+    monkeypatch.delenv("RETRACE_POSTHOG_API_KEY", raising=False)
+    monkeypatch.delenv("RETRACE_LLM_API_KEY", raising=False)
+
+    from retrace.config import load_config
+    cfg = load_config(config_yaml)
+
+    assert cfg.posthog.api_key == "phx_from_yaml"
+    assert cfg.llm.api_key == "sk_from_yaml"

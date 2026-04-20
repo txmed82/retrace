@@ -318,12 +318,15 @@ def load_config(path: Path) -> RetraceConfig:
     load_dotenv(override=False)
     raw = yaml.safe_load(Path(path).read_text()) or {}
 
-    raw.setdefault("posthog", {})["api_key"] = os.environ.get(
-        "RETRACE_POSTHOG_API_KEY", ""
-    )
+    posthog_key_env = os.environ.get("RETRACE_POSTHOG_API_KEY")
+    if posthog_key_env:
+        raw.setdefault("posthog", {})["api_key"] = posthog_key_env
+    elif "api_key" not in raw.setdefault("posthog", {}):
+        raw["posthog"]["api_key"] = ""
 
-    llm_api_key = os.environ.get("RETRACE_LLM_API_KEY", "")
-    raw.setdefault("llm", {})["api_key"] = llm_api_key if llm_api_key else None
+    llm_key_env = os.environ.get("RETRACE_LLM_API_KEY")
+    if llm_key_env:
+        raw.setdefault("llm", {})["api_key"] = llm_key_env
 
     return RetraceConfig.model_validate(raw)
 ```
