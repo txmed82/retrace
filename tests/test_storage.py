@@ -46,3 +46,27 @@ def test_storage_start_and_finish_run(tmp_path: Path):
     assert row.findings_count == 2
     assert row.status == "ok"
     assert row.finished_at is not None
+
+
+import pytest
+
+
+def test_get_run_returns_none_for_unknown_id(tmp_path: Path):
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    assert store.get_run(9999) is None
+
+
+def test_upsert_session_rejects_naive_datetime(tmp_path: Path):
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    s = SessionMeta(
+        id="s",
+        project_id="p",
+        started_at=datetime(2026, 4, 19, 12, 0),  # no tzinfo
+        duration_ms=0,
+        distinct_id=None,
+        event_count=0,
+    )
+    with pytest.raises(ValueError):
+        store.upsert_session(s)

@@ -487,6 +487,8 @@ class Storage:
             conn.executescript(SCHEMA)
 
     def upsert_session(self, s: SessionMeta) -> None:
+        if s.started_at.tzinfo is None:
+            raise ValueError("SessionMeta.started_at must be timezone-aware")
         with self._conn() as conn:
             conn.execute(
                 """
@@ -541,7 +543,9 @@ class Storage:
                 "INSERT INTO runs (started_at) VALUES (?)",
                 (datetime.now(timezone.utc).isoformat(),),
             )
-            return cur.lastrowid
+            rid = cur.lastrowid
+            assert rid is not None
+            return rid
 
     def finish_run(
         self,
@@ -568,9 +572,11 @@ class Storage:
                 ),
             )
 
-    def get_run(self, run_id: int) -> RunRow:
+    def get_run(self, run_id: int) -> Optional[RunRow]:
         with self._conn() as conn:
             row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if not row:
+            return None
         return RunRow(
             id=row["id"],
             started_at=datetime.fromisoformat(row["started_at"]),
