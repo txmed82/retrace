@@ -151,3 +151,102 @@ def test_fetch_since_skips_failing_session_and_continues(
     assert ids == ["sess-ok"]
     assert store.get_session("sess-fail") is None
     assert store.get_session("sess-ok") is not None
+
+
+def test_fetch_since_follows_pagination_next_link(
+    httpx_mock: HTTPXMock, tmp_path: Path, cfg: PostHogConfig
+):
+    since = datetime(2026, 4, 19, 10, 0, tzinfo=timezone.utc)
+
+    httpx_mock.add_response(
+        method="GET",
+        url=(
+            "https://us.i.posthog.com/api/projects/42/session_recordings"
+            "?date_from=2026-04-19T10%3A00%3A00%2B00%3A00&limit=50"
+        ),
+        json={
+            "results": [
+                {
+                    "id": "sess-a",
+                    "start_time": "2026-04-19T11:00:00+00:00",
+                    "recording_duration": 10,
+                    "distinct_id": "u1",
+                    "click_count": 1,
+                    "event_count": 5,
+                }
+            ],
+            "next": (
+                "https://us.i.posthog.com/api/projects/42/session_recordings"
+                "?date_from=2026-04-19T10%3A00%3A00%2B00%3A00&limit=50&cursor=abc"
+            ),
+        },
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=(
+            "https://us.i.posthog.com/api/projects/42/session_recordings"
+            "?date_from=2026-04-19T10%3A00%3A00%2B00%3A00&limit=50&cursor=abc"
+        ),
+        json={
+            "results": [
+                {
+                    "id": "sess-b",
+                    "start_time": "2026-04-19T11:30:00+00:00",
+                    "recording_duration": 20,
+                    "distinct_id": "u2",
+                    "click_count": 0,
+                    "event_count": 3,
+                }
+            ],
+            "next": None,
+        },
+    )
+    for sid in ("sess-a", "sess-b"):
+        httpx_mock.add_response(
+            method="GET",
+            url=f"https://us.i.posthog.com/api/projects/42/session_recordings/{sid}/snapshots",
+            json={"snapshots": []},
+        )
+
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    ingester = PostHogIngester(cfg, store, data_dir=tmp_path / "data")
+
+    ids = ingester.fetch_since(since, max_sessions=50)
+
+    assert ids == ["sess-a", "sess-b"]
+
+
+def test_fetch_since_stops_at_max_sessions_mid_page(
+    httpx_mock: HTTPXMock, tmp_path: Path, cfg: PostHogConfig
+):
+    since = datetime(2026, 4, 19, 10, 0, tzinfo=timezone.utc)
+    httpx_mock.add_response(
+        method="GET",
+        url=(
+            "https://us.i.posthog.com/api/projects/42/session_recordings"
+            "?date_from=2026-04-19T10%3A00%3A00%2B00%3A00&limit=2"
+        ),
+        json={
+            "results": [
+                {"id": "sess-1", "start_time": "2026-04-19T11:00:00+00:00", "recording_duration": 1, "distinct_id": None, "click_count": 0, "event_count": 0},
+                {"id": "sess-2", "start_time": "2026-04-19T11:01:00+00:00", "recording_duration": 1, "distinct_id": None, "click_count": 0, "event_count": 0},
+                {"id": "sess-3", "start_time": "2026-04-19T11:02:00+00:00", "recording_duration": 1, "distinct_id": None, "click_count": 0, "event_count": 0},
+            ],
+            "next": "https://us.i.posthog.com/...cursor=xyz",
+        },
+    )
+    for sid in ("sess-1", "sess-2"):
+        httpx_mock.add_response(
+            method="GET",
+            url=f"https://us.i.posthog.com/api/projects/42/session_recordings/{sid}/snapshots",
+            json={"snapshots": []},
+        )
+
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    ingester = PostHogIngester(cfg, store, data_dir=tmp_path / "data")
+
+    ids = ingester.fetch_since(since, max_sessions=2)
+
+    assert ids == ["sess-1", "sess-2"]
