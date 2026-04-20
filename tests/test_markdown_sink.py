@@ -11,7 +11,8 @@ def test_markdown_sink_writes_report_grouped_by_severity(tmp_path: Path):
         started_at=datetime(2026, 4, 19, 14, 0, tzinfo=timezone.utc),
         finished_at=datetime(2026, 4, 19, 14, 3, tzinfo=timezone.utc),
         sessions_scanned=47,
-        sessions_flagged=2,
+        sessions_with_signals=2,
+        clusters_found=2,
     )
     findings = [
         Finding(
@@ -46,7 +47,7 @@ def test_markdown_sink_writes_report_grouped_by_severity(tmp_path: Path):
     assert len(files) == 1
     text = files[0].read_text()
     assert "Scanned 47 sessions" in text
-    assert "Flagged 2" in text
+    assert "2 flagged into 2 cluster(s)" in text
     crit_idx = text.index("Critical")
     med_idx = text.index("Medium")
     assert crit_idx < med_idx
@@ -60,7 +61,8 @@ def test_markdown_sink_preserves_unknown_severity(tmp_path: Path):
         started_at=datetime(2026, 4, 19, 14, 0, tzinfo=timezone.utc),
         finished_at=datetime(2026, 4, 19, 14, 3, tzinfo=timezone.utc),
         sessions_scanned=1,
-        sessions_flagged=1,
+        sessions_with_signals=1,
+        clusters_found=1,
     )
     findings = [
         Finding(
@@ -88,7 +90,8 @@ def test_markdown_sink_uniquifies_filename_on_collision(tmp_path: Path):
         started_at=datetime(2026, 4, 19, 14, 0, 0, tzinfo=timezone.utc),
         finished_at=datetime(2026, 4, 19, 14, 0, 1, tzinfo=timezone.utc),
         sessions_scanned=0,
-        sessions_flagged=0,
+        sessions_with_signals=0,
+        clusters_found=0,
     )
     sink.write(summary, [])
     sink.write(summary, [])

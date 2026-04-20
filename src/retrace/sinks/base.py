@@ -41,7 +41,8 @@ class RunSummary:
     started_at: datetime
     finished_at: datetime
     sessions_scanned: int
-    sessions_flagged: int
+    sessions_with_signals: int
+    clusters_found: int
     sessions_errored: int = 0
     cap_hit: bool = False
 

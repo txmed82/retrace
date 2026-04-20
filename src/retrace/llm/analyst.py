@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from retrace.detectors.base import Signal
 from retrace.llm.client import LLMClient
-from retrace.sinks.base import Finding
+from retrace.sinks.base import Cluster, Finding
 
 log = logging.getLogger(__name__)
 
@@ -132,4 +132,50 @@ def analyze_session(
         reproduction_steps=_as_string_list(result.get("reproduction_steps")),
         confidence=str(result.get("confidence", "medium")),
         detector_signals=sorted({s.detector for s in signals}),
+    )
+
+
+def analyze_cluster(
+    *,
+    llm_client: LLMClient,
+    cluster: Cluster,
+    events_by_session: dict[str, list[dict[str, Any]]],
+    signals_by_session: dict[str, list[Signal]],
+    session_url_builder: Callable[[str], str],
+) -> Finding:
+    rep_sid = cluster.session_ids[0]
+    rep_events = events_by_session[rep_sid]
+    rep_signals = signals_by_session[rep_sid]
+    system, user = build_prompt(rep_sid, rep_events, rep_signals)
+    header = (
+        f"This issue was observed across {cluster.affected_count} sessions "
+        f"(first at {cluster.first_seen_ms}ms, last at {cluster.last_seen_ms}ms).\n"
+        f"Representative session shown below.\n\n"
+    )
+    user = header + user
+
+    result = llm_client.chat_json(system=system, user=user)
+
+    title = str(result.get("title") or "").strip()
+    what_happened = str(result.get("what_happened") or "").strip()
+    if not title or not what_happened:
+        log.warning(
+            "LLM returned empty critical fields for cluster %s; findings degraded",
+            cluster.fingerprint,
+        )
+
+    return Finding(
+        session_id=rep_sid,
+        session_url=session_url_builder(rep_sid),
+        title=title or "Unclassified issue",
+        severity=str(result.get("severity", "medium")),
+        category=str(result.get("category", "functional_error")),
+        what_happened=what_happened,
+        likely_cause=str(result.get("likely_cause", "")),
+        reproduction_steps=_as_string_list(result.get("reproduction_steps")),
+        confidence=str(result.get("confidence", "medium")),
+        detector_signals=sorted(cluster.signal_summary.keys()),
+        affected_count=cluster.affected_count,
+        first_seen_ms=cluster.first_seen_ms,
+        last_seen_ms=cluster.last_seen_ms,
     )

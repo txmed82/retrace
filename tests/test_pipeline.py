@@ -12,9 +12,10 @@ from retrace.config import (
     RetraceConfig,
     RunConfig,
 )
-import retrace.detectors  # noqa: F401 - triggers detector self-registration
 from retrace.pipeline import run_pipeline
 from retrace.storage import SessionMeta, Storage
+
+import retrace.detectors  # noqa: F401 — triggers built-in detector registration
 
 
 def _make_cfg(tmp_path: Path, max_sessions: int = 10) -> RetraceConfig:
@@ -27,7 +28,16 @@ def _make_cfg(tmp_path: Path, max_sessions: int = 10) -> RetraceConfig:
             output_dir=tmp_path / "reports",
             data_dir=tmp_path / "data",
         ),
-        detectors=DetectorsConfig(console_error=True, network_5xx=True, rage_click=True),
+        detectors=DetectorsConfig(
+            console_error=True,
+            network_5xx=True,
+            network_4xx=True,
+            rage_click=True,
+            dead_click=True,
+            error_toast=True,
+            blank_render=True,
+            session_abandon_on_error=True,
+        ),
     )
 
 
@@ -57,6 +67,19 @@ def _llm_happy_path_response() -> dict:
     }
 
 
+def _seed_session(store: Storage, sid: str, ts: datetime) -> None:
+    store.upsert_session(
+        SessionMeta(
+            id=sid,
+            project_id="42",
+            started_at=ts,
+            duration_ms=1000,
+            distinct_id=None,
+            event_count=0,
+        )
+    )
+
+
 def test_run_pipeline_end_to_end_with_fake_llm_and_ingester(tmp_path: Path):
     cfg = _make_cfg(tmp_path)
     store = Storage(tmp_path / "data" / "retrace.db")
@@ -66,16 +89,7 @@ def test_run_pipeline_end_to_end_with_fake_llm_and_ingester(tmp_path: Path):
     ingester.fetch_since.return_value = ["sess-1"]
     ingester.load_events.return_value = _error_session_events()
 
-    store.upsert_session(
-        SessionMeta(
-            id="sess-1",
-            project_id="42",
-            started_at=datetime(2026, 4, 19, 13, 0, tzinfo=timezone.utc),
-            duration_ms=1000,
-            distinct_id="u1",
-            event_count=2,
-        )
-    )
+    _seed_session(store, "sess-1", datetime(2026, 4, 19, 13, 0, tzinfo=timezone.utc))
 
     llm_client = MagicMock()
     llm_client.chat_json.return_value = _llm_happy_path_response()
@@ -89,7 +103,8 @@ def test_run_pipeline_end_to_end_with_fake_llm_and_ingester(tmp_path: Path):
     )
 
     assert summary.sessions_scanned == 1
-    assert summary.sessions_flagged == 1
+    assert summary.sessions_with_signals == 1
+    assert summary.clusters_found == 1
     assert summary.sessions_errored == 0
     assert summary.cap_hit is False
 
@@ -122,7 +137,8 @@ def test_run_pipeline_skips_sessions_with_no_signals(tmp_path: Path):
     )
 
     assert summary.sessions_scanned == 1
-    assert summary.sessions_flagged == 0
+    assert summary.sessions_with_signals == 0
+    assert summary.clusters_found == 0
     llm_client.chat_json.assert_not_called()
 
 
@@ -131,20 +147,8 @@ def test_run_pipeline_isolates_failing_session_and_continues(tmp_path: Path):
     store = Storage(tmp_path / "data" / "retrace.db")
     store.init_schema()
 
-    for sid, ts in [
-        ("sess-fail", datetime(2026, 4, 19, 13, 0, tzinfo=timezone.utc)),
-        ("sess-ok", datetime(2026, 4, 19, 13, 30, tzinfo=timezone.utc)),
-    ]:
-        store.upsert_session(
-            SessionMeta(
-                id=sid,
-                project_id="42",
-                started_at=ts,
-                duration_ms=1000,
-                distinct_id=None,
-                event_count=0,
-            )
-        )
+    _seed_session(store, "sess-fail", datetime(2026, 4, 19, 13, 0, tzinfo=timezone.utc))
+    _seed_session(store, "sess-ok", datetime(2026, 4, 19, 13, 30, tzinfo=timezone.utc))
 
     ingester = MagicMock()
     ingester.fetch_since.return_value = ["sess-fail", "sess-ok"]
@@ -168,7 +172,8 @@ def test_run_pipeline_isolates_failing_session_and_continues(tmp_path: Path):
     )
 
     assert summary.sessions_scanned == 2
-    assert summary.sessions_flagged == 1
+    assert summary.sessions_with_signals == 1
+    assert summary.clusters_found == 1
     assert summary.sessions_errored == 1
 
 
@@ -179,17 +184,8 @@ def test_run_pipeline_cap_hit_rewinds_cursor_to_oldest_processed(tmp_path: Path)
 
     oldest = datetime(2026, 4, 19, 11, 0, tzinfo=timezone.utc)
     newest = datetime(2026, 4, 19, 13, 0, tzinfo=timezone.utc)
-    for sid, ts in [("sess-old", oldest), ("sess-new", newest)]:
-        store.upsert_session(
-            SessionMeta(
-                id=sid,
-                project_id="42",
-                started_at=ts,
-                duration_ms=0,
-                distinct_id=None,
-                event_count=0,
-            )
-        )
+    _seed_session(store, "sess-old", oldest)
+    _seed_session(store, "sess-new", newest)
 
     ingester = MagicMock()
     ingester.fetch_since.return_value = ["sess-new", "sess-old"]
@@ -215,16 +211,7 @@ def test_run_pipeline_cap_not_hit_advances_cursor_to_now(tmp_path: Path):
     store = Storage(tmp_path / "data" / "retrace.db")
     store.init_schema()
 
-    store.upsert_session(
-        SessionMeta(
-            id="sess-1",
-            project_id="42",
-            started_at=datetime(2026, 4, 19, 13, 0, tzinfo=timezone.utc),
-            duration_ms=0,
-            distinct_id=None,
-            event_count=0,
-        )
-    )
+    _seed_session(store, "sess-1", datetime(2026, 4, 19, 13, 0, tzinfo=timezone.utc))
 
     ingester = MagicMock()
     ingester.fetch_since.return_value = ["sess-1"]
@@ -257,10 +244,42 @@ def test_run_pipeline_finishes_run_with_error_status_on_ingester_failure(tmp_pat
         now=datetime(2026, 4, 19, 14, 0, tzinfo=timezone.utc),
     )
 
-    # The last run row should reflect error status, not a dangling "running".
     with store._conn() as conn:
         row = conn.execute(
             "SELECT status, error FROM runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
     assert row["status"] == "error"
     assert "posthog unreachable" in (row["error"] or "")
+
+
+def test_run_pipeline_clusters_duplicate_sessions_into_one_finding(tmp_path: Path):
+    cfg = _make_cfg(tmp_path)
+    store = Storage(tmp_path / "data" / "retrace.db")
+    store.init_schema()
+
+    _seed_session(store, "s1", datetime(2026, 4, 19, 13, 0, tzinfo=timezone.utc))
+    _seed_session(store, "s2", datetime(2026, 4, 19, 13, 10, tzinfo=timezone.utc))
+
+    ingester = MagicMock()
+    ingester.fetch_since.return_value = ["s1", "s2"]
+    ingester.load_events.return_value = _error_session_events()
+
+    llm_client = MagicMock()
+    llm_client.chat_json.return_value = _llm_happy_path_response()
+
+    summary = run_pipeline(
+        cfg=cfg,
+        store=store,
+        ingester=ingester,
+        llm_client=llm_client,
+        now=datetime(2026, 4, 19, 14, 0, tzinfo=timezone.utc),
+    )
+
+    assert summary.sessions_scanned == 2
+    assert summary.sessions_with_signals == 2
+    assert summary.clusters_found == 1
+    assert llm_client.chat_json.call_count == 1
+
+    reports = list((tmp_path / "reports").glob("*.md"))
+    text = reports[0].read_text()
+    assert "Checkout crashes" in text

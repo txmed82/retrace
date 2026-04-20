@@ -48,6 +48,7 @@ def run(config_path: Path) -> None:
 
     click.echo(
         f"Scanned {summary.sessions_scanned} sessions. "
-        f"Flagged {summary.sessions_flagged}. "
+        f"{summary.sessions_with_signals} flagged into "
+        f"{summary.clusters_found} cluster(s). "
         f"Report written to {cfg.run.output_dir}/"
     )

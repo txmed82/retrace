@@ -50,7 +50,8 @@ class MarkdownSink(Sink):
         out.append(f"# Retrace report — {started_utc.strftime('%Y-%m-%d %H:%M UTC')}\n")
         summary_line = (
             f"Scanned {summary.sessions_scanned} sessions.  "
-            f"Flagged {summary.sessions_flagged}."
+            f"{summary.sessions_with_signals} flagged into "
+            f"{summary.clusters_found} cluster(s)."
         )
         if summary.sessions_errored:
             summary_line += f"  Errored {summary.sessions_errored}."
