@@ -15,4 +15,5 @@ run:
 detectors:
   console_error: true
   network_5xx: true
+  network_4xx: true
   rage_click: true

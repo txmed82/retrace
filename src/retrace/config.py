@@ -32,6 +32,7 @@ class RunConfig(BaseModel):
 class DetectorsConfig(BaseModel):
     console_error: bool = True
     network_5xx: bool = True
+    network_4xx: bool = True
     rage_click: bool = True
 
 

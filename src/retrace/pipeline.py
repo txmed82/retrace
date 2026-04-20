@@ -24,6 +24,8 @@ def _enabled_detector_names(cfg: RetraceConfig) -> set[str]:
         names.add("console_error")
     if d.network_5xx:
         names.add("network_5xx")
+    if d.network_4xx:
+        names.add("network_4xx")
     if d.rage_click:
         names.add("rage_click")
     return names
