@@ -23,6 +23,8 @@ _REGISTRY: dict[str, Detector] = {}
 
 
 def register(detector: Detector) -> Detector:
+    if detector.name in _REGISTRY:
+        raise ValueError(f"detector {detector.name!r} already registered")
     _REGISTRY[detector.name] = detector
     return detector
 
