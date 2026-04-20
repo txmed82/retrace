@@ -56,3 +56,75 @@ def test_analyze_session_returns_finding_from_llm_json():
     assert finding.severity == "high"
     assert finding.session_url == "https://posthog/replay/s1"
     assert finding.detector_signals == ["console_error"]
+
+
+def test_build_prompt_windows_actions_around_signal():
+    # 60 events; signal at ts=5000 should bring the 5000-area actions into view
+    events = [{"type": 4, "timestamp": 0, "data": {"href": "https://x/start"}}]
+    events += [
+        {"type": 3, "timestamp": i * 100, "data": {"source": 2, "type": 2, "id": i}}
+        for i in range(1, 60)
+    ]
+    signals = [
+        Signal(
+            session_id="s",
+            detector="d",
+            timestamp_ms=5000,
+            url="https://x/start",
+            details={},
+        )
+    ]
+    _, usr = build_prompt("s", events, signals)
+    # Click near the pivot (id~50) should be present; earliest click (id=1) should NOT be
+    assert "click: id=50" in usr
+    assert "click: id=1\n" not in usr and "click: id=1 " not in usr
+
+
+def test_analyze_session_coerces_non_list_reproduction_steps():
+    from unittest.mock import MagicMock
+
+    llm = MagicMock()
+    llm.chat_json.return_value = {
+        "title": "t",
+        "severity": "low",
+        "category": "confusion",
+        "what_happened": "w",
+        "likely_cause": "c",
+        "reproduction_steps": "one, two",  # wrong type
+        "confidence": "low",
+    }
+    f = analyze_session(
+        llm_client=llm,
+        session_id="s",
+        session_url="u",
+        events=[],
+        signals=[
+            Signal(session_id="s", detector="d", timestamp_ms=0, url="u", details={})
+        ],
+    )
+    assert f.reproduction_steps == []
+
+
+def test_analyze_session_passes_through_list_reproduction_steps():
+    from unittest.mock import MagicMock
+
+    llm = MagicMock()
+    llm.chat_json.return_value = {
+        "title": "t",
+        "severity": "low",
+        "category": "confusion",
+        "what_happened": "w",
+        "likely_cause": "c",
+        "reproduction_steps": ["a", "b"],
+        "confidence": "low",
+    }
+    f = analyze_session(
+        llm_client=llm,
+        session_id="s",
+        session_url="u",
+        events=[],
+        signals=[
+            Signal(session_id="s", detector="d", timestamp_ms=0, url="u", details={})
+        ],
+    )
+    assert f.reproduction_steps == ["a", "b"]
