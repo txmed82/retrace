@@ -34,6 +34,8 @@ def _enabled_detector_names(cfg: RetraceConfig) -> set[str]:
         names.add("error_toast")
     if d.blank_render:
         names.add("blank_render")
+    if d.session_abandon_on_error:
+        names.add("session_abandon_on_error")
     return names
 
 

@@ -20,3 +20,4 @@ detectors:
   dead_click: true
   error_toast: true
   blank_render: true
+  session_abandon_on_error: true

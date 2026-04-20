@@ -37,6 +37,7 @@ class DetectorsConfig(BaseModel):
     dead_click: bool = True
     error_toast: bool = True
     blank_render: bool = True
+    session_abandon_on_error: bool = True
 
 
 class RetraceConfig(BaseModel):
