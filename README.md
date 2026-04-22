@@ -1,10 +1,22 @@
+<p align="center">
+  <img src="assets/retrace-banner.svg" alt="Retrace banner" width="100%" />
+</p>
+
 # Retrace
 
 Your real users are your QA team. Retrace finds the bugs they hit.
 
-Retrace pulls user session recordings from PostHog, runs eight heuristic detectors over rrweb events, clusters similar sessions, sends each cluster to an OpenAI-compatible LLM for human-readable explanation, and writes a dated markdown bug report.
+Retrace pulls PostHog session recordings, detects likely breakage with heuristic detectors, clusters similar failures, generates clear bug summaries, and outputs actionable fix prompts with likely culprit files.
 
-## Install (dev)
+## What You Get
+
+- Session-level bug detection from rrweb data
+- Clustering so repeated user failures become one issue
+- LLM-written summaries and repro context
+- Local UI with rrweb replay, culprit files, and copyable prompts
+- GitHub repo matching via CLI-connected repo metadata
+
+## Quickstart
 
 Requires Python 3.11+.
 
@@ -13,67 +25,99 @@ uv venv
 uv pip install -e ".[dev]"
 ```
 
-## Set up interactively
+Set up and run:
 
 ```bash
 retrace init
-```
-
-Prompts for PostHog creds, LLM endpoint, cadence, output paths. Live-validates connections before writing. Produces `config.yaml` + `.env`.
-
-Then run:
-
-```bash
 retrace run
 ```
 
-Read the report at `./reports/YYYY-MM-DD-HHMMSS.md`.
+Report output:
 
-## Keep it running on a cron
+- `./reports/YYYY-MM-DD-HHMMSS.md`
+
+## Local UI (Onboarding + Replay + Prompts)
+
+```bash
+retrace ui
+```
+
+Open:
+
+- `http://127.0.0.1:8787`
+
+From the UI you can:
+
+- Set/edit PostHog host, project ID, and API key
+- Save settings to `config.yaml` + `.env`
+- Run system checks for:
+  - PostHog connectivity
+  - `gh` installed/authenticated
+- Copy suggested terminal commands when `gh` is missing/not authed
+- Browse findings from latest report
+- Replay stored rrweb events
+- Inspect likely culprit files and copy Codex/Claude prompts
+
+## Fix Suggestions Workflow
+
+1. Connect repo metadata (CLI):
+
+```bash
+retrace github connect --repo <org/name> --branch main --local-path /path/to/repo
+```
+
+2. Generate fix suggestions from latest report:
+
+```bash
+retrace suggest-fixes --latest --repo <org/name> --out ./reports/fix-prompts
+```
+
+Artifacts:
+
+- `reports/fix-prompts/*.json`
+- `reports/fix-prompts/*.codex.md`
+- `reports/fix-prompts/*.claude.md`
+
+## Core Commands
+
+- `retrace init` — interactive setup + validation
+- `retrace doctor` — health checks for config/services
+- `retrace run` — one-shot ingestion, detection, clustering, report write
+- `retrace ui` — local browser UI and onboarding/settings
+- `retrace github ...` — repo metadata management
+- `retrace suggest-fixes ...` — candidate matching + prompt generation
+
+## Detectors (v0.1)
+
+- `console_error`
+- `network_4xx`
+- `network_5xx`
+- `rage_click`
+- `dead_click`
+- `error_toast`
+- `blank_render`
+- `session_abandon_on_error`
+
+Toggle detectors in `config.yaml`.
+
+## Runtime Data
+
+- `config.yaml` — non-secret config
+- `.env` — secrets (`RETRACE_POSTHOG_API_KEY`, optional `RETRACE_LLM_API_KEY`)
+- `data/retrace.db` — run/session/findings metadata
+- `data/sessions/*.json` — ingested rrweb events
+- `reports/*.md` — findings reports
+- `reports/fix-prompts/*` — generated fix artifacts
+
+## Cron / Background Execution
 
 ```bash
 docker compose up -d
 ```
 
-Respects `RETRACE_CRON` env var (default every 6 hours). Mounts your `config.yaml`, `.env`, and writes `data/` + `reports/` to the host.
+Uses `RETRACE_CRON` (default every 6 hours).
 
-## Health check
+## Design Docs
 
-```bash
-retrace doctor
-```
-
-Re-runs all the validations `init` did. Exits non-zero if anything is broken.
-
-## Detectors (v0.1)
-
-| Detector | What it catches |
-|---|---|
-| `console_error` | `console.error` or uncaught exceptions |
-| `network_4xx` | 4xx HTTP responses (ignores 401 noise) |
-| `network_5xx` | 5xx server errors |
-| `rage_click` | 3+ rapid clicks on the same target |
-| `dead_click` | Click with no DOM mutation or network followup |
-| `error_toast` | DOM nodes with `role=alert`, toast/error classes, or error-like text |
-| `blank_render` | URL dwelt ≥2s with very few DOM nodes |
-| `session_abandon_on_error` | Session ends within 5s of any of the above |
-
-Toggle any via `config.yaml`.
-
-## How it works
-
-```
-PostHog API → Ingester → Detectors → Clusterer → LLM Analyst → Markdown Sink
-```
-
-- **Ingester** follows PostHog's pagination, stores rrweb events atomically to disk + metadata to SQLite.
-- **Detectors** emit structured signals. No LLM at this stage.
-- **Clusterer** groups sessions sharing the same signal fingerprint (detector set + URL path + primary error message) so "100 users hit the same toast" becomes one finding with `affected_count: 100`.
-- **LLM Analyst** takes one representative session per cluster and returns a structured bug report.
-- **Sink** writes the report grouped by severity. One file per run.
-
-## Design docs
-
-- `docs/superpowers/specs/2026-04-19-retrace-design.md` — product spec
-- `docs/superpowers/plans/2026-04-19-retrace-plan-a-vertical-slice.md` — Plan A (v0.1-alpha)
-- `docs/superpowers/plans/2026-04-20-retrace-plan-b-polish-and-breadth.md` — Plan B (v0.1)
+- `docs/superpowers/specs/2026-04-19-retrace-design.md`
+- `docs/superpowers/plans/2026-04-19-retrace-plan-a-vertical-slice.md`
