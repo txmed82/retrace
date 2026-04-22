@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -250,3 +251,58 @@ def test_fetch_since_stops_at_max_sessions_mid_page(
     ids = ingester.fetch_since(since, max_sessions=2)
 
     assert ids == ["sess-1", "sess-2"]
+
+
+def test_fetch_sessions_supports_posthog_blob_v2_sources(
+    httpx_mock: HTTPXMock, tmp_path: Path, cfg: PostHogConfig
+):
+    since = datetime(2026, 4, 19, 10, 0, tzinfo=timezone.utc)
+    httpx_mock.add_response(
+        method="GET",
+        url=(
+            "https://us.i.posthog.com/api/projects/42/session_recordings"
+            "?date_from=2026-04-19T10%3A00%3A00%2B00%3A00&limit=50"
+        ),
+        json={
+            "results": [
+                {
+                    "id": "sess-blob",
+                    "start_time": "2026-04-19T11:00:00+00:00",
+                    "recording_duration": 7,
+                    "distinct_id": "u-blob",
+                    "click_count": 1,
+                }
+            ],
+            "next": None,
+        },
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url="https://us.i.posthog.com/api/projects/42/session_recordings/sess-blob/snapshots",
+        json={"sources": [{"source": "blob_v2", "blob_key": "0"}]},
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=(
+            "https://us.i.posthog.com/api/projects/42/session_recordings/sess-blob/snapshots"
+            "?source=blob_v2&start_blob_key=0&end_blob_key=0"
+        ),
+        text=(
+            '["sess-blob",{"timestamp":1,"type":4,"data":{"href":"https://cerebrallabs.io"}}]\n'
+            '["sess-blob",{"timestamp":2,"type":6,"data":{"source":"console","level":"error","payload":"boom"}}]\n'
+        ),
+        headers={"content-type": "application/jsonl"},
+    )
+
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    ingester = PostHogIngester(cfg, store, data_dir=tmp_path / "data")
+
+    ids = ingester.fetch_since(since, max_sessions=50)
+
+    assert ids == ["sess-blob"]
+    events_path = tmp_path / "data" / "sessions" / "sess-blob.json"
+    events = json.loads(events_path.read_text())
+    assert len(events) == 2
+    assert events[0]["type"] == 4
+    assert events[1]["type"] == 6

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,89 @@ class PostHogIngester:
                 pass
             raise
 
+    def _get_with_retry(
+        self,
+        client: httpx.Client,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        max_attempts: int = 5,
+    ) -> httpx.Response:
+        for attempt in range(max_attempts):
+            resp = client.get(url, headers=self._headers(), params=params)
+            if resp.status_code != 429:
+                resp.raise_for_status()
+                return resp
+            if attempt >= max_attempts - 1:
+                resp.raise_for_status()
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                sleep_s = float(retry_after)
+            else:
+                sleep_s = min(8.0, 0.5 * (2 ** attempt))
+            time.sleep(sleep_s)
+        raise RuntimeError("unreachable retry loop")
+
+    @staticmethod
+    def _parse_concatenated_json(text: str) -> list[Any]:
+        """Parse JSON values concatenated in one stream (PostHog blob_v2/jsonl)."""
+        out: list[Any] = []
+        decoder = json.JSONDecoder()
+        i = 0
+        n = len(text)
+        while i < n:
+            while i < n and text[i].isspace():
+                i += 1
+            if i >= n:
+                break
+            value, j = decoder.raw_decode(text, i)
+            out.append(value)
+            i = j
+        return out
+
+    def _fetch_snapshots(self, client: httpx.Client, session_id: str) -> list[dict[str, Any]]:
+        host = self.cfg.host.rstrip("/")
+        snap_url = (
+            f"{host}/api/projects/{self.cfg.project_id}"
+            f"/session_recordings/{session_id}/snapshots"
+        )
+        snap_resp = self._get_with_retry(client, snap_url)
+        body = snap_resp.json()
+
+        # Legacy shape: {"snapshots": [...]}
+        if isinstance(body, dict) and isinstance(body.get("snapshots"), list):
+            return body.get("snapshots", [])
+
+        # New shape: {"sources":[{"source":"blob_v2","blob_key":"0",...}, ...]}
+        sources = body.get("sources", []) if isinstance(body, dict) else []
+        if not isinstance(sources, list) or not sources:
+            return []
+
+        snapshots: list[dict[str, Any]] = []
+        for src in sources:
+            if not isinstance(src, dict):
+                continue
+            source_name = src.get("source")
+            blob_key = src.get("blob_key")
+            if not source_name or blob_key is None:
+                continue
+
+            blob_resp = self._get_with_retry(
+                client,
+                snap_url,
+                params={
+                    "source": str(source_name),
+                    "start_blob_key": str(blob_key),
+                    "end_blob_key": str(blob_key),
+                },
+            )
+            for item in self._parse_concatenated_json(blob_resp.text):
+                if isinstance(item, list) and len(item) >= 2 and isinstance(item[1], dict):
+                    snapshots.append(item[1])
+                elif isinstance(item, dict):
+                    snapshots.append(item)
+        return snapshots
+
     def fetch_since(self, since: datetime, max_sessions: int) -> list[str]:
         host = self.cfg.host.rstrip("/")
         qs = urlencode({"date_from": since.isoformat(), "limit": max_sessions})
@@ -56,8 +140,7 @@ class PostHogIngester:
             timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
         ) as client:
             while next_url and len(ids) < max_sessions:
-                list_resp = client.get(next_url, headers=self._headers())
-                list_resp.raise_for_status()
+                list_resp = self._get_with_retry(client, next_url)
                 body = list_resp.json()
                 recordings = body.get("results", [])
                 for r in recordings:
@@ -65,13 +148,7 @@ class PostHogIngester:
                         break
                     sid = r["id"]
                     try:
-                        snap_url = (
-                            f"{host}/api/projects/{self.cfg.project_id}"
-                            f"/session_recordings/{sid}/snapshots"
-                        )
-                        snap_resp = client.get(snap_url, headers=self._headers())
-                        snap_resp.raise_for_status()
-                        snapshots = snap_resp.json().get("snapshots", [])
+                        snapshots = self._fetch_snapshots(client, sid)
                         self._atomic_write_json(
                             self.sessions_dir / f"{sid}.json", snapshots
                         )

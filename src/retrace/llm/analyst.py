@@ -88,7 +88,7 @@ def build_prompt(
     user = (
         f"Session: {session_id}\n\n"
         f"Signals detected by heuristics:\n" + "\n".join(signal_lines) + "\n\n"
-        f"User actions around the issue timeframe:\n"
+        "User actions around the issue timeframe:\n"
         + "\n".join(f"  - {a}" for a in actions)
         + "\n\n"
         + _USER_SCHEMA

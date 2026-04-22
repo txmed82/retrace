@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, iter_with_url, register
+from retrace.detectors.base import Signal, event_data, iter_with_url, register
 
 
 FOLLOWUP_WINDOW_MS = 2000
@@ -12,21 +12,21 @@ FOLLOWUP_WINDOW_MS = 2000
 def _is_click(e: dict[str, Any]) -> bool:
     if e.get("type") != 3:
         return False
-    d = e.get("data") or {}
+    d = event_data(e)
     return d.get("source") == 2 and d.get("type") == 2
 
 
 def _is_dom_mutation(e: dict[str, Any]) -> bool:
     if e.get("type") != 3:
         return False
-    d = e.get("data") or {}
+    d = event_data(e)
     return d.get("source") == 0
 
 
 def _is_network(e: dict[str, Any]) -> bool:
     if e.get("type") != 6:
         return False
-    d = e.get("data") or {}
+    d = event_data(e)
     return "network" in str(d.get("plugin", ""))
 
 
@@ -41,7 +41,7 @@ class DeadClickDetector:
             if not _is_click(e):
                 continue
             click_ts = int(e.get("timestamp") or 0)
-            tid = (e.get("data") or {}).get("id")
+            tid = event_data(e).get("id")
             had_followup = False
             for _u2, e2 in enum[i + 1:]:
                 ts2 = int(e2.get("timestamp") or 0)
