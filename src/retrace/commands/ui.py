@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 import shutil
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -481,7 +482,21 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
 
             if path.startswith("/api/session/") and path.endswith("/events"):
                 session_id = path.split("/")[3]
+                # Validate session_id to prevent path traversal
+                if not re.match(r"^[A-Za-z0-9._-]+$", session_id):
+                    self._json({"error": "invalid session_id"}, status=400)
+                    return
                 sp = data_dir / "sessions" / f"{session_id}.json"
+                # Ensure the resolved path is inside sessions directory
+                try:
+                    resolved = sp.resolve()
+                    sessions_dir = (data_dir / "sessions").resolve()
+                    if sessions_dir not in resolved.parents and resolved != sessions_dir:
+                        self._json({"error": "invalid session path"}, status=400)
+                        return
+                except Exception:
+                    self._json({"error": "invalid session path"}, status=400)
+                    return
                 if not sp.exists():
                     self._json({"error": "session not found"}, status=404)
                     return

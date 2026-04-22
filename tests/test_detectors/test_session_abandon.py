@@ -1,4 +1,4 @@
-from tests.fixtures.events import console_event, meta, network_event
+from tests.fixtures.events import console_event, meta
 
 
 def test_session_abandon_fires_when_error_near_end():

@@ -86,7 +86,7 @@ class LLMClient:
             return _parse_json(content)
 
         assert last_exc is not None
-        raise LLMError(f"LLM request failed after 3 attempts") from last_exc
+        raise LLMError("LLM request failed after 3 attempts") from last_exc
 
     @staticmethod
     def _backoff(attempt: int) -> None:

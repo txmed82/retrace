@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from retrace.storage import Storage, SessionMeta
 
 
@@ -46,9 +48,6 @@ def test_storage_start_and_finish_run(tmp_path: Path):
     assert row.findings_count == 2
     assert row.status == "ok"
     assert row.finished_at is not None
-
-
-import pytest
 
 
 def test_get_run_returns_none_for_unknown_id(tmp_path: Path):

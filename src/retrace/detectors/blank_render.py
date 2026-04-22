@@ -55,7 +55,9 @@ class BlankRenderDetector:
             t = e.get("type")
             if t == 4:
                 _maybe_emit(ts)
-                current_url = event_data(e).get("href")
+                href = event_data(e).get("href")
+                if isinstance(href, str):
+                    current_url = href
                 nav_ts = ts
                 last_node_count = None
             elif t == 2:

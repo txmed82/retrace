@@ -71,7 +71,7 @@ class CodeCandidate:
 
 
 def _tokenize(text: str) -> list[str]:
-    cleaned = re.sub(r"https?://\\S+", " ", text.lower())
+    cleaned = re.sub(r"https?://\S+", " ", text.lower())
     toks = [t for t in re.split(r"[^a-z0-9]+", cleaned) if len(t) >= 4]
     return [t for t in toks if t not in _STOPWORDS]
 
@@ -104,9 +104,16 @@ def _iter_source_files(repo_path: Path) -> list[Path]:
         rel = p.relative_to(repo_path).as_posix()
         if not rel.startswith(allow_prefixes):
             continue
-        if ".git" in p.parts or "node_modules" in p.parts or "dist" in p.parts:
+        # Use repo-relative path parts for filtering
+        try:
+            rel_path = p.relative_to(repo_path)
+            parts_to_check = rel_path.parts
+        except ValueError:
+            # Fall back to absolute path parts if not under repo_path
+            parts_to_check = p.parts
+        if ".git" in parts_to_check or "node_modules" in parts_to_check or "dist" in parts_to_check:
             continue
-        if any(part.startswith(".") for part in p.parts):
+        if any(part.startswith(".") for part in parts_to_check):
             continue
         if p.suffix.lower() not in _TEXT_EXTS:
             continue
