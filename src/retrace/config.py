@@ -53,8 +53,10 @@ class RetraceConfig(BaseModel):
 
 
 def load_config(path: Path) -> RetraceConfig:
-    load_dotenv(override=False)
-    raw = yaml.safe_load(Path(path).read_text()) or {}
+    config_path = Path(path)
+    # Keep env scoping local to the chosen config directory.
+    load_dotenv(dotenv_path=config_path.parent / ".env", override=False)
+    raw = yaml.safe_load(config_path.read_text()) or {}
 
     posthog_key_env = os.environ.get("RETRACE_POSTHOG_API_KEY")
     if posthog_key_env:

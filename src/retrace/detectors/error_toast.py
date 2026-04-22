@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, iter_with_url, register
+from retrace.detectors.base import Signal, event_data, iter_with_url, register
 
 
 _CLASS_RE = re.compile(r"\b(toast|snackbar|error|alert|notification)\b", re.IGNORECASE)
@@ -48,7 +48,7 @@ class ErrorToastDetector:
         for url, e in iter_with_url(events):
             if e.get("type") != 3:
                 continue
-            data = e.get("data") or {}
+            data = event_data(e)
             if data.get("source") != 0:
                 continue
             adds = data.get("adds") or []

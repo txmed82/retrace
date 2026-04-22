@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, register
+from retrace.detectors.base import Signal, event_data, register
 
 
 MIN_DWELL_MS = 2000
@@ -55,11 +55,11 @@ class BlankRenderDetector:
             t = e.get("type")
             if t == 4:
                 _maybe_emit(ts)
-                current_url = (e.get("data") or {}).get("href")
+                current_url = event_data(e).get("href")
                 nav_ts = ts
                 last_node_count = None
             elif t == 2:
-                root = (e.get("data") or {}).get("node") or {}
+                root = event_data(e).get("node") or {}
                 last_node_count = _count_element_nodes(root)
         if events:
             _maybe_emit(int(events[-1].get("timestamp") or 0))

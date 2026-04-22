@@ -38,12 +38,17 @@ def get_detector(name: str) -> Detector | None:
     return _REGISTRY.get(name)
 
 
+def event_data(e: dict[str, Any]) -> dict[str, Any]:
+    d = e.get("data")
+    return d if isinstance(d, dict) else {}
+
+
 def iter_with_url(events: list[dict[str, Any]]) -> Iterator[tuple[str, dict[str, Any]]]:
     """Yield (current_url, event) pairs, tracking the latest Meta href forward."""
     url = ""
     for e in events:
         if e.get("type") == 4:
-            data = e.get("data") or {}
+            data = event_data(e)
             href = data.get("href")
             if isinstance(href, str):
                 url = href

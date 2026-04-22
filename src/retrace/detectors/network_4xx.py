@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, iter_with_url, register
+from retrace.detectors.base import Signal, event_data, iter_with_url, register
 
 
 _IGNORED_STATUSES = {401}
@@ -18,10 +18,12 @@ class Network4xxDetector:
         for url, e in iter_with_url(events):
             if e.get("type") != 6:
                 continue
-            data = e.get("data") or {}
+            data = event_data(e)
             if "network" not in str(data.get("plugin", "")):
                 continue
-            payload = data.get("payload") or {}
+            payload = data.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
             status = payload.get("status_code") or payload.get("status")
             if not isinstance(status, int) or not 400 <= status < 500:
                 continue

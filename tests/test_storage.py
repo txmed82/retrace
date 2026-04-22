@@ -70,3 +70,61 @@ def test_upsert_session_rejects_naive_datetime(tmp_path: Path):
     )
     with pytest.raises(ValueError):
         store.upsert_session(s)
+
+
+def test_storage_github_repo_crud(tmp_path: Path):
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+
+    rid = store.upsert_github_repo(
+        repo_full_name="acme/widgets",
+        default_branch="main",
+        remote_url="https://github.com/acme/widgets.git",
+    )
+    assert rid > 0
+
+    got = store.get_github_repo("acme/widgets")
+    assert got is not None
+    assert got.default_branch == "main"
+    assert got.local_path == ""
+
+    rows = store.list_github_repos()
+    assert len(rows) == 1
+    assert rows[0].repo_full_name == "acme/widgets"
+
+    removed = store.delete_github_repo("acme/widgets")
+    assert removed == 1
+    assert store.get_github_repo("acme/widgets") is None
+
+
+def test_storage_report_findings_upsert_and_list(tmp_path: Path):
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+
+    fid = store.upsert_report_finding(
+        report_path="reports/2026-04-22.md",
+        finding_hash="abc123",
+        title="Dead clicks on checkout",
+        severity="high",
+        category="functional_error",
+        session_url="https://us.i.posthog.com/project/1/replay/s1",
+        evidence_text="Evidence A",
+    )
+    assert fid > 0
+
+    # upsert path
+    fid2 = store.upsert_report_finding(
+        report_path="reports/2026-04-22.md",
+        finding_hash="abc123",
+        title="Dead clicks on checkout (updated)",
+        severity="high",
+        category="functional_error",
+        session_url="https://us.i.posthog.com/project/1/replay/s1",
+        evidence_text="Evidence B",
+    )
+    assert fid2 == fid
+
+    rows = store.list_report_findings("reports/2026-04-22.md")
+    assert len(rows) == 1
+    assert rows[0].title == "Dead clicks on checkout (updated)"
+    assert rows[0].evidence_text == "Evidence B"

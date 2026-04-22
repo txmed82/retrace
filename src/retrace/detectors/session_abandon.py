@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, iter_with_url, register
+from retrace.detectors.base import Signal, event_data, iter_with_url, register
 
 
 ABANDON_WINDOW_MS = 5000
@@ -12,9 +12,11 @@ ABANDON_WINDOW_MS = 5000
 def _is_error_ish(e: dict[str, Any]) -> bool:
     if e.get("type") != 6:
         return False
-    d = e.get("data") or {}
+    d = event_data(e)
     plugin = str(d.get("plugin", ""))
-    payload = d.get("payload") or {}
+    payload = d.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
     if plugin.startswith("rrweb/console"):
         return payload.get("level") in {"error", "assert"}
     if "network" in plugin:

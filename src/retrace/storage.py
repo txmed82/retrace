@@ -32,6 +32,50 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS github_repos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_full_name TEXT NOT NULL UNIQUE,
+    default_branch TEXT NOT NULL,
+    remote_url TEXT NOT NULL DEFAULT '',
+    local_path TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT 'github',
+    connected_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS report_findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_path TEXT NOT NULL,
+    finding_hash TEXT NOT NULL,
+    title TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    category TEXT NOT NULL,
+    session_url TEXT NOT NULL,
+    evidence_text TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(report_path, finding_hash)
+);
+
+CREATE TABLE IF NOT EXISTS code_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id INTEGER NOT NULL,
+    repo_id INTEGER NOT NULL,
+    file_path TEXT NOT NULL,
+    symbol TEXT,
+    score REAL NOT NULL DEFAULT 0,
+    rationale_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS fix_prompts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id INTEGER NOT NULL,
+    repo_id INTEGER NOT NULL,
+    agent_target TEXT NOT NULL,
+    prompt_markdown TEXT NOT NULL,
+    prompt_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -56,6 +100,41 @@ class RunRow:
     error: Optional[str]
 
 
+@dataclass
+class GitHubRepoRow:
+    id: int
+    repo_full_name: str
+    default_branch: str
+    remote_url: str
+    local_path: str
+    provider: str
+    connected_at: datetime
+
+
+@dataclass
+class ReportFindingRow:
+    id: int
+    report_path: str
+    finding_hash: str
+    title: str
+    severity: str
+    category: str
+    session_url: str
+    evidence_text: str
+    created_at: datetime
+
+
+@dataclass
+class FixPromptRow:
+    id: int
+    finding_id: int
+    repo_id: int
+    agent_target: str
+    prompt_markdown: str
+    prompt_json: str
+    created_at: datetime
+
+
 class Storage:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -69,6 +148,15 @@ class Storage:
     def init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            # Lightweight migrations for existing DBs.
+            cols_repo = [r["name"] for r in conn.execute("PRAGMA table_info(github_repos)").fetchall()]
+            if "local_path" not in cols_repo:
+                conn.execute("ALTER TABLE github_repos ADD COLUMN local_path TEXT NOT NULL DEFAULT ''")
+            cols_findings = [r["name"] for r in conn.execute("PRAGMA table_info(report_findings)").fetchall()]
+            if "evidence_text" not in cols_findings:
+                conn.execute(
+                    "ALTER TABLE report_findings ADD COLUMN evidence_text TEXT NOT NULL DEFAULT ''"
+                )
 
     def upsert_session(self, s: SessionMeta) -> None:
         if s.started_at.tzinfo is None:
@@ -170,3 +258,252 @@ class Storage:
             status=row["status"],
             error=row["error"],
         )
+
+    def upsert_github_repo(
+        self,
+        *,
+        repo_full_name: str,
+        default_branch: str,
+        remote_url: str = "",
+        local_path: str = "",
+        provider: str = "github",
+    ) -> int:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO github_repos (repo_full_name, default_branch, remote_url, local_path, provider)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(repo_full_name) DO UPDATE SET
+                    default_branch = excluded.default_branch,
+                    remote_url = excluded.remote_url,
+                    local_path = excluded.local_path,
+                    provider = excluded.provider
+                """,
+                (repo_full_name, default_branch, remote_url, local_path, provider),
+            )
+            row = conn.execute(
+                "SELECT id FROM github_repos WHERE repo_full_name = ?",
+                (repo_full_name,),
+            ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    def list_github_repos(self) -> list[GitHubRepoRow]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, repo_full_name, default_branch, remote_url, local_path, provider, connected_at
+                FROM github_repos
+                ORDER BY repo_full_name
+                """
+            ).fetchall()
+        return [
+            GitHubRepoRow(
+                id=int(r["id"]),
+                repo_full_name=str(r["repo_full_name"]),
+                default_branch=str(r["default_branch"]),
+                remote_url=str(r["remote_url"]),
+                local_path=str(r["local_path"]),
+                provider=str(r["provider"]),
+                connected_at=datetime.fromisoformat(str(r["connected_at"]).replace("Z", "+00:00")),
+            )
+            for r in rows
+        ]
+
+    def get_github_repo(self, repo_full_name: str) -> Optional[GitHubRepoRow]:
+        with self._conn() as conn:
+            r = conn.execute(
+                """
+                SELECT id, repo_full_name, default_branch, remote_url, local_path, provider, connected_at
+                FROM github_repos
+                WHERE repo_full_name = ?
+                """,
+                (repo_full_name,),
+            ).fetchone()
+        if not r:
+            return None
+        return GitHubRepoRow(
+            id=int(r["id"]),
+            repo_full_name=str(r["repo_full_name"]),
+            default_branch=str(r["default_branch"]),
+            remote_url=str(r["remote_url"]),
+            local_path=str(r["local_path"]),
+            provider=str(r["provider"]),
+            connected_at=datetime.fromisoformat(str(r["connected_at"]).replace("Z", "+00:00")),
+        )
+
+    def delete_github_repo(self, repo_full_name: str) -> int:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM github_repos WHERE repo_full_name = ?",
+                (repo_full_name,),
+            )
+            return int(cur.rowcount)
+
+    def upsert_report_finding(
+        self,
+        *,
+        report_path: str,
+        finding_hash: str,
+        title: str,
+        severity: str,
+        category: str,
+        session_url: str,
+        evidence_text: str = "",
+    ) -> int:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO report_findings
+                (report_path, finding_hash, title, severity, category, session_url, evidence_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_path, finding_hash) DO UPDATE SET
+                    title = excluded.title,
+                    severity = excluded.severity,
+                    category = excluded.category,
+                    session_url = excluded.session_url,
+                    evidence_text = excluded.evidence_text
+                """,
+                (report_path, finding_hash, title, severity, category, session_url, evidence_text),
+            )
+            row = conn.execute(
+                """
+                SELECT id FROM report_findings
+                WHERE report_path = ? AND finding_hash = ?
+                """,
+                (report_path, finding_hash),
+            ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    def list_report_findings(self, report_path: Optional[str] = None) -> list[ReportFindingRow]:
+        with self._conn() as conn:
+            if report_path is None:
+                rows = conn.execute(
+                    """
+                    SELECT id, report_path, finding_hash, title, severity, category, session_url, evidence_text, created_at
+                    FROM report_findings
+                    ORDER BY id
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, report_path, finding_hash, title, severity, category, session_url, evidence_text, created_at
+                    FROM report_findings
+                    WHERE report_path = ?
+                    ORDER BY id
+                    """,
+                    (report_path,),
+                ).fetchall()
+        return [
+            ReportFindingRow(
+                id=int(r["id"]),
+                report_path=str(r["report_path"]),
+                finding_hash=str(r["finding_hash"]),
+                title=str(r["title"]),
+                severity=str(r["severity"]),
+                category=str(r["category"]),
+                session_url=str(r["session_url"]),
+                evidence_text=str(r["evidence_text"]),
+                created_at=datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00")),
+            )
+            for r in rows
+        ]
+
+    def replace_code_candidates(
+        self,
+        *,
+        finding_id: int,
+        repo_id: int,
+        candidates: list[tuple[str, Optional[str], float, str]],
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM code_candidates WHERE finding_id = ? AND repo_id = ?",
+                (finding_id, repo_id),
+            )
+            conn.executemany(
+                """
+                INSERT INTO code_candidates (finding_id, repo_id, file_path, symbol, score, rationale_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [(finding_id, repo_id, fp, sym, score, rationale) for fp, sym, score, rationale in candidates],
+            )
+
+    def list_code_candidates(
+        self,
+        *,
+        finding_id: int,
+        repo_id: int,
+    ) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT file_path, symbol, score, rationale_json
+                FROM code_candidates
+                WHERE finding_id = ? AND repo_id = ?
+                ORDER BY score DESC, file_path
+                """,
+                (finding_id, repo_id),
+            ).fetchall()
+
+    def replace_fix_prompts(
+        self,
+        *,
+        finding_id: int,
+        repo_id: int,
+        prompts: list[tuple[str, str, str]],
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM fix_prompts WHERE finding_id = ? AND repo_id = ?",
+                (finding_id, repo_id),
+            )
+            conn.executemany(
+                """
+                INSERT INTO fix_prompts (finding_id, repo_id, agent_target, prompt_markdown, prompt_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [(finding_id, repo_id, target, md, pj) for target, md, pj in prompts],
+            )
+
+    def list_fix_prompts(
+        self,
+        *,
+        finding_id: int,
+        repo_id: Optional[int] = None,
+    ) -> list[FixPromptRow]:
+        with self._conn() as conn:
+            if repo_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT id, finding_id, repo_id, agent_target, prompt_markdown, prompt_json, created_at
+                    FROM fix_prompts
+                    WHERE finding_id = ?
+                    ORDER BY id
+                    """,
+                    (finding_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, finding_id, repo_id, agent_target, prompt_markdown, prompt_json, created_at
+                    FROM fix_prompts
+                    WHERE finding_id = ? AND repo_id = ?
+                    ORDER BY id
+                    """,
+                    (finding_id, repo_id),
+                ).fetchall()
+        return [
+            FixPromptRow(
+                id=int(r["id"]),
+                finding_id=int(r["finding_id"]),
+                repo_id=int(r["repo_id"]),
+                agent_target=str(r["agent_target"]),
+                prompt_markdown=str(r["prompt_markdown"]),
+                prompt_json=str(r["prompt_json"]),
+                created_at=datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00")),
+            )
+            for r in rows
+        ]
