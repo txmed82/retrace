@@ -6,13 +6,40 @@ import click
 import httpx
 import questionary
 
+from retrace.llm.client import build_llm_http_request, fetch_llm_models
 
-LLM_KINDS = [
-    "Local (llama.cpp / ollama / LM Studio)",
-    "OpenAI",
-    "Anthropic (via LiteLLM proxy)",
-    "Custom OpenAI-compatible endpoint",
-]
+LLM_KINDS = {
+    "Local (OpenAI-compatible: llama.cpp / ollama / LM Studio)": "openai_compatible",
+    "OpenAI API (cloud)": "openai",
+    "Anthropic API (cloud)": "anthropic",
+    "OpenRouter API (cloud)": "openrouter",
+    "Custom OpenAI-compatible endpoint": "openai_compatible",
+}
+
+LLM_DEFAULTS = {
+    "Local (OpenAI-compatible: llama.cpp / ollama / LM Studio)": {
+        "base_url": "http://localhost:8080/v1",
+        "model": "llama-3.1-8b-instruct",
+    },
+    "OpenAI API (cloud)": {
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+    },
+    "Anthropic API (cloud)": {
+        "base_url": "https://api.anthropic.com/v1",
+        "model": "claude-3-5-sonnet-latest",
+    },
+    "OpenRouter API (cloud)": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "openai/gpt-4o-mini",
+    },
+    "Custom OpenAI-compatible endpoint": {
+        "base_url": "",
+        "model": "",
+    },
+}
+_CLOUD_PROVIDERS = {"openai", "anthropic", "openrouter"}
+_CUSTOM_MODEL_SENTINEL = "<Enter custom model>"
 
 
 @click.command("init")
@@ -28,29 +55,60 @@ def init_command() -> None:
 
     _validate_posthog(ph_host, ph_project_id, ph_api_key)
 
-    llm_kind = questionary.select(
+    llm_kind_label = questionary.select(
         "LLM backend?",
-        choices=LLM_KINDS,
+        choices=list(LLM_KINDS.keys()),
     ).ask()
+    llm_provider = LLM_KINDS[llm_kind_label]
 
-    default_base = {
-        LLM_KINDS[0]: "http://localhost:8080/v1",
-        LLM_KINDS[1]: "https://api.openai.com/v1",
-        LLM_KINDS[2]: "http://localhost:8000/v1",
-        LLM_KINDS[3]: "",
-    }[llm_kind]
-    default_model = {
-        LLM_KINDS[0]: "llama-3.1-8b-instruct",
-        LLM_KINDS[1]: "gpt-4o-mini",
-        LLM_KINDS[2]: "claude-3-5-sonnet",
-        LLM_KINDS[3]: "",
-    }[llm_kind]
+    default_base = LLM_DEFAULTS[llm_kind_label]["base_url"]
+    default_model = LLM_DEFAULTS[llm_kind_label]["model"]
 
     llm_base_url = questionary.text("LLM base URL?", default=default_base).ask()
-    llm_model = questionary.text("LLM model?", default=default_model).ask()
-    llm_api_key = questionary.password("LLM API key (empty for local)?").ask()
+    key_label = {
+        "openai": "OpenAI API key (sk-...)?",
+        "anthropic": "Anthropic API key (sk-ant-...)?",
+        "openrouter": "OpenRouter API key (sk-or-...)?",
+        "openai_compatible": "LLM API key (empty for local)?",
+    }[llm_provider]
+    llm_api_key = questionary.password(key_label).ask()
+    if llm_provider in _CLOUD_PROVIDERS and not (llm_api_key or "").strip():
+        raise click.ClickException(f"{llm_provider} requires an API key.")
 
-    _validate_llm(llm_base_url, llm_model, llm_api_key)
+    fetch_models = questionary.confirm(
+        "Fetch available models from provider/API?",
+        default=(llm_provider in _CLOUD_PROVIDERS),
+    ).ask()
+    models: list[str] = []
+    if fetch_models:
+        try:
+            models = fetch_llm_models(
+                provider=llm_provider,
+                base_url=llm_base_url,
+                api_key=llm_api_key or None,
+            )
+            if models:
+                click.echo(f"  ✓ Found {len(models)} model(s)")
+            else:
+                click.echo("  ! No models returned, falling back to manual entry.")
+        except Exception as exc:
+            click.echo(f"  ! Model discovery failed ({exc}), falling back to manual entry.")
+
+    if models:
+        choices = list(models) + [_CUSTOM_MODEL_SENTINEL]
+        selected = questionary.select(
+            "LLM model?",
+            choices=choices,
+            default=default_model if default_model in models else choices[0],
+        ).ask()
+        if selected == _CUSTOM_MODEL_SENTINEL:
+            llm_model = questionary.text("LLM model?", default=default_model).ask()
+        else:
+            llm_model = selected
+    else:
+        llm_model = questionary.text("LLM model?", default=default_model).ask()
+
+    _validate_llm(llm_provider, llm_base_url, llm_model, llm_api_key)
 
     lookback_hours = int(
         questionary.text("Lookback hours on first run?", default="6").ask()
@@ -69,6 +127,7 @@ def init_command() -> None:
         ph_host=ph_host,
         ph_project_id=ph_project_id,
         ph_api_key=ph_api_key,
+        llm_provider=llm_provider,
         llm_base_url=llm_base_url,
         llm_model=llm_model,
         llm_api_key=llm_api_key,
@@ -96,16 +155,18 @@ def _validate_posthog(host: str, project_id: str, api_key: str) -> None:
     click.echo("  \u2713 PostHog connection OK")
 
 
-def _validate_llm(base_url: str, model: str, api_key: str) -> None:
-    url = f"{base_url.rstrip('/')}/chat/completions"
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    body = {
-        "model": model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 4,
-    }
+def _validate_llm(provider: str, base_url: str, model: str, api_key: str) -> None:
+    url, headers, body = build_llm_http_request(
+        provider=provider,
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        system="You are a test assistant.",
+        user="reply with ping",
+        temperature=0.0,
+        response_json=False,
+        max_tokens=8,
+    )
     with httpx.Client(timeout=30) as c:
         resp = c.post(url, headers=headers, json=body)
         resp.raise_for_status()
@@ -119,6 +180,7 @@ def _write_config(
     ph_host: str,
     ph_project_id: str,
     ph_api_key: str,
+    llm_provider: str,
     llm_base_url: str,
     llm_model: str,
     llm_api_key: str,
@@ -133,6 +195,7 @@ def _write_config(
   project_id: "{ph_project_id}"
 
 llm:
+  provider: {llm_provider}
   base_url: {llm_base_url}
   model: {llm_model}
 

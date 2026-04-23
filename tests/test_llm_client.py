@@ -5,8 +5,12 @@ from retrace.config import LLMConfig
 from retrace.llm.client import LLMClient, LLMError
 
 
-def _cfg(api_key: str | None = None) -> LLMConfig:
-    return LLMConfig(base_url="http://localhost:8080/v1", model="test", api_key=api_key)
+def _cfg(
+    api_key: str | None = None,
+    provider: str = "openai_compatible",
+    base_url: str = "http://localhost:8080/v1",
+) -> LLMConfig:
+    return LLMConfig(provider=provider, base_url=base_url, model="test", api_key=api_key)
 
 
 def test_chat_json_returns_parsed_dict(httpx_mock: HTTPXMock):
@@ -85,3 +89,38 @@ def test_chat_json_sends_no_auth_header_when_api_key_none(httpx_mock: HTTPXMock)
         client.chat_json(system="s", user="u")
     req = httpx_mock.get_requests()[-1]
     assert "authorization" not in {k.lower() for k in req.headers}
+
+
+def test_chat_json_anthropic_uses_messages_endpoint_and_parses_content(httpx_mock: HTTPXMock):
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.anthropic.com/v1/messages",
+        json={"content": [{"type": "text", "text": '{"ok": true}'}]},
+    )
+    with LLMClient(
+        _cfg(
+            provider="anthropic",
+            base_url="https://api.anthropic.com/v1",
+            api_key="sk-ant-test",
+        )
+    ) as client:
+        assert client.chat_json(system="s", user="u") == {"ok": True}
+    req = httpx_mock.get_requests()[-1]
+    assert req.headers["x-api-key"] == "sk-ant-test"
+    assert "anthropic-version" in {k.lower() for k in req.headers}
+
+
+def test_chat_json_anthropic_raises_on_missing_text_content(httpx_mock: HTTPXMock):
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.anthropic.com/v1/messages",
+        json={"content": [{"type": "tool_use", "name": "x"}]},
+    )
+    with LLMClient(
+        _cfg(
+            provider="anthropic",
+            base_url="https://api.anthropic.com/v1",
+            api_key="sk-ant-test",
+        )
+    ) as client, pytest.raises(LLMError):
+        client.chat_json(system="s", user="u")

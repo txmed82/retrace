@@ -20,6 +20,14 @@ class Finding:
     affected_count: int = 1
     first_seen_ms: int = 0
     last_seen_ms: int = 0
+    distinct_id: str = ""
+    error_issue_ids: list[str] = field(default_factory=list)
+    trace_ids: list[str] = field(default_factory=list)
+    top_stack_frame: str = ""
+    error_tracking_url: str = ""
+    logs_url: str = ""
+    first_error_ts_ms: int = 0
+    last_error_ts_ms: int = 0
 
 
 @dataclass

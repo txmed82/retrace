@@ -11,7 +11,7 @@ _ANSWERS = {
     "ph_host": "https://us.i.posthog.com",
     "ph_project_id": "42",
     "ph_api_key": "phx_test",
-    "llm_kind": "Local (llama.cpp / ollama / LM Studio)",
+    "llm_kind": "Local (OpenAI-compatible: llama.cpp / ollama / LM Studio)",
     "llm_base_url": "http://localhost:8080/v1",
     "llm_model": "llama-3.1-8b-instruct",
     "llm_api_key": "",
@@ -87,4 +87,5 @@ def test_init_writes_config_and_env_with_validated_connections(
     cfg_text = (tmp_path / "config.yaml").read_text()
     assert "project_id: \"42\"" in cfg_text or "project_id: '42'" in cfg_text
     assert "us.i.posthog.com" in cfg_text
+    assert "provider: openai_compatible" in cfg_text
     assert "llama-3.1-8b-instruct" in cfg_text

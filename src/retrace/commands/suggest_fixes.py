@@ -92,6 +92,14 @@ def suggest_fixes_command(
             category=f.category,
             session_url=f.session_url,
             evidence_text=f.evidence_text,
+            distinct_id=str(getattr(f, "distinct_id", "") or ""),
+            error_issue_ids=list(getattr(f, "error_issue_ids", []) or []),
+            trace_ids=list(getattr(f, "trace_ids", []) or []),
+            top_stack_frame=str(getattr(f, "top_stack_frame", "") or ""),
+            error_tracking_url=str(getattr(f, "error_tracking_url", "") or ""),
+            logs_url=str(getattr(f, "logs_url", "") or ""),
+            first_error_ts_ms=int(getattr(f, "first_error_ts_ms", 0) or 0),
+            last_error_ts_ms=int(getattr(f, "last_error_ts_ms", 0) or 0),
         )
         stored += 1
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -16,6 +16,7 @@ class PostHogConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
+    provider: Literal["openai_compatible", "openai", "anthropic", "openrouter"] = "openai_compatible"
     base_url: str
     model: str
     api_key: Optional[str] = None
@@ -64,7 +65,17 @@ def load_config(path: Path) -> RetraceConfig:
     elif "api_key" not in raw.setdefault("posthog", {}):
         raw["posthog"]["api_key"] = ""
 
+    llm_provider = str(((raw.get("llm") or {}).get("provider") or "openai_compatible")).strip()
     llm_key_env = os.environ.get("RETRACE_LLM_API_KEY")
+    if not llm_key_env:
+        provider_env_map = {
+            "openai": "RETRACE_OPENAI_API_KEY",
+            "anthropic": "RETRACE_ANTHROPIC_API_KEY",
+            "openrouter": "RETRACE_OPENROUTER_API_KEY",
+        }
+        provider_env = provider_env_map.get(llm_provider)
+        if provider_env:
+            llm_key_env = os.environ.get(provider_env)
     if llm_key_env:
         raw.setdefault("llm", {})["api_key"] = llm_key_env
 

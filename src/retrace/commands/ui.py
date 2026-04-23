@@ -14,19 +14,43 @@ import click
 import httpx
 import yaml
 
+from retrace.llm.client import build_llm_http_request, fetch_llm_models
 from retrace.reports.parser import parse_report_findings
 from retrace.storage import Storage
 
+_CLOUD_LLM_PROVIDERS = {"openai", "anthropic", "openrouter"}
+
+_LLM_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
+    "openai_compatible": {
+        "base_url": "http://localhost:8080/v1",
+        "model": "llama-3.1-8b-instruct",
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+    },
+    "anthropic": {
+        "base_url": "https://api.anthropic.com/v1",
+        "model": "claude-3-5-sonnet-latest",
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "openai/gpt-4o-mini",
+    },
+}
+
 
 def _default_config() -> dict[str, Any]:
+    llm_default = _LLM_PROVIDER_DEFAULTS["openai_compatible"]
     return {
         "posthog": {
             "host": "https://us.i.posthog.com",
             "project_id": "",
         },
         "llm": {
-            "base_url": "http://localhost:8080/v1",
-            "model": "llama-3.1-8b-instruct",
+            "provider": "openai_compatible",
+            "base_url": llm_default["base_url"],
+            "model": llm_default["model"],
         },
         "run": {
             "lookback_hours": 168,
@@ -153,6 +177,52 @@ def _posthog_check(host: str, project_id: str, api_key: str) -> dict[str, Any]:
         return {"configured": True, "reachable": False, "detail": str(exc)}
 
 
+def _llm_check(provider: str, base_url: str, model: str, api_key: str) -> dict[str, Any]:
+    configured = bool(provider.strip() and base_url.strip() and model.strip())
+    if not configured:
+        return {"configured": False, "reachable": None, "detail": "Missing provider/base URL/model."}
+    try:
+        url, headers, body = build_llm_http_request(
+            provider=provider,
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            system="You are a test assistant.",
+            user="reply with ping",
+            temperature=0.0,
+            response_json=False,
+            max_tokens=8,
+        )
+        with httpx.Client(timeout=12) as c:
+            r = c.post(url, headers=headers, json=body)
+        if r.status_code // 100 == 2:
+            return {"configured": True, "reachable": True, "detail": f"OK ({r.status_code})"}
+        return {"configured": True, "reachable": False, "detail": f"HTTP {r.status_code}"}
+    except Exception as exc:
+        return {"configured": True, "reachable": False, "detail": str(exc)}
+
+
+def _llm_defaults(provider: str) -> dict[str, str]:
+    return _LLM_PROVIDER_DEFAULTS.get(provider, _LLM_PROVIDER_DEFAULTS["openai_compatible"])
+
+
+def _llm_models(provider: str, base_url: str, api_key: str) -> dict[str, Any]:
+    p = provider.strip() or "openai_compatible"
+    if p in _CLOUD_LLM_PROVIDERS and not api_key.strip():
+        return {"ok": False, "error": "API key required for selected provider."}
+    if not base_url.strip():
+        return {"ok": False, "error": "Base URL is required."}
+    try:
+        models = fetch_llm_models(
+            provider=p,
+            base_url=base_url.strip(),
+            api_key=api_key.strip() or None,
+        )
+        return {"ok": True, "models": models}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def _to_findings_payload(
     *,
     store: Storage,
@@ -208,6 +278,14 @@ def _to_findings_payload(
                 "session_id": _session_id_from_url(f.session_url),
                 "session_url": f.session_url,
                 "evidence_text": f.evidence_text,
+                "distinct_id": row.distinct_id if row else "",
+                "error_issue_ids": row.error_issue_ids if row else [],
+                "trace_ids": row.trace_ids if row else [],
+                "top_stack_frame": row.top_stack_frame if row else "",
+                "error_tracking_url": row.error_tracking_url if row else "",
+                "logs_url": row.logs_url if row else "",
+                "first_error_ts_ms": row.first_error_ts_ms if row else 0,
+                "last_error_ts_ms": row.last_error_ts_ms if row else 0,
                 "candidates": candidates,
                 "prompts": prompts,
             }
@@ -266,6 +344,14 @@ _INDEX_HTML = """<!doctype html>
   <script>
     let findings = [];
     let active = null;
+    const LLM_DEFAULTS = {
+      openai_compatible: { base_url: 'http://localhost:8080/v1', model: 'llama-3.1-8b-instruct' },
+      openai: { base_url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+      anthropic: { base_url: 'https://api.anthropic.com/v1', model: 'claude-3-5-sonnet-latest' },
+      openrouter: { base_url: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o-mini' },
+    };
+    const CLOUD_PROVIDERS = new Set(['openai', 'anthropic', 'openrouter']);
+    const CUSTOM_MODEL = '__custom__';
 
     function esc(s){ return String(s || \"\").replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c])); }
     function byId(id){ return document.getElementById(id); }
@@ -273,12 +359,77 @@ _INDEX_HTML = """<!doctype html>
     function copyText(s){ navigator.clipboard.writeText(String(s || \"\")); }
     function copyPrompt(key){ if(active?.prompts?.[key]) copyText(active.prompts[key]); }
 
+    function llmKeyLabel(provider){
+      if(provider === 'openai') return 'OpenAI API Key';
+      if(provider === 'anthropic') return 'Anthropic API Key';
+      if(provider === 'openrouter') return 'OpenRouter API Key';
+      return 'LLM API Key (optional for local)';
+    }
+
+    function syncProviderUI(applyDefaults=false){
+      const provider = byId('llmProvider').value || 'openai_compatible';
+      const keyLbl = byId('llmKeyLabel');
+      const keyReq = byId('llmKeyRequired');
+      if(keyLbl) keyLbl.textContent = llmKeyLabel(provider);
+      if(keyReq) keyReq.textContent = CLOUD_PROVIDERS.has(provider) ? 'required' : 'optional';
+      if(applyDefaults){
+        const d = LLM_DEFAULTS[provider] || LLM_DEFAULTS.openai_compatible;
+        if(byId('llmBaseUrl')) byId('llmBaseUrl').value = d.base_url;
+        if(byId('llmModel')) byId('llmModel').value = d.model;
+      }
+    }
+
+    async function fetchModels(ev){
+      ev.preventDefault();
+      const provider = byId('llmProvider').value || 'openai_compatible';
+      const body = {
+        provider,
+        base_url: byId('llmBaseUrl').value,
+        api_key: byId('llmApiKey').value,
+      };
+      const status = byId('llmModelStatus');
+      status.textContent = 'Loading models...';
+      const res = await fetch('/api/llm/models', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        status.textContent = data.error || 'Model discovery failed';
+        return;
+      }
+      const models = data.models || [];
+      const picker = byId('llmModelPicker');
+      if(!models.length){
+        status.textContent = 'No models returned. You can still type one manually.';
+        picker.style.display = 'none';
+        return;
+      }
+      status.textContent = `Loaded ${models.length} model(s).`;
+      picker.innerHTML = models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('') + `<option value="${CUSTOM_MODEL}">Custom...</option>`;
+      picker.style.display = 'block';
+      const cur = byId('llmModel').value;
+      const hasCur = models.includes(cur);
+      picker.value = hasCur ? cur : models[0];
+      byId('llmModel').value = hasCur ? cur : models[0];
+    }
+
+    function onModelPick(){
+      const picker = byId('llmModelPicker');
+      if(!picker) return;
+      if(picker.value === CUSTOM_MODEL){
+        return;
+      }
+      byId('llmModel').value = picker.value;
+    }
+
     async function saveSettings(ev){
       ev.preventDefault();
       const body = {
         posthog_host: byId('phHost').value,
         posthog_project_id: byId('phProject').value,
         posthog_api_key: byId('phKey').value,
+        llm_provider: byId('llmProvider').value,
+        llm_base_url: byId('llmBaseUrl').value,
+        llm_model: byId('llmModel').value,
+        llm_api_key: byId('llmApiKey').value,
       };
       const res = await fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
       const data = await res.json();
@@ -293,6 +444,12 @@ _INDEX_HTML = """<!doctype html>
       const checks = await cRes.json();
       const gh = checks.gh || {};
       const ph = checks.posthog || {};
+      const llm = checks.llm || {};
+      const llmProvider = settings.llm_provider || 'openai_compatible';
+      const llmProviderLabel = llmProvider === 'openai' ? 'OpenAI'
+        : llmProvider === 'anthropic' ? 'Anthropic'
+        : llmProvider === 'openrouter' ? 'OpenRouter'
+        : 'OpenAI-compatible';
       byId('onboarding').innerHTML = `
         <h3>Onboarding & Settings</h3>
         <form id=\"settingsForm\">
@@ -302,13 +459,34 @@ _INDEX_HTML = """<!doctype html>
           <input id=\"phProject\" value=\"${esc(settings.posthog_project_id)}\" />
           <div class=\"lbl\">PostHog Personal API Key</div>
           <input id=\"phKey\" value=\"${esc(settings.posthog_api_key)}\" />
+          <div class=\"lbl\">LLM Provider</div>
+          <select id=\"llmProvider\" style=\"width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;\">
+            <option value=\"openai_compatible\" ${llmProvider === 'openai_compatible' ? 'selected' : ''}>OpenAI-compatible (local/custom)</option>
+            <option value=\"openai\" ${llmProvider === 'openai' ? 'selected' : ''}>OpenAI API</option>
+            <option value=\"anthropic\" ${llmProvider === 'anthropic' ? 'selected' : ''}>Anthropic API</option>
+            <option value=\"openrouter\" ${llmProvider === 'openrouter' ? 'selected' : ''}>OpenRouter API</option>
+          </select>
+          <div class=\"lbl\">LLM Base URL</div>
+          <input id=\"llmBaseUrl\" value=\"${esc(settings.llm_base_url)}\" />
+          <div class=\"lbl\">LLM Model</div>
+          <input id=\"llmModel\" value=\"${esc(settings.llm_model)}\" />
+          <div style=\"margin-top:6px\"><button class=\"btn\" type=\"button\" id=\"fetchModelsBtn\">Fetch Models</button> <span class=\"empty\" id=\"llmModelStatus\"></span></div>
+          <select id=\"llmModelPicker\" style=\"display:none; margin-top:8px; width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;\"></select>
+          <div class=\"lbl\" id=\"llmKeyLabel\">LLM API Key</div>
+          <div class=\"empty\">Key: <span id=\"llmKeyRequired\">optional</span></div>
+          <input id=\"llmApiKey\" value=\"${esc(settings.llm_api_key)}\" />
           <div style=\"margin-top:10px\"><button class=\"btn\" type=\"submit\">Save Settings</button></div>
         </form>
         <div style=\"margin-top:10px\" class=\"empty\">GitHub CLI: <span class=\"${gh.installed?'ok':'bad'}\">${gh.installed?'installed':'missing'}</span> · auth: <span class=\"${gh.authed?'ok':'bad'}\">${gh.authed?'ok':'not authed'}</span></div>
         <div class=\"empty\">PostHog check: <span class=\"${ph.reachable===true?'ok':(ph.reachable===false?'bad':'')}\">${ph.reachable===true?'reachable':(ph.reachable===false?'unreachable':'not configured')}</span> ${esc(ph.detail || '')}</div>
+        <div class=\"empty\">LLM check (${esc(llmProviderLabel)}): <span class=\"${llm.reachable===true?'ok':(llm.reachable===false?'bad':'')}\">${llm.reachable===true?'reachable':(llm.reachable===false?'unreachable':'not configured')}</span> ${esc(llm.detail || '')}</div>
         ${!gh.installed ? `<div class=\"empty\">Run in terminal: <code>${esc(gh.commands?.install || 'brew install gh')}</code> <button class=\"btn\" onclick=\"copyText('${esc(gh.commands?.install || 'brew install gh')}')\">Copy</button></div>` : ''}
         ${gh.installed && !gh.authed ? `<div class=\"empty\">Run in terminal: <code>${esc(gh.commands?.login || 'gh auth login')}</code> <button class=\"btn\" onclick=\"copyText('${esc(gh.commands?.login || 'gh auth login')}')\">Copy</button></div>` : ''}
       `;
+      byId('llmProvider').addEventListener('change', () => syncProviderUI(true));
+      byId('fetchModelsBtn').addEventListener('click', fetchModels);
+      byId('llmModelPicker').addEventListener('change', onModelPick);
+      syncProviderUI(false);
       byId('settingsForm').addEventListener('submit', saveSettings);
     }
 
@@ -348,6 +526,11 @@ _INDEX_HTML = """<!doctype html>
       const cands = (active.candidates||[]).map(c => `<li><code>${esc(c.file_path)}</code> (score=${c.score})<br><span class=\"empty\">${esc(c.rationale)}</span></li>`).join('');
       const codex = active.prompts?.codex || '';
       const claude = active.prompts?.claude_code || '';
+      const errIssues = (active.error_issue_ids||[]).join(', ') || '—';
+      const traceIds = (active.trace_ids||[]).join(', ') || '—';
+      const errWindow = (active.first_error_ts_ms || active.last_error_ts_ms)
+        ? `${active.first_error_ts_ms} → ${active.last_error_ts_ms}`
+        : '—';
       root.innerHTML = `
         <div class=\"meta card\"><h3>${esc(active.title)}</h3><div class=\"empty\">${esc(active.severity)} · ${esc(active.category)}</div><div style=\"margin-top:8px\"><a href=\"${esc(active.session_url)}\" target=\"_blank\">Open PostHog replay</a></div></div>
         <div style=\"height:10px\"></div>
@@ -356,6 +539,20 @@ _INDEX_HTML = """<!doctype html>
         <div class=\"grid\">
           <div class=\"card\"><h3>Likely Culprits</h3>${cands ? `<ul>${cands}</ul>` : '<div class=\"empty\">No candidates generated.</div>'}</div>
           <div class=\"card\"><h3>Evidence</h3><pre>${esc(active.evidence_text)}</pre></div>
+        </div>
+        <div style=\"height:12px\"></div>
+        <div class=\"grid\">
+          <div class=\"card\">
+            <h3>Observability Links</h3>
+            <div class=\"empty\">Distinct ID: <code>${esc(active.distinct_id || '—')}</code></div>
+            <div class=\"empty\">Error issues: <code>${esc(errIssues)}</code></div>
+            <div class=\"empty\">Trace IDs: <code>${esc(traceIds)}</code></div>
+            <div class=\"empty\">Top stack frame: <code>${esc(active.top_stack_frame || '—')}</code></div>
+            <div class=\"empty\">Error window (ms): <code>${esc(errWindow)}</code></div>
+            <div style=\"margin-top:8px\">${active.error_tracking_url ? `<a href=\"${esc(active.error_tracking_url)}\" target=\"_blank\">Open Error Tracking</a>` : '<span class=\"empty\">Error Tracking link unavailable</span>'}</div>
+            <div style=\"margin-top:4px\">${active.logs_url ? `<a href=\"${esc(active.logs_url)}\" target=\"_blank\">Open Logs</a>` : '<span class=\"empty\">Logs link unavailable</span>'}</div>
+          </div>
+          <div class=\"card\"><h3>Correlation Status</h3><div class=\"empty\">Placeholder enrichment is enabled. Wire live PostHog Error Tracking/Logs queries next to populate issue IDs and traces.</div></div>
         </div>
         <div style=\"height:12px\"></div>
         <div class=\"grid\">
@@ -416,6 +613,10 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
             "posthog_host": str(((cfg.get("posthog") or {}).get("host") or "https://us.i.posthog.com")),
             "posthog_project_id": str(((cfg.get("posthog") or {}).get("project_id") or "")),
             "posthog_api_key": env.get("RETRACE_POSTHOG_API_KEY", ""),
+            "llm_provider": str(((cfg.get("llm") or {}).get("provider") or "openai_compatible")),
+            "llm_base_url": str(((cfg.get("llm") or {}).get("base_url") or "http://localhost:8080/v1")),
+            "llm_model": str(((cfg.get("llm") or {}).get("model") or "llama-3.1-8b-instruct")),
+            "llm_api_key": env.get("RETRACE_LLM_API_KEY", ""),
         }
 
     class Handler(BaseHTTPRequestHandler):
@@ -465,6 +666,12 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
                             s["posthog_host"],
                             s["posthog_project_id"],
                             s["posthog_api_key"],
+                        ),
+                        "llm": _llm_check(
+                            s["llm_provider"],
+                            s["llm_base_url"],
+                            s["llm_model"],
+                            s["llm_api_key"],
                         ),
                     }
                 )
@@ -517,18 +724,41 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
                 host_v = str(body.get("posthog_host", "")).strip() or "https://us.i.posthog.com"
                 project_v = str(body.get("posthog_project_id", "")).strip()
                 key_v = str(body.get("posthog_api_key", "")).strip()
+                llm_provider_v = str(body.get("llm_provider", "")).strip() or "openai_compatible"
+                defaults = _llm_defaults(llm_provider_v)
+                llm_base_url_v = str(body.get("llm_base_url", "")).strip() or defaults["base_url"]
+                llm_model_v = str(body.get("llm_model", "")).strip() or defaults["model"]
+                llm_key_v = str(body.get("llm_api_key", "")).strip()
+                if llm_provider_v in _CLOUD_LLM_PROVIDERS and not llm_key_v:
+                    self._json(
+                        {"error": f"{llm_provider_v} requires an API key."},
+                        status=400,
+                    )
+                    return
 
                 cfg = _read_config(config_path)
                 cfg.setdefault("posthog", {})["host"] = host_v
                 cfg.setdefault("posthog", {})["project_id"] = project_v
+                cfg.setdefault("llm", {})["provider"] = llm_provider_v
+                cfg.setdefault("llm", {})["base_url"] = llm_base_url_v
+                cfg.setdefault("llm", {})["model"] = llm_model_v
                 _write_config(config_path, cfg)
 
                 env = _read_env(env_path)
                 env["RETRACE_POSTHOG_API_KEY"] = key_v
-                env.setdefault("RETRACE_LLM_API_KEY", "")
+                env["RETRACE_LLM_API_KEY"] = llm_key_v
                 _write_env(env_path, env)
 
                 self._json({"ok": True, "settings": current_settings()})
+                return
+
+            if path == "/api/llm/models":
+                body = self._read_json_body()
+                provider_v = str(body.get("provider", "")).strip() or "openai_compatible"
+                base_url_v = str(body.get("base_url", "")).strip()
+                key_v = str(body.get("api_key", "")).strip()
+                result = _llm_models(provider_v, base_url_v, key_v)
+                self._json(result, status=200 if result.get("ok") else 400)
                 return
 
             self._json({"error": "not found"}, status=404)

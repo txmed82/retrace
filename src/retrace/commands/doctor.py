@@ -7,6 +7,7 @@ import click
 import httpx
 
 from retrace.config import load_config
+from retrace.llm.client import build_llm_http_request
 
 
 @click.command("doctor")
@@ -32,22 +33,21 @@ def doctor_command(config_path: Path) -> None:
         checks.append(("PostHog", False, str(exc)))
 
     try:
-        url = f"{cfg.llm.base_url.rstrip('/')}/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if cfg.llm.api_key:
-            headers["Authorization"] = f"Bearer {cfg.llm.api_key}"
+        url, headers, body = build_llm_http_request(
+            provider=cfg.llm.provider,
+            base_url=cfg.llm.base_url,
+            model=cfg.llm.model,
+            api_key=cfg.llm.api_key,
+            system="You are a test assistant.",
+            user="reply with ping",
+            temperature=0.0,
+            response_json=False,
+            max_tokens=8,
+        )
         with httpx.Client(timeout=30) as c:
-            resp = c.post(
-                url,
-                headers=headers,
-                json={
-                    "model": cfg.llm.model,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 4,
-                },
-            )
+            resp = c.post(url, headers=headers, json=body)
             resp.raise_for_status()
-        checks.append(("LLM", True, f"reached {url}"))
+        checks.append(("LLM", True, f"{cfg.llm.provider} reached {url}"))
     except Exception as exc:
         checks.append(("LLM", False, str(exc)))
 
