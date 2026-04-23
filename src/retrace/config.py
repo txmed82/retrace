@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 class PostHogConfig(BaseModel):
     host: str
+    app_host: Optional[str] = None
     project_id: str
     api_key: str
 
@@ -65,7 +66,8 @@ def load_config(path: Path) -> RetraceConfig:
     elif "api_key" not in raw.setdefault("posthog", {}):
         raw["posthog"]["api_key"] = ""
 
-    llm_provider = str(((raw.get("llm") or {}).get("provider") or "openai_compatible")).strip()
+    llm_provider = str(((raw.get("llm") or {}).get("provider") or "openai_compatible")).strip().lower()
+    raw.setdefault("llm", {})["provider"] = llm_provider
     llm_key_env = os.environ.get("RETRACE_LLM_API_KEY")
     if not llm_key_env:
         provider_env_map = {

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import os
 import platform
 import re
+import socket
 import shutil
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -177,14 +180,73 @@ def _posthog_check(host: str, project_id: str, api_key: str) -> dict[str, Any]:
         return {"configured": True, "reachable": False, "detail": str(exc)}
 
 
+def _truthy_env(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validate_base_url(base_url: str) -> tuple[bool, str, str]:
+    """Validate outbound model-provider URLs to reduce SSRF risk."""
+    raw = base_url.strip()
+    if not raw:
+        return False, "", "Base URL is required."
+
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        return False, "", "Base URL must use http or https."
+    if not parsed.hostname:
+        return False, "", "Base URL must include a hostname."
+
+    if parsed.query or parsed.fragment:
+        return False, "", "Base URL must not include query parameters or fragments."
+
+    default_port = 443 if scheme == "https" else 80
+    port = parsed.port or default_port
+    allow_internal = _truthy_env("RETRACE_ALLOW_INTERNAL_URLS")
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        return False, "", f"Base URL hostname resolution failed: {exc}"
+
+    if not allow_internal:
+        for _, _, _, _, sockaddr in infos:
+            if not sockaddr:
+                continue
+            try:
+                ip = ipaddress.ip_address(sockaddr[0])
+            except ValueError:
+                continue
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                return (
+                    False,
+                    "",
+                    f"Base URL resolves to a non-public address ({ip}). "
+                    "Set RETRACE_ALLOW_INTERNAL_URLS=true to override.",
+                )
+
+    normalized = f"{scheme}://{parsed.netloc}{parsed.path or ''}".rstrip("/")
+    return True, normalized, ""
+
+
 def _llm_check(provider: str, base_url: str, model: str, api_key: str) -> dict[str, Any]:
-    configured = bool(provider.strip() and base_url.strip() and model.strip())
+    p = provider.strip().lower()
+    configured = bool(p and base_url.strip() and model.strip())
     if not configured:
         return {"configured": False, "reachable": None, "detail": "Missing provider/base URL/model."}
+    ok_url, safe_base_url, err = _validate_base_url(base_url)
+    if not ok_url:
+        return {"configured": True, "reachable": False, "detail": err}
     try:
         url, headers, body = build_llm_http_request(
-            provider=provider,
-            base_url=base_url,
+            provider=p,
+            base_url=safe_base_url,
             model=model,
             api_key=api_key,
             system="You are a test assistant.",
@@ -203,19 +265,20 @@ def _llm_check(provider: str, base_url: str, model: str, api_key: str) -> dict[s
 
 
 def _llm_defaults(provider: str) -> dict[str, str]:
-    return _LLM_PROVIDER_DEFAULTS.get(provider, _LLM_PROVIDER_DEFAULTS["openai_compatible"])
+    return _LLM_PROVIDER_DEFAULTS.get(provider.strip().lower(), _LLM_PROVIDER_DEFAULTS["openai_compatible"])
 
 
 def _llm_models(provider: str, base_url: str, api_key: str) -> dict[str, Any]:
-    p = provider.strip() or "openai_compatible"
+    p = provider.strip().lower() or "openai_compatible"
     if p in _CLOUD_LLM_PROVIDERS and not api_key.strip():
         return {"ok": False, "error": "API key required for selected provider."}
-    if not base_url.strip():
-        return {"ok": False, "error": "Base URL is required."}
+    ok_url, safe_base_url, err = _validate_base_url(base_url)
+    if not ok_url:
+        return {"ok": False, "error": err}
     try:
         models = fetch_llm_models(
             provider=p,
-            base_url=base_url.strip(),
+            base_url=safe_base_url,
             api_key=api_key.strip() or None,
         )
         return {"ok": True, "models": models}
@@ -458,7 +521,7 @@ _INDEX_HTML = """<!doctype html>
           <div class=\"lbl\">PostHog Project ID</div>
           <input id=\"phProject\" value=\"${esc(settings.posthog_project_id)}\" />
           <div class=\"lbl\">PostHog Personal API Key</div>
-          <input id=\"phKey\" value=\"${esc(settings.posthog_api_key)}\" />
+          <input id=\"phKey\" value=\"\" placeholder=\"${settings.posthog_api_key_present ? 'Configured (leave blank to keep current)' : 'Enter PostHog key (phx_...)'}\" />
           <div class=\"lbl\">LLM Provider</div>
           <select id=\"llmProvider\" style=\"width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;\">
             <option value=\"openai_compatible\" ${llmProvider === 'openai_compatible' ? 'selected' : ''}>OpenAI-compatible (local/custom)</option>
@@ -474,7 +537,7 @@ _INDEX_HTML = """<!doctype html>
           <select id=\"llmModelPicker\" style=\"display:none; margin-top:8px; width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;\"></select>
           <div class=\"lbl\" id=\"llmKeyLabel\">LLM API Key</div>
           <div class=\"empty\">Key: <span id=\"llmKeyRequired\">optional</span></div>
-          <input id=\"llmApiKey\" value=\"${esc(settings.llm_api_key)}\" />
+          <input id=\"llmApiKey\" value=\"\" placeholder=\"${settings.llm_api_key_present ? 'Configured (leave blank to keep current)' : 'Enter LLM API key'}\" />
           <div style=\"margin-top:10px\"><button class=\"btn\" type=\"submit\">Save Settings</button></div>
         </form>
         <div style=\"margin-top:10px\" class=\"empty\">GitHub CLI: <span class=\"${gh.installed?'ok':'bad'}\">${gh.installed?'installed':'missing'}</span> · auth: <span class=\"${gh.authed?'ok':'bad'}\">${gh.authed?'ok':'not authed'}</span></div>
@@ -528,9 +591,20 @@ _INDEX_HTML = """<!doctype html>
       const claude = active.prompts?.claude_code || '';
       const errIssues = (active.error_issue_ids||[]).join(', ') || '—';
       const traceIds = (active.trace_ids||[]).join(', ') || '—';
+      const issueCount = (active.error_issue_ids||[]).filter(Boolean).length;
+      const traceCount = (active.trace_ids||[]).filter(Boolean).length;
+      const hasStack = Boolean((active.top_stack_frame || '').trim());
+      const hasErrorLink = Boolean(active.error_tracking_url);
+      const hasLogsLink = Boolean(active.logs_url);
+      const hasCorrelation = issueCount > 0 || traceCount > 0 || hasStack || hasErrorLink || hasLogsLink;
       const errWindow = (active.first_error_ts_ms || active.last_error_ts_ms)
         ? `${active.first_error_ts_ms} → ${active.last_error_ts_ms}`
         : '—';
+      const correlationStatusHtml = hasCorrelation
+        ? `<div class=\"empty\">Live correlation data found.</div>
+           <div class=\"empty\">Issues: <code>${issueCount}</code> · Traces: <code>${traceCount}</code> · Stack frame: <code>${hasStack ? 'yes' : 'no'}</code></div>
+           <div class=\"empty\" style=\"margin-top:4px\">Links: ${hasErrorLink ? 'Error Tracking' : '—'} ${hasLogsLink ? 'Logs' : ''}</div>`
+        : `<div class=\"empty\">No correlated error/log/trace evidence yet for this finding.</div>`;
       root.innerHTML = `
         <div class=\"meta card\"><h3>${esc(active.title)}</h3><div class=\"empty\">${esc(active.severity)} · ${esc(active.category)}</div><div style=\"margin-top:8px\"><a href=\"${esc(active.session_url)}\" target=\"_blank\">Open PostHog replay</a></div></div>
         <div style=\"height:10px\"></div>
@@ -552,7 +626,7 @@ _INDEX_HTML = """<!doctype html>
             <div style=\"margin-top:8px\">${active.error_tracking_url ? `<a href=\"${esc(active.error_tracking_url)}\" target=\"_blank\">Open Error Tracking</a>` : '<span class=\"empty\">Error Tracking link unavailable</span>'}</div>
             <div style=\"margin-top:4px\">${active.logs_url ? `<a href=\"${esc(active.logs_url)}\" target=\"_blank\">Open Logs</a>` : '<span class=\"empty\">Logs link unavailable</span>'}</div>
           </div>
-          <div class=\"card\"><h3>Correlation Status</h3><div class=\"empty\">Placeholder enrichment is enabled. Wire live PostHog Error Tracking/Logs queries next to populate issue IDs and traces.</div></div>
+          <div class=\"card\"><h3>Correlation Status</h3>${correlationStatusHtml}</div>
         </div>
         <div style=\"height:12px\"></div>
         <div class=\"grid\">
@@ -606,18 +680,22 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
     store = Storage(data_dir / "retrace.db")
     store.init_schema()
 
-    def current_settings() -> dict[str, str]:
+    def current_settings(*, include_secrets: bool = False) -> dict[str, Any]:
         cfg = _read_config(config_path)
         env = _read_env(env_path)
-        return {
+        settings: dict[str, Any] = {
             "posthog_host": str(((cfg.get("posthog") or {}).get("host") or "https://us.i.posthog.com")),
             "posthog_project_id": str(((cfg.get("posthog") or {}).get("project_id") or "")),
-            "posthog_api_key": env.get("RETRACE_POSTHOG_API_KEY", ""),
+            "posthog_api_key_present": bool(env.get("RETRACE_POSTHOG_API_KEY", "").strip()),
             "llm_provider": str(((cfg.get("llm") or {}).get("provider") or "openai_compatible")),
             "llm_base_url": str(((cfg.get("llm") or {}).get("base_url") or "http://localhost:8080/v1")),
             "llm_model": str(((cfg.get("llm") or {}).get("model") or "llama-3.1-8b-instruct")),
-            "llm_api_key": env.get("RETRACE_LLM_API_KEY", ""),
+            "llm_api_key_present": bool(env.get("RETRACE_LLM_API_KEY", "").strip()),
         }
+        if include_secrets:
+            settings["posthog_api_key"] = env.get("RETRACE_POSTHOG_API_KEY", "")
+            settings["llm_api_key"] = env.get("RETRACE_LLM_API_KEY", "")
+        return settings
 
     class Handler(BaseHTTPRequestHandler):
         def _json(self, payload: Any, status: int = 200) -> None:
@@ -658,7 +736,7 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
                 return
 
             if path == "/api/system-checks":
-                s = current_settings()
+                s = current_settings(include_secrets=True)
                 self._json(
                     {
                         "gh": _gh_checks(),
@@ -729,7 +807,9 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
                 llm_base_url_v = str(body.get("llm_base_url", "")).strip() or defaults["base_url"]
                 llm_model_v = str(body.get("llm_model", "")).strip() or defaults["model"]
                 llm_key_v = str(body.get("llm_api_key", "")).strip()
-                if llm_provider_v in _CLOUD_LLM_PROVIDERS and not llm_key_v:
+                env = _read_env(env_path)
+                effective_llm_key = llm_key_v or env.get("RETRACE_LLM_API_KEY", "").strip()
+                if llm_provider_v in _CLOUD_LLM_PROVIDERS and not effective_llm_key:
                     self._json(
                         {"error": f"{llm_provider_v} requires an API key."},
                         status=400,
@@ -744,9 +824,11 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
                 cfg.setdefault("llm", {})["model"] = llm_model_v
                 _write_config(config_path, cfg)
 
-                env = _read_env(env_path)
-                env["RETRACE_POSTHOG_API_KEY"] = key_v
-                env["RETRACE_LLM_API_KEY"] = llm_key_v
+                # Empty secret fields mean "keep existing" to avoid accidental secret clearing.
+                if key_v:
+                    env["RETRACE_POSTHOG_API_KEY"] = key_v
+                if llm_key_v:
+                    env["RETRACE_LLM_API_KEY"] = llm_key_v
                 _write_env(env_path, env)
 
                 self._json({"ok": True, "settings": current_settings()})
@@ -756,7 +838,9 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
                 body = self._read_json_body()
                 provider_v = str(body.get("provider", "")).strip() or "openai_compatible"
                 base_url_v = str(body.get("base_url", "")).strip()
-                key_v = str(body.get("api_key", "")).strip()
+                key_v = str(body.get("api_key", "")).strip() or _read_env(env_path).get(
+                    "RETRACE_LLM_API_KEY", ""
+                ).strip()
                 result = _llm_models(provider_v, base_url_v, key_v)
                 self._json(result, status=200 if result.get("ok") else 400)
                 return

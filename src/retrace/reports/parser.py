@@ -4,6 +4,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Optional
 
 
 _SEVERITY_RE = re.compile(r"^##\s+.*\b(Critical|High|Medium|Low)\b", re.IGNORECASE)
@@ -19,6 +20,12 @@ class ParsedFinding:
     category: str
     session_url: str
     evidence_text: str
+    distinct_id: Optional[str] = None
+    error_issue_ids: Optional[list[str]] = None
+    trace_ids: Optional[list[str]] = None
+    top_stack_frame: Optional[str] = None
+    error_tracking_url: Optional[str] = None
+    logs_url: Optional[str] = None
 
     @property
     def session_id(self) -> str:
@@ -77,6 +84,7 @@ def parse_report_findings(path: Path) -> list[ParsedFinding]:
                 category = m_category.group(1).strip()
 
         evidence_text = "\n".join(block).strip()
+        correlation = _parse_correlation_fields(block)
         if not session_url:
             continue
         out.append(
@@ -86,7 +94,64 @@ def parse_report_findings(path: Path) -> list[ParsedFinding]:
                 category=category,
                 session_url=session_url,
                 evidence_text=evidence_text,
+                distinct_id=correlation["distinct_id"],
+                error_issue_ids=correlation["error_issue_ids"],
+                trace_ids=correlation["trace_ids"],
+                top_stack_frame=correlation["top_stack_frame"],
+                error_tracking_url=correlation["error_tracking_url"],
+                logs_url=correlation["logs_url"],
             )
         )
 
     return out
+
+
+def _parse_correlation_fields(block: list[str]) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "distinct_id": None,
+        "error_issue_ids": None,
+        "trace_ids": None,
+        "top_stack_frame": None,
+        "error_tracking_url": None,
+        "logs_url": None,
+    }
+    in_section = False
+    for raw_line in block:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower() == "**correlated evidence:**":
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if not line.startswith("- "):
+            if line.startswith("**"):
+                break
+            continue
+
+        # "- Label: value"
+        payload = line[2:]
+        if ":" not in payload:
+            continue
+        label, value = payload.split(":", 1)
+        key = label.strip().lower()
+        val = value.strip()
+        if val in {"—", "-", ""}:
+            val = ""
+
+        if key == "distinct id":
+            fields["distinct_id"] = val or None
+        elif key == "error issues":
+            items = [x.strip() for x in val.split(",") if x.strip()]
+            fields["error_issue_ids"] = items or None
+        elif key == "trace ids":
+            items = [x.strip() for x in val.split(",") if x.strip()]
+            fields["trace_ids"] = items or None
+        elif key == "top stack frame":
+            fields["top_stack_frame"] = val or None
+        elif key == "error tracking":
+            fields["error_tracking_url"] = val or None
+        elif key == "logs":
+            fields["logs_url"] = val or None
+    return fields

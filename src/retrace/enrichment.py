@@ -391,8 +391,8 @@ class CorrelationEnricher:
         return self._project_url("logs", params)
 
     def _project_url(self, path: str, params: dict[str, str]) -> str:
-        host = self.cfg.posthog.host.rstrip("/")
-        base = f"{host}/project/{self.cfg.posthog.project_id}/{path}"
+        app_host = (self.cfg.posthog.app_host or self.cfg.posthog.host).rstrip("/")
+        base = f"{app_host}/project/{self.cfg.posthog.project_id}/{path}"
         return f"{base}?{urlencode(params)}"
 
     @staticmethod

@@ -92,3 +92,27 @@ def test_load_config_supports_provider_specific_llm_env(tmp_path, monkeypatch):
 
     assert cfg.llm.provider == "anthropic"
     assert cfg.llm.api_key == "sk-ant-test"
+
+
+def test_load_config_normalizes_provider_before_env_lookup(tmp_path, monkeypatch):
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text(
+        textwrap.dedent(
+            """
+            posthog:
+              host: https://us.i.posthog.com
+              project_id: "1"
+            llm:
+              provider: Anthropic
+              base_url: https://api.anthropic.com/v1
+              model: claude-3-5-sonnet-latest
+            """
+        )
+    )
+    monkeypatch.delenv("RETRACE_LLM_API_KEY", raising=False)
+    monkeypatch.setenv("RETRACE_ANTHROPIC_API_KEY", "sk-ant-normalized")
+
+    cfg = load_config(config_yaml)
+
+    assert cfg.llm.provider == "anthropic"
+    assert cfg.llm.api_key == "sk-ant-normalized"
