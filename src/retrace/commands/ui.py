@@ -305,30 +305,42 @@ def _posthog_check(host: str, project_id: str, api_key: str) -> dict[str, Any]:
         }
 
     # Validate and pin the IP to prevent DNS rebinding
-    ok_url, safe_host, err, pinned_ip = _validate_base_url(host)
+    ok_url, safe_host, err, pinned_ips = _validate_base_url(host)
     if not ok_url:
         return {"configured": True, "reachable": False, "detail": err}
 
     url = f"{safe_host.rstrip('/')}/api/projects/{project_id}/"
+    parsed = urlparse(safe_host)
+    last_exc: Optional[Exception] = None
+    last_status: Optional[int] = None
     try:
-        # Create transport that uses pinned IP to prevent TOCTOU/DNS rebinding
-        parsed = urlparse(safe_host)
-        transport = _create_pinned_transport(
-            pinned_ip, parsed.hostname or "", parsed.scheme or ""
-        )
-        with httpx.Client(timeout=8, transport=transport) as c:
-            r = c.get(url, headers={"Authorization": f"Bearer {api_key}"})
-        if r.status_code // 100 == 2:
+        for pinned_ip in pinned_ips:
+            try:
+                # Use validated/pinned IP to prevent TOCTOU/DNS rebinding.
+                transport = _create_pinned_transport(
+                    pinned_ip, parsed.hostname or "", parsed.scheme or ""
+                )
+                with httpx.Client(timeout=8, transport=transport) as c:
+                    r = c.get(url, headers={"Authorization": f"Bearer {api_key}"})
+                last_status = r.status_code
+                if r.status_code // 100 == 2:
+                    return {
+                        "configured": True,
+                        "reachable": True,
+                        "detail": f"OK ({r.status_code})",
+                    }
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if last_status is not None:
             return {
                 "configured": True,
-                "reachable": True,
-                "detail": f"OK ({r.status_code})",
+                "reachable": False,
+                "detail": f"HTTP {last_status}",
             }
-        return {
-            "configured": True,
-            "reachable": False,
-            "detail": f"HTTP {r.status_code}",
-        }
+        if last_exc:
+            raise last_exc
+        return {"configured": True, "reachable": False, "detail": "No pinned IPs available."}
     except Exception as exc:
         return {"configured": True, "reachable": False, "detail": str(exc)}
 
@@ -337,26 +349,26 @@ def _truthy_env(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _validate_base_url(base_url: str) -> tuple[bool, str, str, str]:
+def _validate_base_url(base_url: str) -> tuple[bool, str, str, list[str]]:
     """Validate outbound model-provider URLs to reduce SSRF risk.
 
-    Returns: (ok, normalized_url, error_message, pinned_ip)
-    The pinned_ip is the first acceptable IP address resolved during validation,
-    which must be used for the actual HTTP request to prevent DNS rebinding attacks.
+    Returns: (ok, normalized_url, error_message, pinned_ips)
+    pinned_ips are acceptable IPs resolved during validation and must be used
+    for actual HTTP requests to prevent DNS rebinding attacks.
     """
     raw = base_url.strip()
     if not raw:
-        return False, "", "Base URL is required.", ""
+        return False, "", "Base URL is required.", []
 
     parsed = urlparse(raw)
     scheme = (parsed.scheme or "").lower()
     if scheme not in {"http", "https"}:
-        return False, "", "Base URL must use http or https.", ""
+        return False, "", "Base URL must use http or https.", []
     if not parsed.hostname:
-        return False, "", "Base URL must include a hostname.", ""
+        return False, "", "Base URL must include a hostname.", []
 
     if parsed.query or parsed.fragment:
-        return False, "", "Base URL must not include query parameters or fragments.", ""
+        return False, "", "Base URL must not include query parameters or fragments.", []
 
     default_port = 443 if scheme == "https" else 80
     port = parsed.port or default_port
@@ -364,9 +376,9 @@ def _validate_base_url(base_url: str) -> tuple[bool, str, str, str]:
     try:
         infos = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
-        return False, "", f"Base URL hostname resolution failed: {exc}", ""
+        return False, "", f"Base URL hostname resolution failed: {exc}", []
 
-    pinned_ip = ""
+    pinned_ips: list[str] = []
     if not allow_internal:
         for _, _, _, _, sockaddr in infos:
             if not sockaddr:
@@ -383,28 +395,29 @@ def _validate_base_url(base_url: str) -> tuple[bool, str, str, str]:
                 or ip.is_reserved
                 or ip.is_unspecified
             ):
-                return (
-                    False,
-                    "",
-                    f"Base URL resolves to a non-public address ({ip}). "
-                    "Set RETRACE_ALLOW_INTERNAL_URLS=true to override.",
-                    "",
-                )
-            # Pin the first acceptable IP
-            if not pinned_ip:
-                pinned_ip = sockaddr[0]
+                continue
+            ip_s = sockaddr[0]
+            if ip_s not in pinned_ips:
+                pinned_ips.append(ip_s)
     else:
-        # If internal URLs are allowed, pin the first resolved IP
+        # If internal URLs are allowed, keep all resolved IPs (deduped).
         for _, _, _, _, sockaddr in infos:
             if sockaddr:
-                pinned_ip = sockaddr[0]
-                break
+                ip_s = sockaddr[0]
+                if ip_s not in pinned_ips:
+                    pinned_ips.append(ip_s)
 
-    if not pinned_ip:
-        return False, "", "No acceptable IP addresses found for base URL.", ""
+    if not pinned_ips:
+        return (
+            False,
+            "",
+            "No acceptable IP addresses found for base URL. "
+            "Set RETRACE_ALLOW_INTERNAL_URLS=true to allow internal hosts.",
+            [],
+        )
 
     normalized = f"{scheme}://{parsed.netloc}{parsed.path or ''}".rstrip("/")
-    return True, normalized, "", pinned_ip
+    return True, normalized, "", pinned_ips
 
 
 def _llm_check(
@@ -418,9 +431,12 @@ def _llm_check(
             "reachable": None,
             "detail": "Missing provider/base URL/model.",
         }
-    ok_url, safe_base_url, err, pinned_ip = _validate_base_url(base_url)
+    ok_url, safe_base_url, err, pinned_ips = _validate_base_url(base_url)
     if not ok_url:
         return {"configured": True, "reachable": False, "detail": err}
+    parsed = urlparse(safe_base_url)
+    last_exc: Optional[Exception] = None
+    last_status: Optional[int] = None
     try:
         url, headers, body = build_llm_http_request(
             provider=p,
@@ -433,24 +449,32 @@ def _llm_check(
             response_json=False,
             max_tokens=8,
         )
-        # Create transport that uses pinned IP to prevent TOCTOU/DNS rebinding
-        parsed = urlparse(safe_base_url)
-        transport = _create_pinned_transport(
-            pinned_ip, parsed.hostname or "", parsed.scheme or ""
-        )
-        with httpx.Client(timeout=12, transport=transport) as c:
-            r = c.post(url, headers=headers, json=body)
-        if r.status_code // 100 == 2:
+        for pinned_ip in pinned_ips:
+            try:
+                transport = _create_pinned_transport(
+                    pinned_ip, parsed.hostname or "", parsed.scheme or ""
+                )
+                with httpx.Client(timeout=12, transport=transport) as c:
+                    r = c.post(url, headers=headers, json=body)
+                last_status = r.status_code
+                if r.status_code // 100 == 2:
+                    return {
+                        "configured": True,
+                        "reachable": True,
+                        "detail": f"OK ({r.status_code})",
+                    }
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if last_status is not None:
             return {
                 "configured": True,
-                "reachable": True,
-                "detail": f"OK ({r.status_code})",
+                "reachable": False,
+                "detail": f"HTTP {last_status}",
             }
-        return {
-            "configured": True,
-            "reachable": False,
-            "detail": f"HTTP {r.status_code}",
-        }
+        if last_exc:
+            raise last_exc
+        return {"configured": True, "reachable": False, "detail": "No pinned IPs available."}
     except Exception as exc:
         return {"configured": True, "reachable": False, "detail": str(exc)}
 
@@ -488,30 +512,39 @@ def _llm_models(provider: str, base_url: str, api_key: str) -> dict[str, Any]:
     p = provider.strip().lower() or "openai_compatible"
     if p in _CLOUD_LLM_PROVIDERS and not api_key.strip():
         return {"ok": False, "error": "API key required for selected provider."}
-    ok_url, safe_base_url, err, pinned_ip = _validate_base_url(base_url)
+    ok_url, safe_base_url, err, pinned_ips = _validate_base_url(base_url)
     if not ok_url:
         return {"ok": False, "error": err}
+    parsed = urlparse(safe_base_url)
+    last_exc: Optional[Exception] = None
+    last_status: Optional[int] = None
     try:
-        # Create transport that uses pinned IP to prevent TOCTOU/DNS rebinding
-        parsed = urlparse(safe_base_url)
-        transport = _create_pinned_transport(
-            pinned_ip, parsed.hostname or "", parsed.scheme or ""
-        )
-
         # We can't pass transport to fetch_llm_models without modifying it,
         # so we inline the model fetching logic here with our secure transport
         from retrace.llm.client import _build_headers, _extract_model_ids
 
         headers = _build_headers(provider=p, api_key=api_key.strip() or None)
         url = f"{safe_base_url.rstrip('/')}/models"
-
-        with httpx.Client(timeout=10, transport=transport) as c:
-            resp = c.get(url, headers=headers)
-            resp.raise_for_status()
-            payload = resp.json()
-
-        models = _extract_model_ids(payload)
-        return {"ok": True, "models": models}
+        for pinned_ip in pinned_ips:
+            try:
+                transport = _create_pinned_transport(
+                    pinned_ip, parsed.hostname or "", parsed.scheme or ""
+                )
+                with httpx.Client(timeout=10, transport=transport) as c:
+                    resp = c.get(url, headers=headers)
+                    last_status = resp.status_code
+                    resp.raise_for_status()
+                    payload = resp.json()
+                models = _extract_model_ids(payload)
+                return {"ok": True, "models": models}
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if last_status is not None:
+            return {"ok": False, "error": f"HTTP {last_status}"}
+        if last_exc:
+            raise last_exc
+        return {"ok": False, "error": "No pinned IPs available."}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
