@@ -11,10 +11,11 @@ _ANSWERS = {
     "ph_host": "https://us.i.posthog.com",
     "ph_project_id": "42",
     "ph_api_key": "phx_test",
-    "llm_kind": "Local (llama.cpp / ollama / LM Studio)",
+    "llm_kind": "Local (OpenAI-compatible: llama.cpp / ollama / LM Studio)",
     "llm_base_url": "http://localhost:8080/v1",
     "llm_model": "llama-3.1-8b-instruct",
     "llm_api_key": "",
+    "fetch_models": False,
     "lookback_hours": "6",
     "max_sessions_per_run": "50",
     "output_dir": "./reports",
@@ -29,6 +30,7 @@ _PROMPT_KEYWORDS = [
     ("PostHog personal API key", "ph_api_key"),
     ("LLM backend", "llm_kind"),
     ("LLM base URL", "llm_base_url"),
+    ("Fetch available models", "fetch_models"),
     ("LLM model", "llm_model"),
     ("LLM API key", "llm_api_key"),
     ("Lookback hours", "lookback_hours"),
@@ -70,10 +72,16 @@ def test_init_writes_config_and_env_with_validated_connections(
     runner = CliRunner()
 
     with patch("retrace.commands.init.questionary") as q:
-        q.text.side_effect = lambda message, default="": _fake_prompt(_match_key(message))
+        q.text.side_effect = lambda message, default="": _fake_prompt(
+            _match_key(message)
+        )
         q.password.side_effect = lambda message: _fake_prompt(_match_key(message))
-        q.select.side_effect = lambda message, choices: _fake_prompt(_match_key(message))
-        q.confirm.side_effect = lambda message, default=False: _fake_prompt(_match_key(message))
+        q.select.side_effect = lambda message, choices: _fake_prompt(
+            _match_key(message)
+        )
+        q.confirm.side_effect = lambda message, default=False: _fake_prompt(
+            _match_key(message)
+        )
 
         result = runner.invoke(main, ["init"])
 
@@ -85,6 +93,7 @@ def test_init_writes_config_and_env_with_validated_connections(
     assert "RETRACE_POSTHOG_API_KEY=phx_test" in env_text
 
     cfg_text = (tmp_path / "config.yaml").read_text()
-    assert "project_id: \"42\"" in cfg_text or "project_id: '42'" in cfg_text
+    assert 'project_id: "42"' in cfg_text or "project_id: '42'" in cfg_text
     assert "us.i.posthog.com" in cfg_text
+    assert "provider: openai_compatible" in cfg_text
     assert "llama-3.1-8b-instruct" in cfg_text

@@ -82,7 +82,12 @@ def _keywords(title: str, category: str, evidence_text: str) -> list[str]:
     extras = []
     if "store" in base or "store" in evidence_l:
         extras += ["store", "checkout", "payment", "purchase", "product"]
-    if "click" in base or "unresponsive" in base or "rage" in base or "click" in evidence_l:
+    if (
+        "click" in base
+        or "unresponsive" in base
+        or "rage" in base
+        or "click" in evidence_l
+    ):
         extras += ["click", "button", "onClick", "pointer", "disabled"]
     if "home" in base or "homepage" in base or "homepage" in evidence_l:
         extras += ["home", "landing", "cta", "hero"]
@@ -111,7 +116,11 @@ def _iter_source_files(repo_path: Path) -> list[Path]:
         except ValueError:
             # Fall back to absolute path parts if not under repo_path
             parts_to_check = p.parts
-        if ".git" in parts_to_check or "node_modules" in parts_to_check or "dist" in parts_to_check:
+        if (
+            ".git" in parts_to_check
+            or "node_modules" in parts_to_check
+            or "dist" in parts_to_check
+        ):
             continue
         if any(part.startswith(".") for part in parts_to_check):
             continue
@@ -121,7 +130,9 @@ def _iter_source_files(repo_path: Path) -> list[Path]:
     return files
 
 
-def _score_file(repo_path: Path, file_path: Path, terms: list[str]) -> tuple[float, str]:
+def _score_file(
+    repo_path: Path, file_path: Path, terms: list[str]
+) -> tuple[float, str]:
     rel = file_path.relative_to(repo_path).as_posix()
     score = 0.0
     hits: list[str] = []

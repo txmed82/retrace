@@ -108,6 +108,14 @@ def test_storage_report_findings_upsert_and_list(tmp_path: Path):
         category="functional_error",
         session_url="https://us.i.posthog.com/project/1/replay/s1",
         evidence_text="Evidence A",
+        distinct_id="user-123",
+        error_issue_ids=["ERR-42"],
+        trace_ids=["trace-1"],
+        top_stack_frame="TypeError: Cannot read properties of undefined",
+        error_tracking_url="https://us.i.posthog.com/project/1/error_tracking?session_id=s1",
+        logs_url="https://us.i.posthog.com/project/1/logs?session_id=s1",
+        first_error_ts_ms=100,
+        last_error_ts_ms=200,
     )
     assert fid > 0
 
@@ -120,6 +128,14 @@ def test_storage_report_findings_upsert_and_list(tmp_path: Path):
         category="functional_error",
         session_url="https://us.i.posthog.com/project/1/replay/s1",
         evidence_text="Evidence B",
+        distinct_id="user-123",
+        error_issue_ids=["ERR-42"],
+        trace_ids=["trace-1"],
+        top_stack_frame="TypeError: Cannot read properties of undefined",
+        error_tracking_url="https://us.i.posthog.com/project/1/error_tracking?session_id=s1",
+        logs_url="https://us.i.posthog.com/project/1/logs?session_id=s1",
+        first_error_ts_ms=100,
+        last_error_ts_ms=200,
     )
     assert fid2 == fid
 
@@ -127,3 +143,11 @@ def test_storage_report_findings_upsert_and_list(tmp_path: Path):
     assert len(rows) == 1
     assert rows[0].title == "Dead clicks on checkout (updated)"
     assert rows[0].evidence_text == "Evidence B"
+    assert rows[0].distinct_id == "user-123"
+    assert rows[0].error_issue_ids == ["ERR-42"]
+    assert rows[0].trace_ids == ["trace-1"]
+    assert rows[0].top_stack_frame.startswith("TypeError")
+    assert rows[0].error_tracking_url.endswith("/error_tracking?session_id=s1")
+    assert rows[0].logs_url.endswith("/logs?session_id=s1")
+    assert rows[0].first_error_ts_ms == 100
+    assert rows[0].last_error_ts_ms == 200

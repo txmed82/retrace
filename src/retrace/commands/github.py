@@ -21,7 +21,9 @@ def github_group() -> None:
 
 
 @github_group.command("connect")
-@click.option("--repo", "repo_full_name", required=True, help="GitHub repo in org/name format.")
+@click.option(
+    "--repo", "repo_full_name", required=True, help="GitHub repo in org/name format."
+)
 @click.option("--branch", "default_branch", default="main", show_default=True)
 @click.option(
     "--local-path",
@@ -29,7 +31,12 @@ def github_group() -> None:
     default=None,
     help="Local checkout path for matching/scoring.",
 )
-@click.option("--token-env", default="GITHUB_TOKEN", show_default=True, help="Reserved for future auth checks.")
+@click.option(
+    "--token-env",
+    default="GITHUB_TOKEN",
+    show_default=True,
+    help="Reserved for future auth checks.",
+)
 @click.option(
     "--config",
     "config_path",
@@ -56,7 +63,9 @@ def github_connect(
         provider="github",
     )
     if local_path:
-        click.echo(f"Connected {repo_full_name} (branch={default_branch}, local_path={local_path})")
+        click.echo(
+            f"Connected {repo_full_name} (branch={default_branch}, local_path={local_path})"
+        )
     else:
         click.echo(f"Connected {repo_full_name} (branch={default_branch})")
 
@@ -77,11 +86,15 @@ def github_list(*, config_path: Path) -> None:
         return
     for r in repos:
         lp = f"  local_path={r.local_path}" if r.local_path else ""
-        click.echo(f"- {r.repo_full_name}  branch={r.default_branch}  provider={r.provider}{lp}")
+        click.echo(
+            f"- {r.repo_full_name}  branch={r.default_branch}  provider={r.provider}{lp}"
+        )
 
 
 @github_group.command("disconnect")
-@click.option("--repo", "repo_full_name", required=True, help="GitHub repo in org/name format.")
+@click.option(
+    "--repo", "repo_full_name", required=True, help="GitHub repo in org/name format."
+)
 @click.option(
     "--config",
     "config_path",

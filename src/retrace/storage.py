@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -52,6 +53,14 @@ CREATE TABLE IF NOT EXISTS report_findings (
     category TEXT NOT NULL,
     session_url TEXT NOT NULL,
     evidence_text TEXT NOT NULL DEFAULT '',
+    distinct_id TEXT NOT NULL DEFAULT '',
+    error_issue_ids_json TEXT NOT NULL DEFAULT '[]',
+    trace_ids_json TEXT NOT NULL DEFAULT '[]',
+    top_stack_frame TEXT NOT NULL DEFAULT '',
+    error_tracking_url TEXT NOT NULL DEFAULT '',
+    logs_url TEXT NOT NULL DEFAULT '',
+    first_error_ts_ms INTEGER NOT NULL DEFAULT 0,
+    last_error_ts_ms INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(report_path, finding_hash)
 );
@@ -121,6 +130,14 @@ class ReportFindingRow:
     category: str
     session_url: str
     evidence_text: str
+    distinct_id: str
+    error_issue_ids: list[str]
+    trace_ids: list[str]
+    top_stack_frame: str
+    error_tracking_url: str
+    logs_url: str
+    first_error_ts_ms: int
+    last_error_ts_ms: int
     created_at: datetime
 
 
@@ -149,13 +166,53 @@ class Storage:
         with self._conn() as conn:
             conn.executescript(SCHEMA)
             # Lightweight migrations for existing DBs.
-            cols_repo = [r["name"] for r in conn.execute("PRAGMA table_info(github_repos)").fetchall()]
+            cols_repo = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(github_repos)").fetchall()
+            ]
             if "local_path" not in cols_repo:
-                conn.execute("ALTER TABLE github_repos ADD COLUMN local_path TEXT NOT NULL DEFAULT ''")
-            cols_findings = [r["name"] for r in conn.execute("PRAGMA table_info(report_findings)").fetchall()]
+                conn.execute(
+                    "ALTER TABLE github_repos ADD COLUMN local_path TEXT NOT NULL DEFAULT ''"
+                )
+            cols_findings = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(report_findings)").fetchall()
+            ]
             if "evidence_text" not in cols_findings:
                 conn.execute(
                     "ALTER TABLE report_findings ADD COLUMN evidence_text TEXT NOT NULL DEFAULT ''"
+                )
+            if "distinct_id" not in cols_findings:
+                conn.execute(
+                    "ALTER TABLE report_findings ADD COLUMN distinct_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "error_issue_ids_json" not in cols_findings:
+                conn.execute(
+                    "ALTER TABLE report_findings ADD COLUMN error_issue_ids_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "trace_ids_json" not in cols_findings:
+                conn.execute(
+                    "ALTER TABLE report_findings ADD COLUMN trace_ids_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "top_stack_frame" not in cols_findings:
+                conn.execute(
+                    "ALTER TABLE report_findings ADD COLUMN top_stack_frame TEXT NOT NULL DEFAULT ''"
+                )
+            if "error_tracking_url" not in cols_findings:
+                conn.execute(
+                    "ALTER TABLE report_findings ADD COLUMN error_tracking_url TEXT NOT NULL DEFAULT ''"
+                )
+            if "logs_url" not in cols_findings:
+                conn.execute(
+                    "ALTER TABLE report_findings ADD COLUMN logs_url TEXT NOT NULL DEFAULT ''"
+                )
+            if "first_error_ts_ms" not in cols_findings:
+                conn.execute(
+                    "ALTER TABLE report_findings ADD COLUMN first_error_ts_ms INTEGER NOT NULL DEFAULT 0"
+                )
+            if "last_error_ts_ms" not in cols_findings:
+                conn.execute(
+                    "ALTER TABLE report_findings ADD COLUMN last_error_ts_ms INTEGER NOT NULL DEFAULT 0"
                 )
 
     def upsert_session(self, s: SessionMeta) -> None:
@@ -252,7 +309,9 @@ class Storage:
         return RunRow(
             id=row["id"],
             started_at=datetime.fromisoformat(row["started_at"]),
-            finished_at=datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None,
+            finished_at=datetime.fromisoformat(row["finished_at"])
+            if row["finished_at"]
+            else None,
             sessions_scanned=row["sessions_scanned"],
             findings_count=row["findings_count"],
             status=row["status"],
@@ -305,7 +364,9 @@ class Storage:
                 remote_url=str(r["remote_url"]),
                 local_path=str(r["local_path"]),
                 provider=str(r["provider"]),
-                connected_at=datetime.fromisoformat(str(r["connected_at"]).replace("Z", "+00:00")),
+                connected_at=datetime.fromisoformat(
+                    str(r["connected_at"]).replace("Z", "+00:00")
+                ),
             )
             for r in rows
         ]
@@ -329,7 +390,9 @@ class Storage:
             remote_url=str(r["remote_url"]),
             local_path=str(r["local_path"]),
             provider=str(r["provider"]),
-            connected_at=datetime.fromisoformat(str(r["connected_at"]).replace("Z", "+00:00")),
+            connected_at=datetime.fromisoformat(
+                str(r["connected_at"]).replace("Z", "+00:00")
+            ),
         )
 
     def delete_github_repo(self, repo_full_name: str) -> int:
@@ -350,21 +413,59 @@ class Storage:
         category: str,
         session_url: str,
         evidence_text: str = "",
+        distinct_id: str = "",
+        error_issue_ids: Optional[list[str]] = None,
+        trace_ids: Optional[list[str]] = None,
+        top_stack_frame: str = "",
+        error_tracking_url: str = "",
+        logs_url: str = "",
+        first_error_ts_ms: int = 0,
+        last_error_ts_ms: int = 0,
     ) -> int:
+        error_ids = json.dumps(error_issue_ids or [])
+        trace_json = json.dumps(trace_ids or [])
         with self._conn() as conn:
             conn.execute(
                 """
                 INSERT INTO report_findings
-                (report_path, finding_hash, title, severity, category, session_url, evidence_text)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (
+                    report_path, finding_hash, title, severity, category, session_url, evidence_text,
+                    distinct_id, error_issue_ids_json, trace_ids_json, top_stack_frame, error_tracking_url,
+                    logs_url, first_error_ts_ms, last_error_ts_ms
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(report_path, finding_hash) DO UPDATE SET
                     title = excluded.title,
                     severity = excluded.severity,
                     category = excluded.category,
                     session_url = excluded.session_url,
-                    evidence_text = excluded.evidence_text
+                    evidence_text = excluded.evidence_text,
+                    distinct_id = excluded.distinct_id,
+                    error_issue_ids_json = excluded.error_issue_ids_json,
+                    trace_ids_json = excluded.trace_ids_json,
+                    top_stack_frame = excluded.top_stack_frame,
+                    error_tracking_url = excluded.error_tracking_url,
+                    logs_url = excluded.logs_url,
+                    first_error_ts_ms = excluded.first_error_ts_ms,
+                    last_error_ts_ms = excluded.last_error_ts_ms
                 """,
-                (report_path, finding_hash, title, severity, category, session_url, evidence_text),
+                (
+                    report_path,
+                    finding_hash,
+                    title,
+                    severity,
+                    category,
+                    session_url,
+                    evidence_text,
+                    distinct_id,
+                    error_ids,
+                    trace_json,
+                    top_stack_frame,
+                    error_tracking_url,
+                    logs_url,
+                    int(first_error_ts_ms),
+                    int(last_error_ts_ms),
+                ),
             )
             row = conn.execute(
                 """
@@ -376,12 +477,17 @@ class Storage:
         assert row is not None
         return int(row["id"])
 
-    def list_report_findings(self, report_path: Optional[str] = None) -> list[ReportFindingRow]:
+    def list_report_findings(
+        self, report_path: Optional[str] = None
+    ) -> list[ReportFindingRow]:
         with self._conn() as conn:
             if report_path is None:
                 rows = conn.execute(
                     """
-                    SELECT id, report_path, finding_hash, title, severity, category, session_url, evidence_text, created_at
+                    SELECT
+                        id, report_path, finding_hash, title, severity, category, session_url, evidence_text,
+                        distinct_id, error_issue_ids_json, trace_ids_json, top_stack_frame,
+                        error_tracking_url, logs_url, first_error_ts_ms, last_error_ts_ms, created_at
                     FROM report_findings
                     ORDER BY id
                     """
@@ -389,7 +495,10 @@ class Storage:
             else:
                 rows = conn.execute(
                     """
-                    SELECT id, report_path, finding_hash, title, severity, category, session_url, evidence_text, created_at
+                    SELECT
+                        id, report_path, finding_hash, title, severity, category, session_url, evidence_text,
+                        distinct_id, error_issue_ids_json, trace_ids_json, top_stack_frame,
+                        error_tracking_url, logs_url, first_error_ts_ms, last_error_ts_ms, created_at
                     FROM report_findings
                     WHERE report_path = ?
                     ORDER BY id
@@ -406,10 +515,30 @@ class Storage:
                 category=str(r["category"]),
                 session_url=str(r["session_url"]),
                 evidence_text=str(r["evidence_text"]),
-                created_at=datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00")),
+                distinct_id=str(r["distinct_id"] or ""),
+                error_issue_ids=self._parse_string_list_json(r["error_issue_ids_json"]),
+                trace_ids=self._parse_string_list_json(r["trace_ids_json"]),
+                top_stack_frame=str(r["top_stack_frame"] or ""),
+                error_tracking_url=str(r["error_tracking_url"] or ""),
+                logs_url=str(r["logs_url"] or ""),
+                first_error_ts_ms=int(r["first_error_ts_ms"] or 0),
+                last_error_ts_ms=int(r["last_error_ts_ms"] or 0),
+                created_at=datetime.fromisoformat(
+                    str(r["created_at"]).replace("Z", "+00:00")
+                ),
             )
             for r in rows
         ]
+
+    @staticmethod
+    def _parse_string_list_json(raw: object) -> list[str]:
+        try:
+            parsed = json.loads(str(raw or "[]"))
+        except Exception:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [str(item) for item in parsed]
 
     def replace_code_candidates(
         self,
@@ -428,7 +557,10 @@ class Storage:
                 INSERT INTO code_candidates (finding_id, repo_id, file_path, symbol, score, rationale_json)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                [(finding_id, repo_id, fp, sym, score, rationale) for fp, sym, score, rationale in candidates],
+                [
+                    (finding_id, repo_id, fp, sym, score, rationale)
+                    for fp, sym, score, rationale in candidates
+                ],
             )
 
     def list_code_candidates(
@@ -503,7 +635,9 @@ class Storage:
                 agent_target=str(r["agent_target"]),
                 prompt_markdown=str(r["prompt_markdown"]),
                 prompt_json=str(r["prompt_json"]),
-                created_at=datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00")),
+                created_at=datetime.fromisoformat(
+                    str(r["created_at"]).replace("Z", "+00:00")
+                ),
             )
             for r in rows
         ]

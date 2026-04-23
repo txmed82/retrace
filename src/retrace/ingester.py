@@ -65,7 +65,7 @@ class PostHogIngester:
             if retry_after and retry_after.isdigit():
                 sleep_s = float(retry_after)
             else:
-                sleep_s = min(8.0, 0.5 * (2 ** attempt))
+                sleep_s = min(8.0, 0.5 * (2**attempt))
             time.sleep(sleep_s)
         raise RuntimeError("unreachable retry loop")
 
@@ -86,7 +86,9 @@ class PostHogIngester:
             i = j
         return out
 
-    def _fetch_snapshots(self, client: httpx.Client, session_id: str) -> list[dict[str, Any]]:
+    def _fetch_snapshots(
+        self, client: httpx.Client, session_id: str
+    ) -> list[dict[str, Any]]:
         host = self.cfg.host.rstrip("/")
         snap_url = (
             f"{host}/api/projects/{self.cfg.project_id}"
@@ -123,7 +125,11 @@ class PostHogIngester:
                 },
             )
             for item in self._parse_concatenated_json(blob_resp.text):
-                if isinstance(item, list) and len(item) >= 2 and isinstance(item[1], dict):
+                if (
+                    isinstance(item, list)
+                    and len(item) >= 2
+                    and isinstance(item[1], dict)
+                ):
                     snapshots.append(item[1])
                 elif isinstance(item, dict):
                     snapshots.append(item)

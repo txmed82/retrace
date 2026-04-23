@@ -53,6 +53,8 @@ def test_markdown_sink_writes_report_grouped_by_severity(tmp_path: Path):
     assert crit_idx < med_idx
     assert "Checkout crashes on empty cart" in text
     assert "https://posthog/replay/s1" in text
+    assert "Correlated evidence" in text
+    assert "Error Tracking:" in text and "Logs:" in text
 
 
 def test_markdown_sink_preserves_unknown_severity(tmp_path: Path):

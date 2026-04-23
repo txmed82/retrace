@@ -220,12 +220,16 @@ def test_run_pipeline_cap_not_hit_advances_cursor_to_now(tmp_path: Path):
     llm_client = MagicMock()
 
     now = datetime(2026, 4, 19, 14, 0, tzinfo=timezone.utc)
-    run_pipeline(cfg=cfg, store=store, ingester=ingester, llm_client=llm_client, now=now)
+    run_pipeline(
+        cfg=cfg, store=store, ingester=ingester, llm_client=llm_client, now=now
+    )
 
     assert store.get_last_run_cursor() == now
 
 
-def test_run_pipeline_finishes_run_with_error_status_on_ingester_failure(tmp_path: Path):
+def test_run_pipeline_finishes_run_with_error_status_on_ingester_failure(
+    tmp_path: Path,
+):
     cfg = _make_cfg(tmp_path)
     store = Storage(tmp_path / "data" / "retrace.db")
     store.init_schema()

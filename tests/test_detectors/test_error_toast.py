@@ -30,7 +30,9 @@ def test_error_toast_detects_role_alert():
 
     events = [
         meta(ts=0, href="https://x/"),
-        _add_node_event(ts=1000, tag="div", attrs={"role": "alert"}, text="Something went wrong"),
+        _add_node_event(
+            ts=1000, tag="div", attrs={"role": "alert"}, text="Something went wrong"
+        ),
     ]
     signals = detector.detect("s", events)
     assert len(signals) == 1
@@ -42,7 +44,9 @@ def test_error_toast_detects_toast_class():
 
     events = [
         meta(ts=0),
-        _add_node_event(ts=100, tag="div", attrs={"class": "toast error"}, text="Failed to save"),
+        _add_node_event(
+            ts=100, tag="div", attrs={"class": "toast error"}, text="Failed to save"
+        ),
     ]
     assert len(detector.detect("s", events)) == 1
 

@@ -6,6 +6,7 @@ rrweb event types we care about:
   3 = IncrementalSnapshot (source 2 = MouseInteraction, source 5 = Input)
   6 = Plugin (console, network)
 """
+
 from __future__ import annotations
 
 from typing import Any

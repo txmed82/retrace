@@ -7,7 +7,9 @@ def test_network_5xx_detects_server_errors():
     events = [
         meta(ts=0, href="https://app.example.com/orders"),
         network_event(ts=500, url="https://api.example.com/orders", status=200),
-        network_event(ts=1000, url="https://api.example.com/orders", status=503, method="POST"),
+        network_event(
+            ts=1000, url="https://api.example.com/orders", status=503, method="POST"
+        ),
     ]
     signals = detector.detect("sess-1", events)
     assert len(signals) == 1

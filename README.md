@@ -49,9 +49,11 @@ Open:
 From the UI you can:
 
 - Set/edit PostHog host, project ID, and API key
+- Set/edit LLM provider, base URL, model, and API key
 - Save settings to `config.yaml` + `.env`
 - Run system checks for:
   - PostHog connectivity
+  - LLM connectivity
   - `gh` installed/authenticated
 - Copy suggested terminal commands when `gh` is missing/not authed
 - Browse findings from latest report
@@ -104,10 +106,32 @@ Toggle detectors in `config.yaml`.
 
 - `config.yaml` — non-secret config
 - `.env` — secrets (`RETRACE_POSTHOG_API_KEY`, optional `RETRACE_LLM_API_KEY`)
+- LLM providers supported: `openai_compatible` (local/custom), `openai`, `anthropic`, `openrouter`
 - `data/retrace.db` — run/session/findings metadata
 - `data/sessions/*.json` — ingested rrweb events
 - `reports/*.md` — findings reports
 - `reports/fix-prompts/*` — generated fix artifacts
+
+## CI/CD (GitHub Actions)
+
+This repo includes `.github/workflows/ci-cd.yml` with:
+
+- **CI on every push and pull request**
+  - Python 3.11 setup
+  - `uv` dependency install
+  - `ruff check src tests`
+  - `pytest -q`
+- **Docker build validation on every push and pull request**
+  - Builds `docker/Dockerfile` (no publish)
+- **CD on pushes to `main`**
+  - Publishes Docker image to GHCR:
+    - `ghcr.io/<owner>/<repo>:sha-<commit>`
+    - `ghcr.io/<owner>/<repo>:latest`
+
+Notes:
+
+- GHCR publishing uses `GITHUB_TOKEN` with `packages: write`.
+- Secrets in `.env` are not used by CI/CD; keep runtime secrets in your deployment environment.
 
 ## Cron / Background Execution
 

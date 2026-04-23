@@ -5,7 +5,9 @@ from retrace.detectors import Signal, register, get_detector
 
 
 def test_signal_is_frozen():
-    s = Signal(session_id="x", detector="d", timestamp_ms=0, url="https://x/", details={})
+    s = Signal(
+        session_id="x", detector="d", timestamp_ms=0, url="https://x/", details={}
+    )
     with pytest.raises(dataclasses.FrozenInstanceError):
         s.session_id = "y"  # type: ignore[misc]
 
@@ -20,6 +22,7 @@ def test_signal_each_instance_gets_its_own_details_dict():
 def test_register_and_get_detector_roundtrip():
     class FakeDetector:
         name = "fake_for_test"
+
         def detect(self, session_id, events):
             return []
 
@@ -30,11 +33,13 @@ def test_register_and_get_detector_roundtrip():
 def test_register_raises_on_duplicate_name():
     class A:
         name = "dup_for_test"
+
         def detect(self, session_id, events):
             return []
 
     class B:
         name = "dup_for_test"
+
         def detect(self, session_id, events):
             return []
 

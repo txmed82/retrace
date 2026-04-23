@@ -7,6 +7,7 @@ from typing import Any
 from retrace.clusterer import cluster_sessions
 from retrace.config import RetraceConfig
 from retrace.detectors import Signal, all_detectors
+from retrace.enrichment import CorrelationEnricher
 from retrace.ingester import PostHogIngester
 from retrace.llm.analyst import analyze_cluster
 from retrace.llm.client import LLMClient
@@ -55,7 +56,9 @@ def run_pipeline(
     llm_client: LLMClient,
     now: datetime,
 ) -> RunSummary:
-    started_at = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    started_at = (
+        now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    )
     run_id = store.start_run()
 
     status = "ok"
@@ -108,6 +111,7 @@ def run_pipeline(
 
         sessions_with_signals = len(signals_by_session)
         clusters = cluster_sessions(signals_by_session, min_size=cfg.cluster.min_size)
+        enricher = CorrelationEnricher(cfg, store)
 
         for cluster in clusters:
             try:
@@ -117,6 +121,9 @@ def run_pipeline(
                     events_by_session=events_by_session,
                     signals_by_session=signals_by_session,
                     session_url_builder=lambda sid: _session_replay_url(cfg, sid),
+                )
+                finding = enricher.enrich(
+                    finding, signals_by_session.get(finding.session_id, [])
                 )
                 findings.append(finding)
             except Exception as exc:

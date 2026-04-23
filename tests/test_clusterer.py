@@ -34,13 +34,39 @@ def test_cluster_groups_sessions_with_same_fingerprint():
 
 
 def test_cluster_splits_different_detectors():
-    sig_a = [Signal(session_id="a", detector="console_error", timestamp_ms=0, url="https://x/", details={"message": "m"})]
-    sig_b = [Signal(session_id="b", detector="rage_click", timestamp_ms=0, url="https://x/", details={})]
+    sig_a = [
+        Signal(
+            session_id="a",
+            detector="console_error",
+            timestamp_ms=0,
+            url="https://x/",
+            details={"message": "m"},
+        )
+    ]
+    sig_b = [
+        Signal(
+            session_id="b",
+            detector="rage_click",
+            timestamp_ms=0,
+            url="https://x/",
+            details={},
+        )
+    ]
     clusters = cluster_sessions({"a": sig_a, "b": sig_b}, min_size=1)
     assert len(clusters) == 2
 
 
 def test_cluster_respects_min_size():
-    sig = {"a": [Signal(session_id="a", detector="d", timestamp_ms=0, url="u", details={"message": "m"})]}
+    sig = {
+        "a": [
+            Signal(
+                session_id="a",
+                detector="d",
+                timestamp_ms=0,
+                url="u",
+                details={"message": "m"},
+            )
+        ]
+    }
     assert cluster_sessions(sig, min_size=2) == []
     assert len(cluster_sessions(sig, min_size=1)) == 1
