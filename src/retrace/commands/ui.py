@@ -66,14 +66,24 @@ def _create_pinned_transport(
             # Set Host header to the original hostname (required for virtual hosting)
             request.headers["Host"] = self._original_hostname
 
+            # Prepare the pinned IP for use in URL netloc
+            # IPv6 addresses must be bracketed; also percent-encode zone IDs
+            pinned_ip_for_url = self._pinned_ip
+            if ":" in self._pinned_ip:
+                # This looks like an IPv6 address
+                # Percent-encode any zone identifier (% becomes %25)
+                pinned_ip_for_url = self._pinned_ip.replace("%", "%25")
+                # Wrap in brackets for URL
+                pinned_ip_for_url = f"[{pinned_ip_for_url}]"
+
             # Replace hostname with pinned IP in the netloc
             if ":" in parsed.netloc and not parsed.netloc.startswith("["):
                 # Explicit port present: hostname:port -> ip:port
                 _, port = parsed.netloc.rsplit(":", 1)
-                new_netloc = f"{self._pinned_ip}:{port}"
+                new_netloc = f"{pinned_ip_for_url}:{port}"
             else:
                 # No explicit port: hostname -> ip
-                new_netloc = self._pinned_ip
+                new_netloc = pinned_ip_for_url
 
             # Reconstruct the URL with pinned IP
             new_path = parsed.path or "/"
@@ -449,6 +459,29 @@ def _llm_defaults(provider: str) -> dict[str, str]:
     return _LLM_PROVIDER_DEFAULTS.get(
         provider.strip().lower(), _LLM_PROVIDER_DEFAULTS["openai_compatible"]
     )
+
+
+def _resolve_llm_api_key(provider: str, env_vars: dict[str, str]) -> str:
+    """Resolve the effective LLM API key using the same logic as load_config().
+
+    Args:
+        provider: The LLM provider name
+        env_vars: Dictionary of environment variables (from .env file or os.environ)
+
+    Returns:
+        The effective API key (may be empty string)
+    """
+    llm_key_env = env_vars.get("RETRACE_LLM_API_KEY", "").strip()
+    if not llm_key_env:
+        provider_env_map = {
+            "openai": "RETRACE_OPENAI_API_KEY",
+            "anthropic": "RETRACE_ANTHROPIC_API_KEY",
+            "openrouter": "RETRACE_OPENROUTER_API_KEY",
+        }
+        provider_env = provider_env_map.get(provider.strip().lower())
+        if provider_env:
+            llm_key_env = env_vars.get(provider_env, "").strip()
+    return llm_key_env
 
 
 def _llm_models(provider: str, base_url: str, api_key: str) -> dict[str, Any]:
@@ -893,6 +926,10 @@ def ui_command(
     def current_settings(*, include_secrets: bool = False) -> dict[str, Any]:
         cfg = _read_config(config_path)
         env = _read_env(env_path)
+        llm_provider = str(
+            ((cfg.get("llm") or {}).get("provider") or "openai_compatible")
+        )
+        effective_llm_key = _resolve_llm_api_key(llm_provider, env)
         settings: dict[str, Any] = {
             "posthog_host": str(
                 ((cfg.get("posthog") or {}).get("host") or "https://us.i.posthog.com")
@@ -903,20 +940,18 @@ def ui_command(
             "posthog_api_key_present": bool(
                 env.get("RETRACE_POSTHOG_API_KEY", "").strip()
             ),
-            "llm_provider": str(
-                ((cfg.get("llm") or {}).get("provider") or "openai_compatible")
-            ),
+            "llm_provider": llm_provider,
             "llm_base_url": str(
                 ((cfg.get("llm") or {}).get("base_url") or "http://localhost:8080/v1")
             ),
             "llm_model": str(
                 ((cfg.get("llm") or {}).get("model") or "llama-3.1-8b-instruct")
             ),
-            "llm_api_key_present": bool(env.get("RETRACE_LLM_API_KEY", "").strip()),
+            "llm_api_key_present": bool(effective_llm_key),
         }
         if include_secrets:
             settings["posthog_api_key"] = env.get("RETRACE_POSTHOG_API_KEY", "")
-            settings["llm_api_key"] = env.get("RETRACE_LLM_API_KEY", "")
+            settings["llm_api_key"] = effective_llm_key
         return settings
 
     class Handler(BaseHTTPRequestHandler):
@@ -1042,8 +1077,9 @@ def ui_command(
                 )
                 llm_key_v = str(body.get("llm_api_key", "")).strip()
                 env = _read_env(env_path)
-                effective_llm_key = (
-                    llm_key_v or env.get("RETRACE_LLM_API_KEY", "").strip()
+                # Compute effective LLM key: prefer new value from form, else resolve from env
+                effective_llm_key = llm_key_v or _resolve_llm_api_key(
+                    llm_provider_v, env
                 )
                 if llm_provider_v in _CLOUD_LLM_PROVIDERS and not effective_llm_key:
                     self._json(
@@ -1076,9 +1112,10 @@ def ui_command(
                     str(body.get("provider", "")).strip() or "openai_compatible"
                 )
                 base_url_v = str(body.get("base_url", "")).strip()
-                key_v = (
-                    str(body.get("api_key", "")).strip()
-                    or _read_env(env_path).get("RETRACE_LLM_API_KEY", "").strip()
+                # Compute effective LLM key: prefer value from request, else resolve from env
+                env = _read_env(env_path)
+                key_v = str(body.get("api_key", "")).strip() or _resolve_llm_api_key(
+                    provider_v, env
                 )
                 result = _llm_models(provider_v, base_url_v, key_v)
                 self._json(result, status=200 if result.get("ok") else 400)
