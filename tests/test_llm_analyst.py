@@ -156,6 +156,7 @@ def test_analyze_session_warns_when_critical_fields_empty(caplog):
 
     assert f.title == "Unclassified issue"
     assert any(
-        "empty critical fields" in rec.message.lower() or "degraded" in rec.message.lower()
+        "empty critical fields" in rec.message.lower()
+        or "degraded" in rec.message.lower()
         for rec in caplog.records
     )

@@ -56,7 +56,9 @@ def run_pipeline(
     llm_client: LLMClient,
     now: datetime,
 ) -> RunSummary:
-    started_at = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    started_at = (
+        now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    )
     run_id = store.start_run()
 
     status = "ok"
@@ -120,7 +122,9 @@ def run_pipeline(
                     signals_by_session=signals_by_session,
                     session_url_builder=lambda sid: _session_replay_url(cfg, sid),
                 )
-                finding = enricher.enrich(finding, signals_by_session.get(finding.session_id, []))
+                finding = enricher.enrich(
+                    finding, signals_by_session.get(finding.session_id, [])
+                )
                 findings.append(finding)
             except Exception as exc:
                 errors += 1

@@ -92,7 +92,9 @@ def init_command() -> None:
             else:
                 click.echo("  ! No models returned, falling back to manual entry.")
         except Exception as exc:
-            click.echo(f"  ! Model discovery failed ({exc}), falling back to manual entry.")
+            click.echo(
+                f"  ! Model discovery failed ({exc}), falling back to manual entry."
+            )
 
     if models:
         choices = list(models) + [_CUSTOM_MODEL_SENTINEL]
@@ -116,9 +118,7 @@ def init_command() -> None:
     max_sessions_per_run = int(
         questionary.text("Max sessions per run?", default="50").ask()
     )
-    output_dir = questionary.text(
-        "Report output directory?", default="./reports"
-    ).ask()
+    output_dir = questionary.text("Report output directory?", default="./reports").ask()
     data_dir = questionary.text("Data directory?", default="./data").ask()
 
     _write_config(
@@ -143,6 +143,7 @@ def init_command() -> None:
     if run_now:
         click.echo("Running... (use `retrace run` to run again later)")
         from retrace.cli import run as run_cmd
+
         ctx = click.Context(run_cmd)
         ctx.invoke(run_cmd, config_path=Path("config.yaml"))
 

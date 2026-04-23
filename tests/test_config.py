@@ -45,6 +45,7 @@ def test_load_config_merges_yaml_and_env(tmp_path: Path, monkeypatch):
 
 def test_load_config_keeps_yaml_keys_when_env_unset(tmp_path, monkeypatch):
     import textwrap
+
     config_yaml = tmp_path / "config.yaml"
     config_yaml.write_text(
         textwrap.dedent(
@@ -64,6 +65,7 @@ def test_load_config_keeps_yaml_keys_when_env_unset(tmp_path, monkeypatch):
     monkeypatch.delenv("RETRACE_LLM_API_KEY", raising=False)
 
     from retrace.config import load_config
+
     cfg = load_config(config_yaml)
 
     assert cfg.posthog.api_key == "phx_from_yaml"

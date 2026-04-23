@@ -17,11 +17,129 @@ import click
 import httpx
 import yaml
 
-from retrace.llm.client import build_llm_http_request, fetch_llm_models
+from retrace.llm.client import build_llm_http_request
 from retrace.reports.parser import parse_report_findings
 from retrace.storage import Storage
 
 _CLOUD_LLM_PROVIDERS = {"openai", "anthropic", "openrouter"}
+
+
+def _create_pinned_transport(
+    pinned_ip: str, hostname: str, scheme: str
+) -> httpx.HTTPTransport:
+    """Create an httpx transport that connects to a pinned IP address.
+
+    This prevents DNS rebinding/TOCTOU attacks by ensuring the HTTP connection uses the
+    IP address that was validated during URL checking, rather than performing a fresh
+    DNS resolution that could return a different (malicious) IP.
+
+    Args:
+        pinned_ip: The IP address to connect to (already validated)
+        hostname: The original hostname (used for Host header and, for HTTPS, SNI)
+        scheme: The URL scheme ('http' or 'https')
+
+    Returns:
+        An HTTPTransport configured to connect to the pinned IP with proper SNI for HTTPS
+
+    Implementation:
+        For HTTPS, this creates a custom NetworkBackend that wraps SSL sockets with the
+        correct server_hostname for SNI, ensuring TLS certificate validation works properly
+        even though we're connecting to an IP address.
+    """
+    import ssl
+
+    class PinnedHTTPTransport(httpx.HTTPTransport):
+        """Transport that rewrites requests to use a pinned IP address."""
+
+        def __init__(
+            self, pinned_ip: str, original_hostname: str, *args: Any, **kwargs: Any
+        ):
+            self._pinned_ip = pinned_ip
+            self._original_hostname = original_hostname
+            super().__init__(*args, **kwargs)
+
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            # Rewrite the request URL to use the pinned IP instead of hostname
+            original_url = str(request.url)
+            parsed = urlparse(original_url)
+
+            # Set Host header to the original hostname (required for virtual hosting)
+            request.headers["Host"] = self._original_hostname
+
+            # Replace hostname with pinned IP in the netloc
+            if ":" in parsed.netloc and not parsed.netloc.startswith("["):
+                # Explicit port present: hostname:port -> ip:port
+                _, port = parsed.netloc.rsplit(":", 1)
+                new_netloc = f"{self._pinned_ip}:{port}"
+            else:
+                # No explicit port: hostname -> ip
+                new_netloc = self._pinned_ip
+
+            # Reconstruct the URL with pinned IP
+            new_path = parsed.path or "/"
+            new_url = f"{parsed.scheme}://{new_netloc}{new_path}"
+            if parsed.query:
+                new_url += f"?{parsed.query}"
+            if parsed.fragment:
+                new_url += f"#{parsed.fragment}"
+
+            request.url = httpx.URL(new_url)
+
+            return super().handle_request(request)
+
+    if scheme == "https":
+        # For HTTPS, create a custom network backend that sets correct SNI
+        ssl_context = ssl.create_default_context()
+
+        # Create a custom NetworkBackend that wraps sockets with correct server_hostname
+        from httpcore._backends.sync import SyncBackend
+
+        class SNINetworkBackend(SyncBackend):
+            """NetworkBackend that overrides SNI hostname for SSL connections."""
+
+            def __init__(self, pinned_ip: str, sni_hostname: str):
+                super().__init__()
+                self._pinned_ip = pinned_ip
+                self._sni_hostname = sni_hostname
+
+            def start_tls(
+                self,
+                sock: socket.socket,
+                ssl_context: ssl.SSLContext,
+                server_hostname: Optional[str] = None,
+                timeout: Optional[float] = None,
+            ) -> ssl.SSLSocket:
+                # Override server_hostname to use the original hostname for SNI
+                # when we're connecting to our pinned IP
+                try:
+                    peername = sock.getpeername()
+                    if peername and peername[0] == self._pinned_ip:
+                        server_hostname = self._sni_hostname
+                except Exception:
+                    pass
+
+                # Wrap the socket with SSL using the correct server_hostname
+                return super().start_tls(sock, ssl_context, server_hostname, timeout)
+
+        network_backend = SNINetworkBackend(pinned_ip=pinned_ip, sni_hostname=hostname)
+
+        transport = PinnedHTTPTransport(
+            pinned_ip=pinned_ip,
+            original_hostname=hostname,
+            verify=ssl_context,
+            network_backend=network_backend,
+        )
+
+        return transport
+    else:
+        # For HTTP, no SSL/SNI concerns
+        transport = PinnedHTTPTransport(
+            pinned_ip=pinned_ip,
+            original_hostname=hostname,
+        )
+
+        return transport
+
 
 _LLM_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     "openai_compatible": {
@@ -115,7 +233,9 @@ def _write_env(env_path: Path, vals: dict[str, str]) -> None:
 
 
 def _latest_report(report_dir: Path) -> Optional[Path]:
-    files = sorted(report_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = sorted(
+        report_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
     return files[0] if files else None
 
 
@@ -168,14 +288,37 @@ def _gh_checks() -> dict[str, Any]:
 def _posthog_check(host: str, project_id: str, api_key: str) -> dict[str, Any]:
     configured = bool(host.strip() and project_id.strip() and api_key.strip())
     if not configured:
-        return {"configured": False, "reachable": None, "detail": "Missing host/project/API key."}
-    url = f"{host.rstrip('/')}/api/projects/{project_id}/"
+        return {
+            "configured": False,
+            "reachable": None,
+            "detail": "Missing host/project/API key.",
+        }
+
+    # Validate and pin the IP to prevent DNS rebinding
+    ok_url, safe_host, err, pinned_ip = _validate_base_url(host)
+    if not ok_url:
+        return {"configured": True, "reachable": False, "detail": err}
+
+    url = f"{safe_host.rstrip('/')}/api/projects/{project_id}/"
     try:
-        with httpx.Client(timeout=8) as c:
+        # Create transport that uses pinned IP to prevent TOCTOU/DNS rebinding
+        parsed = urlparse(safe_host)
+        transport = _create_pinned_transport(
+            pinned_ip, parsed.hostname or "", parsed.scheme or ""
+        )
+        with httpx.Client(timeout=8, transport=transport) as c:
             r = c.get(url, headers={"Authorization": f"Bearer {api_key}"})
         if r.status_code // 100 == 2:
-            return {"configured": True, "reachable": True, "detail": f"OK ({r.status_code})"}
-        return {"configured": True, "reachable": False, "detail": f"HTTP {r.status_code}"}
+            return {
+                "configured": True,
+                "reachable": True,
+                "detail": f"OK ({r.status_code})",
+            }
+        return {
+            "configured": True,
+            "reachable": False,
+            "detail": f"HTTP {r.status_code}",
+        }
     except Exception as exc:
         return {"configured": True, "reachable": False, "detail": str(exc)}
 
@@ -184,21 +327,26 @@ def _truthy_env(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _validate_base_url(base_url: str) -> tuple[bool, str, str]:
-    """Validate outbound model-provider URLs to reduce SSRF risk."""
+def _validate_base_url(base_url: str) -> tuple[bool, str, str, str]:
+    """Validate outbound model-provider URLs to reduce SSRF risk.
+
+    Returns: (ok, normalized_url, error_message, pinned_ip)
+    The pinned_ip is the first acceptable IP address resolved during validation,
+    which must be used for the actual HTTP request to prevent DNS rebinding attacks.
+    """
     raw = base_url.strip()
     if not raw:
-        return False, "", "Base URL is required."
+        return False, "", "Base URL is required.", ""
 
     parsed = urlparse(raw)
     scheme = (parsed.scheme or "").lower()
     if scheme not in {"http", "https"}:
-        return False, "", "Base URL must use http or https."
+        return False, "", "Base URL must use http or https.", ""
     if not parsed.hostname:
-        return False, "", "Base URL must include a hostname."
+        return False, "", "Base URL must include a hostname.", ""
 
     if parsed.query or parsed.fragment:
-        return False, "", "Base URL must not include query parameters or fragments."
+        return False, "", "Base URL must not include query parameters or fragments.", ""
 
     default_port = 443 if scheme == "https" else 80
     port = parsed.port or default_port
@@ -206,8 +354,9 @@ def _validate_base_url(base_url: str) -> tuple[bool, str, str]:
     try:
         infos = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
-        return False, "", f"Base URL hostname resolution failed: {exc}"
+        return False, "", f"Base URL hostname resolution failed: {exc}", ""
 
+    pinned_ip = ""
     if not allow_internal:
         for _, _, _, _, sockaddr in infos:
             if not sockaddr:
@@ -229,18 +378,37 @@ def _validate_base_url(base_url: str) -> tuple[bool, str, str]:
                     "",
                     f"Base URL resolves to a non-public address ({ip}). "
                     "Set RETRACE_ALLOW_INTERNAL_URLS=true to override.",
+                    "",
                 )
+            # Pin the first acceptable IP
+            if not pinned_ip:
+                pinned_ip = sockaddr[0]
+    else:
+        # If internal URLs are allowed, pin the first resolved IP
+        for _, _, _, _, sockaddr in infos:
+            if sockaddr:
+                pinned_ip = sockaddr[0]
+                break
+
+    if not pinned_ip:
+        return False, "", "No acceptable IP addresses found for base URL.", ""
 
     normalized = f"{scheme}://{parsed.netloc}{parsed.path or ''}".rstrip("/")
-    return True, normalized, ""
+    return True, normalized, "", pinned_ip
 
 
-def _llm_check(provider: str, base_url: str, model: str, api_key: str) -> dict[str, Any]:
+def _llm_check(
+    provider: str, base_url: str, model: str, api_key: str
+) -> dict[str, Any]:
     p = provider.strip().lower()
     configured = bool(p and base_url.strip() and model.strip())
     if not configured:
-        return {"configured": False, "reachable": None, "detail": "Missing provider/base URL/model."}
-    ok_url, safe_base_url, err = _validate_base_url(base_url)
+        return {
+            "configured": False,
+            "reachable": None,
+            "detail": "Missing provider/base URL/model.",
+        }
+    ok_url, safe_base_url, err, pinned_ip = _validate_base_url(base_url)
     if not ok_url:
         return {"configured": True, "reachable": False, "detail": err}
     try:
@@ -255,32 +423,61 @@ def _llm_check(provider: str, base_url: str, model: str, api_key: str) -> dict[s
             response_json=False,
             max_tokens=8,
         )
-        with httpx.Client(timeout=12) as c:
+        # Create transport that uses pinned IP to prevent TOCTOU/DNS rebinding
+        parsed = urlparse(safe_base_url)
+        transport = _create_pinned_transport(
+            pinned_ip, parsed.hostname or "", parsed.scheme or ""
+        )
+        with httpx.Client(timeout=12, transport=transport) as c:
             r = c.post(url, headers=headers, json=body)
         if r.status_code // 100 == 2:
-            return {"configured": True, "reachable": True, "detail": f"OK ({r.status_code})"}
-        return {"configured": True, "reachable": False, "detail": f"HTTP {r.status_code}"}
+            return {
+                "configured": True,
+                "reachable": True,
+                "detail": f"OK ({r.status_code})",
+            }
+        return {
+            "configured": True,
+            "reachable": False,
+            "detail": f"HTTP {r.status_code}",
+        }
     except Exception as exc:
         return {"configured": True, "reachable": False, "detail": str(exc)}
 
 
 def _llm_defaults(provider: str) -> dict[str, str]:
-    return _LLM_PROVIDER_DEFAULTS.get(provider.strip().lower(), _LLM_PROVIDER_DEFAULTS["openai_compatible"])
+    return _LLM_PROVIDER_DEFAULTS.get(
+        provider.strip().lower(), _LLM_PROVIDER_DEFAULTS["openai_compatible"]
+    )
 
 
 def _llm_models(provider: str, base_url: str, api_key: str) -> dict[str, Any]:
     p = provider.strip().lower() or "openai_compatible"
     if p in _CLOUD_LLM_PROVIDERS and not api_key.strip():
         return {"ok": False, "error": "API key required for selected provider."}
-    ok_url, safe_base_url, err = _validate_base_url(base_url)
+    ok_url, safe_base_url, err, pinned_ip = _validate_base_url(base_url)
     if not ok_url:
         return {"ok": False, "error": err}
     try:
-        models = fetch_llm_models(
-            provider=p,
-            base_url=safe_base_url,
-            api_key=api_key.strip() or None,
+        # Create transport that uses pinned IP to prevent TOCTOU/DNS rebinding
+        parsed = urlparse(safe_base_url)
+        transport = _create_pinned_transport(
+            pinned_ip, parsed.hostname or "", parsed.scheme or ""
         )
+
+        # We can't pass transport to fetch_llm_models without modifying it,
+        # so we inline the model fetching logic here with our secure transport
+        from retrace.llm.client import _build_headers, _extract_model_ids
+
+        headers = _build_headers(provider=p, api_key=api_key.strip() or None)
+        url = f"{safe_base_url.rstrip('/')}/models"
+
+        with httpx.Client(timeout=10, transport=transport) as c:
+            resp = c.get(url, headers=headers)
+            resp.raise_for_status()
+            payload = resp.json()
+
+        models = _extract_model_ids(payload)
         return {"ok": True, "models": models}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -315,10 +512,14 @@ def _to_findings_payload(
         candidates: list[dict[str, Any]] = []
         prompts: dict[str, str] = {}
         if row and chosen_repo:
-            for c in store.list_code_candidates(finding_id=row.id, repo_id=chosen_repo.id):
+            for c in store.list_code_candidates(
+                finding_id=row.id, repo_id=chosen_repo.id
+            ):
                 rationale = ""
                 try:
-                    rationale = (json.loads(str(c["rationale_json"])) or {}).get("rationale", "")
+                    rationale = (json.loads(str(c["rationale_json"])) or {}).get(
+                        "rationale", ""
+                    )
                 except Exception:
                     rationale = str(c["rationale_json"])
                 candidates.append(
@@ -667,15 +868,24 @@ _INDEX_HTML = """<!doctype html>
 )
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8787, show_default=True, type=int)
-@click.option("--repo", "repo_full_name", default=None, help="Optional connected repo full name filter.")
-def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional[str]) -> None:
+@click.option(
+    "--repo",
+    "repo_full_name",
+    default=None,
+    help="Optional connected repo full name filter.",
+)
+def ui_command(
+    config_path: Path, host: str, port: int, repo_full_name: Optional[str]
+) -> None:
     """Run local browser UI for onboarding + findings + rrweb replay."""
 
     env_path = config_path.parent / ".env"
 
     cfg_dict = _read_config(config_path)
     data_dir = Path(str(((cfg_dict.get("run") or {}).get("data_dir") or "./data")))
-    output_dir = Path(str(((cfg_dict.get("run") or {}).get("output_dir") or "./reports")))
+    output_dir = Path(
+        str(((cfg_dict.get("run") or {}).get("output_dir") or "./reports"))
+    )
 
     store = Storage(data_dir / "retrace.db")
     store.init_schema()
@@ -684,12 +894,24 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
         cfg = _read_config(config_path)
         env = _read_env(env_path)
         settings: dict[str, Any] = {
-            "posthog_host": str(((cfg.get("posthog") or {}).get("host") or "https://us.i.posthog.com")),
-            "posthog_project_id": str(((cfg.get("posthog") or {}).get("project_id") or "")),
-            "posthog_api_key_present": bool(env.get("RETRACE_POSTHOG_API_KEY", "").strip()),
-            "llm_provider": str(((cfg.get("llm") or {}).get("provider") or "openai_compatible")),
-            "llm_base_url": str(((cfg.get("llm") or {}).get("base_url") or "http://localhost:8080/v1")),
-            "llm_model": str(((cfg.get("llm") or {}).get("model") or "llama-3.1-8b-instruct")),
+            "posthog_host": str(
+                ((cfg.get("posthog") or {}).get("host") or "https://us.i.posthog.com")
+            ),
+            "posthog_project_id": str(
+                ((cfg.get("posthog") or {}).get("project_id") or "")
+            ),
+            "posthog_api_key_present": bool(
+                env.get("RETRACE_POSTHOG_API_KEY", "").strip()
+            ),
+            "llm_provider": str(
+                ((cfg.get("llm") or {}).get("provider") or "openai_compatible")
+            ),
+            "llm_base_url": str(
+                ((cfg.get("llm") or {}).get("base_url") or "http://localhost:8080/v1")
+            ),
+            "llm_model": str(
+                ((cfg.get("llm") or {}).get("model") or "llama-3.1-8b-instruct")
+            ),
             "llm_api_key_present": bool(env.get("RETRACE_LLM_API_KEY", "").strip()),
         }
         if include_secrets:
@@ -776,7 +998,10 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
                 try:
                     resolved = sp.resolve()
                     sessions_dir = (data_dir / "sessions").resolve()
-                    if sessions_dir not in resolved.parents and resolved != sessions_dir:
+                    if (
+                        sessions_dir not in resolved.parents
+                        and resolved != sessions_dir
+                    ):
                         self._json({"error": "invalid session path"}, status=400)
                         return
                 except Exception:
@@ -799,16 +1024,27 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
             path = urlparse(self.path).path
             if path == "/api/settings":
                 body = self._read_json_body()
-                host_v = str(body.get("posthog_host", "")).strip() or "https://us.i.posthog.com"
+                host_v = (
+                    str(body.get("posthog_host", "")).strip()
+                    or "https://us.i.posthog.com"
+                )
                 project_v = str(body.get("posthog_project_id", "")).strip()
                 key_v = str(body.get("posthog_api_key", "")).strip()
-                llm_provider_v = str(body.get("llm_provider", "")).strip() or "openai_compatible"
+                llm_provider_v = (
+                    str(body.get("llm_provider", "")).strip() or "openai_compatible"
+                )
                 defaults = _llm_defaults(llm_provider_v)
-                llm_base_url_v = str(body.get("llm_base_url", "")).strip() or defaults["base_url"]
-                llm_model_v = str(body.get("llm_model", "")).strip() or defaults["model"]
+                llm_base_url_v = (
+                    str(body.get("llm_base_url", "")).strip() or defaults["base_url"]
+                )
+                llm_model_v = (
+                    str(body.get("llm_model", "")).strip() or defaults["model"]
+                )
                 llm_key_v = str(body.get("llm_api_key", "")).strip()
                 env = _read_env(env_path)
-                effective_llm_key = llm_key_v or env.get("RETRACE_LLM_API_KEY", "").strip()
+                effective_llm_key = (
+                    llm_key_v or env.get("RETRACE_LLM_API_KEY", "").strip()
+                )
                 if llm_provider_v in _CLOUD_LLM_PROVIDERS and not effective_llm_key:
                     self._json(
                         {"error": f"{llm_provider_v} requires an API key."},
@@ -836,11 +1072,14 @@ def ui_command(config_path: Path, host: str, port: int, repo_full_name: Optional
 
             if path == "/api/llm/models":
                 body = self._read_json_body()
-                provider_v = str(body.get("provider", "")).strip() or "openai_compatible"
+                provider_v = (
+                    str(body.get("provider", "")).strip() or "openai_compatible"
+                )
                 base_url_v = str(body.get("base_url", "")).strip()
-                key_v = str(body.get("api_key", "")).strip() or _read_env(env_path).get(
-                    "RETRACE_LLM_API_KEY", ""
-                ).strip()
+                key_v = (
+                    str(body.get("api_key", "")).strip()
+                    or _read_env(env_path).get("RETRACE_LLM_API_KEY", "").strip()
+                )
                 result = _llm_models(provider_v, base_url_v, key_v)
                 self._json(result, status=200 if result.get("ok") else 400)
                 return

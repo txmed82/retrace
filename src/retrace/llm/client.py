@@ -80,7 +80,9 @@ class LLMClient:
             resp.raise_for_status()
             payload = resp.json()
             try:
-                content = extract_llm_text_content(provider=self.cfg.provider, payload=payload)
+                content = extract_llm_text_content(
+                    provider=self.cfg.provider, payload=payload
+                )
             except LLMError as exc:
                 raise LLMError(f"unexpected LLM response shape: {payload!r}") from exc
             if not isinstance(content, str):
@@ -94,7 +96,7 @@ class LLMClient:
     def _backoff(attempt: int) -> None:
         # 0.5s, 1s (no sleep after final attempt since loop exits)
         if attempt < 2:
-            time.sleep(0.5 * (2 ** attempt))
+            time.sleep(0.5 * (2**attempt))
 
 
 def _parse_json(content: str) -> dict[str, Any]:
@@ -108,7 +110,9 @@ def _parse_json(content: str) -> dict[str, Any]:
         try:
             result = json.loads(m.group(1))
         except json.JSONDecodeError as exc:
-            raise LLMError(f"LLM fenced content not valid JSON: {content[:200]!r}") from exc
+            raise LLMError(
+                f"LLM fenced content not valid JSON: {content[:200]!r}"
+            ) from exc
     if not isinstance(result, dict):
         raise LLMError(f"LLM returned non-object JSON: {result!r}")
     return result
@@ -167,7 +171,11 @@ def extract_llm_text_content(*, provider: str, payload: dict[str, Any]) -> str:
             raise LLMError("anthropic response missing content list")
         texts: list[str] = []
         for block in blocks:
-            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            ):
                 texts.append(block["text"])
         if not texts:
             raise LLMError("anthropic response had no text content")
@@ -176,7 +184,9 @@ def extract_llm_text_content(*, provider: str, payload: dict[str, Any]) -> str:
     try:
         content = payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise LLMError("openai-compatible response missing choices[0].message.content") from exc
+        raise LLMError(
+            "openai-compatible response missing choices[0].message.content"
+        ) from exc
     if isinstance(content, list):
         texts: list[str] = []
         for item in content:

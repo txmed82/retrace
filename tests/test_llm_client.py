@@ -10,7 +10,9 @@ def _cfg(
     provider: str = "openai_compatible",
     base_url: str = "http://localhost:8080/v1",
 ) -> LLMConfig:
-    return LLMConfig(provider=provider, base_url=base_url, model="test", api_key=api_key)
+    return LLMConfig(
+        provider=provider, base_url=base_url, model="test", api_key=api_key
+    )
 
 
 def test_chat_json_returns_parsed_dict(httpx_mock: HTTPXMock):
@@ -19,7 +21,12 @@ def test_chat_json_returns_parsed_dict(httpx_mock: HTTPXMock):
         url="http://localhost:8080/v1/chat/completions",
         json={
             "choices": [
-                {"message": {"role": "assistant", "content": '{"title":"x","severity":"high"}'}}
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"title":"x","severity":"high"}',
+                    }
+                }
             ]
         },
     )
@@ -32,7 +39,11 @@ def test_chat_json_strips_code_fences(httpx_mock: HTTPXMock):
     httpx_mock.add_response(
         method="POST",
         url="http://localhost:8080/v1/chat/completions",
-        json={"choices": [{"message": {"role": "assistant", "content": '```json\n{"a":1}\n```'}}]},
+        json={
+            "choices": [
+                {"message": {"role": "assistant", "content": '```json\n{"a":1}\n```'}}
+            ]
+        },
     )
     with LLMClient(_cfg()) as client:
         assert client.chat_json(system="s", user="u") == {"a": 1}
@@ -91,7 +102,9 @@ def test_chat_json_sends_no_auth_header_when_api_key_none(httpx_mock: HTTPXMock)
     assert "authorization" not in {k.lower() for k in req.headers}
 
 
-def test_chat_json_anthropic_uses_messages_endpoint_and_parses_content(httpx_mock: HTTPXMock):
+def test_chat_json_anthropic_uses_messages_endpoint_and_parses_content(
+    httpx_mock: HTTPXMock,
+):
     httpx_mock.add_response(
         method="POST",
         url="https://api.anthropic.com/v1/messages",
@@ -116,11 +129,14 @@ def test_chat_json_anthropic_raises_on_missing_text_content(httpx_mock: HTTPXMoc
         url="https://api.anthropic.com/v1/messages",
         json={"content": [{"type": "tool_use", "name": "x"}]},
     )
-    with LLMClient(
-        _cfg(
-            provider="anthropic",
-            base_url="https://api.anthropic.com/v1",
-            api_key="sk-ant-test",
-        )
-    ) as client, pytest.raises(LLMError):
+    with (
+        LLMClient(
+            _cfg(
+                provider="anthropic",
+                base_url="https://api.anthropic.com/v1",
+                api_key="sk-ant-test",
+            )
+        ) as client,
+        pytest.raises(LLMError),
+    ):
         client.chat_json(system="s", user="u")

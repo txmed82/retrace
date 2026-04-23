@@ -26,7 +26,9 @@ def doctor_command(config_path: Path) -> None:
     try:
         url = f"{cfg.posthog.host.rstrip('/')}/api/projects/{cfg.posthog.project_id}/"
         with httpx.Client(timeout=15) as c:
-            resp = c.get(url, headers={"Authorization": f"Bearer {cfg.posthog.api_key}"})
+            resp = c.get(
+                url, headers={"Authorization": f"Bearer {cfg.posthog.api_key}"}
+            )
             resp.raise_for_status()
         checks.append(("PostHog", True, f"reached {url}"))
     except Exception as exc:

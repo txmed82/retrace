@@ -17,8 +17,12 @@ from retrace.storage import SessionMeta, Storage
 
 def _cfg(*, api_key: str = "phx_test") -> RetraceConfig:
     return RetraceConfig(
-        posthog=PostHogConfig(host="https://us.i.posthog.com", project_id="42", api_key=api_key),
-        llm=LLMConfig(provider="openai_compatible", base_url="http://localhost:8080/v1", model="x"),
+        posthog=PostHogConfig(
+            host="https://us.i.posthog.com", project_id="42", api_key=api_key
+        ),
+        llm=LLMConfig(
+            provider="openai_compatible", base_url="http://localhost:8080/v1", model="x"
+        ),
         run=RunConfig(output_dir=Path("./reports"), data_dir=Path("./data")),
         detectors=DetectorsConfig(),
         cluster=ClusterConfig(),

@@ -20,7 +20,11 @@ def test_session_abandon_ignores_error_long_before_end():
         meta(ts=0),
         console_event(ts=1000, level="error", message="boom"),
         *[
-            {"type": 3, "timestamp": 1000 + i * 200, "data": {"source": 2, "type": 2, "id": 1}}
+            {
+                "type": 3,
+                "timestamp": 1000 + i * 200,
+                "data": {"source": 2, "type": 2, "id": 1},
+            }
             for i in range(1, 100)
         ],
     ]

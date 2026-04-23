@@ -12,7 +12,9 @@ from retrace.storage import Storage
 
 @pytest.fixture
 def cfg() -> PostHogConfig:
-    return PostHogConfig(host="https://us.i.posthog.com", project_id="42", api_key="phx_test")
+    return PostHogConfig(
+        host="https://us.i.posthog.com", project_id="42", api_key="phx_test"
+    )
 
 
 def test_fetch_sessions_since_stores_metadata_and_snapshots(
@@ -42,7 +44,11 @@ def test_fetch_sessions_since_stores_metadata_and_snapshots(
     httpx_mock.add_response(
         method="GET",
         url="https://us.i.posthog.com/api/projects/42/session_recordings/sess-1/snapshots",
-        json={"snapshots": [{"type": 4, "timestamp": 0, "data": {"href": "https://x.com/"}}]},
+        json={
+            "snapshots": [
+                {"type": 4, "timestamp": 0, "data": {"href": "https://x.com/"}}
+            ]
+        },
     )
 
     store = Storage(tmp_path / "retrace.db")
@@ -230,9 +236,30 @@ def test_fetch_since_stops_at_max_sessions_mid_page(
         ),
         json={
             "results": [
-                {"id": "sess-1", "start_time": "2026-04-19T11:00:00+00:00", "recording_duration": 1, "distinct_id": None, "click_count": 0, "event_count": 0},
-                {"id": "sess-2", "start_time": "2026-04-19T11:01:00+00:00", "recording_duration": 1, "distinct_id": None, "click_count": 0, "event_count": 0},
-                {"id": "sess-3", "start_time": "2026-04-19T11:02:00+00:00", "recording_duration": 1, "distinct_id": None, "click_count": 0, "event_count": 0},
+                {
+                    "id": "sess-1",
+                    "start_time": "2026-04-19T11:00:00+00:00",
+                    "recording_duration": 1,
+                    "distinct_id": None,
+                    "click_count": 0,
+                    "event_count": 0,
+                },
+                {
+                    "id": "sess-2",
+                    "start_time": "2026-04-19T11:01:00+00:00",
+                    "recording_duration": 1,
+                    "distinct_id": None,
+                    "click_count": 0,
+                    "event_count": 0,
+                },
+                {
+                    "id": "sess-3",
+                    "start_time": "2026-04-19T11:02:00+00:00",
+                    "recording_duration": 1,
+                    "distinct_id": None,
+                    "click_count": 0,
+                    "event_count": 0,
+                },
             ],
             "next": "https://us.i.posthog.com/...cursor=xyz",
         },

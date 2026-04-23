@@ -43,7 +43,7 @@ class DeadClickDetector:
             click_ts = int(e.get("timestamp") or 0)
             tid = event_data(e).get("id")
             had_followup = False
-            for _u2, e2 in enum[i + 1:]:
+            for _u2, e2 in enum[i + 1 :]:
                 ts2 = int(e2.get("timestamp") or 0)
                 if ts2 - click_ts > FOLLOWUP_WINDOW_MS:
                     break

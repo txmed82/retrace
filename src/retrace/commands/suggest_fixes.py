@@ -19,18 +19,43 @@ def _slugify(text: str) -> str:
 
 
 def _latest_report(report_dir: Path) -> Path:
-    files = sorted(report_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = sorted(
+        report_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
     if not files:
         raise click.ClickException(f"No report files found in {report_dir}")
     return files[0]
 
 
 @click.command("suggest-fixes")
-@click.option("--report", "report_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--latest", "use_latest", is_flag=True, default=False, help="Use latest markdown report.")
-@click.option("--repo", "repo_full_name", required=True, help="Connected repo in org/name format.")
-@click.option("--repo-path", type=click.Path(exists=True, file_okay=False, path_type=Path), default=None, help="Optional local checkout path override.")
-@click.option("--out", "out_dir", type=click.Path(file_okay=False, path_type=Path), default=Path("./reports/fix-prompts"), show_default=True)
+@click.option(
+    "--report",
+    "report_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--latest",
+    "use_latest",
+    is_flag=True,
+    default=False,
+    help="Use latest markdown report.",
+)
+@click.option(
+    "--repo", "repo_full_name", required=True, help="Connected repo in org/name format."
+)
+@click.option(
+    "--repo-path",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Optional local checkout path override.",
+)
+@click.option(
+    "--out",
+    "out_dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path("./reports/fix-prompts"),
+    show_default=True,
+)
 @click.option(
     "--config",
     "config_path",
@@ -63,7 +88,9 @@ def suggest_fixes_command(
     target_report = _latest_report(cfg.run.output_dir) if use_latest else report_path
     assert target_report is not None
 
-    effective_repo_path = repo_path or (Path(repo.local_path) if repo.local_path else None)
+    effective_repo_path = repo_path or (
+        Path(repo.local_path) if repo.local_path else None
+    )
     if repo_path:
         store.upsert_github_repo(
             repo_full_name=repo.repo_full_name,

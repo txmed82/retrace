@@ -166,10 +166,18 @@ class Storage:
         with self._conn() as conn:
             conn.executescript(SCHEMA)
             # Lightweight migrations for existing DBs.
-            cols_repo = [r["name"] for r in conn.execute("PRAGMA table_info(github_repos)").fetchall()]
+            cols_repo = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(github_repos)").fetchall()
+            ]
             if "local_path" not in cols_repo:
-                conn.execute("ALTER TABLE github_repos ADD COLUMN local_path TEXT NOT NULL DEFAULT ''")
-            cols_findings = [r["name"] for r in conn.execute("PRAGMA table_info(report_findings)").fetchall()]
+                conn.execute(
+                    "ALTER TABLE github_repos ADD COLUMN local_path TEXT NOT NULL DEFAULT ''"
+                )
+            cols_findings = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(report_findings)").fetchall()
+            ]
             if "evidence_text" not in cols_findings:
                 conn.execute(
                     "ALTER TABLE report_findings ADD COLUMN evidence_text TEXT NOT NULL DEFAULT ''"
@@ -301,7 +309,9 @@ class Storage:
         return RunRow(
             id=row["id"],
             started_at=datetime.fromisoformat(row["started_at"]),
-            finished_at=datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None,
+            finished_at=datetime.fromisoformat(row["finished_at"])
+            if row["finished_at"]
+            else None,
             sessions_scanned=row["sessions_scanned"],
             findings_count=row["findings_count"],
             status=row["status"],
@@ -354,7 +364,9 @@ class Storage:
                 remote_url=str(r["remote_url"]),
                 local_path=str(r["local_path"]),
                 provider=str(r["provider"]),
-                connected_at=datetime.fromisoformat(str(r["connected_at"]).replace("Z", "+00:00")),
+                connected_at=datetime.fromisoformat(
+                    str(r["connected_at"]).replace("Z", "+00:00")
+                ),
             )
             for r in rows
         ]
@@ -378,7 +390,9 @@ class Storage:
             remote_url=str(r["remote_url"]),
             local_path=str(r["local_path"]),
             provider=str(r["provider"]),
-            connected_at=datetime.fromisoformat(str(r["connected_at"]).replace("Z", "+00:00")),
+            connected_at=datetime.fromisoformat(
+                str(r["connected_at"]).replace("Z", "+00:00")
+            ),
         )
 
     def delete_github_repo(self, repo_full_name: str) -> int:
@@ -463,7 +477,9 @@ class Storage:
         assert row is not None
         return int(row["id"])
 
-    def list_report_findings(self, report_path: Optional[str] = None) -> list[ReportFindingRow]:
+    def list_report_findings(
+        self, report_path: Optional[str] = None
+    ) -> list[ReportFindingRow]:
         with self._conn() as conn:
             if report_path is None:
                 rows = conn.execute(
@@ -507,7 +523,9 @@ class Storage:
                 logs_url=str(r["logs_url"] or ""),
                 first_error_ts_ms=int(r["first_error_ts_ms"] or 0),
                 last_error_ts_ms=int(r["last_error_ts_ms"] or 0),
-                created_at=datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00")),
+                created_at=datetime.fromisoformat(
+                    str(r["created_at"]).replace("Z", "+00:00")
+                ),
             )
             for r in rows
         ]
@@ -539,7 +557,10 @@ class Storage:
                 INSERT INTO code_candidates (finding_id, repo_id, file_path, symbol, score, rationale_json)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                [(finding_id, repo_id, fp, sym, score, rationale) for fp, sym, score, rationale in candidates],
+                [
+                    (finding_id, repo_id, fp, sym, score, rationale)
+                    for fp, sym, score, rationale in candidates
+                ],
             )
 
     def list_code_candidates(
@@ -614,7 +635,9 @@ class Storage:
                 agent_target=str(r["agent_target"]),
                 prompt_markdown=str(r["prompt_markdown"]),
                 prompt_json=str(r["prompt_json"]),
-                created_at=datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00")),
+                created_at=datetime.fromisoformat(
+                    str(r["created_at"]).replace("Z", "+00:00")
+                ),
             )
             for r in rows
         ]

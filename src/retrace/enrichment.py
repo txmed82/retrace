@@ -39,9 +39,7 @@ class CorrelationEnricher:
         self.read_timeout_s = max(1.0, float(read_timeout_s))
         self.max_retries = max(1, int(max_retries))
         self.query_host = self._query_host(cfg.posthog.host)
-        self.query_url = (
-            f"{self.query_host.rstrip('/')}/api/projects/{cfg.posthog.project_id}/query/"
-        )
+        self.query_url = f"{self.query_host.rstrip('/')}/api/projects/{cfg.posthog.project_id}/query/"
 
     def enrich(self, finding: Finding, signals: list[Signal]) -> Finding:
         meta = self.store.get_session(finding.session_id)
@@ -50,7 +48,9 @@ class CorrelationEnricher:
         if first_error_ts_ms == 0 and last_error_ts_ms == 0:
             # Fall back to detector window when no explicit error detector fired.
             first_error_ts_ms, last_error_ts_ms = self._signal_window(signals)
-        query_from_ms, query_to_ms = self._expanded_window(first_error_ts_ms, last_error_ts_ms)
+        query_from_ms, query_to_ms = self._expanded_window(
+            first_error_ts_ms, last_error_ts_ms
+        )
 
         issue_ids: list[str] = []
         trace_ids: list[str] = []
@@ -64,12 +64,12 @@ class CorrelationEnricher:
                     from_ms=query_from_ms,
                     to_ms=query_to_ms,
                 )
-                issue_ids, trace_ids, top_stack_frame = self._extract_exception_correlation(
-                    exceptions
+                issue_ids, trace_ids, top_stack_frame = (
+                    self._extract_exception_correlation(exceptions)
                 )
                 if first_error_ts_ms == 0 and last_error_ts_ms == 0:
-                    first_error_ts_ms, last_error_ts_ms = self._timestamp_bounds_from_rows(
-                        exceptions
+                    first_error_ts_ms, last_error_ts_ms = (
+                        self._timestamp_bounds_from_rows(exceptions)
                     )
             except Exception as exc:
                 log.warning(
@@ -87,7 +87,11 @@ class CorrelationEnricher:
                     to_ms=query_to_ms,
                 )
                 trace_ids = self._merge_trace_ids(
-                    trace_ids, [self._first_nonempty(r, "trace_id", "$trace_id") for r in log_rows]
+                    trace_ids,
+                    [
+                        self._first_nonempty(r, "trace_id", "$trace_id")
+                        for r in log_rows
+                    ],
                 )
             except Exception as exc:
                 log.warning(
@@ -252,7 +256,10 @@ class CorrelationEnricher:
                 if not isinstance(row, list):
                     continue
                 out.append(
-                    {str(columns[i]): row[i] for i in range(min(len(columns), len(row)))}
+                    {
+                        str(columns[i]): row[i]
+                        for i in range(min(len(columns), len(row)))
+                    }
                 )
             return out
         return []
@@ -265,10 +272,14 @@ class CorrelationEnricher:
         trace_ids: list[str] = []
         top_stack_frame = ""
         for row in rows:
-            issue = CorrelationEnricher._first_nonempty(row, "issue_id", "$exception_fingerprint")
+            issue = CorrelationEnricher._first_nonempty(
+                row, "issue_id", "$exception_fingerprint"
+            )
             if issue and issue not in issue_ids:
                 issue_ids.append(issue)
-            trace_id = CorrelationEnricher._first_nonempty(row, "trace_id", "trace_id_alt", "$trace_id")
+            trace_id = CorrelationEnricher._first_nonempty(
+                row, "trace_id", "trace_id_alt", "$trace_id"
+            )
             if trace_id and trace_id not in trace_ids:
                 trace_ids.append(trace_id)
             if not top_stack_frame:
@@ -356,7 +367,8 @@ class CorrelationEnricher:
         error_ts = [
             int(s.timestamp_ms)
             for s in signals
-            if s.detector in {"console_error", "network_5xx", "network_4xx", "error_toast"}
+            if s.detector
+            in {"console_error", "network_5xx", "network_4xx", "error_toast"}
         ]
         if not error_ts:
             return 0, 0
@@ -382,7 +394,9 @@ class CorrelationEnricher:
             params["issue"] = issue_ids[0]
         return self._project_url("error_tracking", params)
 
-    def _logs_url(self, *, session_id: str, distinct_id: str, trace_ids: list[str]) -> str:
+    def _logs_url(
+        self, *, session_id: str, distinct_id: str, trace_ids: list[str]
+    ) -> str:
         params: dict[str, str] = {"session_id": session_id}
         if distinct_id:
             params["distinct_id"] = distinct_id

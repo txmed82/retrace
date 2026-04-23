@@ -21,30 +21,32 @@ def _render_finding(f: Finding) -> str:
     ]
     if f.affected_count > 1:
         lines.append(f"- **Affected:** {f.affected_count} sessions")
-    lines.extend([
-        f"- **Category:** {f.category}",
-        f"- **Confidence:** {f.confidence}",
-        f"- **Signals:** {signals}",
-        "",
-        f"**What happened:** {f.what_happened}",
-        "",
-        f"**Likely cause:** {f.likely_cause}",
-        "",
-        "**Correlated evidence:**",
-        f"- Distinct ID: {f.distinct_id or '—'}",
-        f"- Error issues: {error_issue_ids}",
-        f"- Trace IDs: {trace_ids}",
-        f"- Top stack frame: {f.top_stack_frame or '—'}",
-        f"- Error window (ms): {f.first_error_ts_ms} → {f.last_error_ts_ms}"
-        if (f.first_error_ts_ms or f.last_error_ts_ms)
-        else "- Error window (ms): —",
-        f"- Error Tracking: {f.error_tracking_url or '—'}",
-        f"- Logs: {f.logs_url or '—'}",
-        "",
-        "**Reproduction:**",
-        steps,
-        "",
-    ])
+    lines.extend(
+        [
+            f"- **Category:** {f.category}",
+            f"- **Confidence:** {f.confidence}",
+            f"- **Signals:** {signals}",
+            "",
+            f"**What happened:** {f.what_happened}",
+            "",
+            f"**Likely cause:** {f.likely_cause}",
+            "",
+            "**Correlated evidence:**",
+            f"- Distinct ID: {f.distinct_id or '—'}",
+            f"- Error issues: {error_issue_ids}",
+            f"- Trace IDs: {trace_ids}",
+            f"- Top stack frame: {f.top_stack_frame or '—'}",
+            f"- Error window (ms): {f.first_error_ts_ms} → {f.last_error_ts_ms}"
+            if (f.first_error_ts_ms or f.last_error_ts_ms)
+            else "- Error window (ms): —",
+            f"- Error Tracking: {f.error_tracking_url or '—'}",
+            f"- Logs: {f.logs_url or '—'}",
+            "",
+            "**Reproduction:**",
+            steps,
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 

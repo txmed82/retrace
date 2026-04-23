@@ -17,4 +17,11 @@ from retrace.detectors import error_toast as _error_toast  # noqa: F401
 from retrace.detectors import blank_render as _blank_render  # noqa: F401
 from retrace.detectors import session_abandon as _session_abandon  # noqa: F401
 
-__all__ = ["Detector", "Signal", "all_detectors", "get_detector", "iter_with_url", "register"]
+__all__ = [
+    "Detector",
+    "Signal",
+    "all_detectors",
+    "get_detector",
+    "iter_with_url",
+    "register",
+]

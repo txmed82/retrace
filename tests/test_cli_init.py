@@ -72,10 +72,16 @@ def test_init_writes_config_and_env_with_validated_connections(
     runner = CliRunner()
 
     with patch("retrace.commands.init.questionary") as q:
-        q.text.side_effect = lambda message, default="": _fake_prompt(_match_key(message))
+        q.text.side_effect = lambda message, default="": _fake_prompt(
+            _match_key(message)
+        )
         q.password.side_effect = lambda message: _fake_prompt(_match_key(message))
-        q.select.side_effect = lambda message, choices: _fake_prompt(_match_key(message))
-        q.confirm.side_effect = lambda message, default=False: _fake_prompt(_match_key(message))
+        q.select.side_effect = lambda message, choices: _fake_prompt(
+            _match_key(message)
+        )
+        q.confirm.side_effect = lambda message, default=False: _fake_prompt(
+            _match_key(message)
+        )
 
         result = runner.invoke(main, ["init"])
 
@@ -87,7 +93,7 @@ def test_init_writes_config_and_env_with_validated_connections(
     assert "RETRACE_POSTHOG_API_KEY=phx_test" in env_text
 
     cfg_text = (tmp_path / "config.yaml").read_text()
-    assert "project_id: \"42\"" in cfg_text or "project_id: '42'" in cfg_text
+    assert 'project_id: "42"' in cfg_text or "project_id: '42'" in cfg_text
     assert "us.i.posthog.com" in cfg_text
     assert "provider: openai_compatible" in cfg_text
     assert "llama-3.1-8b-instruct" in cfg_text

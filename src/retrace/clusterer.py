@@ -37,7 +37,9 @@ def cluster_sessions(
     signals_by_session: dict[str, list[Signal]],
     min_size: int = 1,
 ) -> list[Cluster]:
-    grouped: dict[tuple[str, str, str], list[tuple[str, list[Signal]]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str], list[tuple[str, list[Signal]]]] = defaultdict(
+        list
+    )
     for sid, signals in signals_by_session.items():
         if not signals:
             continue
