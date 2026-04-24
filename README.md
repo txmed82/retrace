@@ -15,6 +15,7 @@ Retrace pulls PostHog session recordings, detects likely breakage with heuristic
 - LLM-written summaries and repro context
 - Local UI with rrweb replay, culprit files, and copyable prompts
 - GitHub repo matching via CLI-connected repo metadata
+- Local Browser Harness UI tester with saved reusable specs
 
 ## Quickstart
 
@@ -86,8 +87,57 @@ Artifacts:
 - `retrace doctor` — health checks for config/services
 - `retrace run` — one-shot ingestion, detection, clustering, report write
 - `retrace ui` — local browser UI and onboarding/settings
+- `retrace tester ...` — describe tests or generate suite drafts with Browser Harness
 - `retrace github ...` — repo metadata management
 - `retrace suggest-fixes ...` — candidate matching + prompt generation
+
+## Local UI Tester (Browser Harness First)
+
+Retrace now includes a local-first tester workflow built around Browser Harness.
+
+Create a reusable described test:
+
+```bash
+retrace tester create \
+  --name "Signup flow" \
+  --mode describe \
+  --prompt "Go through signup and verify dashboard loads" \
+  --app-url http://127.0.0.1:3000 \
+  --start-cmd "npm run dev"
+```
+
+Create an AI suite-draft spec:
+
+```bash
+retrace tester create-suite \
+  --name "Systematic app regression suite"
+```
+
+Run a saved spec:
+
+```bash
+retrace tester run <spec_id>
+```
+
+List specs and runs:
+
+```bash
+retrace tester list
+retrace tester runs
+```
+
+Spec and run artifacts are stored under:
+
+- `data/ui-tests/specs/*.json`
+- `data/ui-tests/runs/*/run.json`
+- `data/ui-tests/runs/*/harness.log`
+
+UI support:
+
+- `retrace ui` now includes a `Local UI Tester` panel for:
+  - `Describe Test` mode (per-test prompt)
+  - `AI Explore Full Suite` mode (systematic suite draft)
+- Onboarding includes tester auth setup (none/form/JWT/custom headers), and secret fields keep existing values when left blank.
 
 ## Detectors (v0.1)
 
@@ -105,7 +155,7 @@ Toggle detectors in `config.yaml`.
 ## Runtime Data
 
 - `config.yaml` — non-secret config
-- `.env` — secrets (`RETRACE_POSTHOG_API_KEY`, optional `RETRACE_LLM_API_KEY`)
+- `.env` — secrets (`RETRACE_POSTHOG_API_KEY`, optional `RETRACE_LLM_API_KEY`, optional tester auth secrets)
 - LLM providers supported: `openai_compatible` (local/custom), `openai`, `anthropic`, `openrouter`
 - `data/retrace.db` — run/session/findings metadata
 - `data/sessions/*.json` — ingested rrweb events

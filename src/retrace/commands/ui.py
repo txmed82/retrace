@@ -20,6 +20,17 @@ import yaml
 from retrace.llm.client import build_llm_http_request
 from retrace.reports.parser import parse_report_findings
 from retrace.storage import Storage
+from retrace.tester import (
+    DEFAULT_APP_URL,
+    DEFAULT_HARNESS_COMMAND,
+    create_spec,
+    list_specs,
+    load_run_summaries,
+    load_spec,
+    run_spec,
+    runs_dir_for_data_dir,
+    specs_dir_for_data_dir,
+)
 
 _CLOUD_LLM_PROVIDERS = {"openai", "anthropic", "openrouter"}
 
@@ -201,6 +212,18 @@ def _default_config() -> dict[str, Any]:
         },
         "cluster": {
             "min_size": 1,
+        },
+        "tester": {
+            "app_url": DEFAULT_APP_URL,
+            "start_command": "",
+            "harness_command": DEFAULT_HARNESS_COMMAND,
+            "auth_required": False,
+            "auth_mode": "none",
+            "auth_login_url": "",
+            "auth_username": "",
+            "auth_password_env": "RETRACE_TESTER_AUTH_PASSWORD",
+            "auth_jwt_env": "RETRACE_TESTER_AUTH_JWT",
+            "auth_headers_env": "RETRACE_TESTER_AUTH_HEADERS",
         },
     }
 
@@ -667,6 +690,8 @@ _INDEX_HTML = """<!doctype html>
     <div class=\"right\" id=\"detail\">
       <div class=\"card\" id=\"onboarding\"></div>
       <div style=\"height:12px\"></div>
+      <div class=\"card\" id=\"tester\"></div>
+      <div style=\"height:12px\"></div>
       <div id=\"findingDetail\"><div class=\"empty\">Select a finding.</div></div>
     </div>
   </div>
@@ -760,11 +785,22 @@ _INDEX_HTML = """<!doctype html>
         llm_base_url: byId('llmBaseUrl').value,
         llm_model: byId('llmModel').value,
         llm_api_key: byId('llmApiKey').value,
+        tester_app_url: byId('testerAppUrl').value,
+        tester_start_command: byId('testerStartCommand').value,
+        tester_harness_command: byId('testerHarnessCommand').value,
+        tester_auth_required: byId('testerAuthRequired').value,
+        tester_auth_mode: byId('testerAuthMode').value,
+        tester_auth_login_url: byId('testerAuthLoginUrl').value,
+        tester_auth_username: byId('testerAuthUsername').value,
+        tester_auth_password: byId('testerAuthPassword').value,
+        tester_auth_jwt: byId('testerAuthJwt').value,
+        tester_auth_headers: byId('testerAuthHeaders').value,
       };
       const res = await fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
       const data = await res.json();
       if(!res.ok){ alert(data.error || 'Save failed'); return; }
       await loadOnboarding();
+      await loadTesterPanel();
       await bootFindings();
     }
 
@@ -805,6 +841,34 @@ _INDEX_HTML = """<!doctype html>
           <div class=\"lbl\" id=\"llmKeyLabel\">LLM API Key</div>
           <div class=\"empty\">Key: <span id=\"llmKeyRequired\">optional</span></div>
           <input id=\"llmApiKey\" value=\"\" placeholder=\"${settings.llm_api_key_present ? 'Configured (leave blank to keep current)' : 'Enter LLM API key'}\" />
+          <div class=\"lbl\">Tester App URL</div>
+          <input id=\"testerAppUrl\" value=\"${esc(settings.tester_app_url || 'http://127.0.0.1:3000')}\" />
+          <div class=\"lbl\">Tester Start Command</div>
+          <input id=\"testerStartCommand\" value=\"${esc(settings.tester_start_command || '')}\" placeholder=\"npm run dev\" />
+          <div class=\"lbl\">Tester Harness Command Template</div>
+          <input id=\"testerHarnessCommand\" value=\"${esc(settings.tester_harness_command || 'browser-harness run --url {app_url} --task {prompt_q} --output {run_dir_q}')}\" />
+          <div class=\"lbl\">Tester Auth Required?</div>
+          <select id=\"testerAuthRequired\" style=\"width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;\">
+            <option value=\"false\" ${settings.tester_auth_required ? '' : 'selected'}>No</option>
+            <option value=\"true\" ${settings.tester_auth_required ? 'selected' : ''}>Yes</option>
+          </select>
+          <div class=\"lbl\">Tester Auth Mode</div>
+          <select id=\"testerAuthMode\" style=\"width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;\">
+            <option value=\"none\" ${settings.tester_auth_mode === 'none' ? 'selected' : ''}>None</option>
+            <option value=\"form\" ${settings.tester_auth_mode === 'form' ? 'selected' : ''}>Form login</option>
+            <option value=\"jwt\" ${settings.tester_auth_mode === 'jwt' ? 'selected' : ''}>JWT bearer</option>
+            <option value=\"headers\" ${settings.tester_auth_mode === 'headers' ? 'selected' : ''}>Custom headers</option>
+          </select>
+          <div class=\"lbl\">Tester Auth Login URL</div>
+          <input id=\"testerAuthLoginUrl\" value=\"${esc(settings.tester_auth_login_url || '')}\" placeholder=\"http://127.0.0.1:3000/login\" />
+          <div class=\"lbl\">Tester Auth Username</div>
+          <input id=\"testerAuthUsername\" value=\"${esc(settings.tester_auth_username || '')}\" />
+          <div class=\"lbl\">Tester Auth Password</div>
+          <input id=\"testerAuthPassword\" value=\"\" placeholder=\"${settings.tester_auth_password_present ? 'Configured (leave blank to keep current)' : 'Optional test password'}\" />
+          <div class=\"lbl\">Tester Auth JWT</div>
+          <input id=\"testerAuthJwt\" value=\"\" placeholder=\"${settings.tester_auth_jwt_present ? 'Configured (leave blank to keep current)' : 'Optional bearer token'}\" />
+          <div class=\"lbl\">Tester Auth Headers (JSON)</div>
+          <input id=\"testerAuthHeaders\" value=\"\" placeholder=\"${settings.tester_auth_headers_present ? 'Configured (leave blank to keep current)' : '{\\\"x-test\\\":\\\"value\\\"}'}\" />
           <div style=\"margin-top:10px\"><button class=\"btn\" type=\"submit\">Save Settings</button></div>
         </form>
         <div style=\"margin-top:10px\" class=\"empty\">GitHub CLI: <span class=\"${gh.installed?'ok':'bad'}\">${gh.installed?'installed':'missing'}</span> · auth: <span class=\"${gh.authed?'ok':'bad'}\">${gh.authed?'ok':'not authed'}</span></div>
@@ -818,6 +882,91 @@ _INDEX_HTML = """<!doctype html>
       byId('llmModelPicker').addEventListener('change', onModelPick);
       syncProviderUI(false);
       byId('settingsForm').addEventListener('submit', saveSettings);
+    }
+
+    async function createTesterSpec(ev){
+      ev.preventDefault();
+      const body = {
+        name: byId('testerName').value,
+        mode: byId('testerMode').value,
+        prompt: byId('testerPrompt').value,
+        app_url: byId('testerSpecAppUrl').value,
+      };
+      const res = await fetch('/api/tester/specs', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){ alert(data.error || 'Failed to create tester spec'); return; }
+      byId('testerPrompt').value = '';
+      await loadTesterPanel();
+    }
+
+    async function runTesterSpec(){
+      const specId = byId('testerSpecSelect').value;
+      if(!specId){ return; }
+      byId('testerRunStatus').textContent = 'Running...';
+      const res = await fetch('/api/tester/run', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ spec_id: specId }),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        const msg = data?.result?.error || data.error || 'Run failed';
+        byId('testerRunStatus').textContent = `Failed: ${msg}`;
+        await loadTesterPanel();
+        return;
+      }
+      byId('testerRunStatus').textContent = `OK run ${data.result.run_id}`;
+      await loadTesterPanel();
+    }
+
+    async function loadTesterPanel(){
+      const [specRes, runsRes, settingsRes] = await Promise.all([
+        fetch('/api/tester/specs'),
+        fetch('/api/tester/runs'),
+        fetch('/api/settings'),
+      ]);
+      const specData = await specRes.json();
+      const runData = await runsRes.json();
+      const settings = await settingsRes.json();
+      const specs = specData.specs || [];
+      const runs = runData.runs || [];
+      const specOptions = specs.map(s =>
+        `<option value="${esc(s.spec_id)}">${esc(s.name)} (${esc(s.mode)})</option>`
+      ).join('');
+      const runRows = runs.map(r =>
+        `<li><code>${esc(r.run_id || '')}</code> · ${r.ok ? '<span class="ok">ok</span>' : '<span class="bad">fail</span>'} · <code>${esc(r.spec_id || '')}</code><br><span class="empty">${esc(r.run_dir || '')}</span></li>`
+      ).join('');
+      byId('tester').innerHTML = `
+        <h3>Local UI Tester (Describe + Suite Explore)</h3>
+        <form id="testerCreateForm">
+          <div class="lbl">Test Name</div>
+          <input id="testerName" value="" placeholder="Checkout happy path" />
+          <div class="lbl">Mode</div>
+          <select id="testerMode" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
+            <option value="describe">Describe Test</option>
+            <option value="explore_suite">AI Explore Full Suite</option>
+          </select>
+          <div class="lbl">Prompt / Task</div>
+          <input id="testerPrompt" value="" placeholder="Describe a specific test. Leave blank for suite exploration mode." />
+          <div class="lbl">App URL (override)</div>
+          <input id="testerSpecAppUrl" value="${esc(settings.tester_app_url || 'http://127.0.0.1:3000')}" />
+          <div style="margin-top:10px"><button class="btn" type="submit">Save Test Spec</button></div>
+        </form>
+        <div style="height:10px"></div>
+        <div class="lbl">Run Saved Spec</div>
+        <select id="testerSpecSelect" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
+          ${specOptions || '<option value="">No specs yet</option>'}
+        </select>
+        <div style="margin-top:8px"><button class="btn" id="runTesterBtn" type="button">Run Selected Test</button> <span class="empty" id="testerRunStatus"></span></div>
+        <div class="lbl" style="margin-top:10px">Recent Runs</div>
+        ${runRows ? `<ul>${runRows}</ul>` : '<div class="empty">No runs yet.</div>'}
+      `;
+      byId('testerCreateForm').addEventListener('submit', createTesterSpec);
+      byId('runTesterBtn').addEventListener('click', runTesterSpec);
     }
 
     function renderList() {
@@ -915,6 +1064,7 @@ _INDEX_HTML = """<!doctype html>
 
     async function boot(){
       await loadOnboarding();
+      await loadTesterPanel();
       await bootFindings();
     }
     boot();
@@ -981,6 +1131,39 @@ def ui_command(
                 ((cfg.get("llm") or {}).get("model") or "llama-3.1-8b-instruct")
             ),
             "llm_api_key_present": bool(effective_llm_key),
+            "tester_app_url": str(
+                ((cfg.get("tester") or {}).get("app_url") or DEFAULT_APP_URL)
+            ),
+            "tester_start_command": str(
+                ((cfg.get("tester") or {}).get("start_command") or "")
+            ),
+            "tester_harness_command": str(
+                (
+                    (cfg.get("tester") or {}).get("harness_command")
+                    or DEFAULT_HARNESS_COMMAND
+                )
+            ),
+            "tester_auth_required": bool(
+                (cfg.get("tester") or {}).get("auth_required") or False
+            ),
+            "tester_auth_mode": str(
+                ((cfg.get("tester") or {}).get("auth_mode") or "none")
+            ),
+            "tester_auth_login_url": str(
+                ((cfg.get("tester") or {}).get("auth_login_url") or "")
+            ),
+            "tester_auth_username": str(
+                ((cfg.get("tester") or {}).get("auth_username") or "")
+            ),
+            "tester_auth_password_present": bool(
+                env.get("RETRACE_TESTER_AUTH_PASSWORD", "").strip()
+            ),
+            "tester_auth_jwt_present": bool(
+                env.get("RETRACE_TESTER_AUTH_JWT", "").strip()
+            ),
+            "tester_auth_headers_present": bool(
+                env.get("RETRACE_TESTER_AUTH_HEADERS", "").strip()
+            ),
         }
         if include_secrets:
             settings["posthog_api_key"] = env.get("RETRACE_POSTHOG_API_KEY", "")
@@ -1055,6 +1238,18 @@ def ui_command(
                 self._json({"report_path": str(rp) if rp else "", "findings": findings})
                 return
 
+            if path == "/api/tester/specs":
+                specs = [
+                    s.__dict__ for s in list_specs(specs_dir_for_data_dir(data_dir))
+                ]
+                self._json({"specs": specs})
+                return
+
+            if path == "/api/tester/runs":
+                runs = load_run_summaries(runs_dir_for_data_dir(data_dir), limit=20)
+                self._json({"runs": runs})
+                return
+
             if path.startswith("/api/session/") and path.endswith("/events"):
                 session_id = path.split("/")[3]
                 # Validate session_id to prevent path traversal
@@ -1109,6 +1304,36 @@ def ui_command(
                     str(body.get("llm_model", "")).strip() or defaults["model"]
                 )
                 llm_key_v = str(body.get("llm_api_key", "")).strip()
+                tester_app_url_v = (
+                    str(body.get("tester_app_url", "")).strip() or DEFAULT_APP_URL
+                )
+                tester_start_command_v = str(
+                    body.get("tester_start_command", "")
+                ).strip()
+                tester_harness_command_v = (
+                    str(body.get("tester_harness_command", "")).strip()
+                    or DEFAULT_HARNESS_COMMAND
+                )
+                tester_auth_required_v = (
+                    str(body.get("tester_auth_required", "false")).strip().lower()
+                    in {"1", "true", "yes", "on"}
+                )
+                tester_auth_mode_v = (
+                    str(body.get("tester_auth_mode", "")).strip().lower() or "none"
+                )
+                tester_auth_login_url_v = str(
+                    body.get("tester_auth_login_url", "")
+                ).strip()
+                tester_auth_username_v = str(
+                    body.get("tester_auth_username", "")
+                ).strip()
+                tester_auth_password_v = str(
+                    body.get("tester_auth_password", "")
+                ).strip()
+                tester_auth_jwt_v = str(body.get("tester_auth_jwt", "")).strip()
+                tester_auth_headers_v = str(
+                    body.get("tester_auth_headers", "")
+                ).strip()
                 env = _read_env(env_path)
                 # Compute effective LLM key: prefer new value from form, else resolve from env
                 effective_llm_key = llm_key_v or _resolve_llm_api_key(
@@ -1127,6 +1352,15 @@ def ui_command(
                 cfg.setdefault("llm", {})["provider"] = llm_provider_v
                 cfg.setdefault("llm", {})["base_url"] = llm_base_url_v
                 cfg.setdefault("llm", {})["model"] = llm_model_v
+                cfg.setdefault("tester", {})["app_url"] = tester_app_url_v
+                cfg.setdefault("tester", {})["start_command"] = tester_start_command_v
+                cfg.setdefault("tester", {})[
+                    "harness_command"
+                ] = tester_harness_command_v
+                cfg.setdefault("tester", {})["auth_required"] = tester_auth_required_v
+                cfg.setdefault("tester", {})["auth_mode"] = tester_auth_mode_v
+                cfg.setdefault("tester", {})["auth_login_url"] = tester_auth_login_url_v
+                cfg.setdefault("tester", {})["auth_username"] = tester_auth_username_v
                 _write_config(config_path, cfg)
 
                 # Empty secret fields mean "keep existing" to avoid accidental secret clearing.
@@ -1134,6 +1368,12 @@ def ui_command(
                     env["RETRACE_POSTHOG_API_KEY"] = key_v
                 if llm_key_v:
                     env["RETRACE_LLM_API_KEY"] = llm_key_v
+                if tester_auth_password_v:
+                    env["RETRACE_TESTER_AUTH_PASSWORD"] = tester_auth_password_v
+                if tester_auth_jwt_v:
+                    env["RETRACE_TESTER_AUTH_JWT"] = tester_auth_jwt_v
+                if tester_auth_headers_v:
+                    env["RETRACE_TESTER_AUTH_HEADERS"] = tester_auth_headers_v
                 _write_env(env_path, env)
 
                 self._json({"ok": True, "settings": current_settings()})
@@ -1152,6 +1392,65 @@ def ui_command(
                 )
                 result = _llm_models(provider_v, base_url_v, key_v)
                 self._json(result, status=200 if result.get("ok") else 400)
+                return
+
+            if path == "/api/tester/specs":
+                body = self._read_json_body()
+                settings = current_settings()
+                spec = create_spec(
+                    specs_dir=specs_dir_for_data_dir(data_dir),
+                    name=str(body.get("name", "")).strip() or "UI test",
+                    prompt=str(body.get("prompt", "")).strip(),
+                    app_url=str(body.get("app_url", "")).strip()
+                    or settings["tester_app_url"],
+                    start_command=str(body.get("start_command", "")).strip()
+                    or settings["tester_start_command"],
+                    harness_command=str(body.get("harness_command", "")).strip()
+                    or settings["tester_harness_command"],
+                    mode=str(body.get("mode", "")).strip() or "describe",
+                    auth_required=bool(settings["tester_auth_required"]),
+                    auth_mode=str(settings["tester_auth_mode"] or "none"),
+                    auth_login_url=str(settings["tester_auth_login_url"] or ""),
+                    auth_username=str(settings["tester_auth_username"] or ""),
+                )
+                self._json({"ok": True, "spec": spec.__dict__})
+                return
+
+            if path == "/api/tester/run":
+                body = self._read_json_body()
+                spec_id = str(body.get("spec_id", "")).strip()
+                if not spec_id:
+                    self._json({"ok": False, "error": "spec_id is required"}, status=400)
+                    return
+                try:
+                    spec = load_spec(specs_dir_for_data_dir(data_dir), spec_id)
+                except Exception:
+                    self._json({"ok": False, "error": "spec not found"}, status=404)
+                    return
+                result = run_spec(
+                    spec=spec,
+                    runs_dir=runs_dir_for_data_dir(data_dir),
+                    prompt_override=str(body.get("prompt", "")).strip() or None,
+                    app_url_override=str(body.get("app_url", "")).strip() or None,
+                    start_command_override=str(body.get("start_command", "")).strip()
+                    or None,
+                    auth_context_override={
+                        "required": "true" if bool(spec.auth_required) else "false",
+                        "mode": str(spec.auth_mode or "none"),
+                        "login_url": str(spec.auth_login_url or ""),
+                        "username": str(spec.auth_username or ""),
+                        "password": _read_env(env_path).get(
+                            spec.auth_password_env, ""
+                        ),
+                        "jwt": _read_env(env_path).get(spec.auth_jwt_env, ""),
+                        "headers_json": _read_env(env_path).get(
+                            spec.auth_headers_env, ""
+                        ),
+                    },
+                    cwd=config_path.parent,
+                )
+                status = 200 if result.ok else 400
+                self._json({"ok": result.ok, "result": result.__dict__}, status=status)
                 return
 
             self._json({"error": "not found"}, status=404)

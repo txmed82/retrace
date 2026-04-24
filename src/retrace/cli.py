@@ -9,6 +9,7 @@ from retrace.commands.doctor import doctor_command
 from retrace.commands.github import github_group
 from retrace.commands.init import init_command
 from retrace.commands.suggest_fixes import suggest_fixes_command
+from retrace.commands.tester import tester_group
 from retrace.commands.ui import ui_command
 from retrace.config import load_config
 from retrace.ingester import PostHogIngester
@@ -64,3 +65,4 @@ main.add_command(doctor_command)
 main.add_command(github_group)
 main.add_command(suggest_fixes_command)
 main.add_command(ui_command)
+main.add_command(tester_group)
