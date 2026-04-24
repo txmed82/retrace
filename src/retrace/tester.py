@@ -191,7 +191,7 @@ def create_spec(
     auth_headers_env: str = "RETRACE_TESTER_AUTH_HEADERS",
 ) -> TesterSpec:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    spec_id = f"{ts}-{slugify(name)[:48]}"
+    spec_id = f"{ts}-{slugify(name)[:40]}-{uuid.uuid4().hex[:8]}"
     created_at = now_iso()
     spec = TesterSpec(
         schema_version=SPEC_SCHEMA_VERSION,

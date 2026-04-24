@@ -648,6 +648,27 @@ class Storage:
                     """,
                     (status, occ, report_path, h),
                 )
+
+            # Remove stale findings for this report_path that are no longer present.
+            if unique_hashes:
+                # Build parameterized query for NOT IN clause
+                placeholders = ",".join("?" * len(unique_hashes))
+                conn.execute(
+                    f"""
+                    DELETE FROM report_findings
+                    WHERE report_path = ? AND finding_hash NOT IN ({placeholders})
+                    """,
+                    [report_path] + unique_hashes,
+                )
+            else:
+                # If no hashes in result, delete all rows for this report_path
+                conn.execute(
+                    """
+                    DELETE FROM report_findings
+                    WHERE report_path = ?
+                    """,
+                    (report_path,),
+                )
         return result
 
     @staticmethod
