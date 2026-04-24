@@ -96,6 +96,7 @@ def test_tester_run_retries_and_marks_flaky(tmp_path: Path, monkeypatch) -> None
     assert create.exit_code == 0, create.output
 
     listed = runner.invoke(main, ["tester", "list"])
+    assert listed.exit_code == 0, f"tester list failed: {listed.output}"
     spec_id = listed.output.splitlines()[0].split("\t")[0]
 
     ran = runner.invoke(main, ["tester", "run", spec_id, "--retries", "1"])

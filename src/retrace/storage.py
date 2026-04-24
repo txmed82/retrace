@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS finding_regression_status (
     status TEXT NOT NULL DEFAULT 'new',
     first_seen_report_path TEXT NOT NULL,
     last_seen_report_path TEXT NOT NULL,
+    last_seen_report_seq INTEGER NOT NULL DEFAULT 0,
     occurrence_count INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -234,6 +235,14 @@ class Storage:
             if "regression_occurrence_count" not in cols_findings:
                 conn.execute(
                     "ALTER TABLE report_findings ADD COLUMN regression_occurrence_count INTEGER NOT NULL DEFAULT 1"
+                )
+            cols_regression = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(finding_regression_status)").fetchall()
+            ]
+            if "last_seen_report_seq" not in cols_regression:
+                conn.execute(
+                    "ALTER TABLE finding_regression_status ADD COLUMN last_seen_report_seq INTEGER NOT NULL DEFAULT 0"
                 )
 
     def upsert_session(self, s: SessionMeta) -> None:
@@ -571,11 +580,15 @@ class Storage:
         now = datetime.now(timezone.utc).isoformat()
         unique_hashes = list(dict.fromkeys(finding_hashes))
         result: dict[str, tuple[str, int]] = {}
+
+        # Derive current report sequence from timestamp in path or use current timestamp
+        current_report_seq = int(datetime.now(timezone.utc).timestamp() * 1000)
+
         with self._conn() as conn:
             for h in unique_hashes:
                 row = conn.execute(
                     """
-                    SELECT status, occurrence_count
+                    SELECT status, occurrence_count, last_seen_report_seq
                     FROM finding_regression_status
                     WHERE finding_hash = ?
                     """,
@@ -587,10 +600,10 @@ class Storage:
                     conn.execute(
                         """
                         INSERT INTO finding_regression_status
-                        (finding_hash, status, first_seen_report_path, last_seen_report_path, occurrence_count, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        (finding_hash, status, first_seen_report_path, last_seen_report_path, last_seen_report_seq, occurrence_count, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (h, status, report_path, report_path, occ, now),
+                        (h, status, report_path, report_path, current_report_seq, occ, now),
                     )
                 else:
                     prev_status = str(row["status"] or "new")
@@ -605,22 +618,24 @@ class Storage:
                     conn.execute(
                         """
                         UPDATE finding_regression_status
-                        SET status = ?, last_seen_report_path = ?, occurrence_count = ?, updated_at = ?
+                        SET status = ?, last_seen_report_path = ?, last_seen_report_seq = ?, occurrence_count = ?, updated_at = ?
                         WHERE finding_hash = ?
                         """,
-                        (status, report_path, occ, now, h),
+                        (status, report_path, current_report_seq, occ, now, h),
                     )
                 result[h] = (status, occ)
 
-            # Any previously active finding not present in this report becomes resolved.
+            # Any previously active finding not present in this report becomes resolved,
+            # but only if the last seen sequence is less than current (prevents older reports from resolving newer findings).
             conn.execute(
                 """
                 UPDATE finding_regression_status
                 SET status = 'resolved', updated_at = ?
                 WHERE status IN ('new','ongoing','regressed')
-                  AND last_seen_report_path != ?
+                  AND last_seen_report_seq < ?
+                  AND finding_hash NOT IN (SELECT DISTINCT value FROM json_each(?))
                 """,
-                (now, report_path),
+                (now, current_report_seq, json.dumps(unique_hashes)),
             )
 
             # Sync this report rows with computed states.

@@ -156,6 +156,7 @@ def _serve_stdio() -> None:
         line = raw.strip()
         if not line:
             continue
+        req_id = None
         try:
             req = json.loads(line)
             req_id = req.get("id")
@@ -208,7 +209,7 @@ def _serve_stdio() -> None:
             _send(
                 {
                     "jsonrpc": "2.0",
-                    "id": None,
+                    "id": req_id,
                     "error": {"code": -32000, "message": str(exc)},
                 }
             )

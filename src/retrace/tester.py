@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,7 +82,19 @@ def runs_dir_for_data_dir(data_dir: Path) -> Path:
 
 
 def _spec_path(specs_dir: Path, spec_id: str) -> Path:
-    return specs_dir / f"{spec_id}.json"
+    # Validate spec_id to prevent path traversal
+    if not spec_id or not re.match(r'^[a-zA-Z0-9_-]+$', spec_id):
+        raise ValueError("Invalid spec_id: must contain only alphanumeric characters, hyphens, and underscores")
+
+    # Build the path and verify it's contained within specs_dir
+    candidate_path = (specs_dir / f"{spec_id}.json").resolve()
+    try:
+        specs_dir_resolved = specs_dir.resolve()
+        candidate_path.relative_to(specs_dir_resolved)
+    except (ValueError, RuntimeError):
+        raise ValueError("Invalid spec_id: path traversal detected")
+
+    return candidate_path
 
 
 def save_spec(specs_dir: Path, spec: TesterSpec) -> Path:
@@ -209,17 +222,34 @@ def create_spec(
 
 
 def _run_shell(
-    command: str, *, stdout_fh: Any, stderr_fh: Any, cwd: Optional[Path] = None
+    command: str,
+    *,
+    stdout_fh: Any,
+    stderr_fh: Any,
+    cwd: Optional[Path] = None,
+    auth_context: Optional[dict[str, str]] = None,
 ) -> subprocess.Popen[Any]:
     shell = os.environ.get("SHELL", "").strip()
     shell_cmd = shell if shell and shutil.which(shell) else ""
     if not shell_cmd:
         shell_cmd = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+
+    # Prepare environment with auth credentials if provided
+    env = os.environ.copy()
+    if auth_context:
+        if auth_context.get("password"):
+            env["RETRACE_TESTER_AUTH_PASSWORD"] = auth_context["password"]
+        if auth_context.get("jwt"):
+            env["RETRACE_TESTER_AUTH_JWT"] = auth_context["jwt"]
+        if auth_context.get("headers_json"):
+            env["RETRACE_TESTER_AUTH_HEADERS"] = auth_context["headers_json"]
+
     return subprocess.Popen(
         [shell_cmd, "-lc", command],
         stdout=stdout_fh,
         stderr=stderr_fh,
         cwd=str(cwd) if cwd else None,
+        env=env,
     )
 
 
@@ -318,17 +348,18 @@ def run_spec(
 ) -> TesterRunResult:
     validate_spec(spec)
     runs_dir.mkdir(parents=True, exist_ok=True)
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     run_dir = runs_dir / f"{run_id}-{slugify(spec.name)[:40]}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=False)
 
     prompt = (prompt_override or spec.prompt or "").strip()
     app_url = (app_url_override or spec.app_url or DEFAULT_APP_URL).strip()
     start_command = (start_command_override or spec.start_command or "").strip()
+    auth_context = auth_context_override or _auth_context_from_env(spec)
     final_prompt = _compose_task_prompt(
         mode=spec.mode,
         prompt=prompt,
-        auth_context=auth_context_override or _auth_context_from_env(spec),
+        auth_context=auth_context,
     )
     harness_cmd = _format_harness_command(
         spec.harness_command,
@@ -365,7 +396,7 @@ def run_spec(
                     if attempt > 0:
                         harness_log.write(f"\n--- retry attempt {attempt} ---\n")
                     harness_proc = _run_shell(
-                        harness_cmd, stdout_fh=harness_log, stderr_fh=harness_log, cwd=cwd
+                        harness_cmd, stdout_fh=harness_log, stderr_fh=harness_log, cwd=cwd, auth_context=auth_context
                     )
                     last_exit = harness_proc.wait(timeout=900)
                 if last_exit == 0:
