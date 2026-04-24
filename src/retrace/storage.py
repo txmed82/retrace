@@ -61,8 +61,19 @@ CREATE TABLE IF NOT EXISTS report_findings (
     logs_url TEXT NOT NULL DEFAULT '',
     first_error_ts_ms INTEGER NOT NULL DEFAULT 0,
     last_error_ts_ms INTEGER NOT NULL DEFAULT 0,
+    regression_state TEXT NOT NULL DEFAULT 'new',
+    regression_occurrence_count INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(report_path, finding_hash)
+);
+
+CREATE TABLE IF NOT EXISTS finding_regression_status (
+    finding_hash TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'new',
+    first_seen_report_path TEXT NOT NULL,
+    last_seen_report_path TEXT NOT NULL,
+    occurrence_count INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS code_candidates (
@@ -138,6 +149,8 @@ class ReportFindingRow:
     logs_url: str
     first_error_ts_ms: int
     last_error_ts_ms: int
+    regression_state: str
+    regression_occurrence_count: int
     created_at: datetime
 
 
@@ -213,6 +226,14 @@ class Storage:
             if "last_error_ts_ms" not in cols_findings:
                 conn.execute(
                     "ALTER TABLE report_findings ADD COLUMN last_error_ts_ms INTEGER NOT NULL DEFAULT 0"
+                )
+            if "regression_state" not in cols_findings:
+                conn.execute(
+                    "ALTER TABLE report_findings ADD COLUMN regression_state TEXT NOT NULL DEFAULT 'new'"
+                )
+            if "regression_occurrence_count" not in cols_findings:
+                conn.execute(
+                    "ALTER TABLE report_findings ADD COLUMN regression_occurrence_count INTEGER NOT NULL DEFAULT 1"
                 )
 
     def upsert_session(self, s: SessionMeta) -> None:
@@ -421,6 +442,8 @@ class Storage:
         logs_url: str = "",
         first_error_ts_ms: int = 0,
         last_error_ts_ms: int = 0,
+        regression_state: str = "new",
+        regression_occurrence_count: int = 1,
     ) -> int:
         error_ids = json.dumps(error_issue_ids or [])
         trace_json = json.dumps(trace_ids or [])
@@ -432,8 +455,9 @@ class Storage:
                     report_path, finding_hash, title, severity, category, session_url, evidence_text,
                     distinct_id, error_issue_ids_json, trace_ids_json, top_stack_frame, error_tracking_url,
                     logs_url, first_error_ts_ms, last_error_ts_ms
+                    , regression_state, regression_occurrence_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(report_path, finding_hash) DO UPDATE SET
                     title = excluded.title,
                     severity = excluded.severity,
@@ -447,7 +471,9 @@ class Storage:
                     error_tracking_url = excluded.error_tracking_url,
                     logs_url = excluded.logs_url,
                     first_error_ts_ms = excluded.first_error_ts_ms,
-                    last_error_ts_ms = excluded.last_error_ts_ms
+                    last_error_ts_ms = excluded.last_error_ts_ms,
+                    regression_state = excluded.regression_state,
+                    regression_occurrence_count = excluded.regression_occurrence_count
                 """,
                 (
                     report_path,
@@ -465,6 +491,8 @@ class Storage:
                     logs_url,
                     int(first_error_ts_ms),
                     int(last_error_ts_ms),
+                    str(regression_state or "new"),
+                    int(regression_occurrence_count or 1),
                 ),
             )
             row = conn.execute(
@@ -487,7 +515,8 @@ class Storage:
                     SELECT
                         id, report_path, finding_hash, title, severity, category, session_url, evidence_text,
                         distinct_id, error_issue_ids_json, trace_ids_json, top_stack_frame,
-                        error_tracking_url, logs_url, first_error_ts_ms, last_error_ts_ms, created_at
+                        error_tracking_url, logs_url, first_error_ts_ms, last_error_ts_ms,
+                        regression_state, regression_occurrence_count, created_at
                     FROM report_findings
                     ORDER BY id
                     """
@@ -498,7 +527,8 @@ class Storage:
                     SELECT
                         id, report_path, finding_hash, title, severity, category, session_url, evidence_text,
                         distinct_id, error_issue_ids_json, trace_ids_json, top_stack_frame,
-                        error_tracking_url, logs_url, first_error_ts_ms, last_error_ts_ms, created_at
+                        error_tracking_url, logs_url, first_error_ts_ms, last_error_ts_ms,
+                        regression_state, regression_occurrence_count, created_at
                     FROM report_findings
                     WHERE report_path = ?
                     ORDER BY id
@@ -523,12 +553,87 @@ class Storage:
                 logs_url=str(r["logs_url"] or ""),
                 first_error_ts_ms=int(r["first_error_ts_ms"] or 0),
                 last_error_ts_ms=int(r["last_error_ts_ms"] or 0),
+                regression_state=str(r["regression_state"] or "new"),
+                regression_occurrence_count=int(r["regression_occurrence_count"] or 1),
                 created_at=datetime.fromisoformat(
                     str(r["created_at"]).replace("Z", "+00:00")
                 ),
             )
             for r in rows
         ]
+
+    def reconcile_regression_states(
+        self,
+        *,
+        report_path: str,
+        finding_hashes: list[str],
+    ) -> dict[str, tuple[str, int]]:
+        now = datetime.now(timezone.utc).isoformat()
+        unique_hashes = list(dict.fromkeys(finding_hashes))
+        result: dict[str, tuple[str, int]] = {}
+        with self._conn() as conn:
+            for h in unique_hashes:
+                row = conn.execute(
+                    """
+                    SELECT status, occurrence_count
+                    FROM finding_regression_status
+                    WHERE finding_hash = ?
+                    """,
+                    (h,),
+                ).fetchone()
+                if row is None:
+                    status = "new"
+                    occ = 1
+                    conn.execute(
+                        """
+                        INSERT INTO finding_regression_status
+                        (finding_hash, status, first_seen_report_path, last_seen_report_path, occurrence_count, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (h, status, report_path, report_path, occ, now),
+                    )
+                else:
+                    prev_status = str(row["status"] or "new")
+                    prev_occ = int(row["occurrence_count"] or 0)
+                    if prev_status == "resolved":
+                        status = "regressed"
+                    elif prev_status in {"new", "ongoing", "regressed"}:
+                        status = "ongoing"
+                    else:
+                        status = "ongoing"
+                    occ = prev_occ + 1
+                    conn.execute(
+                        """
+                        UPDATE finding_regression_status
+                        SET status = ?, last_seen_report_path = ?, occurrence_count = ?, updated_at = ?
+                        WHERE finding_hash = ?
+                        """,
+                        (status, report_path, occ, now, h),
+                    )
+                result[h] = (status, occ)
+
+            # Any previously active finding not present in this report becomes resolved.
+            conn.execute(
+                """
+                UPDATE finding_regression_status
+                SET status = 'resolved', updated_at = ?
+                WHERE status IN ('new','ongoing','regressed')
+                  AND last_seen_report_path != ?
+                """,
+                (now, report_path),
+            )
+
+            # Sync this report rows with computed states.
+            for h, (status, occ) in result.items():
+                conn.execute(
+                    """
+                    UPDATE report_findings
+                    SET regression_state = ?, regression_occurrence_count = ?
+                    WHERE report_path = ? AND finding_hash = ?
+                    """,
+                    (status, occ, report_path, h),
+                )
+        return result
 
     @staticmethod
     def _parse_string_list_json(raw: object) -> list[str]:

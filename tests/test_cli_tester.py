@@ -73,3 +73,32 @@ def test_tester_create_suite_defaults_to_explore_mode(
     listed = runner.invoke(main, ["tester", "list"])
     assert listed.exit_code == 0, listed.output
     assert "\texplore_suite\t" in listed.output
+
+
+def test_tester_run_retries_and_marks_flaky(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    create = runner.invoke(
+        main,
+        [
+            "tester",
+            "create",
+            "--name",
+            "Flaky flow",
+            "--prompt",
+            "Run flow",
+            "--harness-cmd",
+            "if [ -f {run_dir_q}/ok ]; then echo ok {app_url_q} {prompt_q}; exit 0; else touch {run_dir_q}/ok; echo timeout {app_url_q} {prompt_q}; exit 1; fi",
+        ],
+    )
+    assert create.exit_code == 0, create.output
+
+    listed = runner.invoke(main, ["tester", "list"])
+    spec_id = listed.output.splitlines()[0].split("\t")[0]
+
+    ran = runner.invoke(main, ["tester", "run", spec_id, "--retries", "1"])
+    assert ran.exit_code == 0, ran.output
+    assert '"status": "flaky_passed"' in ran.output
+    assert '"flaky": true' in ran.output

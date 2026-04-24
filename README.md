@@ -16,6 +16,7 @@ Retrace pulls PostHog session recordings, detects likely breakage with heuristic
 - Local UI with rrweb replay, culprit files, and copyable prompts
 - GitHub repo matching via CLI-connected repo metadata
 - Local Browser Harness UI tester with saved reusable specs
+- Regression-state tracking for replay findings (`new`, `ongoing`, `regressed`, `resolved`)
 
 ## Quickstart
 
@@ -88,6 +89,7 @@ Artifacts:
 - `retrace run` — one-shot ingestion, detection, clustering, report write
 - `retrace ui` — local browser UI and onboarding/settings
 - `retrace tester ...` — describe tests or generate suite drafts with Browser Harness
+- `retrace mcp serve` — single MCP server with multiple tools (findings + tester)
 - `retrace github ...` — repo metadata management
 - `retrace suggest-fixes ...` — candidate matching + prompt generation
 
@@ -116,7 +118,7 @@ retrace tester create-suite \
 Run a saved spec:
 
 ```bash
-retrace tester run <spec_id>
+retrace tester run <spec_id> --retries 1
 ```
 
 List specs and runs:
@@ -138,6 +140,22 @@ UI support:
   - `Describe Test` mode (per-test prompt)
   - `AI Explore Full Suite` mode (systematic suite draft)
 - Onboarding includes tester auth setup (none/form/JWT/custom headers), and secret fields keep existing values when left blank.
+- Tester runs are flake-aware (retry count + flake classification shown in recent runs).
+
+## MCP Server (Single Server, Multiple Tools)
+
+Run:
+
+```bash
+retrace mcp serve
+```
+
+Supported MCP tools:
+
+- `retrace.list_findings`
+- `retrace.list_tester_specs`
+- `retrace.create_tester_spec`
+- `retrace.run_tester_spec`
 
 ## Detectors (v0.1)
 

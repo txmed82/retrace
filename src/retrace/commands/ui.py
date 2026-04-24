@@ -217,6 +217,7 @@ def _default_config() -> dict[str, Any]:
             "app_url": DEFAULT_APP_URL,
             "start_command": "",
             "harness_command": DEFAULT_HARNESS_COMMAND,
+            "max_retries": 1,
             "auth_required": False,
             "auth_mode": "none",
             "auth_login_url": "",
@@ -639,6 +640,10 @@ def _to_findings_payload(
                 "logs_url": row.logs_url if row else "",
                 "first_error_ts_ms": row.first_error_ts_ms if row else 0,
                 "last_error_ts_ms": row.last_error_ts_ms if row else 0,
+                "regression_state": row.regression_state if row else "new",
+                "regression_occurrence_count": row.regression_occurrence_count
+                if row
+                else 1,
                 "candidates": candidates,
                 "prompts": prompts,
             }
@@ -788,6 +793,7 @@ _INDEX_HTML = """<!doctype html>
         tester_app_url: byId('testerAppUrl').value,
         tester_start_command: byId('testerStartCommand').value,
         tester_harness_command: byId('testerHarnessCommand').value,
+        tester_max_retries: byId('testerMaxRetries').value,
         tester_auth_required: byId('testerAuthRequired').value,
         tester_auth_mode: byId('testerAuthMode').value,
         tester_auth_login_url: byId('testerAuthLoginUrl').value,
@@ -847,6 +853,8 @@ _INDEX_HTML = """<!doctype html>
           <input id=\"testerStartCommand\" value=\"${esc(settings.tester_start_command || '')}\" placeholder=\"npm run dev\" />
           <div class=\"lbl\">Tester Harness Command Template</div>
           <input id=\"testerHarnessCommand\" value=\"${esc(settings.tester_harness_command || 'browser-harness run --url {app_url} --task {prompt_q} --output {run_dir_q}')}\" />
+          <div class=\"lbl\">Tester Retry Count</div>
+          <input id=\"testerMaxRetries\" type=\"number\" min=\"0\" value=\"${esc(settings.tester_max_retries || 1)}\" />
           <div class=\"lbl\">Tester Auth Required?</div>
           <select id=\"testerAuthRequired\" style=\"width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;\">
             <option value=\"false\" ${settings.tester_auth_required ? '' : 'selected'}>No</option>
@@ -910,7 +918,10 @@ _INDEX_HTML = """<!doctype html>
       const res = await fetch('/api/tester/run', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ spec_id: specId }),
+        body: JSON.stringify({
+          spec_id: specId,
+          retries: Number(byId('testerMaxRetries')?.value || 1),
+        }),
       });
       const data = await res.json();
       if(!res.ok || !data.ok){
@@ -919,7 +930,7 @@ _INDEX_HTML = """<!doctype html>
         await loadTesterPanel();
         return;
       }
-      byId('testerRunStatus').textContent = `OK run ${data.result.run_id}`;
+      byId('testerRunStatus').textContent = `OK run ${data.result.run_id} (${data.result.status || 'passed'})`;
       await loadTesterPanel();
     }
 
@@ -938,7 +949,7 @@ _INDEX_HTML = """<!doctype html>
         `<option value="${esc(s.spec_id)}">${esc(s.name)} (${esc(s.mode)})</option>`
       ).join('');
       const runRows = runs.map(r =>
-        `<li><code>${esc(r.run_id || '')}</code> · ${r.ok ? '<span class="ok">ok</span>' : '<span class="bad">fail</span>'} · <code>${esc(r.spec_id || '')}</code><br><span class="empty">${esc(r.run_dir || '')}</span></li>`
+        `<li><code>${esc(r.run_id || '')}</code> · ${r.ok ? '<span class="ok">ok</span>' : '<span class="bad">fail</span>'} · <code>${esc(r.status || '')}</code> · attempts=<code>${esc(r.attempts || 1)}</code>${r.flake_reason ? ` · flake=<code>${esc(r.flake_reason)}</code>` : ''} · <code>${esc(r.spec_id || '')}</code><br><span class="empty">${esc(r.run_dir || '')}</span></li>`
       ).join('');
       byId('tester').innerHTML = `
         <h3>Local UI Tester (Describe + Suite Explore)</h3>
@@ -1016,6 +1027,8 @@ _INDEX_HTML = """<!doctype html>
       const errWindow = (active.first_error_ts_ms || active.last_error_ts_ms)
         ? `${active.first_error_ts_ms} → ${active.last_error_ts_ms}`
         : '—';
+      const regressionState = active.regression_state || 'new';
+      const regressionCount = active.regression_occurrence_count || 1;
       const correlationStatusHtml = hasCorrelation
         ? `<div class=\"empty\">Live correlation data found.</div>
            <div class=\"empty\">Issues: <code>${issueCount}</code> · Traces: <code>${traceCount}</code> · Stack frame: <code>${hasStack ? 'yes' : 'no'}</code></div>
@@ -1039,6 +1052,7 @@ _INDEX_HTML = """<!doctype html>
             <div class=\"empty\">Trace IDs: <code>${esc(traceIds)}</code></div>
             <div class=\"empty\">Top stack frame: <code>${esc(active.top_stack_frame || '—')}</code></div>
             <div class=\"empty\">Error window (ms): <code>${esc(errWindow)}</code></div>
+            <div class=\"empty\">Regression: <code>${esc(regressionState)}</code> · seen <code>${esc(regressionCount)}</code> time(s)</div>
             <div style=\"margin-top:8px\">${active.error_tracking_url ? `<a href=\"${esc(active.error_tracking_url)}\" target=\"_blank\">Open Error Tracking</a>` : '<span class=\"empty\">Error Tracking link unavailable</span>'}</div>
             <div style=\"margin-top:4px\">${active.logs_url ? `<a href=\"${esc(active.logs_url)}\" target=\"_blank\">Open Logs</a>` : '<span class=\"empty\">Logs link unavailable</span>'}</div>
           </div>
@@ -1142,6 +1156,9 @@ def ui_command(
                     (cfg.get("tester") or {}).get("harness_command")
                     or DEFAULT_HARNESS_COMMAND
                 )
+            ),
+            "tester_max_retries": int(
+                (cfg.get("tester") or {}).get("max_retries") or 1
             ),
             "tester_auth_required": bool(
                 (cfg.get("tester") or {}).get("auth_required") or False
@@ -1314,6 +1331,12 @@ def ui_command(
                     str(body.get("tester_harness_command", "")).strip()
                     or DEFAULT_HARNESS_COMMAND
                 )
+                try:
+                    tester_max_retries_v = max(
+                        0, int(str(body.get("tester_max_retries", "1")).strip() or "1")
+                    )
+                except Exception:
+                    tester_max_retries_v = 1
                 tester_auth_required_v = (
                     str(body.get("tester_auth_required", "false")).strip().lower()
                     in {"1", "true", "yes", "on"}
@@ -1357,6 +1380,7 @@ def ui_command(
                 cfg.setdefault("tester", {})[
                     "harness_command"
                 ] = tester_harness_command_v
+                cfg.setdefault("tester", {})["max_retries"] = tester_max_retries_v
                 cfg.setdefault("tester", {})["auth_required"] = tester_auth_required_v
                 cfg.setdefault("tester", {})["auth_mode"] = tester_auth_mode_v
                 cfg.setdefault("tester", {})["auth_login_url"] = tester_auth_login_url_v
@@ -1397,22 +1421,26 @@ def ui_command(
             if path == "/api/tester/specs":
                 body = self._read_json_body()
                 settings = current_settings()
-                spec = create_spec(
-                    specs_dir=specs_dir_for_data_dir(data_dir),
-                    name=str(body.get("name", "")).strip() or "UI test",
-                    prompt=str(body.get("prompt", "")).strip(),
-                    app_url=str(body.get("app_url", "")).strip()
-                    or settings["tester_app_url"],
-                    start_command=str(body.get("start_command", "")).strip()
-                    or settings["tester_start_command"],
-                    harness_command=str(body.get("harness_command", "")).strip()
-                    or settings["tester_harness_command"],
-                    mode=str(body.get("mode", "")).strip() or "describe",
-                    auth_required=bool(settings["tester_auth_required"]),
-                    auth_mode=str(settings["tester_auth_mode"] or "none"),
-                    auth_login_url=str(settings["tester_auth_login_url"] or ""),
-                    auth_username=str(settings["tester_auth_username"] or ""),
-                )
+                try:
+                    spec = create_spec(
+                        specs_dir=specs_dir_for_data_dir(data_dir),
+                        name=str(body.get("name", "")).strip() or "UI test",
+                        prompt=str(body.get("prompt", "")).strip(),
+                        app_url=str(body.get("app_url", "")).strip()
+                        or settings["tester_app_url"],
+                        start_command=str(body.get("start_command", "")).strip()
+                        or settings["tester_start_command"],
+                        harness_command=str(body.get("harness_command", "")).strip()
+                        or settings["tester_harness_command"],
+                        mode=str(body.get("mode", "")).strip() or "describe",
+                        auth_required=bool(settings["tester_auth_required"]),
+                        auth_mode=str(settings["tester_auth_mode"] or "none"),
+                        auth_login_url=str(settings["tester_auth_login_url"] or ""),
+                        auth_username=str(settings["tester_auth_username"] or ""),
+                    )
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, status=400)
+                    return
                 self._json({"ok": True, "spec": spec.__dict__})
                 return
 
@@ -1427,6 +1455,18 @@ def ui_command(
                 except Exception:
                     self._json({"ok": False, "error": "spec not found"}, status=404)
                     return
+                try:
+                    retries_v = max(
+                        0,
+                        int(
+                            body.get(
+                                "retries",
+                                current_settings().get("tester_max_retries", 1),
+                            )
+                        ),
+                    )
+                except Exception:
+                    retries_v = int(current_settings().get("tester_max_retries", 1))
                 result = run_spec(
                     spec=spec,
                     runs_dir=runs_dir_for_data_dir(data_dir),
@@ -1434,6 +1474,7 @@ def ui_command(
                     app_url_override=str(body.get("app_url", "")).strip() or None,
                     start_command_override=str(body.get("start_command", "")).strip()
                     or None,
+                    max_retries=retries_v,
                     auth_context_override={
                         "required": "true" if bool(spec.auth_required) else "false",
                         "mode": str(spec.auth_mode or "none"),

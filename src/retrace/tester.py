@@ -18,10 +18,14 @@ DEFAULT_HARNESS_COMMAND = (
     "browser-harness run --url {app_url} --task {prompt_q} --output {run_dir_q}"
 )
 DEFAULT_APP_URL = "http://127.0.0.1:3000"
+SPEC_SCHEMA_VERSION = 1
+ALLOWED_MODES = {"describe", "explore_suite"}
+ALLOWED_AUTH_MODES = {"none", "form", "jwt", "headers"}
 
 
 @dataclass
 class TesterSpec:
+    schema_version: int
     spec_id: str
     name: str
     mode: str
@@ -51,6 +55,10 @@ class TesterRunResult:
     app_log_path: str
     command: str
     final_prompt: str
+    attempts: int
+    flaky: bool
+    flake_reason: str
+    status: str
     error: str = ""
 
 
@@ -104,6 +112,7 @@ def list_specs(specs_dir: Path) -> list[TesterSpec]:
 
 
 def _apply_spec_defaults(data: dict[str, Any]) -> None:
+    data.setdefault("schema_version", SPEC_SCHEMA_VERSION)
     data.setdefault("mode", "describe")
     data.setdefault("auth_required", False)
     data.setdefault("auth_mode", "none")
@@ -112,6 +121,42 @@ def _apply_spec_defaults(data: dict[str, Any]) -> None:
     data.setdefault("auth_password_env", "RETRACE_TESTER_AUTH_PASSWORD")
     data.setdefault("auth_jwt_env", "RETRACE_TESTER_AUTH_JWT")
     data.setdefault("auth_headers_env", "RETRACE_TESTER_AUTH_HEADERS")
+    # Legacy mode migration.
+    mode = str(data.get("mode") or "describe").strip().lower()
+    if mode in {"prompt", "video"}:
+        data["mode"] = "describe"
+    elif mode in {"explore", "suite"}:
+        data["mode"] = "explore_suite"
+
+
+def validate_spec(spec: TesterSpec) -> None:
+    if spec.schema_version != SPEC_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported tester schema_version={spec.schema_version}. "
+            f"Expected {SPEC_SCHEMA_VERSION}."
+        )
+    if not spec.spec_id.strip():
+        raise ValueError("spec_id is required")
+    if not spec.name.strip():
+        raise ValueError("name is required")
+    if spec.mode not in ALLOWED_MODES:
+        raise ValueError(f"mode must be one of: {sorted(ALLOWED_MODES)}")
+    if not spec.app_url.strip():
+        raise ValueError("app_url is required")
+    if not spec.harness_command.strip():
+        raise ValueError("harness_command is required")
+    if "{app_url" not in spec.harness_command:
+        raise ValueError("harness_command must include {app_url} or {app_url_q}")
+    if "{run_dir" not in spec.harness_command:
+        raise ValueError("harness_command must include {run_dir} or {run_dir_q}")
+    if "{prompt" not in spec.harness_command:
+        raise ValueError("harness_command must include {prompt} or {prompt_q}")
+    if spec.auth_mode not in ALLOWED_AUTH_MODES:
+        raise ValueError(f"auth_mode must be one of: {sorted(ALLOWED_AUTH_MODES)}")
+    if spec.auth_required and spec.auth_mode == "none":
+        raise ValueError("auth_mode cannot be 'none' when auth_required=true")
+    if spec.auth_mode == "form" and spec.auth_required and not spec.auth_login_url:
+        raise ValueError("auth_login_url is required for form auth")
 
 
 def create_spec(
@@ -135,6 +180,7 @@ def create_spec(
     spec_id = f"{ts}-{slugify(name)[:48]}"
     created_at = now_iso()
     spec = TesterSpec(
+        schema_version=SPEC_SCHEMA_VERSION,
         spec_id=spec_id,
         name=name.strip() or "UI test",
         mode=(mode.strip() or "describe"),
@@ -156,6 +202,7 @@ def create_spec(
         created_at=created_at,
         updated_at=created_at,
     )
+    validate_spec(spec)
     save_spec(specs_dir, spec)
     return spec
 
@@ -261,8 +308,10 @@ def run_spec(
     app_url_override: Optional[str] = None,
     start_command_override: Optional[str] = None,
     auth_context_override: Optional[dict[str, str]] = None,
+    max_retries: int = 0,
     cwd: Optional[Path] = None,
 ) -> TesterRunResult:
+    validate_spec(spec)
     runs_dir.mkdir(parents=True, exist_ok=True)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run_dir = runs_dir / f"{run_id}-{slugify(spec.name)[:40]}"
@@ -290,6 +339,9 @@ def run_spec(
     app_proc: Optional[subprocess.Popen[Any]] = None
     harness_proc: Optional[subprocess.Popen[Any]] = None
 
+    attempts = 0
+    last_exit = 1
+    last_error = ""
     try:
         with app_log_path.open("w") as app_log:
             if start_command:
@@ -301,25 +353,51 @@ def run_spec(
                         f"App did not become reachable at {app_url} after startup."
                     )
 
-        exit_code = 1
-        with harness_log_path.open("w") as harness_log:
-            harness_proc = _run_shell(
-                harness_cmd, stdout_fh=harness_log, stderr_fh=harness_log, cwd=cwd
-            )
-            exit_code = harness_proc.wait(timeout=900)
+        for attempt in range(max(0, int(max_retries)) + 1):
+            attempts += 1
+            try:
+                with harness_log_path.open("a") as harness_log:
+                    if attempt > 0:
+                        harness_log.write(f"\n--- retry attempt {attempt} ---\n")
+                    harness_proc = _run_shell(
+                        harness_cmd, stdout_fh=harness_log, stderr_fh=harness_log, cwd=cwd
+                    )
+                    last_exit = harness_proc.wait(timeout=900)
+                if last_exit == 0:
+                    break
+            except Exception as exc:
+                last_error = str(exc)
+                last_exit = 1
+                if attempt >= int(max_retries):
+                    break
+                continue
 
+        flake_reason = _classify_flake_reason(harness_log_path, last_error)
+        flaky = attempts > 1 and last_exit == 0
+        ok = last_exit == 0
+        status = (
+            "flaky_passed"
+            if flaky
+            else ("passed" if ok else ("flaky_failed" if flake_reason else "failed"))
+        )
         result = TesterRunResult(
             run_id=run_id,
             spec_id=spec.spec_id,
-            ok=(exit_code == 0),
-            exit_code=exit_code,
+            ok=ok,
+            exit_code=last_exit,
             run_dir=str(run_dir),
             harness_log_path=str(harness_log_path),
             app_log_path=str(app_log_path),
             command=harness_cmd,
             final_prompt=final_prompt,
+            attempts=attempts,
+            flaky=flaky,
+            flake_reason=flake_reason,
+            status=status,
+            error=last_error,
         )
     except Exception as exc:
+        flake_reason = _classify_flake_reason(harness_log_path, str(exc))
         result = TesterRunResult(
             run_id=run_id,
             spec_id=spec.spec_id,
@@ -330,6 +408,10 @@ def run_spec(
             app_log_path=str(app_log_path),
             command=harness_cmd,
             final_prompt=final_prompt,
+            attempts=max(1, attempts),
+            flaky=False,
+            flake_reason=flake_reason,
+            status="flaky_failed" if flake_reason else "failed",
             error=str(exc),
         )
     finally:
@@ -340,6 +422,23 @@ def run_spec(
 
     meta_path.write_text(json.dumps(asdict(result), indent=2) + "\n")
     return result
+
+
+def _classify_flake_reason(harness_log_path: Path, error: str) -> str:
+    text = ""
+    try:
+        if harness_log_path.exists():
+            text = harness_log_path.read_text(encoding="utf-8", errors="ignore").lower()
+    except Exception:
+        text = ""
+    merged = f"{text}\n{(error or '').lower()}"
+    if any(k in merged for k in ["timeout", "timed out", "net::err", "connection reset"]):
+        return "network_timeout"
+    if any(k in merged for k in ["selector", "element not found", "stale element"]):
+        return "selector_drift"
+    if any(k in merged for k in ["401", "403", "unauthorized", "forbidden", "auth"]):
+        return "auth_failure"
+    return ""
 
 
 def load_run_summaries(runs_dir: Path, *, limit: int = 25) -> list[dict[str, Any]]:

@@ -19,6 +19,7 @@ from retrace.tester import (
     runs_dir_for_data_dir,
     save_spec,
     specs_dir_for_data_dir,
+    validate_spec,
 )
 
 
@@ -268,6 +269,7 @@ def tester_update(
     if auth_username is not None:
         spec.auth_username = auth_username
     spec.updated_at = now_iso()
+    validate_spec(spec)
     save_spec(specs_dir, spec)
     click.echo(f"Updated tester spec: {spec.spec_id}")
 
@@ -284,14 +286,22 @@ def tester_update(
 @click.option("--prompt", default=None, help="Override prompt for this run.")
 @click.option("--app-url", default=None, help="Override app URL for this run.")
 @click.option("--start-cmd", default=None, help="Override app startup command.")
+@click.option("--retries", default=None, type=int, help="Override retry count.")
 def tester_run(
     config_path: Path,
     spec_id: str,
     prompt: Optional[str],
     app_url: Optional[str],
     start_cmd: Optional[str],
+    retries: Optional[int],
 ) -> None:
     cfg = load_config(config_path)
+    defaults = _tester_defaults(config_path)
+    retries_v = (
+        max(0, int(retries))
+        if retries is not None
+        else max(0, int(defaults.get("max_retries") or 1))
+    )
     spec = load_spec(specs_dir_for_data_dir(cfg.run.data_dir), spec_id)
     result = run_spec(
         spec=spec,
@@ -299,6 +309,7 @@ def tester_run(
         prompt_override=prompt,
         app_url_override=app_url,
         start_command_override=start_cmd,
+        max_retries=retries_v,
         cwd=config_path.parent,
     )
     click.echo(
@@ -311,6 +322,10 @@ def tester_run(
                 "run_dir": result.run_dir,
                 "harness_log_path": result.harness_log_path,
                 "final_prompt": result.final_prompt,
+                "attempts": result.attempts,
+                "status": result.status,
+                "flaky": result.flaky,
+                "flake_reason": result.flake_reason,
                 "error": result.error,
             },
             indent=2,

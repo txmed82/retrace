@@ -151,3 +151,59 @@ def test_storage_report_findings_upsert_and_list(tmp_path: Path):
     assert rows[0].logs_url.endswith("/logs?session_id=s1")
     assert rows[0].first_error_ts_ms == 100
     assert rows[0].last_error_ts_ms == 200
+    assert rows[0].regression_state == "new"
+    assert rows[0].regression_occurrence_count == 1
+
+
+def test_reconcile_regression_states_tracks_new_ongoing_resolved_regressed(tmp_path: Path):
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+
+    # First report: A and B are new
+    for h in ["A", "B"]:
+        store.upsert_report_finding(
+            report_path="reports/r1.md",
+            finding_hash=h,
+            title=f"Finding {h}",
+            severity="medium",
+            category="functional_error",
+            session_url=f"https://x/replay/{h}",
+        )
+    s1 = store.reconcile_regression_states(
+        report_path="reports/r1.md", finding_hashes=["A", "B"]
+    )
+    assert s1["A"] == ("new", 1)
+    assert s1["B"] == ("new", 1)
+
+    # Second report: A remains, B resolved
+    store.upsert_report_finding(
+        report_path="reports/r2.md",
+        finding_hash="A",
+        title="Finding A",
+        severity="medium",
+        category="functional_error",
+        session_url="https://x/replay/A",
+    )
+    s2 = store.reconcile_regression_states(
+        report_path="reports/r2.md", finding_hashes=["A"]
+    )
+    assert s2["A"] == ("ongoing", 2)
+
+    # Third report: B appears again -> regressed
+    store.upsert_report_finding(
+        report_path="reports/r3.md",
+        finding_hash="B",
+        title="Finding B",
+        severity="medium",
+        category="functional_error",
+        session_url="https://x/replay/B",
+    )
+    s3 = store.reconcile_regression_states(
+        report_path="reports/r3.md", finding_hashes=["B"]
+    )
+    assert s3["B"] == ("regressed", 2)
+
+    rows = store.list_report_findings("reports/r3.md")
+    assert rows[0].finding_hash == "B"
+    assert rows[0].regression_state == "regressed"
+    assert rows[0].regression_occurrence_count == 2
