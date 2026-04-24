@@ -588,7 +588,7 @@ class Storage:
             for h in unique_hashes:
                 row = conn.execute(
                     """
-                    SELECT status, occurrence_count, last_seen_report_seq
+                    SELECT status, occurrence_count, last_seen_report_seq, last_seen_report_path
                     FROM finding_regression_status
                     WHERE finding_hash = ?
                     """,
@@ -608,6 +608,13 @@ class Storage:
                 else:
                     prev_status = str(row["status"] or "new")
                     prev_occ = int(row["occurrence_count"] or 0)
+                    prev_report_path = row["last_seen_report_path"]
+
+                    # Skip update if re-importing the same report
+                    if prev_report_path == report_path:
+                        result[h] = (prev_status, prev_occ)
+                        continue
+
                     if prev_status == "resolved":
                         status = "regressed"
                     elif prev_status in {"new", "ongoing", "regressed"}:
