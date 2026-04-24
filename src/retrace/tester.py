@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -210,8 +211,12 @@ def create_spec(
 def _run_shell(
     command: str, *, stdout_fh: Any, stderr_fh: Any, cwd: Optional[Path] = None
 ) -> subprocess.Popen[Any]:
+    shell = os.environ.get("SHELL", "").strip()
+    shell_cmd = shell if shell and shutil.which(shell) else ""
+    if not shell_cmd:
+        shell_cmd = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
     return subprocess.Popen(
-        ["zsh", "-lc", command],
+        [shell_cmd, "-lc", command],
         stdout=stdout_fh,
         stderr=stderr_fh,
         cwd=str(cwd) if cwd else None,
