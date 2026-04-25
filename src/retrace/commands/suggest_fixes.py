@@ -109,11 +109,14 @@ def suggest_fixes_command(
     out_dir.mkdir(parents=True, exist_ok=True)
     stored = 0
     generated = 0
+    finding_hashes: list[str] = []
 
     for idx, f in enumerate(findings, start=1):
+        f_hash = f.finding_hash()
+        finding_hashes.append(f_hash)
         finding_id = store.upsert_report_finding(
             report_path=str(target_report),
-            finding_hash=f.finding_hash(),
+            finding_hash=f_hash,
             title=f.title,
             severity=f.severity,
             category=f.category,
@@ -193,7 +196,16 @@ def suggest_fixes_command(
         (out_dir / f"{base}.claude.md").write_text(claude_prompt + "\n")
         generated += 1
 
+    regression = store.reconcile_regression_states(
+        report_path=str(target_report),
+        finding_hashes=finding_hashes,
+    )
+    new_count = sum(1 for state, _ in regression.values() if state == "new")
+    regressed_count = sum(1 for state, _ in regression.values() if state == "regressed")
+    ongoing_count = sum(1 for state, _ in regression.values() if state == "ongoing")
+
     click.echo(
         f"Parsed {len(findings)} findings from {target_report}. "
-        f"Stored {stored} findings. Wrote {generated} fix-prompt artifact set(s) to {out_dir}."
+        f"Stored {stored} findings. Wrote {generated} fix-prompt artifact set(s) to {out_dir}. "
+        f"Regression states: new={new_count}, ongoing={ongoing_count}, regressed={regressed_count}."
     )

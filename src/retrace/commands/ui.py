@@ -20,6 +20,17 @@ import yaml
 from retrace.llm.client import build_llm_http_request
 from retrace.reports.parser import parse_report_findings
 from retrace.storage import Storage
+from retrace.tester import (
+    DEFAULT_APP_URL,
+    DEFAULT_HARNESS_COMMAND,
+    create_spec,
+    list_specs,
+    load_run_summaries,
+    load_spec,
+    run_spec,
+    runs_dir_for_data_dir,
+    specs_dir_for_data_dir,
+)
 
 _CLOUD_LLM_PROVIDERS = {"openai", "anthropic", "openrouter"}
 
@@ -202,6 +213,19 @@ def _default_config() -> dict[str, Any]:
         "cluster": {
             "min_size": 1,
         },
+        "tester": {
+            "app_url": DEFAULT_APP_URL,
+            "start_command": "",
+            "harness_command": DEFAULT_HARNESS_COMMAND,
+            "max_retries": 1,
+            "auth_required": False,
+            "auth_mode": "none",
+            "auth_login_url": "",
+            "auth_username": "",
+            "auth_password_env": "RETRACE_TESTER_AUTH_PASSWORD",
+            "auth_jwt_env": "RETRACE_TESTER_AUTH_JWT",
+            "auth_headers_env": "RETRACE_TESTER_AUTH_HEADERS",
+        },
     }
 
 
@@ -305,30 +329,42 @@ def _posthog_check(host: str, project_id: str, api_key: str) -> dict[str, Any]:
         }
 
     # Validate and pin the IP to prevent DNS rebinding
-    ok_url, safe_host, err, pinned_ip = _validate_base_url(host)
+    ok_url, safe_host, err, pinned_ips = _validate_base_url(host)
     if not ok_url:
         return {"configured": True, "reachable": False, "detail": err}
 
     url = f"{safe_host.rstrip('/')}/api/projects/{project_id}/"
+    parsed = urlparse(safe_host)
+    last_exc: Optional[Exception] = None
+    last_status: Optional[int] = None
     try:
-        # Create transport that uses pinned IP to prevent TOCTOU/DNS rebinding
-        parsed = urlparse(safe_host)
-        transport = _create_pinned_transport(
-            pinned_ip, parsed.hostname or "", parsed.scheme or ""
-        )
-        with httpx.Client(timeout=8, transport=transport) as c:
-            r = c.get(url, headers={"Authorization": f"Bearer {api_key}"})
-        if r.status_code // 100 == 2:
+        for pinned_ip in pinned_ips:
+            try:
+                # Use validated/pinned IP to prevent TOCTOU/DNS rebinding.
+                transport = _create_pinned_transport(
+                    pinned_ip, parsed.hostname or "", parsed.scheme or ""
+                )
+                with httpx.Client(timeout=8, transport=transport) as c:
+                    r = c.get(url, headers={"Authorization": f"Bearer {api_key}"})
+                last_status = r.status_code
+                if r.status_code // 100 == 2:
+                    return {
+                        "configured": True,
+                        "reachable": True,
+                        "detail": f"OK ({r.status_code})",
+                    }
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if last_status is not None:
             return {
                 "configured": True,
-                "reachable": True,
-                "detail": f"OK ({r.status_code})",
+                "reachable": False,
+                "detail": f"HTTP {last_status}",
             }
-        return {
-            "configured": True,
-            "reachable": False,
-            "detail": f"HTTP {r.status_code}",
-        }
+        if last_exc:
+            raise last_exc
+        return {"configured": True, "reachable": False, "detail": "No pinned IPs available."}
     except Exception as exc:
         return {"configured": True, "reachable": False, "detail": str(exc)}
 
@@ -337,26 +373,26 @@ def _truthy_env(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _validate_base_url(base_url: str) -> tuple[bool, str, str, str]:
+def _validate_base_url(base_url: str) -> tuple[bool, str, str, list[str]]:
     """Validate outbound model-provider URLs to reduce SSRF risk.
 
-    Returns: (ok, normalized_url, error_message, pinned_ip)
-    The pinned_ip is the first acceptable IP address resolved during validation,
-    which must be used for the actual HTTP request to prevent DNS rebinding attacks.
+    Returns: (ok, normalized_url, error_message, pinned_ips)
+    pinned_ips are acceptable IPs resolved during validation and must be used
+    for actual HTTP requests to prevent DNS rebinding attacks.
     """
     raw = base_url.strip()
     if not raw:
-        return False, "", "Base URL is required.", ""
+        return False, "", "Base URL is required.", []
 
     parsed = urlparse(raw)
     scheme = (parsed.scheme or "").lower()
     if scheme not in {"http", "https"}:
-        return False, "", "Base URL must use http or https.", ""
+        return False, "", "Base URL must use http or https.", []
     if not parsed.hostname:
-        return False, "", "Base URL must include a hostname.", ""
+        return False, "", "Base URL must include a hostname.", []
 
     if parsed.query or parsed.fragment:
-        return False, "", "Base URL must not include query parameters or fragments.", ""
+        return False, "", "Base URL must not include query parameters or fragments.", []
 
     default_port = 443 if scheme == "https" else 80
     port = parsed.port or default_port
@@ -364,9 +400,9 @@ def _validate_base_url(base_url: str) -> tuple[bool, str, str, str]:
     try:
         infos = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
-        return False, "", f"Base URL hostname resolution failed: {exc}", ""
+        return False, "", f"Base URL hostname resolution failed: {exc}", []
 
-    pinned_ip = ""
+    pinned_ips: list[str] = []
     if not allow_internal:
         for _, _, _, _, sockaddr in infos:
             if not sockaddr:
@@ -383,28 +419,29 @@ def _validate_base_url(base_url: str) -> tuple[bool, str, str, str]:
                 or ip.is_reserved
                 or ip.is_unspecified
             ):
-                return (
-                    False,
-                    "",
-                    f"Base URL resolves to a non-public address ({ip}). "
-                    "Set RETRACE_ALLOW_INTERNAL_URLS=true to override.",
-                    "",
-                )
-            # Pin the first acceptable IP
-            if not pinned_ip:
-                pinned_ip = sockaddr[0]
+                continue
+            ip_s = sockaddr[0]
+            if ip_s not in pinned_ips:
+                pinned_ips.append(ip_s)
     else:
-        # If internal URLs are allowed, pin the first resolved IP
+        # If internal URLs are allowed, keep all resolved IPs (deduped).
         for _, _, _, _, sockaddr in infos:
             if sockaddr:
-                pinned_ip = sockaddr[0]
-                break
+                ip_s = sockaddr[0]
+                if ip_s not in pinned_ips:
+                    pinned_ips.append(ip_s)
 
-    if not pinned_ip:
-        return False, "", "No acceptable IP addresses found for base URL.", ""
+    if not pinned_ips:
+        return (
+            False,
+            "",
+            "No acceptable IP addresses found for base URL. "
+            "Set RETRACE_ALLOW_INTERNAL_URLS=true to allow internal hosts.",
+            [],
+        )
 
     normalized = f"{scheme}://{parsed.netloc}{parsed.path or ''}".rstrip("/")
-    return True, normalized, "", pinned_ip
+    return True, normalized, "", pinned_ips
 
 
 def _llm_check(
@@ -418,9 +455,12 @@ def _llm_check(
             "reachable": None,
             "detail": "Missing provider/base URL/model.",
         }
-    ok_url, safe_base_url, err, pinned_ip = _validate_base_url(base_url)
+    ok_url, safe_base_url, err, pinned_ips = _validate_base_url(base_url)
     if not ok_url:
         return {"configured": True, "reachable": False, "detail": err}
+    parsed = urlparse(safe_base_url)
+    last_exc: Optional[Exception] = None
+    last_status: Optional[int] = None
     try:
         url, headers, body = build_llm_http_request(
             provider=p,
@@ -433,24 +473,32 @@ def _llm_check(
             response_json=False,
             max_tokens=8,
         )
-        # Create transport that uses pinned IP to prevent TOCTOU/DNS rebinding
-        parsed = urlparse(safe_base_url)
-        transport = _create_pinned_transport(
-            pinned_ip, parsed.hostname or "", parsed.scheme or ""
-        )
-        with httpx.Client(timeout=12, transport=transport) as c:
-            r = c.post(url, headers=headers, json=body)
-        if r.status_code // 100 == 2:
+        for pinned_ip in pinned_ips:
+            try:
+                transport = _create_pinned_transport(
+                    pinned_ip, parsed.hostname or "", parsed.scheme or ""
+                )
+                with httpx.Client(timeout=12, transport=transport) as c:
+                    r = c.post(url, headers=headers, json=body)
+                last_status = r.status_code
+                if r.status_code // 100 == 2:
+                    return {
+                        "configured": True,
+                        "reachable": True,
+                        "detail": f"OK ({r.status_code})",
+                    }
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if last_status is not None:
             return {
                 "configured": True,
-                "reachable": True,
-                "detail": f"OK ({r.status_code})",
+                "reachable": False,
+                "detail": f"HTTP {last_status}",
             }
-        return {
-            "configured": True,
-            "reachable": False,
-            "detail": f"HTTP {r.status_code}",
-        }
+        if last_exc:
+            raise last_exc
+        return {"configured": True, "reachable": False, "detail": "No pinned IPs available."}
     except Exception as exc:
         return {"configured": True, "reachable": False, "detail": str(exc)}
 
@@ -488,30 +536,39 @@ def _llm_models(provider: str, base_url: str, api_key: str) -> dict[str, Any]:
     p = provider.strip().lower() or "openai_compatible"
     if p in _CLOUD_LLM_PROVIDERS and not api_key.strip():
         return {"ok": False, "error": "API key required for selected provider."}
-    ok_url, safe_base_url, err, pinned_ip = _validate_base_url(base_url)
+    ok_url, safe_base_url, err, pinned_ips = _validate_base_url(base_url)
     if not ok_url:
         return {"ok": False, "error": err}
+    parsed = urlparse(safe_base_url)
+    last_exc: Optional[Exception] = None
+    last_status: Optional[int] = None
     try:
-        # Create transport that uses pinned IP to prevent TOCTOU/DNS rebinding
-        parsed = urlparse(safe_base_url)
-        transport = _create_pinned_transport(
-            pinned_ip, parsed.hostname or "", parsed.scheme or ""
-        )
-
         # We can't pass transport to fetch_llm_models without modifying it,
         # so we inline the model fetching logic here with our secure transport
         from retrace.llm.client import _build_headers, _extract_model_ids
 
         headers = _build_headers(provider=p, api_key=api_key.strip() or None)
         url = f"{safe_base_url.rstrip('/')}/models"
-
-        with httpx.Client(timeout=10, transport=transport) as c:
-            resp = c.get(url, headers=headers)
-            resp.raise_for_status()
-            payload = resp.json()
-
-        models = _extract_model_ids(payload)
-        return {"ok": True, "models": models}
+        for pinned_ip in pinned_ips:
+            try:
+                transport = _create_pinned_transport(
+                    pinned_ip, parsed.hostname or "", parsed.scheme or ""
+                )
+                with httpx.Client(timeout=10, transport=transport) as c:
+                    resp = c.get(url, headers=headers)
+                    last_status = resp.status_code
+                    resp.raise_for_status()
+                    payload = resp.json()
+                models = _extract_model_ids(payload)
+                return {"ok": True, "models": models}
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if last_status is not None:
+            return {"ok": False, "error": f"HTTP {last_status}"}
+        if last_exc:
+            raise last_exc
+        return {"ok": False, "error": "No pinned IPs available."}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -583,6 +640,10 @@ def _to_findings_payload(
                 "logs_url": row.logs_url if row else "",
                 "first_error_ts_ms": row.first_error_ts_ms if row else 0,
                 "last_error_ts_ms": row.last_error_ts_ms if row else 0,
+                "regression_state": row.regression_state if row else "new",
+                "regression_occurrence_count": row.regression_occurrence_count
+                if row
+                else 1,
                 "candidates": candidates,
                 "prompts": prompts,
             }
@@ -633,6 +694,8 @@ _INDEX_HTML = """<!doctype html>
     </div>
     <div class=\"right\" id=\"detail\">
       <div class=\"card\" id=\"onboarding\"></div>
+      <div style=\"height:12px\"></div>
+      <div class=\"card\" id=\"tester\"></div>
       <div style=\"height:12px\"></div>
       <div id=\"findingDetail\"><div class=\"empty\">Select a finding.</div></div>
     </div>
@@ -727,11 +790,23 @@ _INDEX_HTML = """<!doctype html>
         llm_base_url: byId('llmBaseUrl').value,
         llm_model: byId('llmModel').value,
         llm_api_key: byId('llmApiKey').value,
+        tester_app_url: byId('testerAppUrl').value,
+        tester_start_command: byId('testerStartCommand').value,
+        tester_harness_command: byId('testerHarnessCommand').value,
+        tester_max_retries: byId('testerMaxRetries').value,
+        tester_auth_required: byId('testerAuthRequired').value,
+        tester_auth_mode: byId('testerAuthMode').value,
+        tester_auth_login_url: byId('testerAuthLoginUrl').value,
+        tester_auth_username: byId('testerAuthUsername').value,
+        tester_auth_password: byId('testerAuthPassword').value,
+        tester_auth_jwt: byId('testerAuthJwt').value,
+        tester_auth_headers: byId('testerAuthHeaders').value,
       };
       const res = await fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
       const data = await res.json();
       if(!res.ok){ alert(data.error || 'Save failed'); return; }
       await loadOnboarding();
+      await loadTesterPanel();
       await bootFindings();
     }
 
@@ -772,6 +847,36 @@ _INDEX_HTML = """<!doctype html>
           <div class=\"lbl\" id=\"llmKeyLabel\">LLM API Key</div>
           <div class=\"empty\">Key: <span id=\"llmKeyRequired\">optional</span></div>
           <input id=\"llmApiKey\" value=\"\" placeholder=\"${settings.llm_api_key_present ? 'Configured (leave blank to keep current)' : 'Enter LLM API key'}\" />
+          <div class=\"lbl\">Tester App URL</div>
+          <input id=\"testerAppUrl\" value=\"${esc(settings.tester_app_url || 'http://127.0.0.1:3000')}\" />
+          <div class=\"lbl\">Tester Start Command</div>
+          <input id=\"testerStartCommand\" value=\"${esc(settings.tester_start_command || '')}\" placeholder=\"npm run dev\" />
+          <div class=\"lbl\">Tester Harness Command Template</div>
+          <input id=\"testerHarnessCommand\" value=\"${esc(settings.tester_harness_command || 'browser-harness run --url {app_url} --task {prompt_q} --output {run_dir_q}')}\" />
+          <div class=\"lbl\">Tester Retry Count</div>
+          <input id=\"testerMaxRetries\" type=\"number\" min=\"0\" value=\"${esc(settings.tester_max_retries || 1)}\" />
+          <div class=\"lbl\">Tester Auth Required?</div>
+          <select id=\"testerAuthRequired\" style=\"width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;\">
+            <option value=\"false\" ${settings.tester_auth_required ? '' : 'selected'}>No</option>
+            <option value=\"true\" ${settings.tester_auth_required ? 'selected' : ''}>Yes</option>
+          </select>
+          <div class=\"lbl\">Tester Auth Mode</div>
+          <select id=\"testerAuthMode\" style=\"width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;\">
+            <option value=\"none\" ${settings.tester_auth_mode === 'none' ? 'selected' : ''}>None</option>
+            <option value=\"form\" ${settings.tester_auth_mode === 'form' ? 'selected' : ''}>Form login</option>
+            <option value=\"jwt\" ${settings.tester_auth_mode === 'jwt' ? 'selected' : ''}>JWT bearer</option>
+            <option value=\"headers\" ${settings.tester_auth_mode === 'headers' ? 'selected' : ''}>Custom headers</option>
+          </select>
+          <div class=\"lbl\">Tester Auth Login URL</div>
+          <input id=\"testerAuthLoginUrl\" value=\"${esc(settings.tester_auth_login_url || '')}\" placeholder=\"http://127.0.0.1:3000/login\" />
+          <div class=\"lbl\">Tester Auth Username</div>
+          <input id=\"testerAuthUsername\" value=\"${esc(settings.tester_auth_username || '')}\" />
+          <div class=\"lbl\">Tester Auth Password</div>
+          <input id=\"testerAuthPassword\" value=\"\" placeholder=\"${settings.tester_auth_password_present ? 'Configured (leave blank to keep current)' : 'Optional test password'}\" />
+          <div class=\"lbl\">Tester Auth JWT</div>
+          <input id=\"testerAuthJwt\" value=\"\" placeholder=\"${settings.tester_auth_jwt_present ? 'Configured (leave blank to keep current)' : 'Optional bearer token'}\" />
+          <div class=\"lbl\">Tester Auth Headers (JSON)</div>
+          <input id=\"testerAuthHeaders\" value=\"\" placeholder=\"${settings.tester_auth_headers_present ? 'Configured (leave blank to keep current)' : '{\\\"x-test\\\":\\\"value\\\"}'}\" />
           <div style=\"margin-top:10px\"><button class=\"btn\" type=\"submit\">Save Settings</button></div>
         </form>
         <div style=\"margin-top:10px\" class=\"empty\">GitHub CLI: <span class=\"${gh.installed?'ok':'bad'}\">${gh.installed?'installed':'missing'}</span> · auth: <span class=\"${gh.authed?'ok':'bad'}\">${gh.authed?'ok':'not authed'}</span></div>
@@ -785,6 +890,94 @@ _INDEX_HTML = """<!doctype html>
       byId('llmModelPicker').addEventListener('change', onModelPick);
       syncProviderUI(false);
       byId('settingsForm').addEventListener('submit', saveSettings);
+    }
+
+    async function createTesterSpec(ev){
+      ev.preventDefault();
+      const body = {
+        name: byId('testerName').value,
+        mode: byId('testerMode').value,
+        prompt: byId('testerPrompt').value,
+        app_url: byId('testerSpecAppUrl').value,
+      };
+      const res = await fetch('/api/tester/specs', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){ alert(data.error || 'Failed to create tester spec'); return; }
+      byId('testerPrompt').value = '';
+      await loadTesterPanel();
+    }
+
+    async function runTesterSpec(){
+      const specId = byId('testerSpecSelect').value;
+      if(!specId){ return; }
+      byId('testerRunStatus').textContent = 'Running...';
+      const res = await fetch('/api/tester/run', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          spec_id: specId,
+          retries: Number(byId('testerMaxRetries')?.value || 1),
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        const msg = data?.result?.error || data.error || 'Run failed';
+        byId('testerRunStatus').textContent = `Failed: ${msg}`;
+        await loadTesterPanel();
+        return;
+      }
+      byId('testerRunStatus').textContent = `OK run ${data.result.run_id} (${data.result.status || 'passed'})`;
+      await loadTesterPanel();
+    }
+
+    async function loadTesterPanel(){
+      const [specRes, runsRes, settingsRes] = await Promise.all([
+        fetch('/api/tester/specs'),
+        fetch('/api/tester/runs'),
+        fetch('/api/settings'),
+      ]);
+      const specData = await specRes.json();
+      const runData = await runsRes.json();
+      const settings = await settingsRes.json();
+      const specs = specData.specs || [];
+      const runs = runData.runs || [];
+      const specOptions = specs.map(s =>
+        `<option value="${esc(s.spec_id)}">${esc(s.name)} (${esc(s.mode)})</option>`
+      ).join('');
+      const runRows = runs.map(r =>
+        `<li><code>${esc(r.run_id || '')}</code> · ${r.ok ? '<span class="ok">ok</span>' : '<span class="bad">fail</span>'} · <code>${esc(r.status || '')}</code> · attempts=<code>${esc(r.attempts || 1)}</code>${r.flake_reason ? ` · flake=<code>${esc(r.flake_reason)}</code>` : ''} · <code>${esc(r.spec_id || '')}</code><br><span class="empty">${esc(r.run_dir || '')}</span></li>`
+      ).join('');
+      byId('tester').innerHTML = `
+        <h3>Local UI Tester (Describe + Suite Explore)</h3>
+        <form id="testerCreateForm">
+          <div class="lbl">Test Name</div>
+          <input id="testerName" value="" placeholder="Checkout happy path" />
+          <div class="lbl">Mode</div>
+          <select id="testerMode" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
+            <option value="describe">Describe Test</option>
+            <option value="explore_suite">AI Explore Full Suite</option>
+          </select>
+          <div class="lbl">Prompt / Task</div>
+          <input id="testerPrompt" value="" placeholder="Describe a specific test. Leave blank for suite exploration mode." />
+          <div class="lbl">App URL (override)</div>
+          <input id="testerSpecAppUrl" value="${esc(settings.tester_app_url || 'http://127.0.0.1:3000')}" />
+          <div style="margin-top:10px"><button class="btn" type="submit">Save Test Spec</button></div>
+        </form>
+        <div style="height:10px"></div>
+        <div class="lbl">Run Saved Spec</div>
+        <select id="testerSpecSelect" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
+          ${specOptions || '<option value="">No specs yet</option>'}
+        </select>
+        <div style="margin-top:8px"><button class="btn" id="runTesterBtn" type="button">Run Selected Test</button> <span class="empty" id="testerRunStatus"></span></div>
+        <div class="lbl" style="margin-top:10px">Recent Runs</div>
+        ${runRows ? `<ul>${runRows}</ul>` : '<div class="empty">No runs yet.</div>'}
+      `;
+      byId('testerCreateForm').addEventListener('submit', createTesterSpec);
+      byId('runTesterBtn').addEventListener('click', runTesterSpec);
     }
 
     function renderList() {
@@ -834,6 +1027,8 @@ _INDEX_HTML = """<!doctype html>
       const errWindow = (active.first_error_ts_ms || active.last_error_ts_ms)
         ? `${active.first_error_ts_ms} → ${active.last_error_ts_ms}`
         : '—';
+      const regressionState = active.regression_state || 'new';
+      const regressionCount = active.regression_occurrence_count || 1;
       const correlationStatusHtml = hasCorrelation
         ? `<div class=\"empty\">Live correlation data found.</div>
            <div class=\"empty\">Issues: <code>${issueCount}</code> · Traces: <code>${traceCount}</code> · Stack frame: <code>${hasStack ? 'yes' : 'no'}</code></div>
@@ -857,6 +1052,7 @@ _INDEX_HTML = """<!doctype html>
             <div class=\"empty\">Trace IDs: <code>${esc(traceIds)}</code></div>
             <div class=\"empty\">Top stack frame: <code>${esc(active.top_stack_frame || '—')}</code></div>
             <div class=\"empty\">Error window (ms): <code>${esc(errWindow)}</code></div>
+            <div class=\"empty\">Regression: <code>${esc(regressionState)}</code> · seen <code>${esc(regressionCount)}</code> time(s)</div>
             <div style=\"margin-top:8px\">${active.error_tracking_url ? `<a href=\"${esc(active.error_tracking_url)}\" target=\"_blank\">Open Error Tracking</a>` : '<span class=\"empty\">Error Tracking link unavailable</span>'}</div>
             <div style=\"margin-top:4px\">${active.logs_url ? `<a href=\"${esc(active.logs_url)}\" target=\"_blank\">Open Logs</a>` : '<span class=\"empty\">Logs link unavailable</span>'}</div>
           </div>
@@ -882,6 +1078,7 @@ _INDEX_HTML = """<!doctype html>
 
     async function boot(){
       await loadOnboarding();
+      await loadTesterPanel();
       await bootFindings();
     }
     boot();
@@ -948,6 +1145,42 @@ def ui_command(
                 ((cfg.get("llm") or {}).get("model") or "llama-3.1-8b-instruct")
             ),
             "llm_api_key_present": bool(effective_llm_key),
+            "tester_app_url": str(
+                ((cfg.get("tester") or {}).get("app_url") or DEFAULT_APP_URL)
+            ),
+            "tester_start_command": str(
+                ((cfg.get("tester") or {}).get("start_command") or "")
+            ),
+            "tester_harness_command": str(
+                (
+                    (cfg.get("tester") or {}).get("harness_command")
+                    or DEFAULT_HARNESS_COMMAND
+                )
+            ),
+            "tester_max_retries": int(
+                (cfg.get("tester") or {}).get("max_retries") or 1
+            ),
+            "tester_auth_required": bool(
+                (cfg.get("tester") or {}).get("auth_required") or False
+            ),
+            "tester_auth_mode": str(
+                ((cfg.get("tester") or {}).get("auth_mode") or "none")
+            ),
+            "tester_auth_login_url": str(
+                ((cfg.get("tester") or {}).get("auth_login_url") or "")
+            ),
+            "tester_auth_username": str(
+                ((cfg.get("tester") or {}).get("auth_username") or "")
+            ),
+            "tester_auth_password_present": bool(
+                env.get("RETRACE_TESTER_AUTH_PASSWORD", "").strip()
+            ),
+            "tester_auth_jwt_present": bool(
+                env.get("RETRACE_TESTER_AUTH_JWT", "").strip()
+            ),
+            "tester_auth_headers_present": bool(
+                env.get("RETRACE_TESTER_AUTH_HEADERS", "").strip()
+            ),
         }
         if include_secrets:
             settings["posthog_api_key"] = env.get("RETRACE_POSTHOG_API_KEY", "")
@@ -1022,6 +1255,18 @@ def ui_command(
                 self._json({"report_path": str(rp) if rp else "", "findings": findings})
                 return
 
+            if path == "/api/tester/specs":
+                specs = [
+                    s.__dict__ for s in list_specs(specs_dir_for_data_dir(data_dir))
+                ]
+                self._json({"specs": specs})
+                return
+
+            if path == "/api/tester/runs":
+                runs = load_run_summaries(runs_dir_for_data_dir(data_dir), limit=20)
+                self._json({"runs": runs})
+                return
+
             if path.startswith("/api/session/") and path.endswith("/events"):
                 session_id = path.split("/")[3]
                 # Validate session_id to prevent path traversal
@@ -1076,6 +1321,42 @@ def ui_command(
                     str(body.get("llm_model", "")).strip() or defaults["model"]
                 )
                 llm_key_v = str(body.get("llm_api_key", "")).strip()
+                tester_app_url_v = (
+                    str(body.get("tester_app_url", "")).strip() or DEFAULT_APP_URL
+                )
+                tester_start_command_v = str(
+                    body.get("tester_start_command", "")
+                ).strip()
+                tester_harness_command_v = (
+                    str(body.get("tester_harness_command", "")).strip()
+                    or DEFAULT_HARNESS_COMMAND
+                )
+                try:
+                    tester_max_retries_v = max(
+                        0, int(str(body.get("tester_max_retries", "1")).strip() or "1")
+                    )
+                except Exception:
+                    tester_max_retries_v = 1
+                tester_auth_required_v = (
+                    str(body.get("tester_auth_required", "false")).strip().lower()
+                    in {"1", "true", "yes", "on"}
+                )
+                tester_auth_mode_v = (
+                    str(body.get("tester_auth_mode", "")).strip().lower() or "none"
+                )
+                tester_auth_login_url_v = str(
+                    body.get("tester_auth_login_url", "")
+                ).strip()
+                tester_auth_username_v = str(
+                    body.get("tester_auth_username", "")
+                ).strip()
+                tester_auth_password_v = str(
+                    body.get("tester_auth_password", "")
+                ).strip()
+                tester_auth_jwt_v = str(body.get("tester_auth_jwt", "")).strip()
+                tester_auth_headers_v = str(
+                    body.get("tester_auth_headers", "")
+                ).strip()
                 env = _read_env(env_path)
                 # Compute effective LLM key: prefer new value from form, else resolve from env
                 effective_llm_key = llm_key_v or _resolve_llm_api_key(
@@ -1094,6 +1375,16 @@ def ui_command(
                 cfg.setdefault("llm", {})["provider"] = llm_provider_v
                 cfg.setdefault("llm", {})["base_url"] = llm_base_url_v
                 cfg.setdefault("llm", {})["model"] = llm_model_v
+                cfg.setdefault("tester", {})["app_url"] = tester_app_url_v
+                cfg.setdefault("tester", {})["start_command"] = tester_start_command_v
+                cfg.setdefault("tester", {})[
+                    "harness_command"
+                ] = tester_harness_command_v
+                cfg.setdefault("tester", {})["max_retries"] = tester_max_retries_v
+                cfg.setdefault("tester", {})["auth_required"] = tester_auth_required_v
+                cfg.setdefault("tester", {})["auth_mode"] = tester_auth_mode_v
+                cfg.setdefault("tester", {})["auth_login_url"] = tester_auth_login_url_v
+                cfg.setdefault("tester", {})["auth_username"] = tester_auth_username_v
                 _write_config(config_path, cfg)
 
                 # Empty secret fields mean "keep existing" to avoid accidental secret clearing.
@@ -1101,6 +1392,12 @@ def ui_command(
                     env["RETRACE_POSTHOG_API_KEY"] = key_v
                 if llm_key_v:
                     env["RETRACE_LLM_API_KEY"] = llm_key_v
+                if tester_auth_password_v:
+                    env["RETRACE_TESTER_AUTH_PASSWORD"] = tester_auth_password_v
+                if tester_auth_jwt_v:
+                    env["RETRACE_TESTER_AUTH_JWT"] = tester_auth_jwt_v
+                if tester_auth_headers_v:
+                    env["RETRACE_TESTER_AUTH_HEADERS"] = tester_auth_headers_v
                 _write_env(env_path, env)
 
                 self._json({"ok": True, "settings": current_settings()})
@@ -1119,6 +1416,82 @@ def ui_command(
                 )
                 result = _llm_models(provider_v, base_url_v, key_v)
                 self._json(result, status=200 if result.get("ok") else 400)
+                return
+
+            if path == "/api/tester/specs":
+                body = self._read_json_body()
+                settings = current_settings()
+                try:
+                    spec = create_spec(
+                        specs_dir=specs_dir_for_data_dir(data_dir),
+                        name=str(body.get("name", "")).strip() or "UI test",
+                        prompt=str(body.get("prompt", "")).strip(),
+                        app_url=str(body.get("app_url", "")).strip()
+                        or settings["tester_app_url"],
+                        start_command=str(body.get("start_command", "")).strip()
+                        or settings["tester_start_command"],
+                        harness_command=str(body.get("harness_command", "")).strip()
+                        or settings["tester_harness_command"],
+                        mode=str(body.get("mode", "")).strip() or "describe",
+                        auth_required=bool(settings["tester_auth_required"]),
+                        auth_mode=str(settings["tester_auth_mode"] or "none"),
+                        auth_login_url=str(settings["tester_auth_login_url"] or ""),
+                        auth_username=str(settings["tester_auth_username"] or ""),
+                    )
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._json({"ok": True, "spec": spec.__dict__})
+                return
+
+            if path == "/api/tester/run":
+                body = self._read_json_body()
+                spec_id = str(body.get("spec_id", "")).strip()
+                if not spec_id:
+                    self._json({"ok": False, "error": "spec_id is required"}, status=400)
+                    return
+                try:
+                    spec = load_spec(specs_dir_for_data_dir(data_dir), spec_id)
+                except Exception:
+                    self._json({"ok": False, "error": "spec not found"}, status=404)
+                    return
+                try:
+                    retries_v = max(
+                        0,
+                        int(
+                            body.get(
+                                "retries",
+                                current_settings().get("tester_max_retries", 1),
+                            )
+                        ),
+                    )
+                except Exception:
+                    retries_v = int(current_settings().get("tester_max_retries", 1))
+                result = run_spec(
+                    spec=spec,
+                    runs_dir=runs_dir_for_data_dir(data_dir),
+                    prompt_override=str(body.get("prompt", "")).strip() or None,
+                    app_url_override=str(body.get("app_url", "")).strip() or None,
+                    start_command_override=str(body.get("start_command", "")).strip()
+                    or None,
+                    max_retries=retries_v,
+                    auth_context_override={
+                        "required": "true" if bool(spec.auth_required) else "false",
+                        "mode": str(spec.auth_mode or "none"),
+                        "login_url": str(spec.auth_login_url or ""),
+                        "username": str(spec.auth_username or ""),
+                        "password": _read_env(env_path).get(
+                            spec.auth_password_env, ""
+                        ),
+                        "jwt": _read_env(env_path).get(spec.auth_jwt_env, ""),
+                        "headers_json": _read_env(env_path).get(
+                            spec.auth_headers_env, ""
+                        ),
+                    },
+                    cwd=config_path.parent,
+                )
+                status = 200 if result.ok else 400
+                self._json({"ok": result.ok, "result": result.__dict__}, status=status)
                 return
 
             self._json({"error": "not found"}, status=404)
