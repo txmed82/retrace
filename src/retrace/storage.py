@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from uuid import uuid4
 import json
 from pathlib import Path
 from typing import Optional
@@ -97,6 +98,108 @@ CREATE TABLE IF NOT EXISTS fix_prompts (
     prompt_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS organizations (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(org_id, slug)
+);
+
+CREATE TABLE IF NOT EXISTS environments (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, slug)
+);
+
+CREATE TABLE IF NOT EXISTS project_members (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'member',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, email)
+);
+
+CREATE TABLE IF NOT EXISTS sdk_keys (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    prefix TEXT NOT NULL,
+    key_hash TEXT NOT NULL UNIQUE,
+    last4 TEXT NOT NULL,
+    revoked_at TEXT,
+    last_used_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS service_tokens (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    scopes_json TEXT NOT NULL DEFAULT '[]',
+    revoked_at TEXT,
+    last_used_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS replay_sessions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    stable_id TEXT NOT NULL,
+    distinct_id TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    event_count INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, stable_id)
+);
+
+CREATE TABLE IF NOT EXISTS replay_batches (
+    id TEXT PRIMARY KEY,
+    session_row_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    flush_type TEXT NOT NULL DEFAULT 'normal',
+    payload_json TEXT NOT NULL,
+    event_count INTEGER NOT NULL DEFAULT 0,
+    received_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, session_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS processing_jobs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(kind, subject_id)
+);
 """
 
 
@@ -164,6 +267,48 @@ class FixPromptRow:
     prompt_markdown: str
     prompt_json: str
     created_at: datetime
+
+
+@dataclass
+class WorkspaceIds:
+    org_id: str
+    project_id: str
+    environment_id: str
+
+
+@dataclass
+class SDKKeyRow:
+    id: str
+    project_id: str
+    environment_id: str
+    name: str
+    prefix: str
+    key_hash: str
+    last4: str
+    revoked_at: Optional[datetime]
+    last_used_at: Optional[datetime]
+    created_at: datetime
+
+
+@dataclass
+class ServiceTokenRow:
+    id: str
+    project_id: str
+    name: str
+    token_hash: str
+    scopes: list[str]
+    revoked_at: Optional[datetime]
+    last_used_at: Optional[datetime]
+    created_at: datetime
+
+
+@dataclass
+class ReplayBatchResult:
+    session_row_id: str
+    batch_id: str
+    inserted: bool
+    event_count: int
+    processing_job_id: Optional[str] = None
 
 
 class Storage:
@@ -244,6 +389,511 @@ class Storage:
                 conn.execute(
                     "ALTER TABLE finding_regression_status ADD COLUMN last_seen_report_seq INTEGER NOT NULL DEFAULT 0"
                 )
+
+    @staticmethod
+    def _id(prefix: str) -> str:
+        return f"{prefix}_{uuid4().hex}"
+
+    @staticmethod
+    def _slug(value: str) -> str:
+        out = "".join(
+            c.lower() if c.isalnum() else "-"
+            for c in str(value or "").strip()
+        ).strip("-")
+        while "--" in out:
+            out = out.replace("--", "-")
+        return out or "default"
+
+    @staticmethod
+    def _dt(value: object) -> Optional[datetime]:
+        if not value:
+            return None
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+    def ensure_workspace(
+        self,
+        *,
+        org_name: str = "Local",
+        project_name: str = "Default",
+        environment_name: str = "production",
+    ) -> WorkspaceIds:
+        """Create or return a local cloud-style org/project/environment tuple."""
+        org_slug = self._slug(org_name)
+        project_slug = self._slug(project_name)
+        env_slug = self._slug(environment_name)
+        org_id = f"org_{org_slug}"
+
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO organizations (id, name)
+                VALUES (?, ?)
+                ON CONFLICT(id) DO UPDATE SET name = excluded.name
+                """,
+                (org_id, org_name.strip() or "Local"),
+            )
+            row = conn.execute(
+                "SELECT id FROM projects WHERE org_id = ? AND slug = ?",
+                (org_id, project_slug),
+            ).fetchone()
+            if row is None:
+                project_id = self._id("proj")
+                conn.execute(
+                    """
+                    INSERT INTO projects (id, org_id, name, slug)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (project_id, org_id, project_name.strip() or "Default", project_slug),
+                )
+            else:
+                project_id = str(row["id"])
+
+            row = conn.execute(
+                "SELECT id FROM environments WHERE project_id = ? AND slug = ?",
+                (project_id, env_slug),
+            ).fetchone()
+            if row is None:
+                environment_id = self._id("env")
+                conn.execute(
+                    """
+                    INSERT INTO environments (id, project_id, name, slug)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        environment_id,
+                        project_id,
+                        environment_name.strip() or "production",
+                        env_slug,
+                    ),
+                )
+            else:
+                environment_id = str(row["id"])
+
+        return WorkspaceIds(
+            org_id=org_id,
+            project_id=project_id,
+            environment_id=environment_id,
+        )
+
+    def create_sdk_key(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        name: str,
+        key_hash: str,
+        prefix: str,
+        last4: str,
+    ) -> str:
+        key_id = self._id("sdk")
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO sdk_keys
+                (id, project_id, environment_id, name, prefix, key_hash, last4)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    key_id,
+                    project_id,
+                    environment_id,
+                    name.strip() or "SDK key",
+                    prefix,
+                    key_hash,
+                    last4,
+                ),
+            )
+        return key_id
+
+    def add_project_member(
+        self,
+        *,
+        project_id: str,
+        email: str,
+        role: str = "member",
+    ) -> str:
+        member_id = self._id("mem")
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO project_members (id, project_id, email, role)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(project_id, email) DO UPDATE SET role = excluded.role
+                """,
+                (
+                    member_id,
+                    project_id,
+                    email.strip().lower(),
+                    role.strip() or "member",
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT id FROM project_members
+                WHERE project_id = ? AND email = ?
+                """,
+                (project_id, email.strip().lower()),
+            ).fetchone()
+        assert row is not None
+        return str(row["id"])
+
+    def list_project_members(self, project_id: str) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT id, project_id, email, role, created_at
+                FROM project_members
+                WHERE project_id = ?
+                ORDER BY email
+                """,
+                (project_id,),
+            ).fetchall()
+
+    def get_sdk_key_by_hash(self, key_hash: str) -> Optional[SDKKeyRow]:
+        with self._conn() as conn:
+            r = conn.execute(
+                """
+                SELECT id, project_id, environment_id, name, prefix, key_hash, last4,
+                       revoked_at, last_used_at, created_at
+                FROM sdk_keys
+                WHERE key_hash = ?
+                """,
+                (key_hash,),
+            ).fetchone()
+        if not r:
+            return None
+        return SDKKeyRow(
+            id=str(r["id"]),
+            project_id=str(r["project_id"]),
+            environment_id=str(r["environment_id"]),
+            name=str(r["name"]),
+            prefix=str(r["prefix"]),
+            key_hash=str(r["key_hash"]),
+            last4=str(r["last4"]),
+            revoked_at=self._dt(r["revoked_at"]),
+            last_used_at=self._dt(r["last_used_at"]),
+            created_at=self._dt(r["created_at"]) or datetime.now(timezone.utc),
+        )
+
+    def touch_sdk_key(self, key_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sdk_keys SET last_used_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), key_id),
+            )
+
+    def create_service_token(
+        self,
+        *,
+        project_id: str,
+        name: str,
+        token_hash: str,
+        scopes: list[str],
+    ) -> str:
+        token_id = self._id("svc")
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO service_tokens
+                (id, project_id, name, token_hash, scopes_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    token_id,
+                    project_id,
+                    name.strip() or "Service token",
+                    token_hash,
+                    json.dumps([str(s) for s in scopes]),
+                ),
+            )
+        return token_id
+
+    def get_service_token_by_hash(self, token_hash: str) -> Optional[ServiceTokenRow]:
+        with self._conn() as conn:
+            r = conn.execute(
+                """
+                SELECT id, project_id, name, token_hash, scopes_json, revoked_at,
+                       last_used_at, created_at
+                FROM service_tokens
+                WHERE token_hash = ?
+                """,
+                (token_hash,),
+            ).fetchone()
+        if not r:
+            return None
+        return ServiceTokenRow(
+            id=str(r["id"]),
+            project_id=str(r["project_id"]),
+            name=str(r["name"]),
+            token_hash=str(r["token_hash"]),
+            scopes=self._parse_string_list_json(r["scopes_json"]),
+            revoked_at=self._dt(r["revoked_at"]),
+            last_used_at=self._dt(r["last_used_at"]),
+            created_at=self._dt(r["created_at"]) or datetime.now(timezone.utc),
+        )
+
+    def touch_service_token(self, token_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE service_tokens SET last_used_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), token_id),
+            )
+
+    def revoke_service_token(self, token_id: str) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE service_tokens
+                SET revoked_at = COALESCE(revoked_at, ?)
+                WHERE id = ?
+                """,
+                (datetime.now(timezone.utc).isoformat(), token_id),
+            )
+            return int(cur.rowcount) > 0
+
+    def revoke_sdk_key(self, key_id: str) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE sdk_keys
+                SET revoked_at = COALESCE(revoked_at, ?)
+                WHERE id = ?
+                """,
+                (datetime.now(timezone.utc).isoformat(), key_id),
+            )
+            return int(cur.rowcount) > 0
+
+    def insert_replay_batch(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        session_id: str,
+        sequence: int,
+        events: list[dict[str, object]],
+        flush_type: str,
+        distinct_id: str = "",
+        metadata: Optional[dict[str, object]] = None,
+    ) -> ReplayBatchResult:
+        now = datetime.now(timezone.utc).isoformat()
+        clean_flush = flush_type if flush_type in {"normal", "final"} else "normal"
+        event_count = len(events)
+        payload_json = json.dumps(
+            {
+                "sessionId": session_id,
+                "sequence": int(sequence),
+                "flushType": clean_flush,
+                "distinctId": distinct_id,
+                "metadata": metadata or {},
+                "events": events,
+            },
+            separators=(",", ":"),
+        )
+
+        with self._conn() as conn:
+            processing_job_id: Optional[str] = None
+            merged_metadata = metadata or {}
+            row = conn.execute(
+                """
+                SELECT id, metadata_json FROM replay_sessions
+                WHERE project_id = ? AND environment_id = ? AND stable_id = ?
+                """,
+                (project_id, environment_id, session_id),
+            ).fetchone()
+            if row is None:
+                session_row_id = self._id("rs")
+                conn.execute(
+                    """
+                    INSERT INTO replay_sessions
+                    (id, project_id, environment_id, stable_id, distinct_id, started_at,
+                     last_seen_at, event_count, metadata_json, status, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_row_id,
+                        project_id,
+                        environment_id,
+                        session_id,
+                        distinct_id or "",
+                        now,
+                        now,
+                        0,
+                        json.dumps(metadata or {}),
+                        "completed" if clean_flush == "final" else "active",
+                        now,
+                    ),
+                )
+            else:
+                session_row_id = str(row["id"])
+                existing_metadata = self._safe_json_obj(row["metadata_json"])
+                merged_metadata = {**existing_metadata, **(metadata or {})}
+
+            batch_id = self._id("rb")
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO replay_batches
+                (id, session_row_id, project_id, environment_id, session_id, sequence,
+                 flush_type, payload_json, event_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id,
+                    session_row_id,
+                    project_id,
+                    environment_id,
+                    session_id,
+                    int(sequence),
+                    clean_flush,
+                    payload_json,
+                    event_count,
+                ),
+            )
+            inserted = int(cur.rowcount) > 0
+            if not inserted:
+                existing = conn.execute(
+                    """
+                    SELECT id, event_count FROM replay_batches
+                    WHERE project_id = ? AND environment_id = ? AND session_id = ? AND sequence = ?
+                    """,
+                    (project_id, environment_id, session_id, int(sequence)),
+                ).fetchone()
+                assert existing is not None
+                batch_id = str(existing["id"])
+                event_count = int(existing["event_count"])
+            else:
+                conn.execute(
+                    """
+                    UPDATE replay_sessions
+                    SET last_seen_at = ?,
+                        event_count = event_count + ?,
+                        distinct_id = COALESCE(NULLIF(?, ''), distinct_id),
+                        metadata_json = ?,
+                        status = CASE WHEN ? = 'final' THEN 'completed' ELSE status END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        now,
+                        event_count,
+                        distinct_id or "",
+                        json.dumps(merged_metadata),
+                        clean_flush,
+                        now,
+                        session_row_id,
+                    ),
+                )
+                if clean_flush == "final":
+                    processing_job_id = self.enqueue_processing_job(
+                        project_id=project_id,
+                        environment_id=environment_id,
+                        kind="replay.finalize",
+                        subject_id=session_row_id,
+                        payload={
+                            "session_id": session_id,
+                            "batch_id": batch_id,
+                            "sequence": int(sequence),
+                        },
+                        conn=conn,
+                    )
+
+        return ReplayBatchResult(
+            session_row_id=session_row_id,
+            batch_id=batch_id,
+            inserted=inserted,
+            event_count=event_count,
+            processing_job_id=processing_job_id,
+        )
+
+    def enqueue_processing_job(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        kind: str,
+        subject_id: str,
+        payload: dict[str, object],
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> str:
+        job_id = self._id("job")
+        now = datetime.now(timezone.utc).isoformat()
+
+        def _insert(c: sqlite3.Connection) -> str:
+            c.execute(
+                """
+                INSERT OR IGNORE INTO processing_jobs
+                (id, project_id, environment_id, kind, subject_id, status, payload_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    job_id,
+                    project_id,
+                    environment_id,
+                    kind,
+                    subject_id,
+                    json.dumps(payload),
+                    now,
+                ),
+            )
+            row = c.execute(
+                """
+                SELECT id FROM processing_jobs
+                WHERE kind = ? AND subject_id = ?
+                """,
+                (kind, subject_id),
+            ).fetchone()
+            assert row is not None
+            return str(row["id"])
+
+        if conn is not None:
+            return _insert(conn)
+        with self._conn() as owned_conn:
+            return _insert(owned_conn)
+
+    def list_processing_jobs(
+        self,
+        *,
+        kind: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> list[sqlite3.Row]:
+        where: list[str] = []
+        params: list[str] = []
+        if kind is not None:
+            where.append("kind = ?")
+            params.append(kind)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        query = "SELECT * FROM processing_jobs"
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY created_at, id"
+        with self._conn() as conn:
+            return conn.execute(query, params).fetchall()
+
+    def get_replay_session(self, session_id: str) -> Optional[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM replay_sessions
+                WHERE stable_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+
+    def list_replay_batches(self, session_id: str) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM replay_batches
+                WHERE session_id = ?
+                ORDER BY sequence
+                """,
+                (session_id,),
+            ).fetchall()
 
     def upsert_session(self, s: SessionMeta) -> None:
         if s.started_at.tzinfo is None:
@@ -687,6 +1337,14 @@ class Storage:
         if not isinstance(parsed, list):
             return []
         return [str(item) for item in parsed]
+
+    @staticmethod
+    def _safe_json_obj(raw: object) -> dict[str, object]:
+        try:
+            parsed = json.loads(str(raw or "{}"))
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def replace_code_candidates(
         self,
