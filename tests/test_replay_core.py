@@ -324,6 +324,76 @@ def test_replay_core_clusters_sessions_and_regresses_resolved_issue(tmp_path: Pa
     ]
 
 
+def test_replay_core_counts_anonymous_sessions_with_identified_users(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    for session_id, distinct_id in [("sess-known", "user-1"), ("sess-anon", "")]:
+        store.insert_replay_batch(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            session_id=session_id,
+            sequence=0,
+            events=[
+                _navigation("https://app.example/checkout"),
+                _console_error("TypeError: total is undefined"),
+            ],
+            flush_type="final",
+            distinct_id=distinct_id,
+        )
+
+    result = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-known", "sess-anon"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+
+    assert len(result.issues) == 1
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    assert issue["affected_count"] == 2
+    assert issue["affected_users"] == 2
+
+
+def test_replay_core_preserves_representative_session_order(tmp_path: Path) -> None:
+    store, workspace = _workspace(tmp_path)
+    for session_id in ["sess-z", "sess-a"]:
+        store.insert_replay_batch(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            session_id=session_id,
+            sequence=0,
+            events=[
+                _navigation("https://app.example/checkout"),
+                _console_error("Error: checkout failed"),
+            ],
+            flush_type="final",
+        )
+
+    result = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-z", "sess-a"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    assert issue["representative_session_id"] == "sess-z"
+    sessions = store.list_replay_issue_sessions(result.issues[0].issue_id)
+    assert [(row["session_id"], row["role"]) for row in sessions] == [
+        ("sess-z", "representative"),
+        ("sess-a", "supporting"),
+    ]
+
+
 def test_replay_issue_lifecycle_tracks_ongoing_unresolved_and_ticket_created(
     tmp_path: Path,
 ) -> None:
@@ -462,6 +532,46 @@ def test_replay_core_persists_ai_analysis_metadata_and_evidence(tmp_path: Path) 
     click_evidence = evidence["events"][1]
     assert click_evidence["type"] == 3
     assert click_evidence["data_type"] == 2
+
+
+def test_replay_core_windows_evidence_around_representative_signal(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    events = [_navigation("https://app.example/checkout", ts=0)]
+    events.extend(_click(node_id, ts=node_id * 100) for node_id in range(1, 70))
+    events.append(_console_error("TypeError: total is undefined", ts=6500))
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-late",
+        sequence=0,
+        events=events,
+        flush_type="final",
+    )
+
+    process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-late"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+        llm_client=SuccessfulLLM(),  # type: ignore[arg-type]
+    )
+
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    evidence = json.loads(issue["evidence_json"])
+    evidence_node_ids = {
+        event["id"] for event in evidence["events"] if "id" in event
+    }
+    assert 65 in evidence_node_ids
+    assert 1 not in evidence_node_ids
+    assert any(
+        event.get("plugin") == "retrace/console@1" for event in evidence["events"]
+    )
 
 
 def test_replay_core_uses_deterministic_fallback_when_llm_fails(tmp_path: Path) -> None:

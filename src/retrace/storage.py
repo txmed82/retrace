@@ -1192,15 +1192,6 @@ class Storage:
         preview = self._replay_preview(events)
         blob_backend = ""
         blob_key = ""
-        if self.replay_blob_store is not None:
-            blob_backend = self.replay_blob_store.backend
-            blob_key = self.replay_blob_store.write_events(
-                project_id=project_id,
-                environment_id=environment_id,
-                session_id=session_id,
-                sequence=sequence,
-                events=events,
-            )
         payload_json = json.dumps(
             {
                 "sessionId": session_id,
@@ -1269,8 +1260,8 @@ class Storage:
                     int(sequence),
                     clean_flush,
                     payload_json,
-                    blob_backend,
-                    blob_key,
+                    "",
+                    "",
                     event_count,
                 ),
             )
@@ -1287,6 +1278,23 @@ class Storage:
                 batch_id = str(existing["id"])
                 event_count = int(existing["event_count"])
             else:
+                if self.replay_blob_store is not None:
+                    blob_backend = self.replay_blob_store.backend
+                    blob_key = self.replay_blob_store.write_events(
+                        project_id=project_id,
+                        environment_id=environment_id,
+                        session_id=session_id,
+                        sequence=sequence,
+                        events=events,
+                    )
+                    conn.execute(
+                        """
+                        UPDATE replay_batches
+                        SET blob_backend = ?, blob_key = ?
+                        WHERE id = ?
+                        """,
+                        (blob_backend, blob_key, batch_id),
+                    )
                 merged_preview = self._merge_replay_preview(
                     existing_preview,
                     preview,
@@ -1582,12 +1590,19 @@ class Storage:
             """,
             [project_id, environment_id, *session_ids],
         ).fetchall()
+        if not rows:
+            return len(set(session_ids))
         users = {
             str(row["distinct_id"])
             for row in rows
             if str(row["distinct_id"] or "").strip()
         }
-        return len(users) if users else len(set(session_ids))
+        anonymous_sessions = {
+            str(row["stable_id"])
+            for row in rows
+            if not str(row["distinct_id"] or "").strip()
+        }
+        return len(users) + len(anonymous_sessions)
 
     def get_replay_playback(
         self,
@@ -1714,7 +1729,7 @@ class Storage:
         now = datetime.now(timezone.utc).isoformat()
         public_id = self.make_issue_public_id(project_id, environment_id, fingerprint)
         issue_id = self._id("ri")
-        clean_session_ids = sorted(set(str(s) for s in session_ids if str(s)))
+        clean_session_ids = list(dict.fromkeys(str(s) for s in session_ids if str(s)))
         representative_session_id = clean_session_ids[0] if clean_session_ids else ""
         with self._conn() as conn:
             conn.execute(

@@ -270,6 +270,41 @@ def test_replay_playback_reads_filesystem_blob_events_in_sequence(tmp_path: Path
     }
 
 
+def test_replay_duplicate_batch_does_not_overwrite_blob_events(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db", replay_blob_dir=tmp_path / "replay-blobs")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Web")
+
+    first = store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-dup-blob",
+        sequence=0,
+        events=[{"type": 4, "timestamp": 10, "data": {"href": "https://first.test"}}],
+        flush_type="normal",
+    )
+    second = store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-dup-blob",
+        sequence=0,
+        events=[{"type": 4, "timestamp": 20, "data": {"href": "https://second.test"}}],
+        flush_type="normal",
+    )
+
+    assert first.inserted is True
+    assert second.inserted is False
+    playback = store.get_replay_playback(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-dup-blob",
+    )
+    assert playback is not None
+    assert playback.events == [
+        {"type": 4, "timestamp": 10, "data": {"href": "https://first.test"}}
+    ]
+
+
 def test_replay_lookups_are_tenant_scoped(tmp_path: Path) -> None:
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()

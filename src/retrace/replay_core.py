@@ -182,6 +182,27 @@ def _event_evidence(event: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _event_window_around_timestamp(
+    events: list[dict[str, Any]],
+    timestamp_ms: int | None,
+    *,
+    before: int = 20,
+    after: int = 20,
+) -> list[dict[str, Any]]:
+    if not events:
+        return []
+    if timestamp_ms is None:
+        return events[: before + after]
+
+    def distance(index: int) -> int:
+        return abs(int(events[index].get("timestamp") or 0) - timestamp_ms)
+
+    center = min(range(len(events)), key=distance)
+    start = max(0, center - before)
+    end = min(len(events), center + after + 1)
+    return events[start:end]
+
+
 def build_replay_evidence(
     *,
     cluster: Cluster,
@@ -194,16 +215,21 @@ def build_replay_evidence(
         for session_id in cluster.session_ids
         for signal in signals_by_session.get(session_id, [])
     ]
+    representative_signals = signals_by_session.get(representative_session_id, [])
+    pivot_signal = representative_signals[0] if representative_signals else None
+    if pivot_signal is None and all_signals:
+        pivot_signal = all_signals[0]
+    representative_events = _event_window_around_timestamp(
+        events_by_session.get(representative_session_id, []),
+        pivot_signal.timestamp_ms if pivot_signal is not None else None,
+    )
     return {
         "representative_session_id": representative_session_id,
         "session_ids": cluster.session_ids,
         "affected_count": cluster.affected_count,
         "signal_summary": cluster.signal_summary,
         "signals": [_signal_evidence(signal) for signal in all_signals[:20]],
-        "events": [
-            _event_evidence(event)
-            for event in events_by_session.get(representative_session_id, [])[:40]
-        ],
+        "events": [_event_evidence(event) for event in representative_events],
     }
 
 
