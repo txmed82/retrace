@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -48,6 +49,53 @@ def test_storage_start_and_finish_run(tmp_path: Path):
     assert row.findings_count == 2
     assert row.status == "ok"
     assert row.finished_at is not None
+
+
+def test_init_schema_migrates_replay_session_public_ids(tmp_path: Path):
+    db = tmp_path / "retrace.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        CREATE TABLE replay_sessions (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            environment_id TEXT NOT NULL,
+            stable_id TEXT NOT NULL,
+            distinct_id TEXT NOT NULL DEFAULT '',
+            started_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            event_count INTEGER NOT NULL DEFAULT 0,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, environment_id, stable_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO replay_sessions
+        (id, project_id, environment_id, stable_id, started_at, last_seen_at)
+        VALUES ('rs_1', 'proj_1', 'env_1', 'sess_1', '2026-04-26T00:00:00+00:00',
+                '2026-04-26T00:00:00+00:00')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Storage(db)
+    store.init_schema()
+
+    session = store.get_replay_session(
+        project_id="proj_1",
+        environment_id="env_1",
+        session_id="sess_1",
+    )
+    assert session is not None
+    assert session["public_id"] == Storage.make_replay_public_id(
+        "proj_1", "env_1", "sess_1"
+    )
 
 
 def test_get_run_returns_none_for_unknown_id(tmp_path: Path):

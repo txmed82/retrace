@@ -3,10 +3,11 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+import hashlib
 from uuid import uuid4
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 SCHEMA = """
@@ -161,6 +162,7 @@ CREATE TABLE IF NOT EXISTS replay_sessions (
     project_id TEXT NOT NULL,
     environment_id TEXT NOT NULL,
     stable_id TEXT NOT NULL,
+    public_id TEXT NOT NULL,
     distinct_id TEXT NOT NULL DEFAULT '',
     started_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
@@ -184,6 +186,58 @@ CREATE TABLE IF NOT EXISTS replay_batches (
     event_count INTEGER NOT NULL DEFAULT 0,
     received_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(project_id, environment_id, session_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS replay_signals (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    detector TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    url TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    details_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, session_id, detector, timestamp_ms, details_hash)
+);
+
+CREATE TABLE IF NOT EXISTS replay_issues (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    public_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    priority TEXT NOT NULL DEFAULT 'medium',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    title TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    likely_cause TEXT NOT NULL DEFAULT '',
+    reproduction_steps_json TEXT NOT NULL DEFAULT '[]',
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    signal_summary_json TEXT NOT NULL DEFAULT '{}',
+    affected_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_ms INTEGER NOT NULL DEFAULT 0,
+    last_seen_ms INTEGER NOT NULL DEFAULT 0,
+    resolved_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_issues_public
+ON replay_issues(project_id, environment_id, public_id);
+
+CREATE TABLE IF NOT EXISTS replay_issue_sessions (
+    issue_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    first_seen_ms INTEGER NOT NULL DEFAULT 0,
+    last_seen_ms INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(issue_id, session_id)
 );
 
 CREATE TABLE IF NOT EXISTS processing_jobs (
@@ -311,6 +365,20 @@ class ReplayBatchResult:
     processing_job_id: Optional[str] = None
 
 
+@dataclass
+class ReplayPlayback:
+    session: sqlite3.Row
+    batches: list[sqlite3.Row]
+    events: list[dict[str, Any]]
+
+
+@dataclass
+class ReplayIssueUpsertResult:
+    issue_id: str
+    public_id: str
+    inserted: bool
+
+
 class Storage:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -389,10 +457,56 @@ class Storage:
                 conn.execute(
                     "ALTER TABLE finding_regression_status ADD COLUMN last_seen_report_seq INTEGER NOT NULL DEFAULT 0"
                 )
+            cols_replay_sessions = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(replay_sessions)").fetchall()
+            ]
+            if "public_id" not in cols_replay_sessions:
+                conn.execute(
+                    "ALTER TABLE replay_sessions ADD COLUMN public_id TEXT NOT NULL DEFAULT ''"
+                )
+                rows = conn.execute(
+                    "SELECT id, project_id, environment_id, stable_id FROM replay_sessions"
+                ).fetchall()
+                for row in rows:
+                    conn.execute(
+                        "UPDATE replay_sessions SET public_id = ? WHERE id = ?",
+                        (
+                            self.make_replay_public_id(
+                                str(row["project_id"]),
+                                str(row["environment_id"]),
+                                str(row["stable_id"]),
+                            ),
+                            row["id"],
+                        ),
+                    )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_replay_sessions_public
+                ON replay_sessions(project_id, environment_id, public_id)
+                """
+            )
 
     @staticmethod
     def _id(prefix: str) -> str:
         return f"{prefix}_{uuid4().hex}"
+
+    @staticmethod
+    def _public_id(prefix: str, *parts: object) -> str:
+        raw = "\x1f".join(str(p) for p in parts)
+        return f"{prefix}_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+    @classmethod
+    def make_replay_public_id(
+        cls, project_id: str, environment_id: str, session_id: str
+    ) -> str:
+        return cls._public_id("rpl", project_id, environment_id, session_id)
+
+    @classmethod
+    def make_issue_public_id(
+        cls, project_id: str, environment_id: str, fingerprint: str
+    ) -> str:
+        return cls._public_id("bug", project_id, environment_id, fingerprint)
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -696,15 +810,16 @@ class Storage:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO replay_sessions
-                (id, project_id, environment_id, stable_id, distinct_id, started_at,
+                (id, project_id, environment_id, stable_id, public_id, distinct_id, started_at,
                  last_seen_at, event_count, metadata_json, status, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_row_id,
                     project_id,
                     environment_id,
                     session_id,
+                    self.make_replay_public_id(project_id, environment_id, session_id),
                     distinct_id or "",
                     now,
                     now,
@@ -885,6 +1000,49 @@ class Storage:
                 (project_id, environment_id, session_id),
             ).fetchone()
 
+    def get_replay_session_by_public_id(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        replay_id: str,
+    ) -> Optional[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM replay_sessions
+                WHERE project_id = ? AND environment_id = ? AND public_id = ?
+                """,
+                (project_id, environment_id, replay_id),
+            ).fetchone()
+
+    def list_replay_sessions(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        params: list[object] = [project_id, environment_id]
+        where = "project_id = ? AND environment_id = ?"
+        if status is not None:
+            where += " AND status = ?"
+            params.append(status)
+        params.append(max(1, min(int(limit), 500)))
+        with self._conn() as conn:
+            return conn.execute(
+                f"""
+                SELECT *
+                FROM replay_sessions
+                WHERE {where}
+                ORDER BY last_seen_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+
     def list_replay_batches(
         self,
         *,
@@ -902,6 +1060,265 @@ class Storage:
                 """,
                 (project_id, environment_id, session_id),
             ).fetchall()
+
+    def get_replay_playback(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        session_id: Optional[str] = None,
+        replay_id: Optional[str] = None,
+    ) -> Optional[ReplayPlayback]:
+        if not session_id and not replay_id:
+            raise ValueError("session_id or replay_id is required")
+        session = (
+            self.get_replay_session(
+                project_id=project_id,
+                environment_id=environment_id,
+                session_id=session_id,
+            )
+            if session_id
+            else self.get_replay_session_by_public_id(
+                project_id=project_id,
+                environment_id=environment_id,
+                replay_id=str(replay_id),
+            )
+        )
+        if session is None:
+            return None
+        batches = self.list_replay_batches(
+            project_id=project_id,
+            environment_id=environment_id,
+            session_id=str(session["stable_id"]),
+        )
+        events: list[dict[str, Any]] = []
+        for batch in batches:
+            payload = self._safe_json_obj(batch["payload_json"])
+            batch_events = payload.get("events")
+            if isinstance(batch_events, list):
+                events.extend(e for e in batch_events if isinstance(e, dict))
+        return ReplayPlayback(session=session, batches=batches, events=events)
+
+    def upsert_replay_signals(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        signals: list[object],
+    ) -> int:
+        inserted = 0
+        with self._conn() as conn:
+            for signal in signals:
+                session_id = str(getattr(signal, "session_id"))
+                detector = str(getattr(signal, "detector"))
+                timestamp_ms = int(getattr(signal, "timestamp_ms"))
+                url = str(getattr(signal, "url", "") or "")
+                details = getattr(signal, "details", {}) or {}
+                details_json = json.dumps(details, sort_keys=True, separators=(",", ":"))
+                details_hash = hashlib.sha256(details_json.encode("utf-8")).hexdigest()
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO replay_signals
+                    (id, project_id, environment_id, session_id, detector, timestamp_ms,
+                     url, details_json, details_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._id("sig"),
+                        project_id,
+                        environment_id,
+                        session_id,
+                        detector,
+                        timestamp_ms,
+                        url,
+                        details_json,
+                        details_hash,
+                    ),
+                )
+                inserted += int(cur.rowcount)
+        return inserted
+
+    def list_replay_signals(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        session_id: Optional[str] = None,
+    ) -> list[sqlite3.Row]:
+        where = "project_id = ? AND environment_id = ?"
+        params: list[object] = [project_id, environment_id]
+        if session_id is not None:
+            where += " AND session_id = ?"
+            params.append(session_id)
+        with self._conn() as conn:
+            return conn.execute(
+                f"""
+                SELECT *
+                FROM replay_signals
+                WHERE {where}
+                ORDER BY session_id, timestamp_ms, detector
+                """,
+                params,
+            ).fetchall()
+
+    def upsert_replay_issue(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        fingerprint: str,
+        session_ids: list[str],
+        signal_summary: dict[str, int],
+        first_seen_ms: int,
+        last_seen_ms: int,
+        title: str = "",
+        summary: str = "",
+        likely_cause: str = "",
+        reproduction_steps: Optional[list[str]] = None,
+        severity: str = "medium",
+        priority: str = "medium",
+        confidence: str = "medium",
+    ) -> ReplayIssueUpsertResult:
+        now = datetime.now(timezone.utc).isoformat()
+        public_id = self.make_issue_public_id(project_id, environment_id, fingerprint)
+        issue_id = self._id("ri")
+        with self._conn() as conn:
+            existing = conn.execute(
+                """
+                SELECT id FROM replay_issues
+                WHERE project_id = ? AND environment_id = ? AND fingerprint = ?
+                """,
+                (project_id, environment_id, fingerprint),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO replay_issues
+                (id, project_id, environment_id, public_id, fingerprint, status, priority,
+                 severity, title, summary, likely_cause, reproduction_steps_json,
+                 confidence, signal_summary_json, affected_count, first_seen_ms,
+                 last_seen_ms, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, environment_id, fingerprint) DO UPDATE SET
+                    status = CASE
+                        WHEN replay_issues.status = 'resolved' THEN 'regressed'
+                        ELSE replay_issues.status
+                    END,
+                    priority = excluded.priority,
+                    severity = excluded.severity,
+                    title = excluded.title,
+                    summary = excluded.summary,
+                    likely_cause = excluded.likely_cause,
+                    reproduction_steps_json = excluded.reproduction_steps_json,
+                    confidence = excluded.confidence,
+                    signal_summary_json = excluded.signal_summary_json,
+                    affected_count = excluded.affected_count,
+                    first_seen_ms = MIN(replay_issues.first_seen_ms, excluded.first_seen_ms),
+                    last_seen_ms = MAX(replay_issues.last_seen_ms, excluded.last_seen_ms),
+                    resolved_at = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    issue_id,
+                    project_id,
+                    environment_id,
+                    public_id,
+                    fingerprint,
+                    priority,
+                    severity,
+                    title,
+                    summary,
+                    likely_cause,
+                    json.dumps(reproduction_steps or []),
+                    confidence,
+                    json.dumps(signal_summary, sort_keys=True),
+                    len(set(session_ids)),
+                    int(first_seen_ms),
+                    int(last_seen_ms),
+                    now,
+                ),
+            )
+            inserted = existing is None
+            row = conn.execute(
+                """
+                SELECT id, public_id FROM replay_issues
+                WHERE project_id = ? AND environment_id = ? AND fingerprint = ?
+                """,
+                (project_id, environment_id, fingerprint),
+            ).fetchone()
+            assert row is not None
+            issue_id = str(row["id"])
+            public_id = str(row["public_id"])
+            for sid in sorted(set(session_ids)):
+                conn.execute(
+                    """
+                    INSERT INTO replay_issue_sessions
+                    (issue_id, project_id, environment_id, session_id, first_seen_ms, last_seen_ms)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(issue_id, session_id) DO UPDATE SET
+                        first_seen_ms = MIN(replay_issue_sessions.first_seen_ms, excluded.first_seen_ms),
+                        last_seen_ms = MAX(replay_issue_sessions.last_seen_ms, excluded.last_seen_ms)
+                    """,
+                    (
+                        issue_id,
+                        project_id,
+                        environment_id,
+                        sid,
+                        int(first_seen_ms),
+                        int(last_seen_ms),
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE replay_issues
+                SET affected_count = (
+                    SELECT COUNT(*) FROM replay_issue_sessions WHERE issue_id = ?
+                ),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (issue_id, now, issue_id),
+            )
+        return ReplayIssueUpsertResult(
+            issue_id=issue_id,
+            public_id=public_id,
+            inserted=inserted,
+        )
+
+    def list_replay_issues(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        status: Optional[str] = None,
+    ) -> list[sqlite3.Row]:
+        where = "project_id = ? AND environment_id = ?"
+        params: list[object] = [project_id, environment_id]
+        if status is not None:
+            where += " AND status = ?"
+            params.append(status)
+        with self._conn() as conn:
+            return conn.execute(
+                f"""
+                SELECT *
+                FROM replay_issues
+                WHERE {where}
+                ORDER BY updated_at DESC, public_id
+                """,
+                params,
+            ).fetchall()
+
+    def resolve_replay_issue(self, issue_id: str) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE replay_issues
+                SET status = 'resolved', resolved_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, issue_id),
+            )
+            return int(cur.rowcount) > 0
 
     def upsert_session(self, s: SessionMeta) -> None:
         if s.started_at.tzinfo is None:
