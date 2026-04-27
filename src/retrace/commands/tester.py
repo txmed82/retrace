@@ -71,6 +71,13 @@ def _tester_defaults(config_path: Path) -> dict[str, Any]:
 @click.option("--auth-password-env", default="RETRACE_TESTER_AUTH_PASSWORD")
 @click.option("--auth-jwt-env", default="RETRACE_TESTER_AUTH_JWT")
 @click.option("--auth-headers-env", default="RETRACE_TESTER_AUTH_HEADERS")
+@click.option(
+    "--engine",
+    "execution_engine",
+    type=click.Choice(["harness", "native", "auto"], case_sensitive=False),
+    default="harness",
+    show_default=True,
+)
 def tester_create(
     config_path: Path,
     name: str,
@@ -86,6 +93,7 @@ def tester_create(
     auth_password_env: str,
     auth_jwt_env: str,
     auth_headers_env: str,
+    execution_engine: str,
 ) -> None:
     cfg = load_config(config_path)
     defaults = _tester_defaults(config_path)
@@ -113,6 +121,7 @@ def tester_create(
         auth_password_env=auth_password_env,
         auth_jwt_env=auth_jwt_env,
         auth_headers_env=auth_headers_env,
+        execution_engine=execution_engine.lower(),
     )
     click.echo(f"Created tester spec: {spec.spec_id}")
 
@@ -166,6 +175,7 @@ def tester_create_suite(
         auth_password_env="RETRACE_TESTER_AUTH_PASSWORD",
         auth_jwt_env="RETRACE_TESTER_AUTH_JWT",
         auth_headers_env="RETRACE_TESTER_AUTH_HEADERS",
+        execution_engine="harness",
     )
 
 
@@ -229,6 +239,12 @@ def tester_show(config_path: Path, spec_id: str) -> None:
 )
 @click.option("--auth-login-url", default=None)
 @click.option("--auth-username", default=None)
+@click.option(
+    "--engine",
+    "execution_engine",
+    default=None,
+    type=click.Choice(["harness", "native", "auto"], case_sensitive=False),
+)
 def tester_update(
     config_path: Path,
     spec_id: str,
@@ -242,6 +258,7 @@ def tester_update(
     auth_mode: Optional[str],
     auth_login_url: Optional[str],
     auth_username: Optional[str],
+    execution_engine: Optional[str],
 ) -> None:
     from retrace.tester import now_iso
 
@@ -268,6 +285,8 @@ def tester_update(
         spec.auth_login_url = auth_login_url
     if auth_username is not None:
         spec.auth_username = auth_username
+    if execution_engine is not None:
+        spec.execution_engine = execution_engine.lower()
     spec.updated_at = now_iso()
     validate_spec(spec)
     save_spec(specs_dir, spec)
@@ -327,6 +346,9 @@ def tester_run(
                 "flaky": result.flaky,
                 "flake_reason": result.flake_reason,
                 "error": result.error,
+                "execution_engine": result.execution_engine,
+                "artifacts": result.artifacts,
+                "assertion_results": result.assertion_results,
             },
             indent=2,
         )

@@ -379,6 +379,12 @@ class ReplayIssueUpsertResult:
     inserted: bool
 
 
+@dataclass
+class ProcessingJobUpdateResult:
+    job_id: str
+    updated: bool
+
+
 class Storage:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -971,6 +977,8 @@ class Storage:
         *,
         kind: Optional[str] = None,
         status: Optional[str] = None,
+        project_id: Optional[str] = None,
+        limit: int = 100,
     ) -> list[sqlite3.Row]:
         where: list[str] = []
         params: list[str] = []
@@ -980,12 +988,55 @@ class Storage:
         if status is not None:
             where.append("status = ?")
             params.append(status)
+        if project_id is not None:
+            where.append("project_id = ?")
+            params.append(project_id)
         query = "SELECT * FROM processing_jobs"
         if where:
             query += " WHERE " + " AND ".join(where)
-        query += " ORDER BY created_at, id"
+        query += " ORDER BY created_at, id LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
         with self._conn() as conn:
             return conn.execute(query, params).fetchall()
+
+    def claim_processing_job(self, job_id: str) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE processing_jobs
+                SET status = 'running',
+                    attempts = attempts + 1,
+                    updated_at = ?
+                WHERE id = ? AND status IN ('queued', 'failed')
+                """,
+                (now, job_id),
+            )
+            return int(cur.rowcount) > 0
+
+    def finish_processing_job(
+        self,
+        *,
+        job_id: str,
+        status: str,
+        error: str = "",
+    ) -> ProcessingJobUpdateResult:
+        if status not in {"queued", "running", "succeeded", "failed"}:
+            raise ValueError("invalid processing job status")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE processing_jobs
+                SET status = ?, last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, error, now, job_id),
+            )
+            return ProcessingJobUpdateResult(
+                job_id=job_id,
+                updated=int(cur.rowcount) > 0,
+            )
 
     def get_replay_session(
         self,
@@ -1045,6 +1096,18 @@ class Storage:
                 LIMIT ?
                 """,
                 params,
+            ).fetchall()
+
+    def list_recent_replay_sessions(self, *, limit: int = 100) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM replay_sessions
+                ORDER BY last_seen_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 500)),),
             ).fetchall()
 
     def list_replay_batches(
@@ -1302,6 +1365,18 @@ class Storage:
                 ORDER BY updated_at DESC, public_id
                 """,
                 params,
+            ).fetchall()
+
+    def list_recent_replay_issues(self, *, limit: int = 100) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM replay_issues
+                ORDER BY updated_at DESC, public_id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 500)),),
             ).fetchall()
 
     def resolve_replay_issue(self, issue_id: str) -> bool:

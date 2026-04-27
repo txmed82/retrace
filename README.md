@@ -60,6 +60,8 @@ From the UI you can:
 - Copy suggested terminal commands when `gh` is missing/not authed
 - Browse findings from latest report
 - Replay stored rrweb events
+- Inspect first-party replay sessions and replay-backed issues
+- Process queued first-party replay batches into signals and issues
 - Inspect likely culprit files and copy Codex/Claude prompts
 
 ## Fix Suggestions Workflow
@@ -121,6 +123,15 @@ Run a saved spec:
 retrace tester run <spec_id> --retries 1
 ```
 
+Use the native HTTP runner for deterministic smoke specs without Browser Harness:
+
+```bash
+retrace tester create \
+  --name "Homepage smoke" \
+  --engine native \
+  --app-url http://127.0.0.1:3000
+```
+
 List specs and runs:
 
 ```bash
@@ -141,6 +152,46 @@ UI support:
   - `AI Explore Full Suite` mode (systematic suite draft)
 - Onboarding includes tester auth setup (none/form/JWT/custom headers), and secret fields keep existing values when left blank.
 - Tester runs are flake-aware (retry count + flake classification shown in recent runs).
+- Native tester runs write structured assertion and artifact metadata under the run directory.
+
+## First-Party Replay API
+
+Retrace can ingest browser SDK replays directly and process them into replay-backed issues.
+
+Create an SDK key:
+
+```bash
+retrace api create-sdk-key --project Web --environment production
+```
+
+Run the ingest/read API:
+
+```bash
+retrace api serve
+```
+
+Browser SDK ingest endpoint:
+
+- `POST /api/sdk/replay`
+
+Replay dashboard/read endpoints require a service token:
+
+```bash
+retrace api create-service-token --project Web --scope replay:read --scope issues:read --scope replay:write
+```
+
+Available read/process endpoints:
+
+- `GET /api/replays?environment_id=...`
+- `GET /api/replays/{replay_id}?environment_id=...`
+- `GET /api/issues?environment_id=...`
+- `POST /api/replays/process`
+
+Process queued final replay batches locally:
+
+```bash
+retrace api process-replays --limit 25
+```
 
 ## MCP Server (Single Server, Multiple Tools)
 
