@@ -4,11 +4,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+from retrace.detectors.base import Signal
 from retrace.replay_core import (
     ReplaySignalConfig,
     process_queued_replay_jobs,
     process_replay_sessions,
+    summarize_replay_issue,
 )
+from retrace.sinks.base import Cluster
 from retrace.storage import Storage
 
 
@@ -208,6 +211,45 @@ def test_replay_core_uses_deterministic_fallback_when_llm_fails(tmp_path: Path) 
         "Open https://app.example/cart",
         "Click element id 7",
     ]
+
+
+def test_replay_summary_severity_uses_all_cluster_signals() -> None:
+    cluster = Cluster(
+        fingerprint="mixed",
+        session_ids=["low", "high"],
+        signal_summary={"dead_click": 1, "network_5xx": 1},
+        primary_url="https://example.com",
+        first_seen_ms=10,
+        last_seen_ms=20,
+    )
+    finding = summarize_replay_issue(
+        cluster=cluster,
+        events_by_session={
+            "low": [_navigation("https://example.com")],
+            "high": [_navigation("https://example.com/api")],
+        },
+        signals_by_session={
+            "low": [
+                Signal(
+                    session_id="low",
+                    detector="dead_click",
+                    timestamp_ms=10,
+                    url="https://example.com",
+                )
+            ],
+            "high": [
+                Signal(
+                    session_id="high",
+                    detector="network_5xx",
+                    timestamp_ms=20,
+                    url="https://example.com/api",
+                    details={"request_url": "/api/save", "status": 500},
+                )
+            ],
+        },
+    )
+
+    assert finding.severity == "high"
 
 
 def test_replay_core_processes_queued_finalize_jobs(tmp_path: Path) -> None:

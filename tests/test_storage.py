@@ -51,6 +51,30 @@ def test_storage_start_and_finish_run(tmp_path: Path):
     assert row.finished_at is not None
 
 
+def test_finish_processing_job_only_updates_running_jobs(tmp_path: Path):
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    job_id = store.enqueue_processing_job(
+        project_id="proj_1",
+        environment_id="env_1",
+        kind="replay.finalize",
+        subject_id="rs_1",
+        payload={"session_id": "sess_1"},
+    )
+
+    not_running = store.finish_processing_job(job_id=job_id, status="succeeded")
+    assert not_running.updated is False
+    assert store.claim_processing_job(job_id) is True
+
+    succeeded = store.finish_processing_job(job_id=job_id, status="succeeded")
+    assert succeeded.updated is True
+
+    stale = store.finish_processing_job(job_id=job_id, status="failed")
+    assert stale.updated is False
+    jobs = store.list_processing_jobs(kind="replay.finalize", status="succeeded")
+    assert len(jobs) == 1
+
+
 def test_init_schema_migrates_replay_session_public_ids(tmp_path: Path):
     db = tmp_path / "retrace.db"
     conn = sqlite3.connect(db)

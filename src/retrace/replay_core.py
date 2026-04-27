@@ -104,7 +104,11 @@ def summarize_replay_issue(
     signals_by_session: dict[str, list[Signal]],
 ) -> Finding:
     session_id = cluster.session_ids[0]
-    signals = signals_by_session.get(session_id, [])
+    signals = [
+        signal
+        for sid in cluster.session_ids
+        for signal in signals_by_session.get(sid, [])
+    ]
     first_signal = signals[0] if signals else None
     signal_text = _signal_sentence(first_signal) if first_signal else "Replay signal detected"
     detector_names = sorted(cluster.signal_summary)

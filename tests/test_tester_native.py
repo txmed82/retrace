@@ -3,6 +3,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+
 from retrace.tester import (
     create_spec,
     load_spec,
@@ -100,6 +102,7 @@ def test_native_runner_writes_run_json_and_artifacts(tmp_path: Path) -> None:
         result = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
     finally:
         server.shutdown()
+        server.server_close()
 
     run_dir = Path(result.run_dir)
     run_json = json.loads((run_dir / "run.json").read_text())
@@ -111,3 +114,74 @@ def test_native_runner_writes_run_json_and_artifacts(tmp_path: Path) -> None:
     assert any(item["artifact_type"] == "assertion_results" for item in result.artifacts)
     assert (run_dir / "artifacts" / "native-summary.json").exists()
     assert (run_dir / "artifacts" / "assertions.json").exists()
+
+
+def test_native_auth_required_specs_fail_fast(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="native execution"):
+        create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Native auth",
+            prompt="",
+            app_url="http://127.0.0.1:3000",
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            auth_required=True,
+            auth_mode="jwt",
+            exact_steps=[{"id": "home", "action": "get", "path": "/"}],
+        )
+
+
+def test_harness_retry_terminates_timed_out_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    procs: list[object] = []
+
+    class FakeProc:
+        def __init__(self, should_timeout: bool) -> None:
+            self.should_timeout = should_timeout
+            self.stopped = False
+            self.terminated = False
+            self.killed = False
+
+        def wait(self, timeout: int | None = None) -> int:
+            if self.should_timeout and not self.stopped:
+                raise TimeoutError("hung")
+            return 0
+
+        def poll(self) -> int | None:
+            return 0 if self.stopped or not self.should_timeout else None
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.stopped = True
+
+        def kill(self) -> None:
+            self.killed = True
+            self.stopped = True
+
+    def fake_run_shell(*args: object, **kwargs: object) -> FakeProc:
+        proc = FakeProc(should_timeout=not procs)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr("retrace.tester._run_shell", fake_run_shell)
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Retry cleanup",
+        prompt="Open the app",
+        app_url="http://127.0.0.1:3000",
+        start_command="",
+        harness_command="echo {app_url_q} {prompt_q} {run_dir_q}",
+    )
+
+    result = run_spec(
+        spec=spec,
+        runs_dir=runs_dir_for_data_dir(tmp_path),
+        max_retries=1,
+    )
+
+    assert result.ok is True
+    assert len(procs) == 2
+    assert getattr(procs[0], "terminated") is True
+    assert getattr(procs[0], "killed") is False

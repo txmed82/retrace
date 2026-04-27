@@ -1021,7 +1021,7 @@ class Storage:
         status: str,
         error: str = "",
     ) -> ProcessingJobUpdateResult:
-        if status not in {"queued", "running", "succeeded", "failed"}:
+        if status not in {"succeeded", "failed"}:
             raise ValueError("invalid processing job status")
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
@@ -1029,7 +1029,7 @@ class Storage:
                 """
                 UPDATE processing_jobs
                 SET status = ?, last_error = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'running'
                 """,
                 (status, error, now, job_id),
             )

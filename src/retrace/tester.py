@@ -214,6 +214,11 @@ def validate_spec(spec: TesterSpec) -> None:
     needs_harness_command = spec.execution_engine == "harness" or (
         spec.execution_engine == "auto" and not (spec.exact_steps or spec.assertions)
     )
+    native_selected = spec.execution_engine == "native" or (
+        spec.execution_engine == "auto" and bool(spec.exact_steps or spec.assertions)
+    )
+    if native_selected and spec.auth_required:
+        raise ValueError("native execution does not yet support auth_required specs")
     if needs_harness_command:
         if not spec.harness_command.strip():
             raise ValueError("harness_command is required")
@@ -775,6 +780,14 @@ def run_spec(
                 except Exception as exc:
                     last_error = str(exc)
                     last_exit = 1
+                    if harness_proc and harness_proc.poll() is None:
+                        harness_proc.terminate()
+                        try:
+                            harness_proc.wait(timeout=5)
+                        except Exception:
+                            harness_proc.kill()
+                            harness_proc.wait(timeout=5)
+                    harness_proc = None
                     if attempt >= int(max_retries):
                         break
                     continue

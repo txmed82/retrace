@@ -1042,11 +1042,10 @@ _INDEX_HTML = """<!doctype html>
         status.textContent = data.error || 'Processing failed';
         return;
       }
-      status.textContent = `Processed ${data.result.jobs_processed} job(s), updated ${data.result.issues_created_or_updated} issue(s).`;
-      await loadReplayDashboard();
+      await loadReplayDashboard(`Processed ${data.result.jobs_processed} job(s), updated ${data.result.issues_created_or_updated} issue(s).`);
     }
 
-    async function loadReplayDashboard(){
+    async function loadReplayDashboard(processStatus = ''){
       const res = await fetch('/api/replay-dashboard');
       const data = await res.json();
       const issues = data.issues || [];
@@ -1062,7 +1061,7 @@ _INDEX_HTML = """<!doctype html>
         </li>`).join('');
       byId('replayDashboard').innerHTML = `
         <h3>Replay Dashboard</h3>
-        <div><button class="btn" id="processReplayJobsBtn" type="button">Process Queued Replays</button> <span class="empty" id="replayProcessStatus"></span></div>
+        <div><button class="btn" id="processReplayJobsBtn" type="button">Process Queued Replays</button> <span class="empty" id="replayProcessStatus">${esc(processStatus)}</span></div>
         <div class="grid" style="margin-top:10px">
           <div><div class="lbl">Replay-backed Issues</div>${issueRows ? `<ul>${issueRows}</ul>` : '<div class="empty">No replay issues yet.</div>'}</div>
           <div><div class="lbl">Recent Sessions</div>${sessionRows ? `<ul>${sessionRows}</ul>` : '<div class="empty">No first-party replay sessions yet.</div>'}</div>
