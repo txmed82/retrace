@@ -115,7 +115,7 @@ def test_replay_processing_detects_configured_signals_and_creates_issue(
     )
     assert len(issues) == 1
     assert issues[0]["public_id"] == results[0].public_id
-    assert issues[0]["status"] == "open"
+    assert issues[0]["status"] == "new"
     assert issues[0]["affected_count"] == 1
     assert "TypeError" in issues[0]["title"]
     assert json.loads(issues[0]["reproduction_steps_json"])[0].startswith("Open ")

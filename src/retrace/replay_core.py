@@ -4,14 +4,15 @@ import logging
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from retrace.clusterer import cluster_sessions
-from retrace.detectors import Detector, Signal, all_detectors
-from retrace.llm.analyst import analyze_cluster
+from retrace.detectors import Signal, all_detectors
+from retrace.llm.analyst import PROMPT_VERSION, analyze_cluster
 from retrace.llm.client import LLMClient
 from retrace.sinks.base import Cluster, Finding
-from retrace.storage import ReplayIssueUpsertResult, Storage
+from retrace.storage import ReplayIssueUpsertResult, SignalDefinitionRow, Storage
 
 
 log = logging.getLogger(__name__)
@@ -47,11 +48,73 @@ class ReplayJobProcessingResult:
     issues_created_or_updated: int
 
 
-def _configured_detectors(config: ReplaySignalConfig) -> list[Detector]:
+@dataclass(frozen=True)
+class ReplayIssueAnalysis:
+    finding: Finding
+    status: str
+    model: str
+    prompt_version: str
+    created_at: str
+    error: str
+    evidence: dict[str, Any]
+
+
+def _definition_map(
+    *,
+    store: Storage,
+    project_id: str,
+    environment_id: str,
+    config: ReplaySignalConfig,
+) -> dict[str, SignalDefinitionRow]:
     detectors = all_detectors()
-    if config.enabled_detectors is None:
-        return detectors
-    return [d for d in detectors if d.name in config.enabled_detectors]
+    if config.enabled_detectors is not None:
+        names = sorted(config.enabled_detectors)
+        return {
+            name: SignalDefinitionRow(
+                id="",
+                project_id=project_id,
+                environment_id=environment_id,
+                detector=name,
+                enabled=True,
+                run_mode="manual",
+                thresholds={},
+                prompt={},
+                custom_definition="",
+                match_count=0,
+                last_match_at=None,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            for name in names
+        }
+    store.ensure_signal_definitions(
+        project_id=project_id,
+        environment_id=environment_id,
+        detector_names=[detector.name for detector in detectors],
+    )
+    return {
+        definition.detector: definition
+        for definition in store.list_signal_definitions(
+            project_id=project_id,
+            environment_id=environment_id,
+            enabled=True,
+        )
+    }
+
+
+def _filter_signals_by_definition(
+    signals: list[Signal], definition: SignalDefinitionRow | None
+) -> list[Signal]:
+    if definition is None:
+        return signals
+    thresholds = definition.thresholds or {}
+    try:
+        min_matches = int(thresholds.get("min_matches") or 1)
+    except (TypeError, ValueError):
+        min_matches = 1
+    if min_matches > 1 and len(signals) < min_matches:
+        return []
+    return signals
 
 
 def _signal_sentence(signal: Signal) -> str:
@@ -95,6 +158,53 @@ def _action_steps(events: list[dict[str, Any]], limit: int = 6) -> list[str]:
         if len(steps) >= limit:
             break
     return steps or ["Open the replay and follow the recorded user path"]
+
+
+def _signal_evidence(signal: Signal) -> dict[str, Any]:
+    return {
+        "detector": signal.detector,
+        "timestamp_ms": signal.timestamp_ms,
+        "url": signal.url,
+        "details": signal.details,
+    }
+
+
+def _event_evidence(event: dict[str, Any]) -> dict[str, Any]:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    out: dict[str, Any] = {
+        "type": event.get("type"),
+        "timestamp_ms": int(event.get("timestamp") or 0),
+    }
+    if isinstance(data, dict):
+        for key in ("href", "source", "type", "id", "plugin", "payload"):
+            if key in data:
+                out["data_type" if key == "type" else key] = data[key]
+    return out
+
+
+def build_replay_evidence(
+    *,
+    cluster: Cluster,
+    events_by_session: dict[str, list[dict[str, Any]]],
+    signals_by_session: dict[str, list[Signal]],
+) -> dict[str, Any]:
+    representative_session_id = cluster.session_ids[0]
+    all_signals = [
+        signal
+        for session_id in cluster.session_ids
+        for signal in signals_by_session.get(session_id, [])
+    ]
+    return {
+        "representative_session_id": representative_session_id,
+        "session_ids": cluster.session_ids,
+        "affected_count": cluster.affected_count,
+        "signal_summary": cluster.signal_summary,
+        "signals": [_signal_evidence(signal) for signal in all_signals[:20]],
+        "events": [
+            _event_evidence(event)
+            for event in events_by_session.get(representative_session_id, [])[:40]
+        ],
+    }
 
 
 def summarize_replay_issue(
@@ -150,6 +260,12 @@ class ReplayCoreService:
         self.environment_id = environment_id
         self.config = config or ReplaySignalConfig()
         self.llm_client = llm_client
+        self.signal_definitions = _definition_map(
+            store=store,
+            project_id=project_id,
+            environment_id=environment_id,
+            config=self.config,
+        )
 
     def detect_session_signals(
         self,
@@ -158,9 +274,13 @@ class ReplayCoreService:
         events: list[dict[str, Any]],
     ) -> list[Signal]:
         signals: list[Signal] = []
-        for detector in _configured_detectors(self.config):
+        for detector in all_detectors():
+            definition = self.signal_definitions.get(detector.name)
+            if definition is None:
+                continue
             try:
-                signals.extend(detector.detect(session_id, events))
+                detected = detector.detect(session_id, events)
+                signals.extend(_filter_signals_by_definition(detected, definition))
             except Exception as exc:
                 log.warning("detector %s failed on replay %s: %s", detector.name, session_id, exc)
         return signals
@@ -189,6 +309,14 @@ class ReplayCoreService:
                     environment_id=self.environment_id,
                     signals=signals,
                 )
+                counts: dict[str, int] = {}
+                for signal in signals:
+                    counts[signal.detector] = counts.get(signal.detector, 0) + 1
+                self.store.record_signal_definition_matches(
+                    project_id=self.project_id,
+                    environment_id=self.environment_id,
+                    detector_counts=counts,
+                )
 
         clusters = cluster_sessions(
             signals_by_session,
@@ -196,11 +324,12 @@ class ReplayCoreService:
         )
         issues: list[ReplayIssueUpsertResult] = []
         for cluster in clusters:
-            finding = self._analyze_or_fallback(
+            analysis = self._analyze_or_fallback(
                 cluster=cluster,
                 events_by_session=events_by_session,
                 signals_by_session=signals_by_session,
             )
+            finding = analysis.finding
             issues.append(
                 self.store.upsert_replay_issue(
                     project_id=self.project_id,
@@ -217,6 +346,12 @@ class ReplayCoreService:
                     severity=finding.severity,
                     priority=finding.severity,
                     confidence=finding.confidence,
+                    analysis_status=analysis.status,
+                    analysis_model=analysis.model,
+                    analysis_prompt_version=analysis.prompt_version,
+                    analysis_created_at=analysis.created_at,
+                    analysis_error=analysis.error,
+                    evidence=analysis.evidence,
                 )
             )
 
@@ -234,22 +369,61 @@ class ReplayCoreService:
         cluster: Cluster,
         events_by_session: dict[str, list[dict[str, Any]]],
         signals_by_session: dict[str, list[Signal]],
-    ) -> Finding:
+    ) -> ReplayIssueAnalysis:
+        evidence = build_replay_evidence(
+            cluster=cluster,
+            events_by_session=events_by_session,
+            signals_by_session=signals_by_session,
+        )
+        created_at = datetime.now(timezone.utc).isoformat()
         if self.llm_client is not None:
             try:
-                return analyze_cluster(
+                finding = analyze_cluster(
                     llm_client=self.llm_client,
                     cluster=cluster,
                     events_by_session=events_by_session,
                     signals_by_session=signals_by_session,
                     session_url_builder=lambda sid: f"retrace://replay/{sid}",
                 )
+                model = str(getattr(getattr(self.llm_client, "cfg", None), "model", ""))
+                return ReplayIssueAnalysis(
+                    finding=finding,
+                    status="ai",
+                    model=model,
+                    prompt_version=PROMPT_VERSION,
+                    created_at=created_at,
+                    error="",
+                    evidence=evidence,
+                )
             except Exception as exc:
                 log.warning("LLM replay analysis failed for %s: %s", cluster.fingerprint, exc)
-        return summarize_replay_issue(
+                finding = summarize_replay_issue(
+                    cluster=cluster,
+                    events_by_session=events_by_session,
+                    signals_by_session=signals_by_session,
+                )
+                return ReplayIssueAnalysis(
+                    finding=finding,
+                    status="fallback",
+                    model="",
+                    prompt_version=PROMPT_VERSION,
+                    created_at=created_at,
+                    error=str(exc),
+                    evidence=evidence,
+                )
+        finding = summarize_replay_issue(
             cluster=cluster,
             events_by_session=events_by_session,
             signals_by_session=signals_by_session,
+        )
+        return ReplayIssueAnalysis(
+            finding=finding,
+            status="fallback",
+            model="",
+            prompt_version=PROMPT_VERSION,
+            created_at=created_at,
+            error="llm_unavailable",
+            evidence=evidence,
         )
 
 

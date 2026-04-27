@@ -54,6 +54,24 @@ class FailingLLM:
         raise RuntimeError("offline")
 
 
+class SuccessfulLLM:
+    class Cfg:
+        model = "qa-model"
+
+    cfg = Cfg()
+
+    def chat_json(self, *, system: str, user: str) -> dict[str, Any]:
+        return {
+            "title": "Checkout total crashes",
+            "severity": "high",
+            "category": "functional_error",
+            "what_happened": "The checkout page crashes after the user clicks pay.",
+            "likely_cause": "The total value is missing before render.",
+            "reproduction_steps": ["Open checkout", "Click pay"],
+            "confidence": "high",
+        }
+
+
 def test_replay_core_aggregates_playback_batches_before_detection(tmp_path: Path) -> None:
     store, workspace = _workspace(tmp_path)
     store.insert_replay_batch(
@@ -129,9 +147,125 @@ def test_replay_core_persists_only_configured_signal_matches(tmp_path: Path) -> 
     ) == []
 
 
+def test_replay_core_uses_persisted_signal_definitions_by_default(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    for detector in [
+        "dead_click",
+        "blank_render",
+        "network_4xx",
+        "network_5xx",
+        "error_toast",
+        "session_abandon_on_error",
+    ]:
+        store.upsert_signal_definition(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            detector=detector,
+            enabled=False,
+        )
+    store.upsert_signal_definition(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        detector="console_error",
+        enabled=False,
+    )
+    store.upsert_signal_definition(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        detector="rage_click",
+        enabled=True,
+        thresholds={"min_matches": 1},
+        prompt={"instruction": "Flag repeated rage clicks only."},
+        custom_definition="Repeated clicks on the same target.",
+    )
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-defs",
+        sequence=0,
+        events=[
+            _navigation("https://app.example/cart"),
+            _console_error("boom"),
+            _click(1, ts=100),
+            _click(1, ts=200),
+            _click(1, ts=300),
+        ],
+        flush_type="normal",
+    )
+
+    result = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-defs"],
+    )
+
+    assert result.signals_detected == 1
+    signals = store.list_replay_signals(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-defs",
+    )
+    assert [row["detector"] for row in signals] == ["rage_click"]
+    definitions = {
+        definition.detector: definition
+        for definition in store.list_signal_definitions(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+        )
+    }
+    assert definitions["console_error"].enabled is False
+    assert definitions["rage_click"].thresholds == {"min_matches": 1}
+    assert definitions["rage_click"].prompt == {
+        "instruction": "Flag repeated rage clicks only."
+    }
+    assert definitions["rage_click"].custom_definition == "Repeated clicks on the same target."
+    assert definitions["rage_click"].match_count == 1
+    assert definitions["rage_click"].last_match_at is not None
+
+
+def test_replay_signal_definition_min_matches_filters_low_volume_matches(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.upsert_signal_definition(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        detector="console_error",
+        enabled=True,
+        thresholds={"min_matches": 2},
+    )
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-threshold",
+        sequence=0,
+        events=[_navigation("https://app.example/cart"), _console_error("boom")],
+        flush_type="normal",
+    )
+
+    result = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-threshold"],
+    )
+
+    assert result.signals_detected == 0
+    definitions = store.list_signal_definitions(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+    assert {definition.detector: definition.match_count for definition in definitions}[
+        "console_error"
+    ] == 0
+
+
 def test_replay_core_clusters_sessions_and_regresses_resolved_issue(tmp_path: Path) -> None:
     store, workspace = _workspace(tmp_path)
-    for session_id in ["sess-a", "sess-b"]:
+    for session_id, distinct_id in [("sess-a", "user-a"), ("sess-b", "user-b")]:
         store.insert_replay_batch(
             project_id=workspace.project_id,
             environment_id=workspace.environment_id,
@@ -142,6 +276,7 @@ def test_replay_core_clusters_sessions_and_regresses_resolved_issue(tmp_path: Pa
                 _console_error("TypeError: total is undefined"),
             ],
             flush_type="final",
+            distinct_id=distinct_id,
         )
 
     first = process_replay_sessions(
@@ -153,6 +288,13 @@ def test_replay_core_clusters_sessions_and_regresses_resolved_issue(tmp_path: Pa
     )
     assert len(first.issues) == 1
     assert first.issues[0].inserted is True
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    assert issue["status"] == "new"
+    assert issue["representative_session_id"] == "sess-a"
+    assert issue["affected_users"] == 1
     assert store.resolve_replay_issue(first.issues[0].issue_id) is True
 
     second = process_replay_sessions(
@@ -172,7 +314,154 @@ def test_replay_core_clusters_sessions_and_regresses_resolved_issue(tmp_path: Pa
     assert issue["id"] == first.issues[0].issue_id
     assert issue["status"] == "regressed"
     assert issue["affected_count"] == 2
+    assert issue["affected_users"] == 2
+    assert issue["representative_session_id"] == "sess-a"
     assert json.loads(issue["signal_summary_json"]) == {"console_error": 2}
+    sessions = store.list_replay_issue_sessions(first.issues[0].issue_id)
+    assert [(row["session_id"], row["role"]) for row in sessions] == [
+        ("sess-a", "representative"),
+        ("sess-b", "supporting"),
+    ]
+
+
+def test_replay_issue_lifecycle_tracks_ongoing_unresolved_and_ticket_created(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    for session_id in ["sess-a", "sess-b", "sess-c"]:
+        store.insert_replay_batch(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            session_id=session_id,
+            sequence=0,
+            events=[
+                _navigation("https://app.example/checkout"),
+                _console_error("Error: checkout failed"),
+            ],
+            flush_type="final",
+            distinct_id="same-user",
+        )
+
+    first = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-a"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    issue_id = first.issues[0].issue_id
+
+    second = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-a", "sess-b"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    assert second.issues[0].inserted is False
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    assert issue["status"] == "ongoing"
+    assert issue["affected_count"] == 2
+    assert issue["affected_users"] == 1
+
+    assert store.resolve_replay_issue(issue_id) is True
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    assert issue["status"] == "resolved"
+    assert issue["resolved_at"]
+    assert store.mark_replay_issue_unresolved(issue_id) is True
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    assert issue["status"] == "unresolved"
+    assert issue["resolved_at"] is None
+    process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-a", "sess-b", "sess-c"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    assert issue["status"] == "ongoing"
+
+    assert (
+        store.mark_replay_issue_ticket_created(
+            issue_id,
+            external_ticket_id="RET-999",
+            external_ticket_url="https://linear.app/cerebral-labs/issue/RET-999",
+        )
+        is True
+    )
+    process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-a", "sess-b", "sess-c"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    assert issue["status"] == "ticket_created"
+    assert issue["external_ticket_state"] == "created"
+    assert issue["external_ticket_id"] == "RET-999"
+    assert issue["external_ticket_url"].endswith("/RET-999")
+
+
+def test_replay_core_persists_ai_analysis_metadata_and_evidence(tmp_path: Path) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-ai",
+        sequence=0,
+        events=[
+            _navigation("https://app.example/checkout"),
+            _click(9),
+            _console_error("TypeError: total is undefined"),
+        ],
+        flush_type="final",
+    )
+
+    result = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-ai"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+        llm_client=SuccessfulLLM(),  # type: ignore[arg-type]
+    )
+
+    assert len(result.issues) == 1
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    assert issue["title"] == "Checkout total crashes"
+    assert issue["analysis_status"] == "ai"
+    assert issue["analysis_model"] == "qa-model"
+    assert issue["analysis_prompt_version"] == "replay-analysis-v1"
+    assert issue["analysis_created_at"]
+    assert issue["analysis_error"] == ""
+    evidence = json.loads(issue["evidence_json"])
+    assert evidence["representative_session_id"] == "sess-ai"
+    assert evidence["signal_summary"] == {"console_error": 1}
+    assert evidence["signals"][0]["details"]["message"] == "TypeError: total is undefined"
+    assert evidence["events"][0]["href"] == "https://app.example/checkout"
+    click_evidence = evidence["events"][1]
+    assert click_evidence["type"] == 3
+    assert click_evidence["data_type"] == 2
 
 
 def test_replay_core_uses_deterministic_fallback_when_llm_fails(tmp_path: Path) -> None:
@@ -205,6 +494,9 @@ def test_replay_core_uses_deterministic_fallback_when_llm_fails(tmp_path: Path) 
         environment_id=workspace.environment_id,
     )[0]
     assert issue["title"] == "ReferenceError: cart is not defined on replay"
+    assert issue["analysis_status"] == "fallback"
+    assert issue["analysis_prompt_version"] == "replay-analysis-v1"
+    assert issue["analysis_error"] == "offline"
     assert "console_error across 1 replay session(s)" in issue["summary"]
     assert issue["likely_cause"].startswith("Generated from replay signals")
     assert json.loads(issue["reproduction_steps_json"]) == [

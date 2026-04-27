@@ -84,7 +84,12 @@ def _require_service_token(
 
 def _row_dict(row: Any, *, include_payload: bool = False) -> dict[str, Any]:
     out = {k: row[k] for k in row.keys()}
-    for key in ("metadata_json", "signal_summary_json", "reproduction_steps_json"):
+    for key in (
+        "metadata_json",
+        "preview_json",
+        "signal_summary_json",
+        "reproduction_steps_json",
+    ):
         if key in out:
             try:
                 out[key.removesuffix("_json")] = json.loads(out[key] or "{}")
