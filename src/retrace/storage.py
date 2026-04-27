@@ -7,7 +7,7 @@ import hashlib
 from uuid import uuid4
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 
 SCHEMA = """
@@ -168,6 +168,7 @@ CREATE TABLE IF NOT EXISTS replay_sessions (
     last_seen_at TEXT NOT NULL,
     event_count INTEGER NOT NULL DEFAULT 0,
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    preview_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -183,6 +184,8 @@ CREATE TABLE IF NOT EXISTS replay_batches (
     sequence INTEGER NOT NULL,
     flush_type TEXT NOT NULL DEFAULT 'normal',
     payload_json TEXT NOT NULL,
+    blob_backend TEXT NOT NULL DEFAULT '',
+    blob_key TEXT NOT NULL DEFAULT '',
     event_count INTEGER NOT NULL DEFAULT 0,
     received_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(project_id, environment_id, session_id, sequence)
@@ -202,13 +205,31 @@ CREATE TABLE IF NOT EXISTS replay_signals (
     UNIQUE(project_id, environment_id, session_id, detector, timestamp_ms, details_hash)
 );
 
+CREATE TABLE IF NOT EXISTS signal_definitions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    detector TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    run_mode TEXT NOT NULL DEFAULT 'replay_finalize',
+    thresholds_json TEXT NOT NULL DEFAULT '{}',
+    prompt_json TEXT NOT NULL DEFAULT '{}',
+    custom_definition TEXT NOT NULL DEFAULT '',
+    match_count INTEGER NOT NULL DEFAULT 0,
+    last_match_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, detector)
+);
+
 CREATE TABLE IF NOT EXISTS replay_issues (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
     environment_id TEXT NOT NULL,
     public_id TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'open',
+    fingerprint_version INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'new',
     priority TEXT NOT NULL DEFAULT 'medium',
     severity TEXT NOT NULL DEFAULT 'medium',
     title TEXT NOT NULL DEFAULT '',
@@ -216,8 +237,19 @@ CREATE TABLE IF NOT EXISTS replay_issues (
     likely_cause TEXT NOT NULL DEFAULT '',
     reproduction_steps_json TEXT NOT NULL DEFAULT '[]',
     confidence TEXT NOT NULL DEFAULT 'medium',
+    analysis_status TEXT NOT NULL DEFAULT '',
+    analysis_model TEXT NOT NULL DEFAULT '',
+    analysis_prompt_version TEXT NOT NULL DEFAULT '',
+    analysis_created_at TEXT,
+    analysis_error TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
     signal_summary_json TEXT NOT NULL DEFAULT '{}',
     affected_count INTEGER NOT NULL DEFAULT 0,
+    affected_users INTEGER NOT NULL DEFAULT 0,
+    representative_session_id TEXT NOT NULL DEFAULT '',
+    external_ticket_state TEXT NOT NULL DEFAULT '',
+    external_ticket_url TEXT NOT NULL DEFAULT '',
+    external_ticket_id TEXT NOT NULL DEFAULT '',
     first_seen_ms INTEGER NOT NULL DEFAULT 0,
     last_seen_ms INTEGER NOT NULL DEFAULT 0,
     resolved_at TEXT,
@@ -234,6 +266,7 @@ CREATE TABLE IF NOT EXISTS replay_issue_sessions (
     project_id TEXT NOT NULL,
     environment_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'supporting',
     first_seen_ms INTEGER NOT NULL DEFAULT 0,
     last_seen_ms INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -357,6 +390,23 @@ class ServiceTokenRow:
 
 
 @dataclass
+class SignalDefinitionRow:
+    id: str
+    project_id: str
+    environment_id: str
+    detector: str
+    enabled: bool
+    run_mode: str
+    thresholds: dict[str, Any]
+    prompt: dict[str, Any]
+    custom_definition: str
+    match_count: int
+    last_match_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
 class ReplayBatchResult:
     session_row_id: str
     batch_id: str
@@ -385,10 +435,84 @@ class ProcessingJobUpdateResult:
     updated: bool
 
 
+class ReplayBlobStore(Protocol):
+    backend: str
+
+    def write_events(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        session_id: str,
+        sequence: int,
+        events: list[dict[str, object]],
+    ) -> str:
+        ...
+
+    def read_events(self, key: str) -> list[dict[str, Any]]:
+        ...
+
+
+class LocalReplayBlobStore:
+    backend = "local_filesystem"
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _safe_part(value: object) -> str:
+        raw = str(value or "").strip()
+        safe = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in raw)
+        return safe or "default"
+
+    def write_events(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        session_id: str,
+        sequence: int,
+        events: list[dict[str, object]],
+    ) -> str:
+        key = "/".join(
+            [
+                self._safe_part(project_id),
+                self._safe_part(environment_id),
+                self._safe_part(session_id),
+                f"{int(sequence):012d}.json",
+            ]
+        )
+        path = (self.root / key).resolve()
+        root = self.root.resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("replay blob key escaped storage root") from exc
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(events, separators=(",", ":")) + "\n", encoding="utf-8")
+        return key
+
+    def read_events(self, key: str) -> list[dict[str, Any]]:
+        path = (self.root / key).resolve()
+        root = self.root.resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("replay blob key escaped storage root") from exc
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+
 class Storage:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, replay_blob_dir: Optional[Path] = None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.replay_blob_store: ReplayBlobStore | None = (
+            LocalReplayBlobStore(replay_blob_dir) if replay_blob_dir is not None else None
+        )
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -471,6 +595,58 @@ class Storage:
                 conn.execute(
                     "ALTER TABLE replay_sessions ADD COLUMN public_id TEXT NOT NULL DEFAULT ''"
                 )
+            if "preview_json" not in cols_replay_sessions:
+                conn.execute(
+                    "ALTER TABLE replay_sessions ADD COLUMN preview_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            cols_replay_batches = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(replay_batches)").fetchall()
+            ]
+            if "blob_backend" not in cols_replay_batches:
+                conn.execute(
+                    "ALTER TABLE replay_batches ADD COLUMN blob_backend TEXT NOT NULL DEFAULT ''"
+                )
+            if "blob_key" not in cols_replay_batches:
+                conn.execute(
+                    "ALTER TABLE replay_batches ADD COLUMN blob_key TEXT NOT NULL DEFAULT ''"
+                )
+            cols_replay_issues = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(replay_issues)").fetchall()
+            ]
+            replay_issue_columns = {
+                "fingerprint_version": "INTEGER NOT NULL DEFAULT 1",
+                "affected_users": "INTEGER NOT NULL DEFAULT 0",
+                "representative_session_id": "TEXT NOT NULL DEFAULT ''",
+                "external_ticket_state": "TEXT NOT NULL DEFAULT ''",
+                "external_ticket_url": "TEXT NOT NULL DEFAULT ''",
+                "external_ticket_id": "TEXT NOT NULL DEFAULT ''",
+                "analysis_status": "TEXT NOT NULL DEFAULT ''",
+                "analysis_model": "TEXT NOT NULL DEFAULT ''",
+                "analysis_prompt_version": "TEXT NOT NULL DEFAULT ''",
+                "analysis_created_at": "TEXT",
+                "analysis_error": "TEXT NOT NULL DEFAULT ''",
+                "evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+            }
+            for column, ddl in replay_issue_columns.items():
+                if column not in cols_replay_issues:
+                    conn.execute(f"ALTER TABLE replay_issues ADD COLUMN {column} {ddl}")
+            conn.execute(
+                """
+                UPDATE replay_issues
+                SET status = 'new'
+                WHERE status = 'open'
+                """
+            )
+            cols_replay_issue_sessions = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(replay_issue_sessions)").fetchall()
+            ]
+            if "role" not in cols_replay_issue_sessions:
+                conn.execute(
+                    "ALTER TABLE replay_issue_sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'supporting'"
+                )
             rows = conn.execute(
                 """
                 SELECT id, project_id, environment_id, stable_id
@@ -496,6 +672,18 @@ class Storage:
                 ON replay_sessions(project_id, environment_id, public_id)
                 """
             )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_replay_batches_blob
+                ON replay_batches(blob_backend, blob_key)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_signal_definitions_scope
+                ON signal_definitions(project_id, environment_id, enabled)
+                """
+            )
 
     @staticmethod
     def _id(prefix: str) -> str:
@@ -517,6 +705,51 @@ class Storage:
         cls, project_id: str, environment_id: str, fingerprint: str
     ) -> str:
         return cls._public_id("bug", project_id, environment_id, fingerprint)
+
+    @staticmethod
+    def _replay_preview(events: list[dict[str, object]]) -> dict[str, object]:
+        preview: dict[str, object] = {"event_count": len(events)}
+        timestamps = [
+            int(event["timestamp"])
+            for event in events
+            if isinstance(event.get("timestamp"), int)
+        ]
+        if timestamps:
+            preview["first_timestamp_ms"] = min(timestamps)
+            preview["last_timestamp_ms"] = max(timestamps)
+        for event in events:
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+            href = data.get("href")
+            if event.get("type") == 4 and isinstance(href, str) and href:
+                preview["url"] = href
+                break
+        return preview
+
+    @staticmethod
+    def _merge_replay_preview(
+        existing: dict[str, Any],
+        incoming: dict[str, object],
+        *,
+        event_count: int,
+    ) -> dict[str, object]:
+        merged: dict[str, object] = {**existing, "event_count": int(event_count)}
+        for key, reducer in (
+            ("first_timestamp_ms", min),
+            ("last_timestamp_ms", max),
+        ):
+            old = existing.get(key)
+            new = incoming.get(key)
+            if isinstance(old, int) and isinstance(new, int):
+                merged[key] = reducer(old, new)
+            elif isinstance(new, int):
+                merged[key] = new
+            elif isinstance(old, int):
+                merged[key] = old
+        if not merged.get("url") and incoming.get("url"):
+            merged["url"] = str(incoming["url"])
+        return merged
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -673,6 +906,160 @@ class Storage:
                 (project_id,),
             ).fetchall()
 
+    def ensure_signal_definitions(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        detector_names: list[str],
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            for detector in detector_names:
+                clean = str(detector).strip()
+                if not clean:
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO signal_definitions
+                    (id, project_id, environment_id, detector, enabled, run_mode,
+                     thresholds_json, prompt_json, custom_definition, updated_at)
+                    VALUES (?, ?, ?, ?, 1, 'replay_finalize', '{}', '{}', '', ?)
+                    """,
+                    (
+                        self._id("sigdef"),
+                        project_id,
+                        environment_id,
+                        clean,
+                        now,
+                    ),
+                )
+
+    def upsert_signal_definition(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        detector: str,
+        enabled: bool = True,
+        run_mode: str = "replay_finalize",
+        thresholds: Optional[dict[str, Any]] = None,
+        prompt: Optional[dict[str, Any]] = None,
+        custom_definition: str = "",
+    ) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        definition_id = self._id("sigdef")
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO signal_definitions
+                (id, project_id, environment_id, detector, enabled, run_mode,
+                 thresholds_json, prompt_json, custom_definition, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, environment_id, detector) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    run_mode = excluded.run_mode,
+                    thresholds_json = excluded.thresholds_json,
+                    prompt_json = excluded.prompt_json,
+                    custom_definition = excluded.custom_definition,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    definition_id,
+                    project_id,
+                    environment_id,
+                    str(detector).strip(),
+                    1 if enabled else 0,
+                    str(run_mode).strip() or "replay_finalize",
+                    json.dumps(thresholds or {}, sort_keys=True),
+                    json.dumps(prompt or {}, sort_keys=True),
+                    str(custom_definition or ""),
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT id FROM signal_definitions
+                WHERE project_id = ? AND environment_id = ? AND detector = ?
+                """,
+                (project_id, environment_id, str(detector).strip()),
+            ).fetchone()
+        assert row is not None
+        return str(row["id"])
+
+    def list_signal_definitions(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        enabled: Optional[bool] = None,
+    ) -> list[SignalDefinitionRow]:
+        params: list[object] = [project_id, environment_id]
+        where = "project_id = ? AND environment_id = ?"
+        if enabled is not None:
+            where += " AND enabled = ?"
+            params.append(1 if enabled else 0)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM signal_definitions
+                WHERE {where}
+                ORDER BY detector
+                """,
+                params,
+            ).fetchall()
+        return [self._signal_definition_from_row(row) for row in rows]
+
+    def record_signal_definition_matches(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        detector_counts: dict[str, int],
+    ) -> None:
+        if not detector_counts:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            for detector, count in detector_counts.items():
+                if count <= 0:
+                    continue
+                conn.execute(
+                    """
+                    UPDATE signal_definitions
+                    SET match_count = match_count + ?,
+                        last_match_at = ?,
+                        updated_at = ?
+                    WHERE project_id = ? AND environment_id = ? AND detector = ?
+                    """,
+                    (
+                        int(count),
+                        now,
+                        now,
+                        project_id,
+                        environment_id,
+                        detector,
+                    ),
+                )
+
+    def _signal_definition_from_row(self, row: sqlite3.Row) -> SignalDefinitionRow:
+        return SignalDefinitionRow(
+            id=str(row["id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            detector=str(row["detector"]),
+            enabled=bool(row["enabled"]),
+            run_mode=str(row["run_mode"]),
+            thresholds=self._safe_json_obj(row["thresholds_json"]),
+            prompt=self._safe_json_obj(row["prompt_json"]),
+            custom_definition=str(row["custom_definition"] or ""),
+            match_count=int(row["match_count"] or 0),
+            last_match_at=self._dt(row["last_match_at"]),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
     def get_sdk_key_by_hash(self, key_hash: str) -> Optional[SDKKeyRow]:
         with self._conn() as conn:
             r = conn.execute(
@@ -802,6 +1189,9 @@ class Storage:
         now = datetime.now(timezone.utc).isoformat()
         clean_flush = flush_type if flush_type in {"normal", "final"} else "normal"
         event_count = len(events)
+        preview = self._replay_preview(events)
+        blob_backend = ""
+        blob_key = ""
         payload_json = json.dumps(
             {
                 "sessionId": session_id,
@@ -821,8 +1211,8 @@ class Storage:
                 """
                 INSERT OR IGNORE INTO replay_sessions
                 (id, project_id, environment_id, stable_id, public_id, distinct_id, started_at,
-                 last_seen_at, event_count, metadata_json, status, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_seen_at, event_count, metadata_json, preview_json, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_row_id,
@@ -835,13 +1225,14 @@ class Storage:
                     now,
                     0,
                     json.dumps(metadata or {}),
+                    json.dumps(preview, sort_keys=True),
                     "completed" if clean_flush == "final" else "active",
                     now,
                 ),
             )
             row = conn.execute(
                 """
-                SELECT id, metadata_json FROM replay_sessions
+                SELECT id, metadata_json, preview_json, event_count FROM replay_sessions
                 WHERE project_id = ? AND environment_id = ? AND stable_id = ?
                 """,
                 (project_id, environment_id, session_id),
@@ -850,14 +1241,15 @@ class Storage:
             session_row_id = str(row["id"])
             existing_metadata = self._safe_json_obj(row["metadata_json"])
             merged_metadata = {**existing_metadata, **(metadata or {})}
+            existing_preview = self._safe_json_obj(row["preview_json"])
 
             batch_id = self._id("rb")
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO replay_batches
                 (id, session_row_id, project_id, environment_id, session_id, sequence,
-                 flush_type, payload_json, event_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 flush_type, payload_json, blob_backend, blob_key, event_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     batch_id,
@@ -868,6 +1260,8 @@ class Storage:
                     int(sequence),
                     clean_flush,
                     payload_json,
+                    "",
+                    "",
                     event_count,
                 ),
             )
@@ -884,6 +1278,28 @@ class Storage:
                 batch_id = str(existing["id"])
                 event_count = int(existing["event_count"])
             else:
+                if self.replay_blob_store is not None:
+                    blob_backend = self.replay_blob_store.backend
+                    blob_key = self.replay_blob_store.write_events(
+                        project_id=project_id,
+                        environment_id=environment_id,
+                        session_id=session_id,
+                        sequence=sequence,
+                        events=events,
+                    )
+                    conn.execute(
+                        """
+                        UPDATE replay_batches
+                        SET blob_backend = ?, blob_key = ?
+                        WHERE id = ?
+                        """,
+                        (blob_backend, blob_key, batch_id),
+                    )
+                merged_preview = self._merge_replay_preview(
+                    existing_preview,
+                    preview,
+                    event_count=int(row["event_count"] or 0) + event_count,
+                )
                 conn.execute(
                     """
                     UPDATE replay_sessions
@@ -891,6 +1307,7 @@ class Storage:
                         event_count = event_count + ?,
                         distinct_id = COALESCE(NULLIF(?, ''), distinct_id),
                         metadata_json = ?,
+                        preview_json = ?,
                         status = CASE WHEN ? = 'final' THEN 'completed' ELSE status END,
                         updated_at = ?
                     WHERE id = ?
@@ -900,6 +1317,7 @@ class Storage:
                         event_count,
                         distinct_id or "",
                         json.dumps(merged_metadata),
+                        json.dumps(merged_preview, sort_keys=True),
                         clean_flush,
                         now,
                         session_row_id,
@@ -1128,6 +1546,64 @@ class Storage:
                 (project_id, environment_id, session_id),
             ).fetchall()
 
+    def _events_for_replay_batch(self, batch: sqlite3.Row) -> list[dict[str, Any]]:
+        blob_key = ""
+        blob_backend = ""
+        try:
+            blob_key = str(batch["blob_key"] or "")
+            blob_backend = str(batch["blob_backend"] or "")
+        except (IndexError, KeyError):
+            blob_key = ""
+            blob_backend = ""
+        if (
+            blob_key
+            and self.replay_blob_store is not None
+            and blob_backend == self.replay_blob_store.backend
+        ):
+            try:
+                return self.replay_blob_store.read_events(blob_key)
+            except Exception:
+                pass
+
+        payload = self._safe_json_obj(batch["payload_json"])
+        batch_events = payload.get("events")
+        if not isinstance(batch_events, list):
+            return []
+        return [event for event in batch_events if isinstance(event, dict)]
+
+    def _count_distinct_users_for_sessions(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        environment_id: str,
+        session_ids: list[str],
+    ) -> int:
+        if not session_ids:
+            return 0
+        placeholders = ",".join("?" for _ in session_ids)
+        rows = conn.execute(
+            f"""
+            SELECT stable_id, distinct_id
+            FROM replay_sessions
+            WHERE project_id = ? AND environment_id = ? AND stable_id IN ({placeholders})
+            """,
+            [project_id, environment_id, *session_ids],
+        ).fetchall()
+        if not rows:
+            return len(set(session_ids))
+        users = {
+            str(row["distinct_id"])
+            for row in rows
+            if str(row["distinct_id"] or "").strip()
+        }
+        anonymous_sessions = {
+            str(row["stable_id"])
+            for row in rows
+            if not str(row["distinct_id"] or "").strip()
+        }
+        return len(users) + len(anonymous_sessions)
+
     def get_replay_playback(
         self,
         *,
@@ -1160,10 +1636,7 @@ class Storage:
         )
         events: list[dict[str, Any]] = []
         for batch in batches:
-            payload = self._safe_json_obj(batch["payload_json"])
-            batch_events = payload.get("events")
-            if isinstance(batch_events, list):
-                events.extend(e for e in batch_events if isinstance(e, dict))
+            events.extend(self._events_for_replay_batch(batch))
         return ReplayPlayback(session=session, batches=batches, events=events)
 
     def upsert_replay_signals(
@@ -1245,24 +1718,42 @@ class Storage:
         severity: str = "medium",
         priority: str = "medium",
         confidence: str = "medium",
+        fingerprint_version: int = 1,
+        analysis_status: str = "",
+        analysis_model: str = "",
+        analysis_prompt_version: str = "",
+        analysis_created_at: str = "",
+        analysis_error: str = "",
+        evidence: Optional[dict[str, Any]] = None,
     ) -> ReplayIssueUpsertResult:
         now = datetime.now(timezone.utc).isoformat()
         public_id = self.make_issue_public_id(project_id, environment_id, fingerprint)
         issue_id = self._id("ri")
+        clean_session_ids = list(dict.fromkeys(str(s) for s in session_ids if str(s)))
+        representative_session_id = clean_session_ids[0] if clean_session_ids else ""
         with self._conn() as conn:
             conn.execute(
                 """
                 INSERT INTO replay_issues
-                (id, project_id, environment_id, public_id, fingerprint, status, priority,
-                 severity, title, summary, likely_cause, reproduction_steps_json,
-                 confidence, signal_summary_json, affected_count, first_seen_ms,
-                 last_seen_ms, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, project_id, environment_id, public_id, fingerprint,
+                 fingerprint_version, status, priority, severity, title, summary,
+                 likely_cause, reproduction_steps_json, confidence, analysis_status,
+                 analysis_model, analysis_prompt_version, analysis_created_at,
+                 analysis_error, evidence_json, signal_summary_json, affected_count,
+                 affected_users, representative_session_id, first_seen_ms, last_seen_ms,
+                 updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, environment_id, fingerprint) DO UPDATE SET
                     status = CASE
                         WHEN replay_issues.status = 'resolved' THEN 'regressed'
+                        WHEN replay_issues.status = 'new' THEN 'ongoing'
+                        WHEN replay_issues.status = 'unresolved' THEN 'ongoing'
+                        WHEN replay_issues.status = 'ongoing' THEN 'ongoing'
+                        WHEN replay_issues.status = 'regressed' THEN 'ongoing'
+                        WHEN replay_issues.status = 'ticket_created' THEN 'ticket_created'
                         ELSE replay_issues.status
                     END,
+                    fingerprint_version = excluded.fingerprint_version,
                     priority = excluded.priority,
                     severity = excluded.severity,
                     title = excluded.title,
@@ -1270,11 +1761,25 @@ class Storage:
                     likely_cause = excluded.likely_cause,
                     reproduction_steps_json = excluded.reproduction_steps_json,
                     confidence = excluded.confidence,
+                    analysis_status = excluded.analysis_status,
+                    analysis_model = excluded.analysis_model,
+                    analysis_prompt_version = excluded.analysis_prompt_version,
+                    analysis_created_at = excluded.analysis_created_at,
+                    analysis_error = excluded.analysis_error,
+                    evidence_json = excluded.evidence_json,
                     signal_summary_json = excluded.signal_summary_json,
                     affected_count = excluded.affected_count,
+                    affected_users = excluded.affected_users,
+                    representative_session_id = COALESCE(
+                        NULLIF(replay_issues.representative_session_id, ''),
+                        excluded.representative_session_id
+                    ),
                     first_seen_ms = MIN(replay_issues.first_seen_ms, excluded.first_seen_ms),
                     last_seen_ms = MAX(replay_issues.last_seen_ms, excluded.last_seen_ms),
-                    resolved_at = NULL,
+                    resolved_at = CASE
+                        WHEN replay_issues.status = 'resolved' THEN NULL
+                        ELSE replay_issues.resolved_at
+                    END,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1283,6 +1788,7 @@ class Storage:
                     environment_id,
                     public_id,
                     fingerprint,
+                    int(fingerprint_version),
                     priority,
                     severity,
                     title,
@@ -1290,8 +1796,21 @@ class Storage:
                     likely_cause,
                     json.dumps(reproduction_steps or []),
                     confidence,
+                    analysis_status,
+                    analysis_model,
+                    analysis_prompt_version,
+                    analysis_created_at or None,
+                    analysis_error,
+                    json.dumps(evidence or {}, sort_keys=True),
                     json.dumps(signal_summary, sort_keys=True),
-                    len(set(session_ids)),
+                    len(clean_session_ids),
+                    self._count_distinct_users_for_sessions(
+                        conn,
+                        project_id=project_id,
+                        environment_id=environment_id,
+                        session_ids=clean_session_ids,
+                    ),
+                    representative_session_id,
                     int(first_seen_ms),
                     int(last_seen_ms),
                     now,
@@ -1308,13 +1827,18 @@ class Storage:
             inserted = str(row["id"]) == issue_id
             issue_id = str(row["id"])
             public_id = str(row["public_id"])
-            for sid in sorted(set(session_ids)):
+            for sid in clean_session_ids:
                 conn.execute(
                     """
                     INSERT INTO replay_issue_sessions
-                    (issue_id, project_id, environment_id, session_id, first_seen_ms, last_seen_ms)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (issue_id, project_id, environment_id, session_id, role,
+                     first_seen_ms, last_seen_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(issue_id, session_id) DO UPDATE SET
+                        role = CASE
+                            WHEN replay_issue_sessions.role = 'representative' THEN 'representative'
+                            ELSE excluded.role
+                        END,
                         first_seen_ms = MIN(replay_issue_sessions.first_seen_ms, excluded.first_seen_ms),
                         last_seen_ms = MAX(replay_issue_sessions.last_seen_ms, excluded.last_seen_ms)
                     """,
@@ -1323,6 +1847,7 @@ class Storage:
                         project_id,
                         environment_id,
                         sid,
+                        "representative" if sid == representative_session_id else "supporting",
                         int(first_seen_ms),
                         int(last_seen_ms),
                     ),
@@ -1333,10 +1858,31 @@ class Storage:
                 SET affected_count = (
                     SELECT COUNT(*) FROM replay_issue_sessions WHERE issue_id = ?
                 ),
+                    affected_users = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (issue_id, now, issue_id),
+                (
+                    issue_id,
+                    self._count_distinct_users_for_sessions(
+                        conn,
+                        project_id=project_id,
+                        environment_id=environment_id,
+                        session_ids=[
+                            str(row["session_id"])
+                            for row in conn.execute(
+                                """
+                                SELECT session_id
+                                FROM replay_issue_sessions
+                                WHERE issue_id = ?
+                                """,
+                                (issue_id,),
+                            ).fetchall()
+                        ],
+                    ),
+                    now,
+                    issue_id,
+                ),
             )
         return ReplayIssueUpsertResult(
             issue_id=issue_id,
@@ -1367,6 +1913,21 @@ class Storage:
                 params,
             ).fetchall()
 
+    def list_replay_issue_sessions(self, issue_id: str) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM replay_issue_sessions
+                WHERE issue_id = ?
+                ORDER BY
+                    CASE role WHEN 'representative' THEN 0 ELSE 1 END,
+                    created_at,
+                    session_id
+                """,
+                (issue_id,),
+            ).fetchall()
+
     def list_recent_replay_issues(self, *, limit: int = 100) -> list[sqlite3.Row]:
         with self._conn() as conn:
             return conn.execute(
@@ -1379,18 +1940,71 @@ class Storage:
                 (max(1, min(int(limit), 500)),),
             ).fetchall()
 
-    def resolve_replay_issue(self, issue_id: str) -> bool:
+    def transition_replay_issue(
+        self,
+        issue_id: str,
+        *,
+        status: str,
+        external_ticket_id: str = "",
+        external_ticket_url: str = "",
+    ) -> bool:
+        allowed = {
+            "new",
+            "unresolved",
+            "ticket_created",
+            "resolved",
+            "ongoing",
+            "regressed",
+        }
+        if status not in allowed:
+            raise ValueError(f"invalid replay issue status: {status}")
         now = datetime.now(timezone.utc).isoformat()
+        resolved_at = now if status == "resolved" else None
+        external_state = "created" if status == "ticket_created" else ""
         with self._conn() as conn:
             cur = conn.execute(
                 """
                 UPDATE replay_issues
-                SET status = 'resolved', resolved_at = ?, updated_at = ?
+                SET status = ?,
+                    external_ticket_state = COALESCE(NULLIF(?, ''), external_ticket_state),
+                    external_ticket_id = COALESCE(NULLIF(?, ''), external_ticket_id),
+                    external_ticket_url = COALESCE(NULLIF(?, ''), external_ticket_url),
+                    resolved_at = CASE WHEN ? = 'resolved' THEN ? ELSE NULL END,
+                    updated_at = ?
                 WHERE id = ?
                 """,
-                (now, now, issue_id),
+                (
+                    status,
+                    external_state,
+                    external_ticket_id,
+                    external_ticket_url,
+                    status,
+                    resolved_at,
+                    now,
+                    issue_id,
+                ),
             )
             return int(cur.rowcount) > 0
+
+    def resolve_replay_issue(self, issue_id: str) -> bool:
+        return self.transition_replay_issue(issue_id, status="resolved")
+
+    def mark_replay_issue_unresolved(self, issue_id: str) -> bool:
+        return self.transition_replay_issue(issue_id, status="unresolved")
+
+    def mark_replay_issue_ticket_created(
+        self,
+        issue_id: str,
+        *,
+        external_ticket_id: str,
+        external_ticket_url: str,
+    ) -> bool:
+        return self.transition_replay_issue(
+            issue_id,
+            status="ticket_created",
+            external_ticket_id=external_ticket_id,
+            external_ticket_url=external_ticket_url,
+        )
 
     def upsert_session(self, s: SessionMeta) -> None:
         if s.started_at.tzinfo is None:

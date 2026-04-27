@@ -10,6 +10,7 @@ from retrace.sinks.base import Cluster, Finding
 
 log = logging.getLogger(__name__)
 
+PROMPT_VERSION = "replay-analysis-v1"
 
 SYSTEM_PROMPT = """You are a senior QA analyst. You review user session recordings
 and explain bugs in plain English. Respond with a single JSON object matching the

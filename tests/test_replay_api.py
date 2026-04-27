@@ -210,6 +210,101 @@ def test_replay_ingest_merges_session_metadata(tmp_path: Path) -> None:
     assert json.loads(session["metadata_json"]) == {"route": "/signup", "plan": "pro"}
 
 
+def test_replay_playback_reads_filesystem_blob_events_in_sequence(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db", replay_blob_dir=tmp_path / "replay-blobs")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Web")
+
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-blob",
+        sequence=1,
+        events=[{"type": 3, "timestamp": 20, "data": {"source": 2, "type": 2}}],
+        flush_type="final",
+    )
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-blob",
+        sequence=0,
+        events=[
+            {
+                "type": 4,
+                "timestamp": 10,
+                "data": {"href": "https://example.com/start"},
+            }
+        ],
+        flush_type="normal",
+    )
+
+    batches = store.list_replay_batches(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-blob",
+    )
+    assert [b["blob_backend"] for b in batches] == [
+        "local_filesystem",
+        "local_filesystem",
+    ]
+    assert all((tmp_path / "replay-blobs" / b["blob_key"]).exists() for b in batches)
+
+    playback = store.get_replay_playback(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-blob",
+    )
+    assert playback is not None
+    assert [event["type"] for event in playback.events] == [4, 3]
+    session = store.get_replay_session(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-blob",
+    )
+    assert session is not None
+    assert json.loads(session["preview_json"]) == {
+        "event_count": 2,
+        "first_timestamp_ms": 10,
+        "last_timestamp_ms": 20,
+        "url": "https://example.com/start",
+    }
+
+
+def test_replay_duplicate_batch_does_not_overwrite_blob_events(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db", replay_blob_dir=tmp_path / "replay-blobs")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Web")
+
+    first = store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-dup-blob",
+        sequence=0,
+        events=[{"type": 4, "timestamp": 10, "data": {"href": "https://first.test"}}],
+        flush_type="normal",
+    )
+    second = store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-dup-blob",
+        sequence=0,
+        events=[{"type": 4, "timestamp": 20, "data": {"href": "https://second.test"}}],
+        flush_type="normal",
+    )
+
+    assert first.inserted is True
+    assert second.inserted is False
+    playback = store.get_replay_playback(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-dup-blob",
+    )
+    assert playback is not None
+    assert playback.events == [
+        {"type": 4, "timestamp": 10, "data": {"href": "https://first.test"}}
+    ]
+
+
 def test_replay_lookups_are_tenant_scoped(tmp_path: Path) -> None:
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
@@ -448,6 +543,10 @@ def test_api_lists_replays_and_fetches_playback_with_service_token(
             assert response.status == 200
             assert payload["sessions"][0]["stable_id"] == "sess-api"
             assert payload["sessions"][0]["metadata"] == {"route": "/"}
+            assert payload["sessions"][0]["preview"] == {
+                "event_count": 1,
+                "url": "https://example.com",
+            }
 
         with closing(HTTPConnection("127.0.0.1", port, timeout=2)) as conn:
             conn.request(
