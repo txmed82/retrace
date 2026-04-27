@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing, contextmanager
 import gzip
 import json
 from http.server import ThreadingHTTPServer
@@ -23,6 +24,19 @@ from retrace.sdk_keys import (
     create_service_token,
 )
 from retrace.storage import Storage, WorkspaceIds
+
+
+@contextmanager
+def _running_replay_api_server(store: Storage):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(store))
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def _store(tmp_path: Path) -> tuple[Storage, str, WorkspaceIds]:
@@ -299,77 +313,64 @@ run:
 def test_api_rejects_oversized_content_length_before_reading(tmp_path: Path) -> None:
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(store))
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        conn = HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
-        conn.request(
-            "POST",
-            "/api/sdk/replay",
-            body=b"",
-            headers={"Content-Length": str(MAX_REPLAY_BODY_BYTES + 1)},
-        )
-        response = conn.getresponse()
-        payload = json.loads(response.read())
-        assert response.status == 413
-        assert payload["error"] == "body_too_large"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+    with _running_replay_api_server(store) as server:
+        with closing(
+            HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+        ) as conn:
+            conn.request(
+                "POST",
+                "/api/sdk/replay",
+                body=b"",
+                headers={"Content-Length": str(MAX_REPLAY_BODY_BYTES + 1)},
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+            assert response.status == 413
+            assert payload["error"] == "body_too_large"
 
 
 def test_api_rejects_negative_content_length_before_reading(tmp_path: Path) -> None:
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(store))
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        conn = HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
-        conn.request(
-            "POST",
-            "/api/sdk/replay",
-            body=b"",
-            headers={"Content-Length": "-1"},
-        )
-        response = conn.getresponse()
-        payload = json.loads(response.read())
-        assert response.status == 400
-        assert payload["error"] == "invalid_content_length"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+    with _running_replay_api_server(store) as server:
+        with closing(
+            HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+        ) as conn:
+            conn.request(
+                "POST",
+                "/api/sdk/replay",
+                body=b"",
+                headers={"Content-Length": "-1"},
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+            assert response.status == 400
+            assert payload["error"] == "invalid_content_length"
 
 
 def test_api_cors_preflight_for_replay_ingest(tmp_path: Path) -> None:
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(store))
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        conn = HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
-        conn.request(
-            "OPTIONS",
-            "/api/sdk/replay",
-            headers={
-                "Origin": "https://app.example.com",
-                "Access-Control-Request-Method": "POST",
-                "Access-Control-Request-Headers": "x-retrace-key,content-type",
-            },
-        )
-        response = conn.getresponse()
-        response.read()
-        assert response.status == 204
-        assert response.getheader("Access-Control-Allow-Origin") == "*"
-        assert "x-retrace-key" in response.getheader("Access-Control-Allow-Headers", "")
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+    with _running_replay_api_server(store) as server:
+        with closing(
+            HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+        ) as conn:
+            conn.request(
+                "OPTIONS",
+                "/api/sdk/replay",
+                headers={
+                    "Origin": "https://app.example.com",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "x-retrace-key,content-type",
+                },
+            )
+            response = conn.getresponse()
+            response.read()
+            assert response.status == 204
+            assert response.getheader("Access-Control-Allow-Origin") == "*"
+            assert "x-retrace-key" in response.getheader(
+                "Access-Control-Allow-Headers", ""
+            )
 
 
 def test_project_members_and_service_tokens_round_trip(tmp_path: Path) -> None:

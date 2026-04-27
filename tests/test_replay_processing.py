@@ -171,6 +171,7 @@ def test_replay_issue_lifecycle_regresses_resolved_issue(tmp_path: Path) -> None
     updated = store.upsert_replay_issue(
         **{**kwargs, "session_ids": ["s1", "s2"], "last_seen_ms": 200}
     )
+    assert updated.inserted is False
     assert updated.issue_id == created.issue_id
     issue = store.list_replay_issues(
         project_id=workspace.project_id,

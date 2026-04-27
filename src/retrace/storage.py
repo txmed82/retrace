@@ -465,21 +465,25 @@ class Storage:
                 conn.execute(
                     "ALTER TABLE replay_sessions ADD COLUMN public_id TEXT NOT NULL DEFAULT ''"
                 )
-                rows = conn.execute(
-                    "SELECT id, project_id, environment_id, stable_id FROM replay_sessions"
-                ).fetchall()
-                for row in rows:
-                    conn.execute(
-                        "UPDATE replay_sessions SET public_id = ? WHERE id = ?",
-                        (
-                            self.make_replay_public_id(
-                                str(row["project_id"]),
-                                str(row["environment_id"]),
-                                str(row["stable_id"]),
-                            ),
-                            row["id"],
+            rows = conn.execute(
+                """
+                SELECT id, project_id, environment_id, stable_id
+                FROM replay_sessions
+                WHERE public_id IS NULL OR public_id = ''
+                """
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE replay_sessions SET public_id = ? WHERE id = ?",
+                    (
+                        self.make_replay_public_id(
+                            str(row["project_id"]),
+                            str(row["environment_id"]),
+                            str(row["stable_id"]),
                         ),
-                    )
+                        row["id"],
+                    ),
+                )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_replay_sessions_public
@@ -1183,13 +1187,6 @@ class Storage:
         public_id = self.make_issue_public_id(project_id, environment_id, fingerprint)
         issue_id = self._id("ri")
         with self._conn() as conn:
-            existing = conn.execute(
-                """
-                SELECT id FROM replay_issues
-                WHERE project_id = ? AND environment_id = ? AND fingerprint = ?
-                """,
-                (project_id, environment_id, fingerprint),
-            ).fetchone()
             conn.execute(
                 """
                 INSERT INTO replay_issues
@@ -1237,7 +1234,6 @@ class Storage:
                     now,
                 ),
             )
-            inserted = existing is None
             row = conn.execute(
                 """
                 SELECT id, public_id FROM replay_issues
@@ -1246,6 +1242,7 @@ class Storage:
                 (project_id, environment_id, fingerprint),
             ).fetchone()
             assert row is not None
+            inserted = str(row["id"]) == issue_id
             issue_id = str(row["id"])
             public_id = str(row["public_id"])
             for sid in sorted(set(session_ids)):
