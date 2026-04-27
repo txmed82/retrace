@@ -19,7 +19,11 @@ class ConsoleErrorDetector:
             if e.get("type") != 6:
                 continue
             data = event_data(e)
-            if not str(data.get("plugin", "")).startswith("rrweb/console"):
+            plugin = str(data.get("plugin", ""))
+            if not (
+                plugin.startswith("rrweb/console")
+                or plugin.startswith("retrace/console")
+            ):
                 continue
             payload = data.get("payload")
             if not isinstance(payload, dict):
