@@ -8,6 +8,7 @@ from typing import Any
 import click
 
 from retrace.config import load_config
+from retrace.replay_core import process_queued_replay_jobs
 from retrace.storage import Storage
 from retrace.tester import (
     create_spec,
@@ -39,6 +40,39 @@ def _tools() -> list[dict[str, Any]]:
             "inputSchema": {"type": "object", "properties": {"config": {"type": "string"}}},
         },
         {
+            "name": "retrace.list_replay_sessions",
+            "description": "List first-party replay sessions from retrace.db",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+            },
+        },
+        {
+            "name": "retrace.list_replay_issues",
+            "description": "List replay-backed issues from retrace.db",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+            },
+        },
+        {
+            "name": "retrace.process_queued_replays",
+            "description": "Process queued final replay batches into signals and issues",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+            },
+        },
+        {
             "name": "retrace.create_tester_spec",
             "description": "Create a tester spec (describe or explore_suite)",
             "inputSchema": {
@@ -56,6 +90,9 @@ def _tools() -> list[dict[str, Any]]:
                     "auth_mode": {"type": "string"},
                     "auth_login_url": {"type": "string"},
                     "auth_username": {"type": "string"},
+                    "execution_engine": {"type": "string"},
+                    "exact_steps": {"type": "array"},
+                    "assertions": {"type": "array"},
                 },
             },
         },
@@ -110,6 +147,56 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         specs = list_specs(specs_dir_for_data_dir(cfg.run.data_dir))
         return {"count": len(specs), "specs": [s.__dict__ for s in specs]}
 
+    if name == "retrace.list_replay_sessions":
+        limit = max(1, min(int(args.get("limit", 50) or 50), 200))
+        rows = store.list_recent_replay_sessions(limit=limit)
+        return {
+            "count": len(rows),
+            "sessions": [
+                {
+                    "public_id": str(r["public_id"]),
+                    "stable_id": str(r["stable_id"]),
+                    "project_id": str(r["project_id"]),
+                    "environment_id": str(r["environment_id"]),
+                    "distinct_id": str(r["distinct_id"]),
+                    "status": str(r["status"]),
+                    "event_count": int(r["event_count"]),
+                    "last_seen_at": str(r["last_seen_at"]),
+                }
+                for r in rows
+            ],
+        }
+
+    if name == "retrace.list_replay_issues":
+        limit = max(1, min(int(args.get("limit", 50) or 50), 200))
+        rows = store.list_recent_replay_issues(limit=limit)
+        return {
+            "count": len(rows),
+            "issues": [
+                {
+                    "public_id": str(r["public_id"]),
+                    "status": str(r["status"]),
+                    "priority": str(r["priority"]),
+                    "severity": str(r["severity"]),
+                    "title": str(r["title"]),
+                    "affected_count": int(r["affected_count"]),
+                    "updated_at": str(r["updated_at"]),
+                }
+                for r in rows
+            ],
+        }
+
+    if name == "retrace.process_queued_replays":
+        limit = max(1, min(int(args.get("limit", 25) or 25), 100))
+        result = process_queued_replay_jobs(store=store, limit=limit)
+        return {
+            "jobs_seen": result.jobs_seen,
+            "jobs_processed": result.jobs_processed,
+            "jobs_failed": result.jobs_failed,
+            "sessions_processed": result.sessions_processed,
+            "issues_created_or_updated": result.issues_created_or_updated,
+        }
+
     if name == "retrace.create_tester_spec":
         spec = create_spec(
             specs_dir=specs_dir_for_data_dir(cfg.run.data_dir),
@@ -124,6 +211,10 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             auth_mode=str(args.get("auth_mode", "none")).strip(),
             auth_login_url=str(args.get("auth_login_url", "")).strip(),
             auth_username=str(args.get("auth_username", "")).strip(),
+            execution_engine=str(args.get("execution_engine", "harness")).strip()
+            or "harness",
+            exact_steps=list(args.get("exact_steps") or []),
+            assertions=list(args.get("assertions") or []),
         )
         return {"ok": True, "spec": spec.__dict__}
 

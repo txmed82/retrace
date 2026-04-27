@@ -400,3 +400,187 @@ def test_project_members_and_service_tokens_round_trip(tmp_path: Path) -> None:
     assert authed.scopes == ["mcp:read", "issues:write"]
     assert store.revoke_service_token(token.id) is True
     assert authenticate_service_token(store, token.token) is None
+
+
+def test_api_lists_replays_and_fetches_playback_with_service_token(
+    tmp_path: Path,
+) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(
+        org_name="Acme",
+        project_name="Web",
+        environment_name="production",
+    )
+    token = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Dashboard",
+        scopes=["replay:read"],
+    )
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-api",
+        sequence=0,
+        events=[{"type": 4, "data": {"href": "https://example.com"}}],
+        flush_type="final",
+        distinct_id="user-1",
+        metadata={"route": "/"},
+    )
+    session = store.get_replay_session(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-api",
+    )
+    assert session is not None
+
+    with _running_replay_api_server(store) as server:
+        port = server.server_address[1]
+        with closing(HTTPConnection("127.0.0.1", port, timeout=2)) as conn:
+            conn.request(
+                "GET",
+                f"/api/replays?environment_id={workspace.environment_id}",
+                headers={"Authorization": f"Bearer {token.token}"},
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+            assert response.status == 200
+            assert payload["sessions"][0]["stable_id"] == "sess-api"
+            assert payload["sessions"][0]["metadata"] == {"route": "/"}
+
+        with closing(HTTPConnection("127.0.0.1", port, timeout=2)) as conn:
+            conn.request(
+                "GET",
+                f"/api/replays/{session['public_id']}?environment_id={workspace.environment_id}",
+                headers={"Authorization": f"Bearer {token.token}"},
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+            assert response.status == 200
+            assert payload["session"]["stable_id"] == "sess-api"
+            assert payload["events"] == [
+                {"type": 4, "data": {"href": "https://example.com"}}
+            ]
+
+
+def test_api_lists_replay_issues_with_service_token(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Web")
+    token = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Dashboard",
+        scopes=["issues:read"],
+    )
+    store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="dead-click:/signup",
+        session_ids=["sess-1", "sess-2"],
+        signal_summary={"dead_click": 2},
+        first_seen_ms=10,
+        last_seen_ms=20,
+        title="Dead clicks on signup",
+        reproduction_steps=["Open signup", "Click continue"],
+        severity="high",
+        priority="high",
+    )
+
+    with _running_replay_api_server(store) as server:
+        with closing(
+            HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+        ) as conn:
+            conn.request(
+                "GET",
+                f"/api/issues?environment_id={workspace.environment_id}",
+                headers={"Authorization": f"Bearer {token.token}"},
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+            assert response.status == 200
+            assert payload["issues"][0]["title"] == "Dead clicks on signup"
+            assert payload["issues"][0]["signal_summary"] == {"dead_click": 2}
+            assert payload["issues"][0]["reproduction_steps"] == [
+                "Open signup",
+                "Click continue",
+            ]
+
+
+def test_api_replay_reads_reject_browser_sdk_key(tmp_path: Path) -> None:
+    store, key, workspace = _store(tmp_path)
+
+    with _running_replay_api_server(store) as server:
+        with closing(
+            HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+        ) as conn:
+            conn.request(
+                "GET",
+                f"/api/replays?environment_id={workspace.environment_id}",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+            assert response.status == 401
+            assert payload["error"] == "unauthorized"
+
+
+def test_api_processes_queued_replays_with_service_token(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Web")
+    token = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Worker",
+        scopes=["replay:write"],
+    )
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-process",
+        sequence=0,
+        events=[
+            {
+                "type": 4,
+                "timestamp": 0,
+                "data": {"href": "https://example.com"},
+            },
+            {
+                "type": 6,
+                "timestamp": 100,
+                "data": {
+                    "plugin": "retrace/console@1",
+                    "payload": {"level": "error", "payload": ["Error: failed"]},
+                },
+            },
+        ],
+        flush_type="final",
+    )
+
+    with _running_replay_api_server(store) as server:
+        with closing(
+            HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+        ) as conn:
+            conn.request(
+                "POST",
+                "/api/replays/process",
+                body=json.dumps({"limit": 5}),
+                headers={
+                    "Authorization": f"Bearer {token.token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+            assert response.status == 200
+            assert payload["jobs_processed"] == 1
+            assert payload["sessions_processed"] == 1
+            assert payload["issues_created_or_updated"] == 1
+
+    issues = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+    assert issues[0]["title"] == "Error: failed on replay"

@@ -651,6 +651,57 @@ def _to_findings_payload(
     return out
 
 
+def _json_field(row: Any, key: str, fallback: Any) -> Any:
+    try:
+        return json.loads(str(row[key] or ""))
+    except Exception:
+        return fallback
+
+
+def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
+    issues = []
+    for row in store.list_recent_replay_issues(limit=50):
+        issues.append(
+            {
+                "id": str(row["id"]),
+                "public_id": str(row["public_id"]),
+                "project_id": str(row["project_id"]),
+                "environment_id": str(row["environment_id"]),
+                "status": str(row["status"]),
+                "priority": str(row["priority"]),
+                "severity": str(row["severity"]),
+                "title": str(row["title"]),
+                "summary": str(row["summary"]),
+                "likely_cause": str(row["likely_cause"]),
+                "reproduction_steps": _json_field(
+                    row, "reproduction_steps_json", []
+                ),
+                "signal_summary": _json_field(row, "signal_summary_json", {}),
+                "affected_count": int(row["affected_count"]),
+                "first_seen_ms": int(row["first_seen_ms"]),
+                "last_seen_ms": int(row["last_seen_ms"]),
+                "updated_at": str(row["updated_at"]),
+            }
+        )
+    sessions = []
+    for row in store.list_recent_replay_sessions(limit=50):
+        sessions.append(
+            {
+                "id": str(row["id"]),
+                "project_id": str(row["project_id"]),
+                "environment_id": str(row["environment_id"]),
+                "stable_id": str(row["stable_id"]),
+                "public_id": str(row["public_id"]),
+                "distinct_id": str(row["distinct_id"]),
+                "status": str(row["status"]),
+                "event_count": int(row["event_count"]),
+                "metadata": _json_field(row, "metadata_json", {}),
+                "last_seen_at": str(row["last_seen_at"]),
+            }
+        )
+    return {"issues": issues, "sessions": sessions}
+
+
 _INDEX_HTML = """<!doctype html>
 <html>
 <head>
@@ -696,6 +747,8 @@ _INDEX_HTML = """<!doctype html>
       <div class=\"card\" id=\"onboarding\"></div>
       <div style=\"height:12px\"></div>
       <div class=\"card\" id=\"tester\"></div>
+      <div style=\"height:12px\"></div>
+      <div class=\"card\" id=\"replayDashboard\"></div>
       <div style=\"height:12px\"></div>
       <div id=\"findingDetail\"><div class=\"empty\">Select a finding.</div></div>
     </div>
@@ -980,6 +1033,61 @@ _INDEX_HTML = """<!doctype html>
       byId('runTesterBtn').addEventListener('click', runTesterSpec);
     }
 
+    async function processReplayJobs(){
+      const status = byId('replayProcessStatus');
+      status.textContent = 'Processing...';
+      const res = await fetch('/api/replays/process', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({limit: 25})});
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        status.textContent = data.error || 'Processing failed';
+        return;
+      }
+      await loadReplayDashboard(`Processed ${data.result.jobs_processed} job(s), updated ${data.result.issues_created_or_updated} issue(s).`);
+    }
+
+    async function loadReplayDashboard(processStatus = ''){
+      const res = await fetch('/api/replay-dashboard');
+      const data = await res.json();
+      const issues = data.issues || [];
+      const sessions = data.sessions || [];
+      const issueRows = issues.map(i => `
+        <li><code>${esc(i.public_id)}</code> · <strong>${esc(i.title || 'Untitled issue')}</strong><br>
+          <span class="empty">${esc(i.status)} · ${esc(i.severity)} · affected=${esc(i.affected_count)} · signals=${esc(JSON.stringify(i.signal_summary || {}))}</span>
+        </li>`).join('');
+      const sessionRows = sessions.map(s => `
+        <li><button class="btn" type="button" data-replay-session="${esc(s.stable_id)}">Play</button>
+          <code>${esc(s.public_id)}</code> · ${esc(s.stable_id)}<br>
+          <span class="empty">${esc(s.status)} · events=${esc(s.event_count)} · ${esc(s.last_seen_at)}</span>
+        </li>`).join('');
+      byId('replayDashboard').innerHTML = `
+        <h3>Replay Dashboard</h3>
+        <div><button class="btn" id="processReplayJobsBtn" type="button">Process Queued Replays</button> <span class="empty" id="replayProcessStatus">${esc(processStatus)}</span></div>
+        <div class="grid" style="margin-top:10px">
+          <div><div class="lbl">Replay-backed Issues</div>${issueRows ? `<ul>${issueRows}</ul>` : '<div class="empty">No replay issues yet.</div>'}</div>
+          <div><div class="lbl">Recent Sessions</div>${sessionRows ? `<ul>${sessionRows}</ul>` : '<div class="empty">No first-party replay sessions yet.</div>'}</div>
+        </div>
+        <div style="height:10px"></div>
+        <div class="rr"><div id="firstPartyReplay"><div class="empty">Select a first-party replay session.</div></div></div>
+      `;
+      byId('processReplayJobsBtn').addEventListener('click', processReplayJobs);
+      byId('replayDashboard').querySelectorAll('[data-replay-session]').forEach(el => {
+        el.addEventListener('click', () => loadFirstPartyReplay(el.dataset.replaySession));
+      });
+    }
+
+    async function loadFirstPartyReplay(sessionId){
+      const root = byId('firstPartyReplay');
+      root.innerHTML = '<div class="empty">Loading replay...</div>';
+      const res = await fetch(`/api/replay-session/${encodeURIComponent(sessionId)}/events`);
+      const data = await res.json();
+      if(!res.ok || !data.events || !data.events.length){
+        root.innerHTML = `<div class="empty">${esc(data.error || 'No events found.')}</div>`;
+        return;
+      }
+      root.innerHTML = '';
+      new rrwebPlayer({ target: root, props: { events: data.events, width: 980, height: 560, autoPlay: false }});
+    }
+
     function renderList() {
       const root = byId('findings');
       root.innerHTML = findings.map(f => `
@@ -1079,6 +1187,7 @@ _INDEX_HTML = """<!doctype html>
     async function boot(){
       await loadOnboarding();
       await loadTesterPanel();
+      await loadReplayDashboard();
       await bootFindings();
     }
     boot();
@@ -1265,6 +1374,31 @@ def ui_command(
             if path == "/api/tester/runs":
                 runs = load_run_summaries(runs_dir_for_data_dir(data_dir), limit=20)
                 self._json({"runs": runs})
+                return
+
+            if path == "/api/replay-dashboard":
+                self._json(_to_replay_dashboard_payload(store))
+                return
+
+            if path.startswith("/api/replay-session/") and path.endswith("/events"):
+                session_id = path.split("/")[3]
+                if not re.match(r"^[A-Za-z0-9._-]+$", session_id):
+                    self._json({"error": "invalid session_id"}, status=400)
+                    return
+                match = None
+                for session in store.list_recent_replay_sessions(limit=500):
+                    if str(session["stable_id"]) == session_id:
+                        match = session
+                        break
+                if match is None:
+                    self._json({"error": "not found", "events": []}, status=404)
+                    return
+                playback = store.get_replay_playback(
+                    project_id=str(match["project_id"]),
+                    environment_id=str(match["environment_id"]),
+                    session_id=session_id,
+                )
+                self._json({"session_id": session_id, "events": playback.events if playback else []})
                 return
 
             if path.startswith("/api/session/") and path.endswith("/events"):
@@ -1492,6 +1626,29 @@ def ui_command(
                 )
                 status = 200 if result.ok else 400
                 self._json({"ok": result.ok, "result": result.__dict__}, status=status)
+                return
+
+            if path == "/api/replays/process":
+                from retrace.replay_core import process_queued_replay_jobs
+
+                body = self._read_json_body()
+                try:
+                    limit_v = max(1, min(int(body.get("limit") or 25), 100))
+                except (TypeError, ValueError):
+                    limit_v = 25
+                result = process_queued_replay_jobs(store=store, limit=limit_v)
+                self._json(
+                    {
+                        "ok": True,
+                        "result": {
+                            "jobs_seen": result.jobs_seen,
+                            "jobs_processed": result.jobs_processed,
+                            "jobs_failed": result.jobs_failed,
+                            "sessions_processed": result.sessions_processed,
+                            "issues_created_or_updated": result.issues_created_or_updated,
+                        },
+                    }
+                )
                 return
 
             self._json({"error": "not found"}, status=404)
