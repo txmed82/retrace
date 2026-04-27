@@ -22,10 +22,10 @@ from retrace.sdk_keys import (
     create_sdk_key,
     create_service_token,
 )
-from retrace.storage import Storage
+from retrace.storage import Storage, WorkspaceIds
 
 
-def _store(tmp_path: Path) -> tuple[Storage, str]:
+def _store(tmp_path: Path) -> tuple[Storage, str, WorkspaceIds]:
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
     workspace = store.ensure_workspace(
@@ -39,11 +39,11 @@ def _store(tmp_path: Path) -> tuple[Storage, str]:
         environment_id=workspace.environment_id,
         name="Browser SDK",
     )
-    return store, created.key
+    return store, created.key, workspace
 
 
 def test_replay_ingest_accepts_and_dedupes_batches(tmp_path: Path) -> None:
-    store, key = _store(tmp_path)
+    store, key, workspace = _store(tmp_path)
     body = json.dumps(
         {
             "sessionId": "sess-1",
@@ -70,18 +70,31 @@ def test_replay_ingest_accepts_and_dedupes_batches(tmp_path: Path) -> None:
     assert first["duplicate"] is False
     assert second["accepted"] is False
     assert second["duplicate"] is True
-    session = store.get_replay_session("sess-1")
+    session = store.get_replay_session(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-1",
+    )
     assert session is not None
     assert session["event_count"] == 1
     assert session["status"] == "completed"
-    assert len(store.list_replay_batches("sess-1")) == 1
+    assert (
+        len(
+            store.list_replay_batches(
+                project_id=workspace.project_id,
+                environment_id=workspace.environment_id,
+                session_id="sess-1",
+            )
+        )
+        == 1
+    )
     jobs = store.list_processing_jobs(kind="replay.finalize")
     assert len(jobs) == 1
     assert jobs[0]["subject_id"] == session["id"]
 
 
 def test_replay_ingest_accepts_gzip_payload(tmp_path: Path) -> None:
-    store, key = _store(tmp_path)
+    store, key, _workspace = _store(tmp_path)
     body = gzip.compress(
         json.dumps(
             {
@@ -125,7 +138,7 @@ def test_replay_ingest_rejects_gzip_bomb() -> None:
 def test_replay_ingest_accepts_query_param_key_for_beacon_fallback(
     tmp_path: Path,
 ) -> None:
-    store, key = _store(tmp_path)
+    store, key, workspace = _store(tmp_path)
     body = json.dumps(
         {
             "sessionId": "sess-query",
@@ -142,11 +155,18 @@ def test_replay_ingest_accepts_query_param_key_for_beacon_fallback(
     )
 
     assert result["accepted"] is True
-    assert store.get_replay_session("sess-query") is not None
+    assert (
+        store.get_replay_session(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            session_id="sess-query",
+        )
+        is not None
+    )
 
 
 def test_replay_ingest_merges_session_metadata(tmp_path: Path) -> None:
-    store, key = _store(tmp_path)
+    store, key, workspace = _store(tmp_path)
     first = json.dumps(
         {
             "sessionId": "sess-meta",
@@ -167,13 +187,73 @@ def test_replay_ingest_merges_session_metadata(tmp_path: Path) -> None:
     ingest_replay_request(store=store, headers={"x-retrace-key": key}, body=first)
     ingest_replay_request(store=store, headers={"x-retrace-key": key}, body=second)
 
-    session = store.get_replay_session("sess-meta")
+    session = store.get_replay_session(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-meta",
+    )
     assert session is not None
     assert json.loads(session["metadata_json"]) == {"route": "/signup", "plan": "pro"}
 
 
+def test_replay_lookups_are_tenant_scoped(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    first = store.ensure_workspace(
+        org_name="Acme",
+        project_name="Web",
+        environment_name="production",
+    )
+    second = store.ensure_workspace(
+        org_name="Beta",
+        project_name="Web",
+        environment_name="production",
+    )
+
+    store.insert_replay_batch(
+        project_id=first.project_id,
+        environment_id=first.environment_id,
+        session_id="shared-session",
+        sequence=0,
+        events=[{"type": 4}],
+        flush_type="normal",
+        metadata={"tenant": "first"},
+    )
+    store.insert_replay_batch(
+        project_id=second.project_id,
+        environment_id=second.environment_id,
+        session_id="shared-session",
+        sequence=0,
+        events=[{"type": 5}],
+        flush_type="normal",
+        metadata={"tenant": "second"},
+    )
+
+    first_session = store.get_replay_session(
+        project_id=first.project_id,
+        environment_id=first.environment_id,
+        session_id="shared-session",
+    )
+    second_session = store.get_replay_session(
+        project_id=second.project_id,
+        environment_id=second.environment_id,
+        session_id="shared-session",
+    )
+    assert first_session is not None
+    assert second_session is not None
+    assert json.loads(first_session["metadata_json"]) == {"tenant": "first"}
+    assert json.loads(second_session["metadata_json"]) == {"tenant": "second"}
+    assert len(
+        store.list_replay_batches(
+            project_id=first.project_id,
+            environment_id=first.environment_id,
+            session_id="shared-session",
+        )
+    ) == 1
+
+
 def test_replay_ingest_rejects_invalid_key(tmp_path: Path) -> None:
-    store, _ = _store(tmp_path)
+    store, _key, _workspace = _store(tmp_path)
 
     try:
         ingest_replay_request(
@@ -234,6 +314,30 @@ def test_api_rejects_oversized_content_length_before_reading(tmp_path: Path) -> 
         payload = json.loads(response.read())
         assert response.status == 413
         assert payload["error"] == "body_too_large"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_api_rejects_negative_content_length_before_reading(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(store))
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+        conn.request(
+            "POST",
+            "/api/sdk/replay",
+            body=b"",
+            headers={"Content-Length": "-1"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read())
+        assert response.status == 400
+        assert payload["error"] == "invalid_content_length"
     finally:
         server.shutdown()
         server.server_close()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,9 @@ from retrace.replay_api import (
 )
 from retrace.sdk_keys import create_sdk_key, create_service_token
 from retrace.storage import Storage
+
+
+logger = logging.getLogger(__name__)
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -68,6 +72,9 @@ def _handler(store: Storage) -> type[BaseHTTPRequestHandler]:
             except ValueError:
                 _json_response(self, 400, {"error": "invalid_content_length"})
                 return
+            if length < 0:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
             if length > MAX_REPLAY_BODY_BYTES:
                 _json_response(
                     self,
@@ -96,11 +103,15 @@ def _handler(store: Storage) -> type[BaseHTTPRequestHandler]:
                     exc.status,
                     {"error": exc.code, "message": exc.message},
                 )
-            except Exception as exc:
+            except Exception:
+                logger.exception("Unhandled replay ingest error")
                 _json_response(
                     self,
                     500,
-                    {"error": "internal_error", "message": str(exc)},
+                    {
+                        "error": "internal_error",
+                        "message": "An internal server error occurred.",
+                    },
                 )
 
         def log_message(self, format: str, *args: object) -> None:

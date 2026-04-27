@@ -19,4 +19,8 @@ declare module "react" {
   ): void;
 
   export function useMemo<T>(factory: () => T, deps?: unknown[]): T;
+
+  export function useRef<T>(initialValue: T): {
+    current: T;
+  };
 }

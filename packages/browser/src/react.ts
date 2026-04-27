@@ -3,7 +3,7 @@ import {
   createElement,
   useContext,
   useEffect,
-  useMemo,
+  useRef,
   type ReactNode,
 } from "react";
 
@@ -15,7 +15,11 @@ export function RetraceProvider(props: {
   children: ReactNode;
   options: RetraceBrowserOptions;
 }) {
-  const client = useMemo(() => init({ ...props.options, autoStart: false }), [props.options]);
+  const clientRef = useRef<RetraceClient | null>(null);
+  if (!clientRef.current) {
+    clientRef.current = init({ ...props.options, autoStart: false });
+  }
+  const client = clientRef.current;
 
   useEffect(() => {
     if (props.options.autoStart ?? true) {

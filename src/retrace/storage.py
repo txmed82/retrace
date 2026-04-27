@@ -692,7 +692,28 @@ class Storage:
 
         with self._conn() as conn:
             processing_job_id: Optional[str] = None
-            merged_metadata = metadata or {}
+            session_row_id = self._id("rs")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO replay_sessions
+                (id, project_id, environment_id, stable_id, distinct_id, started_at,
+                 last_seen_at, event_count, metadata_json, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_row_id,
+                    project_id,
+                    environment_id,
+                    session_id,
+                    distinct_id or "",
+                    now,
+                    now,
+                    0,
+                    json.dumps(metadata or {}),
+                    "completed" if clean_flush == "final" else "active",
+                    now,
+                ),
+            )
             row = conn.execute(
                 """
                 SELECT id, metadata_json FROM replay_sessions
@@ -700,33 +721,10 @@ class Storage:
                 """,
                 (project_id, environment_id, session_id),
             ).fetchone()
-            if row is None:
-                session_row_id = self._id("rs")
-                conn.execute(
-                    """
-                    INSERT INTO replay_sessions
-                    (id, project_id, environment_id, stable_id, distinct_id, started_at,
-                     last_seen_at, event_count, metadata_json, status, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        session_row_id,
-                        project_id,
-                        environment_id,
-                        session_id,
-                        distinct_id or "",
-                        now,
-                        now,
-                        0,
-                        json.dumps(metadata or {}),
-                        "completed" if clean_flush == "final" else "active",
-                        now,
-                    ),
-                )
-            else:
-                session_row_id = str(row["id"])
-                existing_metadata = self._safe_json_obj(row["metadata_json"])
-                merged_metadata = {**existing_metadata, **(metadata or {})}
+            assert row is not None
+            session_row_id = str(row["id"])
+            existing_metadata = self._safe_json_obj(row["metadata_json"])
+            merged_metadata = {**existing_metadata, **(metadata or {})}
 
             batch_id = self._id("rb")
             cur = conn.execute(
@@ -870,29 +868,39 @@ class Storage:
         with self._conn() as conn:
             return conn.execute(query, params).fetchall()
 
-    def get_replay_session(self, session_id: str) -> Optional[sqlite3.Row]:
+    def get_replay_session(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        session_id: str,
+    ) -> Optional[sqlite3.Row]:
         with self._conn() as conn:
             return conn.execute(
                 """
                 SELECT *
                 FROM replay_sessions
-                WHERE stable_id = ?
-                ORDER BY created_at DESC
-                LIMIT 1
+                WHERE project_id = ? AND environment_id = ? AND stable_id = ?
                 """,
-                (session_id,),
+                (project_id, environment_id, session_id),
             ).fetchone()
 
-    def list_replay_batches(self, session_id: str) -> list[sqlite3.Row]:
+    def list_replay_batches(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        session_id: str,
+    ) -> list[sqlite3.Row]:
         with self._conn() as conn:
             return conn.execute(
                 """
                 SELECT *
                 FROM replay_batches
-                WHERE session_id = ?
+                WHERE project_id = ? AND environment_id = ? AND session_id = ?
                 ORDER BY sequence
                 """,
-                (session_id,),
+                (project_id, environment_id, session_id),
             ).fetchall()
 
     def upsert_session(self, s: SessionMeta) -> None:

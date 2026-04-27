@@ -4,9 +4,9 @@ type ReplayEvent = Record<string, unknown>;
 
 export type RetracePrivacyOptions = {
   maskAllInputs?: boolean;
-  maskTextSelector?: string;
-  blockSelector?: string;
-  ignoreClass?: string;
+  maskTextSelector?: string | null;
+  blockSelector?: string | null;
+  ignoreClass?: string | RegExp;
 };
 
 export type RetraceBrowserOptions = {
@@ -72,6 +72,7 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
   let events: ReplayEvent[] = [];
   let stopRecording: (() => void) | undefined;
   let flushTimer: ReturnType<typeof setInterval> | undefined;
+  let flushInFlight: Promise<void> | undefined;
   const cleanupFns: Array<() => void> = [];
 
   function emitCustom(source: string, payload: Record<string, unknown>): void {
@@ -88,19 +89,45 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     }
   }
 
+  function selectorMatches(target: Element, selector: string | null | undefined): boolean {
+    if (!selector) return false;
+    try {
+      return target.closest(selector) !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  function shouldCaptureTargetText(target: Element): boolean {
+    if (
+      options.privacy?.maskAllInputs !== false &&
+      (target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement)
+    ) {
+      return false;
+    }
+    if (selectorMatches(target, options.privacy?.maskTextSelector)) return false;
+    if (selectorMatches(target, options.privacy?.blockSelector)) return false;
+    return true;
+  }
+
   function describeTarget(target: EventTarget | null): Record<string, unknown> {
     if (!(target instanceof Element)) {
       return {};
     }
-    return {
+    const description: Record<string, unknown> = {
       tagName: target.tagName.toLowerCase(),
       id: target.id || undefined,
       className: typeof target.className === "string" ? target.className : undefined,
       name: target.getAttribute("name") || undefined,
       role: target.getAttribute("role") || undefined,
       ariaLabel: target.getAttribute("aria-label") || undefined,
-      text: target.textContent?.trim().slice(0, 120) || undefined,
     };
+    if (shouldCaptureTargetText(target)) {
+      description.text = target.textContent?.trim().slice(0, 120) || undefined;
+    }
+    return description;
   }
 
   function installInteractionCapture(): void {
@@ -225,43 +252,60 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
   }
 
   async function flush(flushType: "normal" | "final" = "normal"): Promise<void> {
-    if (!enabled || events.length === 0) return;
-    const payload = {
-      sessionId,
-      sequence,
-      flushType,
-      distinctId,
-      metadata: {
-        ...metadata,
-        url: globalThis.location?.href,
-        userAgent: globalThis.navigator?.userAgent,
-        viewport: {
-          width: globalThis.innerWidth,
-          height: globalThis.innerHeight,
-        },
-      },
-      events,
-    };
-    const sentEvents = events;
-    events = [];
-    sequence += 1;
-    try {
-      const res = await fetch(ingestUrl, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-retrace-key": options.apiKey,
-        },
-        body: JSON.stringify(payload),
-        keepalive: flushType === "final",
-      });
-      if (!res.ok) {
-        events = sentEvents.concat(events);
-        sequence -= 1;
+    if (flushInFlight) {
+      await flushInFlight;
+      if (flushType === "final" && events.length > 0) {
+        return flush(flushType);
       }
-    } catch {
-      events = sentEvents.concat(events);
-      sequence -= 1;
+      return;
+    }
+    if (!enabled || events.length === 0) return;
+
+    flushInFlight = (async () => {
+      const sentEvents = events;
+      const sentSequence = sequence;
+      events = [];
+      sequence += 1;
+      const payload = {
+        sessionId,
+        sequence: sentSequence,
+        flushType,
+        distinctId,
+        metadata: {
+          ...metadata,
+          url: globalThis.location?.href,
+          userAgent: globalThis.navigator?.userAgent,
+          viewport: {
+            width: globalThis.innerWidth,
+            height: globalThis.innerHeight,
+          },
+        },
+        events: sentEvents,
+      };
+      try {
+        const res = await fetch(ingestUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-retrace-key": options.apiKey,
+          },
+          body: JSON.stringify(payload),
+          keepalive: flushType === "final",
+        });
+        if (!res.ok) {
+          events = sentEvents.concat(events);
+          sequence = sentSequence;
+        }
+      } catch {
+        events = sentEvents.concat(events);
+        sequence = sentSequence;
+      }
+    })();
+
+    try {
+      await flushInFlight;
+    } finally {
+      flushInFlight = undefined;
     }
   }
 
@@ -305,9 +349,15 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     metadata = { ...metadata, ...(nextMetadata || {}) };
   }
 
-  globalThis.addEventListener?.("pagehide", () => {
+  const onPageHide = () => {
     void flush("final");
-  });
+  };
+  if (enabled) {
+    globalThis.addEventListener?.("pagehide", onPageHide);
+    cleanupFns.push(() => {
+      globalThis.removeEventListener?.("pagehide", onPageHide);
+    });
+  }
 
   if (options.autoStart ?? true) {
     start();
