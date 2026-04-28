@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from retrace.storage import Storage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -82,8 +85,8 @@ def promote_replay_issue(
         base_url=base_url,
     )
 
-    existing_id = str(issue.get(f"external_ticket_id_{provider}") or "")
-    existing_url = str(issue.get(f"external_ticket_url_{provider}") or "")
+    existing_id = str(issue["external_ticket_id"] or "")
+    existing_url = str(issue["external_ticket_url"] or "")
     if existing_id or existing_url:
         return IssueSinkResult(
             issue_id=str(issue["id"]),
@@ -103,11 +106,27 @@ def promote_replay_issue(
         provider=provider,
         external_id=final_external_id,
     )
-    store.mark_replay_issue_ticket_created(
+    success = store.mark_replay_issue_ticket_created(
         str(issue["id"]),
         external_ticket_id=final_external_id,
         external_ticket_url=final_external_url,
     )
+    if not success:
+        logger.error(
+            "Failed to mark replay issue ticket as created: issue_id=%s, external_ticket_id=%s, external_ticket_url=%s",
+            issue["id"],
+            final_external_id,
+            final_external_url,
+        )
+        return IssueSinkResult(
+            issue_id=str(issue["id"]),
+            issue_public_id=str(issue["public_id"]),
+            provider=provider,
+            external_id=final_external_id,
+            external_url=final_external_url,
+            created=False,
+            payload=payload,
+        )
     return IssueSinkResult(
         issue_id=str(issue["id"]),
         issue_public_id=str(issue["public_id"]),
