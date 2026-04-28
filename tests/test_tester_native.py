@@ -233,6 +233,9 @@ def test_native_consensus_uses_retry_votes_after_failure(tmp_path: Path) -> None
     assert assertions[0]["actual"]["pass_votes"] == 2
     assert assertions[0]["actual"]["retry_count"] == 1
     assert assertions[0]["actual"]["evidence"]["snapshot_path"] == "snapshot.json"
+    assert assertions[0]["actual"]["evidence"]["available"] is True
+    assert assertions[0]["actual"]["evidence"]["headers"]["set-cookie"] == "[redacted]"
+    assert assertions[0]["actual"]["evidence"]["body_capture"] is False
     assert assertions[0]["confidence"] == 0.0
 
 

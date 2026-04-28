@@ -605,13 +605,18 @@ def _evaluate_native_assertion(
     kind = str(assertion.get("type") or assertion.get("assertion_type") or "").lower()
     if kind in {"model_consensus", "consensus", "ai_consensus"}:
         consensus_assertion = dict(assertion)
-        consensus_assertion.setdefault(
-            "evidence",
-            _response_assertion_evidence(
-                response,
-                capture_body=bool(assertion.get("capture_body_evidence")),
-            ),
+        response_evidence = _response_assertion_evidence(
+            response,
+            capture_body=bool(assertion.get("capture_body_evidence")),
         )
+        existing_evidence = consensus_assertion.get("evidence")
+        if isinstance(existing_evidence, dict):
+            consensus_assertion["evidence"] = {
+                **response_evidence,
+                **existing_evidence,
+            }
+        else:
+            consensus_assertion["evidence"] = response_evidence
         return _evaluate_consensus_assertion(consensus_assertion)
     if response is None:
         return _assertion_result(
