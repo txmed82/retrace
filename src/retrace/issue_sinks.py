@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 from retrace.storage import Storage
 
@@ -35,7 +36,9 @@ def build_issue_sink_payload(
             {
                 "session_id": session_id,
                 "role": str(session["role"]),
-                "url": f"{base_url.rstrip('/')}/replays/{session_id}" if base_url else f"retrace://replay/{session_id}",
+                "url": f"{base_url.rstrip('/')}/replays/{session_id}"
+                if base_url
+                else f"retrace://replay/{session_id}",
             }
         )
     return {
@@ -112,11 +115,15 @@ def promote_replay_issue(
         external_ticket_url=final_external_url,
     )
     if not success:
+        parsed = urlparse(final_external_url)
+        sanitized_url = urlunparse(
+            (parsed.scheme, parsed.netloc, parsed.path, "", "", "")
+        )
         logger.error(
             "Failed to mark replay issue ticket as created: issue_id=%s, external_ticket_id=%s, external_ticket_url=%s",
             issue["id"],
             final_external_id,
-            final_external_url,
+            sanitized_url,
         )
         return IssueSinkResult(
             issue_id=str(issue["id"]),
