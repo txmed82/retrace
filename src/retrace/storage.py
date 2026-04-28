@@ -1913,6 +1913,24 @@ class Storage:
                 params,
             ).fetchall()
 
+    def get_replay_issue(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        issue_id: str,
+    ) -> Optional[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM replay_issues
+                WHERE project_id = ? AND environment_id = ?
+                  AND (id = ? OR public_id = ?)
+                """,
+                (project_id, environment_id, issue_id, issue_id),
+            ).fetchone()
+
     def list_replay_issue_sessions(self, issue_id: str) -> list[sqlite3.Row]:
         with self._conn() as conn:
             return conn.execute(

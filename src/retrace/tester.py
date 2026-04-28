@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,12 +17,14 @@ from typing import Any, Optional
 
 import httpx
 
+from retrace.llm.client import build_llm_http_request, extract_llm_text_content
+
 
 DEFAULT_HARNESS_COMMAND = (
     "browser-harness run --url {app_url} --task {prompt_q} --output {run_dir_q}"
 )
 DEFAULT_APP_URL = "http://127.0.0.1:3000"
-SPEC_SCHEMA_VERSION = 1
+SPEC_SCHEMA_VERSION = 2
 ALLOWED_MODES = {"describe", "explore_suite"}
 ALLOWED_AUTH_MODES = {"none", "form", "jwt", "headers"}
 ALLOWED_EXECUTION_ENGINES = {"harness", "native", "auto"}
@@ -54,6 +57,7 @@ class TesterSpec:
     browser_settings: dict[str, Any] = field(default_factory=dict)
     fixtures: dict[str, Any] = field(default_factory=dict)
     data_extraction: list[dict[str, Any]] = field(default_factory=list)
+    schedules: list[dict[str, Any]] = field(default_factory=list)
     step_cache_enabled: bool = True
     assertion_consensus_enabled: bool = True
 
@@ -200,8 +204,14 @@ def _apply_spec_defaults(data: dict[str, Any]) -> None:
     data.setdefault("browser_settings", {})
     data.setdefault("fixtures", {})
     data.setdefault("data_extraction", [])
+    data.setdefault("schedules", [])
     data.setdefault("step_cache_enabled", True)
     data.setdefault("assertion_consensus_enabled", True)
+    try:
+        if int(data.get("schema_version") or 1) < SPEC_SCHEMA_VERSION:
+            data["schema_version"] = SPEC_SCHEMA_VERSION
+    except (TypeError, ValueError):
+        data["schema_version"] = SPEC_SCHEMA_VERSION
     # Legacy mode migration.
     mode = str(data.get("mode") or "describe").strip().lower()
     if mode in {"prompt", "video"}:
@@ -267,6 +277,8 @@ def validate_spec(spec: TesterSpec) -> None:
         raise ValueError("fixtures must be an object")
     if not isinstance(spec.data_extraction, list):
         raise ValueError("data_extraction must be a list")
+    if not isinstance(spec.schedules, list):
+        raise ValueError("schedules must be a list")
     if not isinstance(spec.step_cache_enabled, bool):
         raise ValueError("step_cache_enabled must be a boolean")
     if not isinstance(spec.assertion_consensus_enabled, bool):
@@ -297,6 +309,7 @@ def create_spec(
     browser_settings: Optional[dict[str, Any]] = None,
     fixtures: Optional[dict[str, Any]] = None,
     data_extraction: Optional[list[dict[str, Any]]] = None,
+    schedules: Optional[list[dict[str, Any]]] = None,
     step_cache_enabled: bool = True,
     assertion_consensus_enabled: bool = True,
 ) -> TesterSpec:
@@ -333,6 +346,7 @@ def create_spec(
         browser_settings=browser_settings or {},
         fixtures=fixtures or {},
         data_extraction=data_extraction or [],
+        schedules=schedules or [],
         step_cache_enabled=bool(step_cache_enabled),
         assertion_consensus_enabled=bool(assertion_consensus_enabled),
     )
@@ -581,6 +595,278 @@ def _evaluate_consensus_assertion(
     )
 
 
+def _evaluate_model_backed_consensus_assertion(
+    assertion: dict[str, Any],
+    *,
+    response: Optional[httpx.Response],
+) -> TesterAssertionResult:
+    if assertion.get("model_votes") or assertion.get("votes"):
+        return _evaluate_consensus_assertion(assertion)
+
+    models = _consensus_models(assertion)
+    if not models:
+        return _evaluate_consensus_assertion(assertion)
+
+    provider = str(
+        assertion.get("provider")
+        or assertion.get("llm_provider")
+        or os.environ.get("RETRACE_LLM_PROVIDER")
+        or "openai_compatible"
+    )
+    base_url = str(
+        assertion.get("base_url")
+        or assertion.get("llm_base_url")
+        or os.environ.get("RETRACE_LLM_BASE_URL")
+        or ""
+    ).strip()
+    api_key = _consensus_api_key(assertion)
+    timeout = float(assertion.get("timeout_seconds") or 30)
+    prompt = str(
+        assertion.get("prompt")
+        or assertion.get("question")
+        or assertion.get("expected")
+        or "Decide whether the observed page satisfies this assertion."
+    )
+    evidence = _response_assertion_evidence(
+        response,
+        capture_body=bool(assertion.get("capture_body_evidence", True)),
+    )
+    snapshot = _assertion_snapshot_payload(
+        assertion=assertion,
+        evidence=evidence,
+        prompt=prompt,
+    )
+    if not base_url:
+        failed = dict(assertion)
+        failed["model_votes"] = [
+            {
+                "model": model,
+                "ok": False,
+                "error": "missing_llm_base_url",
+            }
+            for model in models
+        ]
+        failed["evidence"] = evidence
+        return _evaluate_consensus_assertion(failed)
+
+    votes = _run_consensus_model_votes(
+        provider=provider,
+        base_url=base_url,
+        api_key=api_key,
+        models=models,
+        prompt=prompt,
+        snapshot=snapshot,
+        timeout=timeout,
+    )
+    parsed = [_bool_from_vote(vote) for vote in votes]
+    retry_votes: list[dict[str, Any]] = []
+    if bool(assertion.get("retry_failed", True)) and any(value is False for value in parsed):
+        retry_models = [
+            model for model, value in zip(models, parsed) if value is False
+        ]
+        retry_votes = _run_consensus_model_votes(
+            provider=provider,
+            base_url=base_url,
+            api_key=api_key,
+            models=retry_models,
+            prompt=f"{prompt}\n\nRetry with fresh evidence and verify carefully.",
+            snapshot=snapshot,
+            timeout=timeout,
+            retry=True,
+        )
+
+    arbiter_vote: str | bool | None = assertion.get("arbiter_vote")
+    combined = votes + retry_votes
+    combined_parsed = [_bool_from_vote(vote) for vote in combined]
+    has_disagreement = (
+        any(value is True for value in combined_parsed)
+        and any(value is False for value in combined_parsed)
+    )
+    arbiter_model = str(assertion.get("arbiter_model") or "").strip()
+    if has_disagreement and arbiter_vote is None and arbiter_model:
+        arbiter = _run_consensus_model_votes(
+            provider=provider,
+            base_url=base_url,
+            api_key=api_key,
+            models=[arbiter_model],
+            prompt=(
+                f"{prompt}\n\nAct as arbiter. Resolve disagreement from these "
+                f"votes: {json.dumps(combined, ensure_ascii=True)}"
+            ),
+            snapshot=snapshot,
+            timeout=timeout,
+        )
+        if arbiter:
+            arbiter_vote = _bool_from_vote(arbiter[0])
+
+    hydrated = dict(assertion)
+    hydrated["model_votes"] = votes
+    hydrated["retry_votes"] = retry_votes
+    hydrated["arbiter_vote"] = arbiter_vote
+    hydrated["evidence"] = evidence
+    return _evaluate_consensus_assertion(hydrated)
+
+
+def _consensus_models(assertion: dict[str, Any]) -> list[str]:
+    raw = assertion.get("models")
+    models: list[str] = []
+    if isinstance(raw, list):
+        models.extend(str(item).strip() for item in raw if str(item).strip())
+    for key in ("primary_model", "secondary_model"):
+        value = str(assertion.get(key) or "").strip()
+        if value:
+            models.append(value)
+    out: list[str] = []
+    for model in models:
+        if model not in out:
+            out.append(model)
+    return out[:4]
+
+
+def _consensus_api_key(assertion: dict[str, Any]) -> str | None:
+    if assertion.get("api_key"):
+        return str(assertion["api_key"])
+    api_key_env = str(assertion.get("api_key_env") or "RETRACE_LLM_API_KEY")
+    return os.environ.get(api_key_env) or None
+
+
+def _assertion_snapshot_payload(
+    *,
+    assertion: dict[str, Any],
+    evidence: dict[str, Any],
+    prompt: str,
+) -> dict[str, Any]:
+    return {
+        "assertion_id": assertion.get("id") or assertion.get("name") or "",
+        "assertion": prompt,
+        "expected": assertion.get("expected"),
+        "url": evidence.get("url"),
+        "status_code": evidence.get("status_code"),
+        "headers": evidence.get("headers", {}),
+        "body_excerpt": evidence.get("body_excerpt", ""),
+        "body_length": evidence.get("body_length", 0),
+        "screenshot_available": False,
+    }
+
+
+def _run_consensus_model_votes(
+    *,
+    provider: str,
+    base_url: str,
+    api_key: str | None,
+    models: list[str],
+    prompt: str,
+    snapshot: dict[str, Any],
+    timeout: float,
+    retry: bool = False,
+) -> list[dict[str, Any]]:
+    if not models:
+        return []
+    max_workers = min(4, len(models))
+    votes: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _call_assertion_model,
+                provider=provider,
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+                snapshot=snapshot,
+                timeout=timeout,
+                retry=retry,
+            ): model
+            for model in models
+        }
+        for future in as_completed(futures):
+            try:
+                votes.append(future.result())
+            except Exception as exc:
+                votes.append(
+                    {
+                        "model": futures[future],
+                        "ok": False,
+                        "error": str(exc),
+                        "retry": retry,
+                    }
+                )
+    order = {model: idx for idx, model in enumerate(models)}
+    return sorted(votes, key=lambda vote: order.get(str(vote.get("model")), 999))
+
+
+def _call_assertion_model(
+    *,
+    provider: str,
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    prompt: str,
+    snapshot: dict[str, Any],
+    timeout: float,
+    retry: bool,
+) -> dict[str, Any]:
+    system = (
+        "You are a strict UI test assertion judge. Return only JSON with keys "
+        "ok (boolean), confidence (0-1), and reasoning (short string)."
+    )
+    user = (
+        f"Assertion: {prompt}\n\n"
+        f"Observed evidence JSON:\n{json.dumps(snapshot, indent=2, ensure_ascii=True)}"
+    )
+    url, headers, body = build_llm_http_request(
+        provider=provider,
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        system=system,
+        user=user,
+        temperature=0.0,
+        response_json=True,
+        max_tokens=256,
+    )
+    with httpx.Client(timeout=timeout) as client:
+        response = client.post(url, headers=headers, json=body)
+        response.raise_for_status()
+        payload = response.json()
+    raw_text = extract_llm_text_content(provider=provider, payload=payload)
+    parsed = _parse_model_vote_json(raw_text)
+
+    # Safely coerce "ok" field to boolean
+    ok_val = parsed.get("ok")
+    if isinstance(ok_val, bool):
+        ok = ok_val
+    elif isinstance(ok_val, str):
+        normalized = ok_val.strip().lower()
+        ok = normalized in {"true", "1", "yes"}
+    elif isinstance(ok_val, (int, float)):
+        ok = bool(ok_val)
+    else:
+        ok = False
+
+    return {
+        "model": model,
+        "ok": ok,
+        "confidence": _coerce_confidence(parsed.get("confidence"), default=0.5),
+        "reasoning": str(parsed.get("reasoning") or ""),
+        "retry": retry,
+    }
+
+
+def _parse_model_vote_json(content: str) -> dict[str, Any]:
+    text = content.strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if not match:
+            raise
+        parsed = json.loads(match.group(1))
+    if not isinstance(parsed, dict):
+        raise ValueError("model vote response must be a JSON object")
+    return parsed
+
+
 def _collect_consensus_votes(assertion: dict[str, Any]) -> list[dict[str, Any]]:
     votes = [
         vote
@@ -617,7 +903,10 @@ def _evaluate_native_assertion(
             }
         else:
             consensus_assertion["evidence"] = response_evidence
-        return _evaluate_consensus_assertion(consensus_assertion)
+        return _evaluate_model_backed_consensus_assertion(
+            consensus_assertion,
+            response=response,
+        )
     if response is None:
         return _assertion_result(
             assertion=assertion,
@@ -784,6 +1073,14 @@ def _run_native_spec(
     steps = spec.exact_steps or [
         {"id": "default-get", "action": "get", "url": app_url}
     ]
+    if _should_use_playwright(spec, steps):
+        return _run_playwright_spec(
+            spec=spec,
+            app_url=app_url,
+            run_dir=run_dir,
+            log_path=log_path,
+            steps=steps,
+        )
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             for idx, step in enumerate(steps):
@@ -932,6 +1229,31 @@ def _run_native_spec(
                             response=last_response,
                         )
                     )
+                elif action in {"click", "type", "keypress", "wait", "hover", "upload", "drag", "drop"}:
+                    artifact_path = artifacts_dir / f"step-{idx}-pending.json"
+                    artifact_path.write_text(
+                        json.dumps(
+                            {
+                                "step": step,
+                                "status": "pending_browser_runtime",
+                                "message": (
+                                    "This replay-derived step requires the Playwright "
+                                    "browser runtime and a durable locator."
+                                ),
+                            },
+                            indent=2,
+                        )
+                        + "\n"
+                    )
+                    artifacts.append(
+                        TesterArtifact(
+                            artifact_id=f"step-{idx}-pending",
+                            artifact_type="pending_browser_step",
+                            path=str(artifact_path),
+                            label=f"Pending browser step {idx + 1}",
+                            metadata={"action": action},
+                        )
+                    )
                 else:
                     assertion_results.append(
                         _assertion_result(
@@ -1059,6 +1381,265 @@ def _run_native_spec(
         assertions_payload,
         error,
     )
+
+
+def _should_use_playwright(spec: TesterSpec, steps: list[dict[str, Any]]) -> bool:
+    runtime = str(
+        spec.browser_settings.get("runtime")
+        or spec.browser_settings.get("browser_runtime")
+        or ""
+    ).strip().lower()
+    if runtime == "playwright":
+        return True
+    browser_actions = {"click", "type", "keypress", "wait", "hover", "upload", "drag", "drop"}
+    return any(
+        str(step.get("action") or step.get("type") or "").lower() in browser_actions
+        and bool(step.get("selector") or step.get("text") or step.get("key"))
+        for step in steps
+    )
+
+
+def _run_playwright_spec(
+    *,
+    spec: TesterSpec,
+    app_url: str,
+    run_dir: Path,
+    log_path: Path,
+    steps: list[dict[str, Any]],
+) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]], str]:
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    artifacts: list[TesterArtifact] = []
+    assertion_results: list[TesterAssertionResult] = []
+    error = ""
+    last_status: int | None = None
+    last_text = ""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        error = f"Playwright runtime unavailable: {exc}"
+        return _playwright_result_payload(
+            artifacts_dir=artifacts_dir,
+            log_path=log_path,
+            artifacts=artifacts,
+            assertion_results=assertion_results,
+            error=error,
+            steps=steps,
+        )
+
+    try:
+        with sync_playwright() as pw:
+            browser_name = str(spec.browser_settings.get("browser") or "chromium")
+            browser_type = getattr(pw, browser_name)
+            browser = browser_type.launch(
+                headless=bool(spec.browser_settings.get("headless", True))
+            )
+            context = browser.new_context(
+                viewport=spec.browser_settings.get("viewport")
+                if isinstance(spec.browser_settings.get("viewport"), dict)
+                else None
+            )
+            page = context.new_page()
+            for idx, step in enumerate(steps):
+                action = str(step.get("action") or step.get("type") or "get").lower()
+                if action in {"visit", "goto", "get", "navigate"}:
+                    response = page.goto(
+                        _join_url(app_url, str(step.get("url") or step.get("path") or "")),
+                        wait_until="domcontentloaded",
+                    )
+                    last_status = response.status if response is not None else None
+                elif action == "click":
+                    selector = _selector_for_browser_step(step)
+                    if not selector:
+                        raise ValueError(f"click step {step.get('id') or idx} needs selector")
+                    page.locator(selector).click()
+                elif action == "type":
+                    selector = _selector_for_browser_step(step)
+                    if not selector:
+                        raise ValueError(f"type step {step.get('id') or idx} needs selector")
+                    page.locator(selector).fill(str(step.get("text") or ""))
+                elif action == "keypress":
+                    page.keyboard.press(str(step.get("key") or "Enter"))
+                elif action == "wait":
+                    page.wait_for_timeout(int(step.get("ms") or step.get("timeout_ms") or 500))
+                elif action == "hover":
+                    selector = _selector_for_browser_step(step)
+                    if not selector:
+                        raise ValueError(f"hover step {step.get('id') or idx} needs selector")
+                    page.locator(selector).hover()
+                elif action == "upload":
+                    selector = _selector_for_browser_step(step)
+                    if not selector:
+                        raise ValueError(f"upload step {step.get('id') or idx} needs selector")
+                    file_path = str(step.get("file") or step.get("file_path") or "")
+                    if not file_path:
+                        raise ValueError(f"upload step {step.get('id') or idx} needs file path")
+                    page.locator(selector).set_input_files(file_path)
+                elif action in {"drag", "drop"}:
+                    raise ValueError(
+                        f"{action} step {step.get('id') or idx} is not yet implemented in Playwright runner"
+                    )
+                elif action in {"assert_status", "status_code"}:
+                    expected = int(step.get("expected", step.get("status", 200)))
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion={"type": "status_code", **step},
+                            ok=last_status == expected,
+                            expected=expected,
+                            actual=last_status,
+                            message=f"Expected status {expected}, got {last_status}.",
+                        )
+                    )
+                elif action in {"assert_text", "text_contains", "contains"}:
+                    last_text = page.locator("body").inner_text(timeout=3000)
+                    expected = str(step.get("expected", step.get("text", "")))
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion={"type": "text_contains", **step},
+                            ok=expected in last_text,
+                            expected=expected,
+                            actual={"contains": expected in last_text},
+                            message=f"Expected page text to contain {expected!r}.",
+                        )
+                    )
+
+            # Evaluate top-level spec.assertions
+            for assertion in spec.assertions:
+                assertion_type = str(
+                    assertion.get("type") or assertion.get("assertion_type") or ""
+                ).lower()
+                if assertion_type in {"status", "status_code", "assert_status"}:
+                    expected = int(assertion.get("expected", assertion.get("status", 200)))
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion=assertion,
+                            ok=last_status == expected,
+                            expected=expected,
+                            actual=last_status,
+                            message=f"Expected status {expected}, got {last_status}.",
+                        )
+                    )
+                elif assertion_type in {"text_contains", "body_contains", "assert_text", "contains"}:
+                    expected = str(assertion.get("expected", assertion.get("text", "")))
+                    try:
+                        last_text = page.locator("body").inner_text(timeout=3000)
+                    except Exception:
+                        last_text = ""
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion=assertion,
+                            ok=expected in last_text,
+                            expected=expected,
+                            actual={"contains": expected in last_text},
+                            message=f"Expected page text to contain {expected!r}.",
+                        )
+                    )
+                elif assertion_type in {"model_consensus", "consensus", "ai_consensus"}:
+                    # For consensus assertions, we don't have an httpx.Response, so pass None
+                    assertion_results.append(
+                        _evaluate_model_backed_consensus_assertion(assertion, response=None)
+                    )
+                else:
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion=assertion,
+                            ok=False,
+                            expected=assertion.get("expected"),
+                            actual={"unsupported_in_playwright": assertion_type},
+                            message=f"Assertion type {assertion_type} not yet supported in Playwright runner.",
+                        )
+                    )
+
+            if not assertion_results:
+                assertion_results.append(
+                    _assertion_result(
+                        assertion={"id": "default-status", "type": "status_code"},
+                        ok=(last_status is None or last_status < 500),
+                        expected="<500",
+                        actual=last_status,
+                        message="Expected browser navigation response below HTTP 500.",
+                    )
+                )
+            screenshot_path = artifacts_dir / "playwright-final.png"
+            page.screenshot(path=str(screenshot_path), full_page=True)
+            artifacts.append(
+                TesterArtifact(
+                    artifact_id="playwright-final-screenshot",
+                    artifact_type="screenshot",
+                    path=str(screenshot_path),
+                    label="Final Playwright screenshot",
+                    metadata={"url": page.url},
+                )
+            )
+            context.close()
+            browser.close()
+    except Exception as exc:
+        error = str(exc)
+
+    return _playwright_result_payload(
+        artifacts_dir=artifacts_dir,
+        log_path=log_path,
+        artifacts=artifacts,
+        assertion_results=assertion_results,
+        error=error,
+        steps=steps,
+    )
+
+
+def _selector_for_browser_step(step: dict[str, Any]) -> str:
+    selector = str(step.get("selector") or "").strip()
+    if selector:
+        return selector
+    target = step.get("target")
+    if isinstance(target, dict):
+        return str(target.get("selector") or "").strip()
+    return ""
+
+
+def _playwright_result_payload(
+    *,
+    artifacts_dir: Path,
+    log_path: Path,
+    artifacts: list[TesterArtifact],
+    assertion_results: list[TesterAssertionResult],
+    error: str,
+    steps: list[dict[str, Any]],
+) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]], str]:
+    assertions_payload = [asdict(item) for item in assertion_results]
+    assertions_path = artifacts_dir / "assertions.json"
+    assertions_path.write_text(json.dumps(assertions_payload, indent=2) + "\n")
+    artifacts.append(
+        TesterArtifact(
+            artifact_id="assertions",
+            artifact_type="assertion_results",
+            path=str(assertions_path),
+            label="Structured assertion results",
+            metadata={"count": len(assertion_results)},
+        )
+    )
+    summary = {
+        "execution_engine": "native",
+        "runtime": "playwright",
+        "steps": steps,
+        "assertion_count": len(assertion_results),
+        "artifact_count": len(artifacts),
+        "error": error,
+    }
+    summary_path = artifacts_dir / "native-summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+    artifacts.append(
+        TesterArtifact(
+            artifact_id="native-summary",
+            artifact_type="native_run_summary",
+            path=str(summary_path),
+            label="Native runner summary",
+            metadata={"runtime": "playwright"},
+        )
+    )
+    with log_path.open("a") as log:
+        log.write(json.dumps(summary, indent=2) + "\n")
+    ok = not error and all(item.ok for item in assertion_results)
+    return 0 if ok else 1, [asdict(item) for item in artifacts], assertions_payload, error
 
 
 def _cached_step_has_effect(*, response: httpx.Response, step: dict[str, Any]) -> bool:

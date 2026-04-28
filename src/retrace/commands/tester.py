@@ -9,6 +9,8 @@ import click
 import yaml
 
 from retrace.config import load_config
+from retrace.replay_specs import generate_spec_from_replay_issue
+from retrace.storage import Storage
 from retrace.tester import (
     DEFAULT_APP_URL,
     DEFAULT_HARNESS_COMMAND,
@@ -295,6 +297,51 @@ def tester_update(
     validate_spec(spec)
     save_spec(specs_dir, spec)
     click.echo(f"Updated tester spec: {spec.spec_id}")
+
+
+@tester_group.command("from-replay-issue")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--project-id", default="", help="Project ID override.")
+@click.option("--environment-id", default="", help="Environment ID override.")
+@click.option("--app-url", default="", help="App URL override for generated spec.")
+@click.argument("issue_id")
+def tester_from_replay_issue(
+    config_path: Path,
+    project_id: str,
+    environment_id: str,
+    app_url: str,
+    issue_id: str,
+) -> None:
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Default")
+    generated = generate_spec_from_replay_issue(
+        store=store,
+        specs_dir=specs_dir_for_data_dir(cfg.run.data_dir),
+        project_id=project_id.strip() or workspace.project_id,
+        environment_id=environment_id.strip() or workspace.environment_id,
+        issue_id=issue_id,
+        app_url=app_url,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "spec_id": generated.spec.spec_id,
+                "issue_public_id": generated.issue_public_id,
+                "replay_public_id": generated.replay_public_id,
+                "confidence": generated.confidence,
+                "known_gaps": generated.known_gaps,
+            },
+            indent=2,
+        )
+    )
 
 
 @tester_group.command("run")
