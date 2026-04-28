@@ -185,6 +185,7 @@ Available read/process endpoints:
 - `GET /api/replays?environment_id=...`
 - `GET /api/replays/{replay_id}?environment_id=...`
 - `GET /api/issues?environment_id=...`
+- `GET /api/metrics`
 - `POST /api/replays/process`
 
 Process queued final replay batches locally:
@@ -192,6 +193,20 @@ Process queued final replay batches locally:
 ```bash
 retrace api process-replays --limit 25
 ```
+
+## Self-Host Compose Stack
+
+```bash
+docker compose up -d
+```
+
+The compose stack now runs separate containers for:
+
+- `api` on `http://127.0.0.1:8788`
+- `worker` for queued replay finalization
+- `cron` for scheduled PostHog ingestion/report generation
+
+All services share mounted `config.yaml`, `.env`, `data`, and `reports` paths.
 
 ## MCP Server (Single Server, Multiple Tools)
 

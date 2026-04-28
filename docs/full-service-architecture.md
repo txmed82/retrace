@@ -40,6 +40,17 @@ Self-host deployments can run these in one Docker Compose stack. Cloud
 deployments can split API, workers, UI, database, object storage, queues, and
 browser runners independently.
 
+The current self-host Compose stack uses three process roles from one image:
+
+- `api`: first-party replay ingest/read APIs and local metrics.
+- `worker`: queued replay finalization, signal detection, and issue updates.
+- `cron`: scheduled PostHog ingestion and report generation.
+
+Local observability is intentionally provider-neutral. The API exposes
+`GET /api/metrics` behind a service token so self-host users can inspect replay
+batch volume, queued/failed jobs, signal counts, issue analysis state, and test
+run status without a managed monitoring dependency.
+
 ## Data Boundary
 
 All user data is scoped by:

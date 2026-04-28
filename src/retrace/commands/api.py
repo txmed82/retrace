@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 import click
 
 from retrace.config import load_config
+from retrace.observability import collect_local_observability
 from retrace.replay_api import (
     MAX_REPLAY_BODY_BYTES,
     ReplayIngestError,
@@ -109,6 +110,9 @@ def _handler(store: Storage) -> type[BaseHTTPRequestHandler]:
             parsed = urlsplit(self.path)
             if parsed.path == "/healthz":
                 _json_response(self, 200, {"ok": True})
+                return
+            if parsed.path == "/api/metrics":
+                self._handle_metrics()
                 return
             if parsed.path == "/api/replays":
                 self._handle_list_replays(parsed.query)
@@ -223,6 +227,14 @@ def _handler(store: Storage) -> type[BaseHTTPRequestHandler]:
                     "sessions": [_row_dict(r) for r in rows],
                 },
             )
+
+        def _handle_metrics(self) -> None:
+            token = _require_service_token(
+                self, store, scopes={"admin", "mcp:read"}
+            )
+            if token is None:
+                return
+            _json_response(self, 200, collect_local_observability(store).to_dict())
 
         def _handle_process_replays(self) -> None:
             token = _require_service_token(
