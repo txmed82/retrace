@@ -629,7 +629,7 @@ def _evaluate_model_backed_consensus_assertion(
     )
     evidence = _response_assertion_evidence(
         response,
-        capture_body=bool(assertion.get("capture_body_evidence", False)),
+        capture_body=bool(assertion.get("capture_body_evidence", True)),
     )
     snapshot = _assertion_snapshot_payload(
         assertion=assertion,
