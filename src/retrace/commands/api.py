@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import click
 
 from retrace.config import load_config
+from retrace.issue_sinks import promote_replay_issue
 from retrace.observability import collect_local_observability, record_api_request
 from retrace.replay_api import (
     MAX_REPLAY_BODY_BYTES,
@@ -535,6 +536,66 @@ def api_process_replays(config_path: Path, limit: int) -> None:
                 "jobs_failed": result.jobs_failed,
                 "sessions_processed": result.sessions_processed,
                 "issues_created_or_updated": result.issues_created_or_updated,
+            },
+            indent=2,
+        )
+    )
+
+
+@api_group.command("promote-issue")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--provider",
+    type=click.Choice(["linear", "github"], case_sensitive=False),
+    required=True,
+)
+@click.option("--project-id", default="", help="Project ID override.")
+@click.option("--environment-id", default="", help="Environment ID override.")
+@click.option("--base-url", default="", help="Base URL used for replay deep links.")
+@click.option("--external-id", default="", help="Existing external issue ID.")
+@click.option("--external-url", default="", help="Existing external issue URL.")
+@click.argument("issue_id")
+def api_promote_issue(
+    config_path: Path,
+    provider: str,
+    project_id: str,
+    environment_id: str,
+    base_url: str,
+    external_id: str,
+    external_url: str,
+    issue_id: str,
+) -> None:
+    """Promote a replay-backed issue into a Linear/GitHub sink payload."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Default")
+    result = promote_replay_issue(
+        store=store,
+        project_id=project_id.strip() or workspace.project_id,
+        environment_id=environment_id.strip() or workspace.environment_id,
+        issue_id=issue_id,
+        provider=provider,
+        base_url=base_url,
+        external_id=external_id,
+        external_url=external_url,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "issue_id": result.issue_id,
+                "issue_public_id": result.issue_public_id,
+                "provider": result.provider,
+                "external_id": result.external_id,
+                "external_url": result.external_url,
+                "created": result.created,
+                "payload": result.payload,
             },
             indent=2,
         )

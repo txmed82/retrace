@@ -41,8 +41,48 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
+class _LLMHandler(BaseHTTPRequestHandler):
+    calls: list[str] = []
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or "0")
+        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        model = str(payload.get("model") or "")
+        self.__class__.calls.append(model)
+        if model == "primary":
+            vote = {"ok": True, "confidence": 0.91, "reasoning": "copy present"}
+        elif model == "secondary":
+            vote = {"ok": False, "confidence": 0.58, "reasoning": "uncertain"}
+        elif model == "secondary-retry":
+            vote = {"ok": True, "confidence": 0.82, "reasoning": "fresh evidence"}
+        elif model == "arbiter":
+            vote = {"ok": True, "confidence": 0.76, "reasoning": "arbiter pass"}
+        else:
+            vote = {"ok": False, "confidence": 0.4, "reasoning": "unknown model"}
+        body = json.dumps({"choices": [{"message": {"content": json.dumps(vote)}}]}).encode(
+            "utf-8"
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
 def _server_url() -> tuple[ThreadingHTTPServer, str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    return server, f"http://{host}:{port}"
+
+
+def _llm_server_url() -> tuple[ThreadingHTTPServer, str]:
+    _LLMHandler.calls = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _LLMHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
@@ -237,6 +277,93 @@ def test_native_consensus_uses_retry_votes_after_failure(tmp_path: Path) -> None
     assert assertions[0]["actual"]["evidence"]["headers"]["set-cookie"] == "[redacted]"
     assert assertions[0]["actual"]["evidence"]["body_capture"] is False
     assert assertions[0]["confidence"] == 0.0
+
+
+def test_native_consensus_can_run_configured_models(tmp_path: Path) -> None:
+    server, app_url = _server_url()
+    llm_server, llm_url = _llm_server_url()
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Consensus live models",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            exact_steps=[{"id": "home", "action": "get", "path": "/"}],
+            assertions=[
+                {
+                    "id": "live-copy",
+                    "type": "model_consensus",
+                    "consensus_group": "copy",
+                    "base_url": llm_url,
+                    "models": ["primary", "secondary-retry"],
+                    "arbiter_model": "arbiter",
+                    "prompt": "The page should welcome the user to Retrace.",
+                }
+            ],
+        )
+
+        result = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        llm_server.shutdown()
+        llm_server.server_close()
+
+    assert result.ok is True
+    assertions = json.loads((Path(result.run_dir) / "artifacts" / "assertions.json").read_text())
+    assert assertions[0]["actual"]["pass_votes"] >= 2
+    assert assertions[0]["actual"]["evidence"]["available"] is True
+    assert assertions[0]["actual"]["evidence"]["body_capture"] is True
+    assert "Welcome to Retrace" in assertions[0]["actual"]["evidence"]["body_excerpt"]
+    assert {vote["model"] for vote in assertions[0]["model_votes"]} == {
+        "primary",
+        "secondary-retry",
+    }
+    assert "primary" in _LLMHandler.calls
+    assert "secondary-retry" in _LLMHandler.calls
+
+
+def test_native_consensus_uses_arbiter_model_on_disagreement(tmp_path: Path) -> None:
+    server, app_url = _server_url()
+    llm_server, llm_url = _llm_server_url()
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Consensus arbiter model",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            exact_steps=[{"id": "home", "action": "get", "path": "/"}],
+            assertions=[
+                {
+                    "id": "arbited-copy",
+                    "type": "model_consensus",
+                    "base_url": llm_url,
+                    "models": ["primary", "secondary"],
+                    "retry_failed": False,
+                    "arbiter_model": "arbiter",
+                    "prompt": "The page should welcome the user to Retrace.",
+                }
+            ],
+        )
+
+        result = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        llm_server.shutdown()
+        llm_server.server_close()
+
+    assert result.ok is True
+    assertions = json.loads((Path(result.run_dir) / "artifacts" / "assertions.json").read_text())
+    assert assertions[0]["actual"]["decision"] == "arbiter"
+    assert assertions[0]["actual"]["arbiter_vote"] is True
+    assert "arbiter" in _LLMHandler.calls
 
 
 def test_native_consensus_handles_null_and_invalid_confidence(tmp_path: Path) -> None:

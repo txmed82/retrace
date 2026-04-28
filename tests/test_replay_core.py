@@ -11,6 +11,8 @@ from retrace.replay_core import (
     process_replay_sessions,
     summarize_replay_issue,
 )
+from retrace.issue_sinks import promote_replay_issue
+from retrace.replay_specs import generate_spec_from_replay_issue
 from retrace.sinks.base import Cluster
 from retrace.storage import Storage
 
@@ -532,6 +534,100 @@ def test_replay_core_persists_ai_analysis_metadata_and_evidence(tmp_path: Path) 
     click_evidence = evidence["events"][1]
     assert click_evidence["type"] == 3
     assert click_evidence["data_type"] == 2
+
+
+def test_generate_spec_from_replay_issue_preserves_public_ids(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-spec",
+        sequence=0,
+        events=[
+            _navigation("https://app.example/checkout"),
+            _click(9),
+            _console_error("TypeError: total is undefined"),
+        ],
+        flush_type="final",
+    )
+    processed = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-spec"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    issue_public_id = processed.issues[0].public_id
+
+    generated = generate_spec_from_replay_issue(
+        store=store,
+        specs_dir=tmp_path / "specs",
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=issue_public_id,
+    )
+
+    assert generated.issue_public_id == issue_public_id
+    assert generated.replay_public_id.startswith("rpl_")
+    assert generated.confidence == "medium"
+    assert generated.known_gaps
+    assert generated.spec.execution_engine == "native"
+    assert generated.spec.app_url == "https://app.example"
+    assert generated.spec.exact_steps[0]["url"] == "https://app.example/checkout"
+    assert generated.spec.exact_steps[1]["action"] == "click"
+    assert generated.spec.fixtures["issue_public_id"] == issue_public_id
+    assert (tmp_path / "specs" / f"{generated.spec.spec_id}.json").exists()
+
+
+def test_promote_replay_issue_dedupes_external_ticket(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-sink",
+        sequence=0,
+        events=[
+            _navigation("https://app.example/checkout"),
+            _console_error("TypeError: total is undefined"),
+        ],
+        flush_type="final",
+    )
+    processed = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-sink"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    issue_public_id = processed.issues[0].public_id
+
+    first = promote_replay_issue(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=issue_public_id,
+        provider="github",
+        base_url="https://retrace.example",
+    )
+    second = promote_replay_issue(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=issue_public_id,
+        provider="github",
+        base_url="https://retrace.example",
+    )
+
+    assert first.created is True
+    assert first.external_id.startswith("GH-bug_")
+    assert first.payload["source_public_id"] == issue_public_id
+    assert first.payload["replay_links"][0]["url"].startswith("https://retrace.example")
+    assert second.created is False
+    assert second.external_id == first.external_id
 
 
 def test_replay_core_windows_evidence_around_representative_signal(
