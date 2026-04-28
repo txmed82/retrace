@@ -20,84 +20,135 @@ class LocalObservabilitySnapshot:
         return asdict(self)
 
 
-def _count_by_status(rows: list[Any]) -> dict[str, int]:
+def _count_rows(rows: list[Any], key: str = "name") -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in rows:
-        status = str(row["status"] or "unknown")
-        counts[status] = counts.get(status, 0) + 1
+        name = str(row[key] or "unknown")
+        counts[name] = int(row["count"] or 0)
     return counts
 
 
 def collect_local_observability(store: Storage) -> LocalObservabilitySnapshot:
     """Return provider-neutral operational counters for local/self-host installs."""
     with store._conn() as conn:
-        replay_sessions = conn.execute(
-            "SELECT status, event_count FROM replay_sessions"
-        ).fetchall()
-        replay_batches = conn.execute(
-            "SELECT event_count, received_at FROM replay_batches"
-        ).fetchall()
-        replay_issues = conn.execute(
+        replay_session_count = int(
+            conn.execute("SELECT COUNT(*) AS count FROM replay_sessions").fetchone()[
+                "count"
+            ]
+            or 0
+        )
+        replay_batch_summary = conn.execute(
             """
-            SELECT status, severity, analysis_status
+            SELECT COUNT(*) AS batch_count,
+                   COALESCE(SUM(event_count), 0) AS event_count
+            FROM replay_batches
+            """
+        ).fetchone()
+        issue_count = int(
+            conn.execute("SELECT COUNT(*) AS count FROM replay_issues").fetchone()[
+                "count"
+            ]
+            or 0
+        )
+        issue_status_rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(status, ''), 'unknown') AS name,
+                   COUNT(*) AS count
             FROM replay_issues
+            GROUP BY COALESCE(NULLIF(status, ''), 'unknown')
             """
         ).fetchall()
-        jobs = conn.execute(
+        issue_severity_rows = conn.execute(
             """
-            SELECT kind, status, attempts, last_error
+            SELECT COALESCE(NULLIF(severity, ''), 'unknown') AS name,
+                   COUNT(*) AS count
+            FROM replay_issues
+            GROUP BY COALESCE(NULLIF(severity, ''), 'unknown')
+            """
+        ).fetchall()
+        analysis_status_rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(analysis_status, ''), 'unknown') AS name,
+                   COUNT(*) AS count
+            FROM replay_issues
+            GROUP BY COALESCE(NULLIF(analysis_status, ''), 'unknown')
+            """
+        ).fetchall()
+        job_rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(kind, ''), 'unknown') AS kind,
+                   COALESCE(NULLIF(status, ''), 'unknown') AS status,
+                   COUNT(*) AS count
             FROM processing_jobs
+            GROUP BY COALESCE(NULLIF(kind, ''), 'unknown'),
+                     COALESCE(NULLIF(status, ''), 'unknown')
             """
         ).fetchall()
-        signals = conn.execute(
-            "SELECT detector FROM replay_signals"
+        failed_jobs = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM processing_jobs
+                WHERE status = 'failed'
+                """
+            ).fetchone()["count"]
+            or 0
+        )
+        retrying_jobs = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM processing_jobs
+                WHERE attempts > 1
+                """
+            ).fetchone()["count"]
+            or 0
+        )
+        detector_rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(detector, ''), 'unknown') AS name,
+                   COUNT(*) AS count
+            FROM replay_signals
+            GROUP BY COALESCE(NULLIF(detector, ''), 'unknown')
+            """
         ).fetchall()
-        tester_runs = conn.execute(
-            "SELECT status, findings_count FROM runs"
+        tester_run_count = int(
+            conn.execute("SELECT COUNT(*) AS count FROM runs").fetchone()["count"] or 0
+        )
+        tester_run_status_rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(status, ''), 'unknown') AS name,
+                   COUNT(*) AS count
+            FROM runs
+            GROUP BY COALESCE(NULLIF(status, ''), 'unknown')
+            """
         ).fetchall()
 
     job_counts: dict[str, dict[str, int]] = {}
-    failed_jobs = 0
-    retrying_jobs = 0
-    for job in jobs:
-        kind = str(job["kind"] or "unknown")
-        status = str(job["status"] or "unknown")
+    for row in job_rows:
+        kind = str(row["kind"] or "unknown")
+        status = str(row["status"] or "unknown")
         job_counts.setdefault(kind, {})
-        job_counts[kind][status] = job_counts[kind].get(status, 0) + 1
-        failed_jobs += 1 if status == "failed" else 0
-        retrying_jobs += 1 if int(job["attempts"] or 0) > 1 else 0
-
-    detector_counts: dict[str, int] = {}
-    for signal in signals:
-        detector = str(signal["detector"] or "unknown")
-        detector_counts[detector] = detector_counts.get(detector, 0) + 1
-
-    issue_severity: dict[str, int] = {}
-    analysis_status: dict[str, int] = {}
-    for issue in replay_issues:
-        severity = str(issue["severity"] or "unknown")
-        issue_severity[severity] = issue_severity.get(severity, 0) + 1
-        status = str(issue["analysis_status"] or "unknown")
-        analysis_status[status] = analysis_status.get(status, 0) + 1
+        job_counts[kind][status] = int(row["count"] or 0)
 
     return LocalObservabilitySnapshot(
         generated_at=datetime.now(timezone.utc).isoformat(),
         api={
-            "replay_sessions": len(replay_sessions),
-            "replay_batches": len(replay_batches),
-            "replay_events": sum(int(row["event_count"] or 0) for row in replay_batches),
+            "replay_sessions": replay_session_count,
+            "replay_batches": int(replay_batch_summary["batch_count"] or 0),
+            "replay_events": int(replay_batch_summary["event_count"] or 0),
         },
         replay_processing={
             "jobs": job_counts,
             "failed_jobs": failed_jobs,
             "retrying_jobs": retrying_jobs,
-            "signals_by_detector": detector_counts,
+            "signals_by_detector": _count_rows(detector_rows),
         },
         ai_analysis={
-            "issues": len(replay_issues),
-            "issues_by_status": _count_by_status(replay_issues),
-            "issues_by_severity": issue_severity,
-            "analysis_by_status": analysis_status,
+            "issues": issue_count,
+            "issues_by_status": _count_rows(issue_status_rows),
+            "issues_by_severity": _count_rows(issue_severity_rows),
+            "analysis_by_status": _count_rows(analysis_status_rows),
         },
         storage={
             "database_path": str(store.path),
@@ -106,7 +157,7 @@ def collect_local_observability(store: Storage) -> LocalObservabilitySnapshot:
             ),
         },
         test_runs={
-            "runs": len(tester_runs),
-            "runs_by_status": _count_by_status(tester_runs),
+            "runs": tester_run_count,
+            "runs_by_status": _count_rows(tester_run_status_rows),
         },
     )

@@ -15,7 +15,8 @@ Initial implementation:
   consensus artifacts.
 - Native tester caches resolved step URLs, verifies cached steps with a real
   request, and records cache hit/miss/auto-heal events.
-- API exposes provider-neutral local metrics at `GET /api/metrics`.
+- API exposes provider-neutral local metrics at `GET /api/metrics`
+  (service-token protected).
 - Docker Compose separates API, replay worker, and cron roles.
 
 ## Slice 2: Replay Product Workflow
