@@ -478,6 +478,13 @@ def _assertion_result(
     assertion_type = str(
         assertion.get("type") or assertion.get("assertion_type") or "unknown"
     )
+    selected_confidence = (
+        confidence
+        if confidence is not None
+        else assertion.get("confidence")
+        if assertion.get("confidence") is not None
+        else 1.0
+    )
     return TesterAssertionResult(
         assertion_id=str(
             assertion.get("id") or assertion.get("name") or uuid.uuid4().hex[:8]
@@ -488,12 +495,18 @@ def _assertion_result(
         actual=actual,
         message=message,
         source=str(assertion.get("source") or "native"),
-        confidence=float(
-            confidence if confidence is not None else assertion.get("confidence") or 1.0
-        ),
+        confidence=_coerce_confidence(selected_confidence, default=1.0),
         consensus_group=str(assertion.get("consensus_group") or ""),
         model_votes=list(assertion.get("model_votes") or []),
     )
+
+
+def _coerce_confidence(raw: Any, *, default: float = 1.0) -> float:
+    try:
+        value = default if raw is None else float(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(0.0, min(1.0, value))
 
 
 def _bool_from_vote(vote: dict[str, Any]) -> bool | None:
@@ -561,8 +574,9 @@ def _evaluate_consensus_assertion(
             f"Consensus {decision}: {pass_count} pass vote(s), "
             f"{fail_count} fail vote(s)."
         ),
-        confidence=float(
-            assertion.get("confidence") if "confidence" in assertion else confidence
+        confidence=_coerce_confidence(
+            assertion.get("confidence") if "confidence" in assertion else confidence,
+            default=confidence,
         ),
     )
 

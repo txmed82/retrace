@@ -236,6 +236,46 @@ def test_native_consensus_uses_retry_votes_after_failure(tmp_path: Path) -> None
     assert assertions[0]["confidence"] == 0.0
 
 
+def test_native_consensus_handles_null_and_invalid_confidence(tmp_path: Path) -> None:
+    server, app_url = _server_url()
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Consensus null confidence",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            assertions=[
+                {
+                    "id": "null-confidence",
+                    "type": "model_consensus",
+                    "model_votes": [{"model": "primary", "ok": True}],
+                    "confidence": None,
+                },
+                {
+                    "id": "invalid-confidence",
+                    "type": "text_contains",
+                    "expected": "Welcome",
+                    "confidence": "not-a-number",
+                },
+            ],
+        )
+
+        result = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result.ok is True
+    assertions = json.loads(
+        (Path(result.run_dir) / "artifacts" / "assertions.json").read_text()
+    )
+    assert assertions[0]["confidence"] == 1.0
+    assert assertions[1]["confidence"] == 1.0
+
+
 def test_native_step_cache_auto_heals_stale_effective_url(tmp_path: Path) -> None:
     server, app_url = _server_url()
     try:
