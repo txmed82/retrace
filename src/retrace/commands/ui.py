@@ -660,7 +660,20 @@ def _json_field(row: Any, key: str, fallback: Any) -> Any:
 
 def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
     issues = []
-    for row in store.list_recent_replay_issues(limit=50):
+    issue_rows = store.list_recent_replay_issues(limit=50)
+    issue_sessions_by_id: dict[str, list[dict[str, Any]]] = {}
+    for session in store.list_replay_issue_sessions_for_issues(
+        [str(row["id"]) for row in issue_rows]
+    ):
+        issue_sessions_by_id.setdefault(str(session["issue_id"]), []).append(
+            {
+                "session_id": str(session["session_id"]),
+                "role": str(session["role"]),
+                "first_seen_ms": int(session["first_seen_ms"]),
+                "last_seen_ms": int(session["last_seen_ms"]),
+            }
+        )
+    for row in issue_rows:
         issues.append(
             {
                 "id": str(row["id"]),
@@ -677,10 +690,18 @@ def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
                     row, "reproduction_steps_json", []
                 ),
                 "signal_summary": _json_field(row, "signal_summary_json", {}),
+                "evidence": _json_field(row, "evidence_json", {}),
                 "affected_count": int(row["affected_count"]),
+                "affected_users": int(row["affected_users"]),
+                "representative_session_id": str(row["representative_session_id"]),
+                "external_ticket_state": str(row["external_ticket_state"]),
+                "external_ticket_url": str(row["external_ticket_url"]),
+                "external_ticket_id": str(row["external_ticket_id"]),
                 "first_seen_ms": int(row["first_seen_ms"]),
                 "last_seen_ms": int(row["last_seen_ms"]),
                 "updated_at": str(row["updated_at"]),
+                "sessions": issue_sessions_by_id.get(str(row["id"]), []),
+                "share_url": f"#issue={str(row['public_id'])}",
             }
         )
     sessions = []
@@ -696,7 +717,9 @@ def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
                 "status": str(row["status"]),
                 "event_count": int(row["event_count"]),
                 "metadata": _json_field(row, "metadata_json", {}),
+                "preview": _json_field(row, "preview_json", {}),
                 "last_seen_at": str(row["last_seen_at"]),
+                "share_url": f"#replay={str(row['public_id'])}",
             }
         )
     return {"issues": issues, "sessions": sessions}
@@ -1050,22 +1073,39 @@ _INDEX_HTML = """<!doctype html>
       const data = await res.json();
       const issues = data.issues || [];
       const sessions = data.sessions || [];
+      const issueOptions = [...new Set(issues.map(i => i.status || 'unknown'))].sort()
+        .map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+      const sessionOptions = [...new Set(sessions.map(s => s.status || 'unknown'))].sort()
+        .map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
       const issueRows = issues.map(i => `
-        <li><code>${esc(i.public_id)}</code> · <strong>${esc(i.title || 'Untitled issue')}</strong><br>
-          <span class="empty">${esc(i.status)} · ${esc(i.severity)} · affected=${esc(i.affected_count)} · signals=${esc(JSON.stringify(i.signal_summary || {}))}</span>
+        <li data-issue-status="${esc(i.status)}"><button class="btn" type="button" data-replay-issue="${esc(i.public_id)}">Inspect</button>
+          <a href="${esc(i.share_url)}"><code>${esc(i.public_id)}</code></a> · <strong>${esc(i.title || 'Untitled issue')}</strong><br>
+          <span class="empty">${esc(i.status)} · ${esc(i.severity)} · affected=${esc(i.affected_count)} · users=${esc(i.affected_users)} · ticket=${esc(i.external_ticket_state || 'none')}</span>
         </li>`).join('');
       const sessionRows = sessions.map(s => `
-        <li><button class="btn" type="button" data-replay-session="${esc(s.stable_id)}">Play</button>
-          <code>${esc(s.public_id)}</code> · ${esc(s.stable_id)}<br>
-          <span class="empty">${esc(s.status)} · events=${esc(s.event_count)} · ${esc(s.last_seen_at)}</span>
+        <li data-session-status="${esc(s.status)}"><button class="btn" type="button" data-replay-session="${esc(s.stable_id)}">Play</button>
+          <a href="${esc(s.share_url)}"><code>${esc(s.public_id)}</code></a> · ${esc(s.stable_id)}<br>
+          <span class="empty">${esc(s.status)} · events=${esc(s.event_count)} · ${esc(s.last_seen_at)} · ${esc(JSON.stringify(s.preview || {}))}</span>
         </li>`).join('');
       byId('replayDashboard').innerHTML = `
         <h3>Replay Dashboard</h3>
         <div><button class="btn" id="processReplayJobsBtn" type="button">Process Queued Replays</button> <span class="empty" id="replayProcessStatus">${esc(processStatus)}</span></div>
         <div class="grid" style="margin-top:10px">
-          <div><div class="lbl">Replay-backed Issues</div>${issueRows ? `<ul>${issueRows}</ul>` : '<div class="empty">No replay issues yet.</div>'}</div>
-          <div><div class="lbl">Recent Sessions</div>${sessionRows ? `<ul>${sessionRows}</ul>` : '<div class="empty">No first-party replay sessions yet.</div>'}</div>
+          <div><div class="lbl">Replay-backed Issues</div>
+            <select id="issueStatusFilter" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
+              <option value="">All statuses</option>${issueOptions}
+            </select>
+            ${issueRows ? `<ul id="replayIssueList">${issueRows}</ul>` : '<div class="empty">No replay issues yet.</div>'}
+          </div>
+          <div><div class="lbl">Recent Sessions</div>
+            <select id="sessionStatusFilter" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
+              <option value="">All statuses</option>${sessionOptions}
+            </select>
+            ${sessionRows ? `<ul id="replaySessionList">${sessionRows}</ul>` : '<div class="empty">No first-party replay sessions yet.</div>'}
+          </div>
         </div>
+        <div style="height:10px"></div>
+        <div id="replayIssueDetail"><div class="empty">Select a replay-backed issue.</div></div>
         <div style="height:10px"></div>
         <div class="rr"><div id="firstPartyReplay"><div class="empty">Select a first-party replay session.</div></div></div>
       `;
@@ -1073,6 +1113,56 @@ _INDEX_HTML = """<!doctype html>
       byId('replayDashboard').querySelectorAll('[data-replay-session]').forEach(el => {
         el.addEventListener('click', () => loadFirstPartyReplay(el.dataset.replaySession));
       });
+      byId('replayDashboard').querySelectorAll('[data-replay-issue]').forEach(el => {
+        el.addEventListener('click', () => renderReplayIssueDetail(issues.find(i => i.public_id === el.dataset.replayIssue)));
+      });
+      byId('issueStatusFilter')?.addEventListener('change', ev => filterReplayRows('replayIssueList', 'issueStatus', ev.target.value));
+      byId('sessionStatusFilter')?.addEventListener('change', ev => filterReplayRows('replaySessionList', 'sessionStatus', ev.target.value));
+      applyReplayHash(issues, sessions);
+    }
+
+    function filterReplayRows(listId, dataKey, value){
+      const list = byId(listId);
+      if(!list) return;
+      list.querySelectorAll('li').forEach(row => {
+        row.style.display = !value || row.dataset[dataKey] === value ? '' : 'none';
+      });
+    }
+
+    function renderReplayIssueDetail(issue){
+      const root = byId('replayIssueDetail');
+      if(!root || !issue){ return; }
+      const steps = (issue.reproduction_steps || []).map(s => `<li>${esc(s)}</li>`).join('');
+      const sessions = (issue.sessions || []).map(s =>
+        `<li><button class="btn" type="button" data-replay-session="${esc(s.session_id)}">Play</button> <code>${esc(s.session_id)}</code> · ${esc(s.role)}</li>`
+      ).join('');
+      root.innerHTML = `
+        <h3>${esc(issue.public_id)} · ${esc(issue.title || 'Replay issue')}</h3>
+        <div class="empty">${esc(issue.status)} · ${esc(issue.severity)} · affected=${esc(issue.affected_count)} · users=${esc(issue.affected_users)}</div>
+        <div class="lbl">Summary</div><div>${esc(issue.summary || '')}</div>
+        <div class="lbl">Likely Cause</div><div>${esc(issue.likely_cause || '')}</div>
+        <div class="lbl">Reproduction Steps</div>${steps ? `<ul>${steps}</ul>` : '<div class="empty">No steps generated yet.</div>'}
+        <div class="lbl">Sessions</div>${sessions ? `<ul>${sessions}</ul>` : '<div class="empty">No linked sessions.</div>'}
+        <div class="lbl">External Ticket</div>
+        <div class="empty">${issue.external_ticket_url ? `<a href="${esc(issue.external_ticket_url)}" target="_blank">${esc(issue.external_ticket_id || issue.external_ticket_url)}</a>` : esc(issue.external_ticket_state || 'none')}</div>
+        <div class="lbl">Signals</div><pre>${esc(JSON.stringify(issue.signal_summary || {}, null, 2))}</pre>
+      `;
+      root.querySelectorAll('[data-replay-session]').forEach(el => {
+        el.addEventListener('click', () => loadFirstPartyReplay(el.dataset.replaySession));
+      });
+    }
+
+    function applyReplayHash(issues, sessions){
+      const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+      const issueId = hash.get('issue');
+      const replayId = hash.get('replay');
+      if(issueId){
+        renderReplayIssueDetail(issues.find(i => i.public_id === issueId));
+      }
+      if(replayId){
+        const session = sessions.find(s => s.public_id === replayId);
+        if(session) loadFirstPartyReplay(session.stable_id);
+      }
     }
 
     async function loadFirstPartyReplay(sessionId){

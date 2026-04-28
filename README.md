@@ -139,9 +139,17 @@ retrace tester list
 retrace tester runs
 ```
 
+Queue a spec for the self-host browser runner:
+
+```bash
+retrace tester enqueue <spec_id>
+retrace tester worker --once
+```
+
 Spec and run artifacts are stored under:
 
 - `data/ui-tests/specs/*.json`
+- `data/ui-tests/queue/*.json`
 - `data/ui-tests/runs/*/run.json`
 - `data/ui-tests/runs/*/harness.log`
 
@@ -203,10 +211,26 @@ docker compose up -d
 The compose stack now runs separate containers for:
 
 - `api` on `http://127.0.0.1:8788`
+- `ui` on `http://127.0.0.1:8787`
 - `worker` for queued replay finalization
+- `browser-runner` for queued UI test specs
 - `cron` for scheduled PostHog ingestion/report generation
 
 All services share mounted `config.yaml`, `.env`, `data`, and `reports` paths.
+The SQLite database, replay blobs, UI test specs, run artifacts, and cache entries
+live under `./data`; generated reports live under `./reports`.
+
+Before upgrading a self-host install, stop the stack and back up `./data`,
+`./reports`, `config.yaml`, and `.env`. Pull or build the new image, then run:
+
+```bash
+docker compose run --rm api retrace doctor
+docker compose up -d
+```
+
+Size persistent storage around replay volume. A small team can usually start with
+10-20 GB for `./data`; increase this when retaining high-traffic replay sessions,
+native tester response artifacts, or long report history.
 
 ## MCP Server (Single Server, Multiple Tools)
 

@@ -153,6 +153,10 @@ def test_metrics_endpoint_returns_local_observability(tmp_path: Path) -> None:
     with _running_replay_api_server(store) as server:
         host, port = server.server_address
         conn = HTTPConnection(host, port, timeout=5)
+        conn.request("GET", "/healthz")
+        health = conn.getresponse()
+        health.read()
+        assert health.status == 200
         conn.request(
             "GET",
             "/api/metrics",
@@ -163,9 +167,13 @@ def test_metrics_endpoint_returns_local_observability(tmp_path: Path) -> None:
         conn.close()
 
     assert response.status == 200
+    assert response.getheader("X-Retrace-Trace-Id")
     assert payload["api"]["replay_sessions"] == 1
     assert payload["api"]["replay_batches"] == 1
     assert payload["replay_processing"]["jobs"]["replay.finalize"]["queued"] == 1
+    assert payload["replay_processing"]["queue_depth"] == 1
+    assert payload["runtime"]["api_requests"] >= 1
+    assert payload["runtime"]["api_latency_ms"]["max"] >= 0
 
 
 def test_replay_ingest_rejects_gzip_bomb() -> None:

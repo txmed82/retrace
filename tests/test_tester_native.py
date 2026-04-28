@@ -32,6 +32,7 @@ class _Handler(BaseHTTPRequestHandler):
         body = b"<html><body>Welcome to Retrace</body></html>"
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
+        self.send_header("Set-Cookie", "session=secret-token")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -178,6 +179,61 @@ def test_native_runner_records_consensus_and_step_cache(tmp_path: Path) -> None:
     assert any(item["status"] == "miss_store" for item in first_cache)
     assert any(item["status"] == "hit" for item in second_cache)
     assert any("/final" in item["cached_url"] for item in second_cache)
+    consensus = json.loads(
+        (Path(first.run_dir) / "artifacts" / "assertions.json").read_text()
+    )
+    assert consensus[0]["actual"]["decision"] == "arbiter"
+    assert consensus[0]["actual"]["disagreement"] is True
+    assert consensus[0]["actual"]["evidence"]["available"] is True
+    assert consensus[0]["actual"]["evidence"]["status_code"] == 200
+    assert consensus[0]["actual"]["evidence"]["headers"]["set-cookie"] == "[redacted]"
+    assert consensus[0]["actual"]["evidence"]["body_capture"] is False
+    assert "body_excerpt" not in consensus[0]["actual"]["evidence"]
+    assert consensus[0]["confidence"] >= 0.67
+
+
+def test_native_consensus_uses_retry_votes_after_failure(tmp_path: Path) -> None:
+    server, app_url = _server_url()
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Consensus retry",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            assertions=[
+                {
+                    "id": "retry-copy",
+                    "type": "model_consensus",
+                    "model_votes": [
+                        {"model": "primary", "ok": False, "reasoning": "stale"},
+                        {"model": "secondary", "ok": True, "reasoning": "present"},
+                    ],
+                    "retry_votes": [
+                        {"model": "primary", "ok": True, "reasoning": "fresh evidence"}
+                    ],
+                    "confidence": 0.0,
+                    "evidence": {
+                        "snapshot_path": "snapshot.json",
+                        "screenshot_path": "shot.png",
+                    },
+                }
+            ],
+        )
+
+        result = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result.ok is True
+    assertions = json.loads((Path(result.run_dir) / "artifacts" / "assertions.json").read_text())
+    assert assertions[0]["actual"]["pass_votes"] == 2
+    assert assertions[0]["actual"]["retry_count"] == 1
+    assert assertions[0]["actual"]["evidence"]["snapshot_path"] == "snapshot.json"
+    assert assertions[0]["confidence"] == 0.0
 
 
 def test_native_step_cache_auto_heals_stale_effective_url(tmp_path: Path) -> None:
@@ -211,6 +267,76 @@ def test_native_step_cache_auto_heals_stale_effective_url(tmp_path: Path) -> Non
         (Path(second.run_dir) / "artifacts" / "step-cache-events.json").read_text()
     )
     assert any(item["status"] == "auto_heal" for item in second_cache)
+
+
+def test_native_step_cache_bypasses_on_retry(tmp_path: Path) -> None:
+    server, app_url = _server_url()
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Retry bypass",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            exact_steps=[
+                {
+                    "id": "home",
+                    "action": "get",
+                    "path": "/redirect",
+                    "expected_text": "missing on purpose",
+                }
+            ],
+            assertions=[
+                {"id": "force-retry", "type": "text_contains", "expected": "not here"}
+            ],
+        )
+
+        first = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+        second = run_spec(
+            spec=spec,
+            runs_dir=runs_dir_for_data_dir(tmp_path),
+            max_retries=1,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert first.ok is False
+    assert second.ok is False
+    cache_events = json.loads(
+        (Path(second.run_dir) / "artifacts" / "step-cache-events.json").read_text()
+    )
+    assert any(item["status"] == "bypass" for item in cache_events)
+
+
+def test_native_step_cache_does_not_emit_cold_bypass_event(tmp_path: Path) -> None:
+    server, app_url = _server_url()
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Cold bypass",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            exact_steps=[
+                {"id": "home", "action": "get", "path": "/", "cache_bypass": True}
+            ],
+        )
+
+        result = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result.ok is True
+    cache_events = json.loads(
+        (Path(result.run_dir) / "artifacts" / "step-cache-events.json").read_text()
+    )
+    assert not any(item["status"] == "bypass" for item in cache_events)
 
 
 def test_native_auth_required_specs_fail_fast(tmp_path: Path) -> None:

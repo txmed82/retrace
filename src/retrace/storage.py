@@ -1928,6 +1928,28 @@ class Storage:
                 (issue_id,),
             ).fetchall()
 
+    def list_replay_issue_sessions_for_issues(
+        self, issue_ids: list[str]
+    ) -> list[sqlite3.Row]:
+        clean_ids = [str(issue_id).strip() for issue_id in issue_ids if str(issue_id).strip()]
+        if not clean_ids:
+            return []
+        placeholders = ",".join("?" for _ in clean_ids)
+        with self._conn() as conn:
+            return conn.execute(
+                f"""
+                SELECT *
+                FROM replay_issue_sessions
+                WHERE issue_id IN ({placeholders})
+                ORDER BY
+                    issue_id,
+                    CASE role WHEN 'representative' THEN 0 ELSE 1 END,
+                    created_at,
+                    session_id
+                """,
+                clean_ids,
+            ).fetchall()
+
     def list_recent_replay_issues(self, *, limit: int = 100) -> list[sqlite3.Row]:
         with self._conn() as conn:
             return conn.execute(
