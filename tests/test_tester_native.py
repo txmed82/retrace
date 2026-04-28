@@ -16,6 +16,19 @@ from retrace.tester import (
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "/final")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path == "/broken":
+            body = b"broken"
+            self.send_response(500)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         body = b"<html><body>Welcome to Retrace</body></html>"
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
@@ -114,6 +127,90 @@ def test_native_runner_writes_run_json_and_artifacts(tmp_path: Path) -> None:
     assert any(item["artifact_type"] == "assertion_results" for item in result.artifacts)
     assert (run_dir / "artifacts" / "native-summary.json").exists()
     assert (run_dir / "artifacts" / "assertions.json").exists()
+
+
+def test_native_runner_records_consensus_and_step_cache(tmp_path: Path) -> None:
+    server, app_url = _server_url()
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Consensus cache",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            exact_steps=[{"id": "home", "action": "get", "path": "/redirect"}],
+            assertions=[
+                {
+                    "id": "ai-copy",
+                    "type": "model_consensus",
+                    "consensus_group": "copy",
+                    "model_votes": [
+                        {"model": "primary", "ok": True},
+                        {"model": "secondary", "ok": False},
+                    ],
+                    "arbiter_vote": "pass",
+                }
+            ],
+        )
+
+        first = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+        second = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert first.ok is True
+    assert second.ok is True
+    first_artifacts = {item["artifact_type"] for item in first.artifacts}
+    second_artifacts = {item["artifact_type"] for item in second.artifacts}
+    assert "assertion_consensus" in first_artifacts
+    assert "step_cache_events" in first_artifacts
+    assert "step_cache_events" in second_artifacts
+
+    first_cache = json.loads(
+        (Path(first.run_dir) / "artifacts" / "step-cache-events.json").read_text()
+    )
+    second_cache = json.loads(
+        (Path(second.run_dir) / "artifacts" / "step-cache-events.json").read_text()
+    )
+    assert any(item["status"] == "miss_store" for item in first_cache)
+    assert any(item["status"] == "hit" for item in second_cache)
+    assert any("/final" in item["cached_url"] for item in second_cache)
+
+
+def test_native_step_cache_auto_heals_stale_effective_url(tmp_path: Path) -> None:
+    server, app_url = _server_url()
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Stale cache",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            exact_steps=[{"id": "home", "action": "get", "path": "/"}],
+        )
+
+        first = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+        cache_dir = tmp_path / "ui-tests" / "cache" / "native-steps"
+        cache_file = next(cache_dir.glob("*.json"))
+        payload = json.loads(cache_file.read_text())
+        payload["effective_url"] = f"{app_url}/broken"
+        cache_file.write_text(json.dumps(payload))
+        second = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert first.ok is True
+    assert second.ok is True
+    second_cache = json.loads(
+        (Path(second.run_dir) / "artifacts" / "step-cache-events.json").read_text()
+    )
+    assert any(item["status"] == "auto_heal" for item in second_cache)
 
 
 def test_native_auth_required_specs_fail_fast(tmp_path: Path) -> None:

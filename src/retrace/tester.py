@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shlex
@@ -53,6 +54,8 @@ class TesterSpec:
     browser_settings: dict[str, Any] = field(default_factory=dict)
     fixtures: dict[str, Any] = field(default_factory=dict)
     data_extraction: list[dict[str, Any]] = field(default_factory=list)
+    step_cache_enabled: bool = True
+    assertion_consensus_enabled: bool = True
 
 
 @dataclass
@@ -76,6 +79,16 @@ class TesterArtifact:
     path: str
     label: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TesterStepCacheEvent:
+    step_id: str
+    cache_key: str
+    status: str
+    cached_url: str
+    resolved_url: str
+    message: str
 
 
 @dataclass
@@ -183,6 +196,8 @@ def _apply_spec_defaults(data: dict[str, Any]) -> None:
     data.setdefault("browser_settings", {})
     data.setdefault("fixtures", {})
     data.setdefault("data_extraction", [])
+    data.setdefault("step_cache_enabled", True)
+    data.setdefault("assertion_consensus_enabled", True)
     # Legacy mode migration.
     mode = str(data.get("mode") or "describe").strip().lower()
     if mode in {"prompt", "video"}:
@@ -248,6 +263,10 @@ def validate_spec(spec: TesterSpec) -> None:
         raise ValueError("fixtures must be an object")
     if not isinstance(spec.data_extraction, list):
         raise ValueError("data_extraction must be a list")
+    if not isinstance(spec.step_cache_enabled, bool):
+        raise ValueError("step_cache_enabled must be a boolean")
+    if not isinstance(spec.assertion_consensus_enabled, bool):
+        raise ValueError("assertion_consensus_enabled must be a boolean")
 
 
 def create_spec(
@@ -274,6 +293,8 @@ def create_spec(
     browser_settings: Optional[dict[str, Any]] = None,
     fixtures: Optional[dict[str, Any]] = None,
     data_extraction: Optional[list[dict[str, Any]]] = None,
+    step_cache_enabled: bool = True,
+    assertion_consensus_enabled: bool = True,
 ) -> TesterSpec:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     spec_id = f"{ts}-{slugify(name)[:40]}-{uuid.uuid4().hex[:8]}"
@@ -308,6 +329,8 @@ def create_spec(
         browser_settings=browser_settings or {},
         fixtures=fixtures or {},
         data_extraction=data_extraction or [],
+        step_cache_enabled=bool(step_cache_enabled),
+        assertion_consensus_enabled=bool(assertion_consensus_enabled),
     )
     validate_spec(spec)
     save_spec(specs_dir, spec)
@@ -466,12 +489,79 @@ def _assertion_result(
     )
 
 
+def _bool_from_vote(vote: dict[str, Any]) -> bool | None:
+    for key in ("ok", "passed", "pass", "result"):
+        if key not in vote:
+            continue
+        value = vote[key]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            clean = value.strip().lower()
+            if clean in {"pass", "passed", "true", "ok", "yes"}:
+                return True
+            if clean in {"fail", "failed", "false", "no"}:
+                return False
+    return None
+
+
+def _evaluate_consensus_assertion(
+    assertion: dict[str, Any],
+) -> TesterAssertionResult:
+    votes = [
+        vote
+        for vote in list(assertion.get("model_votes") or assertion.get("votes") or [])
+        if isinstance(vote, dict)
+    ]
+    parsed: list[bool] = []
+    for vote in votes:
+        value = _bool_from_vote(vote)
+        if value is not None:
+            parsed.append(value)
+    if not parsed:
+        return _assertion_result(
+            assertion=assertion,
+            ok=False,
+            expected=assertion.get("expected", "model vote majority"),
+            actual={"votes": votes, "error": "no_parseable_votes"},
+            message="Consensus assertion did not include parseable model votes.",
+        )
+
+    pass_count = sum(1 for value in parsed if value)
+    fail_count = len(parsed) - pass_count
+    arbiter_vote = assertion.get("arbiter_vote")
+    arbiter = _bool_from_vote({"result": arbiter_vote}) if arbiter_vote is not None else None
+    if pass_count == fail_count and arbiter is not None:
+        ok = arbiter
+        decision = "arbiter"
+    else:
+        ok = pass_count > fail_count
+        decision = "majority"
+    return _assertion_result(
+        assertion=assertion,
+        ok=ok,
+        expected=assertion.get("expected", "model vote majority"),
+        actual={
+            "decision": decision,
+            "pass_votes": pass_count,
+            "fail_votes": fail_count,
+            "arbiter_vote": arbiter,
+        },
+        message=(
+            f"Consensus {decision}: {pass_count} pass vote(s), "
+            f"{fail_count} fail vote(s)."
+        ),
+    )
+
+
 def _evaluate_native_assertion(
     assertion: dict[str, Any],
     *,
     response: Optional[httpx.Response],
 ) -> TesterAssertionResult:
     kind = str(assertion.get("type") or assertion.get("assertion_type") or "").lower()
+    if kind in {"model_consensus", "consensus", "ai_consensus"}:
+        return _evaluate_consensus_assertion(assertion)
     if response is None:
         return _assertion_result(
             assertion=assertion,
@@ -523,6 +613,60 @@ def _evaluate_native_assertion(
     )
 
 
+def _cache_key_for_step(*, spec: TesterSpec, app_url: str, step: dict[str, Any]) -> str:
+    payload = {
+        "spec_id": spec.spec_id,
+        "app_url": app_url,
+        "action": str(step.get("action") or step.get("type") or "get").lower(),
+        "url": str(step.get("url") or ""),
+        "path": str(step.get("path") or ""),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def _load_step_cache(cache_dir: Path, cache_key: str) -> dict[str, Any] | None:
+    path = cache_dir / f"{cache_key}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _save_step_cache(cache_dir: Path, cache_key: str, payload: dict[str, Any]) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / f"{cache_key}.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _consensus_summary(results: list[TesterAssertionResult]) -> list[dict[str, Any]]:
+    groups: dict[str, list[TesterAssertionResult]] = {}
+    for result in results:
+        if result.consensus_group:
+            groups.setdefault(result.consensus_group, []).append(result)
+    summary: list[dict[str, Any]] = []
+    for group, items in sorted(groups.items()):
+        passed = sum(1 for item in items if item.ok)
+        failed = len(items) - passed
+        summary.append(
+            {
+                "group": group,
+                "assertion_count": len(items),
+                "passed": passed,
+                "failed": failed,
+                "ok": failed == 0,
+                "disagreement": passed > 0 and failed > 0,
+            }
+        )
+    return summary
+
+
 def _run_native_spec(
     *,
     spec: TesterSpec,
@@ -537,6 +681,8 @@ def _run_native_spec(
     last_response: Optional[httpx.Response] = None
     error = ""
     timeout = float(spec.browser_settings.get("timeout_seconds") or 10)
+    cache_events: list[TesterStepCacheEvent] = []
+    cache_dir = run_dir.parent.parent / "cache" / "native-steps"
 
     steps = spec.exact_steps or [
         {"id": "default-get", "action": "get", "url": app_url}
@@ -546,10 +692,88 @@ def _run_native_spec(
             for idx, step in enumerate(steps):
                 action = str(step.get("action") or step.get("type") or "get").lower()
                 if action in {"visit", "goto", "get", "navigate"}:
-                    url = _join_url(
+                    resolved_url = _join_url(
                         app_url, str(step.get("url") or step.get("path") or "")
                     )
-                    last_response = client.get(url)
+                    cache_key = _cache_key_for_step(
+                        spec=spec,
+                        app_url=app_url,
+                        step=step,
+                    )
+                    cached = (
+                        _load_step_cache(cache_dir, cache_key)
+                        if spec.step_cache_enabled
+                        else None
+                    )
+                    cached_url = ""
+                    if cached:
+                        cached_url = str(
+                            cached.get("effective_url")
+                            or cached.get("resolved_url")
+                            or ""
+                        )
+                    use_cached_url = bool(cached_url and cached_url != resolved_url)
+                    request_url = cached_url if use_cached_url else resolved_url
+                    if use_cached_url:
+                        cache_events.append(
+                            TesterStepCacheEvent(
+                                step_id=str(step.get("id") or idx),
+                                cache_key=cache_key,
+                                status="hit",
+                                cached_url=cached_url,
+                                resolved_url=resolved_url,
+                                message="Using cached effective URL.",
+                            )
+                        )
+                    try:
+                        last_response = client.get(request_url)
+                        if use_cached_url and last_response.status_code >= 500:
+                            raise httpx.HTTPStatusError(
+                                "Cached step URL returned server error.",
+                                request=last_response.request,
+                                response=last_response,
+                            )
+                    except Exception as exc:
+                        if not use_cached_url:
+                            raise
+                        cache_events.append(
+                            TesterStepCacheEvent(
+                                step_id=str(step.get("id") or idx),
+                                cache_key=cache_key,
+                                status="auto_heal",
+                                cached_url=cached_url,
+                                resolved_url=resolved_url,
+                                message=(
+                                    f"{exc}; retried fresh spec URL instead of cached "
+                                    "effective URL."
+                                ),
+                            )
+                        )
+                        last_response = client.get(resolved_url)
+                    if spec.step_cache_enabled and last_response.status_code < 500:
+                        effective_url = str(last_response.url)
+                        _save_step_cache(
+                            cache_dir,
+                            cache_key,
+                            {
+                                "spec_id": spec.spec_id,
+                                "step_id": str(step.get("id") or idx),
+                                "resolved_url": resolved_url,
+                                "effective_url": effective_url,
+                                "updated_at": now_iso(),
+                            },
+                        )
+                        if not use_cached_url:
+                            cache_events.append(
+                                TesterStepCacheEvent(
+                                    step_id=str(step.get("id") or idx),
+                                    cache_key=cache_key,
+                                    status="miss_store",
+                                    cached_url="",
+                                    resolved_url=effective_url,
+                                    message="Stored effective URL for future runs.",
+                                )
+                            )
                     response_path = artifacts_dir / f"response-{idx}.txt"
                     response_path.write_text(last_response.text, encoding="utf-8")
                     artifacts.append(
@@ -649,11 +873,39 @@ def _run_native_spec(
             metadata={"count": len(assertion_results)},
         )
     )
+    consensus = _consensus_summary(assertion_results) if spec.assertion_consensus_enabled else []
+    if consensus:
+        consensus_path = artifacts_dir / "assertion-consensus.json"
+        consensus_path.write_text(json.dumps(consensus, indent=2) + "\n")
+        artifacts.append(
+            TesterArtifact(
+                artifact_id="assertion-consensus",
+                artifact_type="assertion_consensus",
+                path=str(consensus_path),
+                label="Assertion consensus summary",
+                metadata={"group_count": len(consensus)},
+            )
+        )
+    cache_events_payload = [asdict(item) for item in cache_events]
+    if cache_events_payload:
+        cache_path = artifacts_dir / "step-cache-events.json"
+        cache_path.write_text(json.dumps(cache_events_payload, indent=2) + "\n")
+        artifacts.append(
+            TesterArtifact(
+                artifact_id="step-cache-events",
+                artifact_type="step_cache_events",
+                path=str(cache_path),
+                label="Step cache and auto-heal events",
+                metadata={"count": len(cache_events_payload)},
+            )
+        )
 
     summary = {
         "execution_engine": "native",
         "steps": steps,
         "assertion_count": len(assertion_results),
+        "consensus_group_count": len(consensus),
+        "step_cache_event_count": len(cache_events_payload),
         "artifact_count": len(artifacts),
         "error": error,
     }

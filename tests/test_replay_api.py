@@ -129,6 +129,45 @@ def test_replay_ingest_accepts_gzip_payload(tmp_path: Path) -> None:
     assert result["event_count"] == 1
 
 
+def test_metrics_endpoint_returns_local_observability(tmp_path: Path) -> None:
+    store, key, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Admin",
+        scopes=["admin"],
+    )
+    ingest_replay_request(
+        store=store,
+        headers={"x-retrace-key": key},
+        body=json.dumps(
+            {
+                "sessionId": "sess-metrics",
+                "sequence": 0,
+                "flushType": "final",
+                "events": [{"type": 4, "data": {"href": "https://example.com"}}],
+            }
+        ).encode(),
+    )
+
+    with _running_replay_api_server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "GET",
+            "/api/metrics",
+            headers={"Authorization": f"Bearer {service.token}"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 200
+    assert payload["api"]["replay_sessions"] == 1
+    assert payload["api"]["replay_batches"] == 1
+    assert payload["replay_processing"]["jobs"]["replay.finalize"]["queued"] == 1
+
+
 def test_replay_ingest_rejects_gzip_bomb() -> None:
     oversized = gzip.compress(
         json.dumps(
