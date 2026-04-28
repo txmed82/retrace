@@ -131,6 +131,8 @@ def test_tester_enqueue_and_worker_runs_queued_spec(
     enqueue = runner.invoke(main, ["tester", "enqueue", spec_id])
     assert enqueue.exit_code == 0, enqueue.output
     assert '"status": "queued"' in enqueue.output
+    queue_dir = tmp_path / "data" / "ui-tests" / "queue"
+    assert not list(queue_dir.glob("*.tmp"))
 
     worker = runner.invoke(main, ["tester", "worker", "--once"])
     assert worker.exit_code == 0, worker.output
@@ -138,3 +140,37 @@ def test_tester_enqueue_and_worker_runs_queued_spec(
 
     assert any((tmp_path / "data" / "ui-tests" / "queue" / "done").glob("*.json"))
     assert any((tmp_path / "data" / "ui-tests" / "runs").glob("*/run.json"))
+
+
+def test_tester_enqueue_honors_zero_retry_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "config.yaml").write_text(
+        _CONFIG_YAML
+        + """
+tester:
+  max_retries: 0
+"""
+    )
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    create = runner.invoke(
+        main,
+        [
+            "tester",
+            "create",
+            "--name",
+            "No retries",
+            "--prompt",
+            "Open the page",
+            "--harness-cmd",
+            "echo RUN {app_url_q} {prompt_q} > {run_dir}/out.txt",
+        ],
+    )
+    assert create.exit_code == 0, create.output
+    spec_id = create.output.strip().split(": ")[1]
+
+    enqueue = runner.invoke(main, ["tester", "enqueue", spec_id])
+    assert enqueue.exit_code == 0, enqueue.output
+    assert '"retries": 0' in enqueue.output

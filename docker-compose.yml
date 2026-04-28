@@ -27,7 +27,7 @@ services:
     ports:
       - "8787:8787"
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      - ./config.yaml:/app/config.yaml
       - ./.env:/app/.env
       - ./data:/app/data
       - ./reports:/app/reports

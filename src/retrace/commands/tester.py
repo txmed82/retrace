@@ -394,7 +394,10 @@ def tester_enqueue(
         retries=(
             max(0, int(retries))
             if retries is not None
-            else max(0, int(defaults.get("max_retries") or 1))
+            else max(
+                0,
+                int(defaults["max_retries"]) if "max_retries" in defaults else 1,
+            )
         ),
     )
     click.echo(json.dumps(job, indent=2))

@@ -1299,7 +1299,13 @@ def enqueue_spec_run(
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
-    (queue_dir / f"{job_id}.json").write_text(json.dumps(payload, indent=2) + "\n")
+    final_path = queue_dir / f"{job_id}.json"
+    temp_path = queue_dir / f".{job_id}.json.tmp"
+    with temp_path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, indent=2) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    temp_path.replace(final_path)
     return payload
 
 
