@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -12,9 +13,12 @@ from retrace.tester import (
     DEFAULT_APP_URL,
     DEFAULT_HARNESS_COMMAND,
     create_spec,
+    enqueue_spec_run,
     list_specs,
     load_run_summaries,
     load_spec,
+    queue_dir_for_data_dir,
+    run_queued_spec_once,
     run_spec,
     runs_dir_for_data_dir,
     save_spec,
@@ -355,6 +359,77 @@ def tester_run(
     )
     if not result.ok:
         raise click.ClickException("Tester run failed.")
+
+
+@tester_group.command("enqueue")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.argument("spec_id")
+@click.option("--prompt", default=None, help="Override prompt for this queued run.")
+@click.option("--app-url", default=None, help="Override app URL for this queued run.")
+@click.option("--start-cmd", default=None, help="Override app startup command.")
+@click.option("--retries", default=None, type=int, help="Override retry count.")
+def tester_enqueue(
+    config_path: Path,
+    spec_id: str,
+    prompt: Optional[str],
+    app_url: Optional[str],
+    start_cmd: Optional[str],
+    retries: Optional[int],
+) -> None:
+    cfg = load_config(config_path)
+    defaults = _tester_defaults(config_path)
+    load_spec(specs_dir_for_data_dir(cfg.run.data_dir), spec_id)
+    job = enqueue_spec_run(
+        queue_dir=queue_dir_for_data_dir(cfg.run.data_dir),
+        spec_id=spec_id,
+        prompt_override=prompt,
+        app_url_override=app_url,
+        start_command_override=start_cmd,
+        retries=(
+            max(0, int(retries))
+            if retries is not None
+            else max(
+                0,
+                int(defaults["max_retries"]) if "max_retries" in defaults else 1,
+            )
+        ),
+    )
+    click.echo(json.dumps(job, indent=2))
+
+
+@tester_group.command("worker")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--once", is_flag=True, help="Process at most one queued tester job.")
+@click.option("--interval", default=30, show_default=True, type=int)
+def tester_worker(config_path: Path, once: bool, interval: int) -> None:
+    cfg = load_config(config_path)
+    specs_dir = specs_dir_for_data_dir(cfg.run.data_dir)
+    runs_dir = runs_dir_for_data_dir(cfg.run.data_dir)
+    queue_dir = queue_dir_for_data_dir(cfg.run.data_dir)
+    while True:
+        job = run_queued_spec_once(
+            specs_dir=specs_dir,
+            runs_dir=runs_dir,
+            queue_dir=queue_dir,
+            cwd=config_path.parent,
+        )
+        if job is not None:
+            click.echo(json.dumps(job, indent=2))
+        if once:
+            return
+        time.sleep(max(1, int(interval)))
 
 
 @tester_group.command("runs")

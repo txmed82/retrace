@@ -16,6 +16,23 @@ services:
       - ./reports:/app/reports
     restart: unless-stopped
 
+  ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    environment:
+      - RETRACE_MODE=ui
+      - RETRACE_UI_HOST=0.0.0.0
+      - RETRACE_UI_PORT=8787
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ./.env:/app/.env
+      - ./data:/app/data
+      - ./reports:/app/reports
+    restart: unless-stopped
+
   worker:
     build:
       context: .
@@ -24,6 +41,20 @@ services:
       - RETRACE_MODE=worker
       - RETRACE_WORKER_INTERVAL_SECONDS=10
       - RETRACE_WORKER_LIMIT=25
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+      - ./reports:/app/reports
+    restart: unless-stopped
+
+  browser-runner:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    environment:
+      - RETRACE_MODE=browser-runner
+      - RETRACE_BROWSER_RUNNER_INTERVAL_SECONDS=30
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./.env:/app/.env:ro

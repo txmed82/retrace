@@ -129,6 +129,10 @@ def runs_dir_for_data_dir(data_dir: Path) -> Path:
     return data_dir / "ui-tests" / "runs"
 
 
+def queue_dir_for_data_dir(data_dir: Path) -> Path:
+    return data_dir / "ui-tests" / "queue"
+
+
 def _spec_path(specs_dir: Path, spec_id: str) -> Path:
     # Validate spec_id to prevent path traversal
     if not spec_id or not re.match(r'^[a-zA-Z0-9_-]+$', spec_id):
@@ -469,9 +473,17 @@ def _assertion_result(
     expected: Any,
     actual: Any,
     message: str,
+    confidence: float | None = None,
 ) -> TesterAssertionResult:
     assertion_type = str(
         assertion.get("type") or assertion.get("assertion_type") or "unknown"
+    )
+    selected_confidence = (
+        confidence
+        if confidence is not None
+        else assertion.get("confidence")
+        if assertion.get("confidence") is not None
+        else 1.0
     )
     return TesterAssertionResult(
         assertion_id=str(
@@ -483,10 +495,18 @@ def _assertion_result(
         actual=actual,
         message=message,
         source=str(assertion.get("source") or "native"),
-        confidence=float(assertion.get("confidence") or 1.0),
+        confidence=_coerce_confidence(selected_confidence, default=1.0),
         consensus_group=str(assertion.get("consensus_group") or ""),
         model_votes=list(assertion.get("model_votes") or []),
     )
+
+
+def _coerce_confidence(raw: Any, *, default: float = 1.0) -> float:
+    try:
+        value = default if raw is None else float(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(0.0, min(1.0, value))
 
 
 def _bool_from_vote(vote: dict[str, Any]) -> bool | None:
@@ -508,11 +528,7 @@ def _bool_from_vote(vote: dict[str, Any]) -> bool | None:
 def _evaluate_consensus_assertion(
     assertion: dict[str, Any],
 ) -> TesterAssertionResult:
-    votes = [
-        vote
-        for vote in list(assertion.get("model_votes") or assertion.get("votes") or [])
-        if isinstance(vote, dict)
-    ]
+    votes = _collect_consensus_votes(assertion)
     parsed: list[bool] = []
     for vote in votes:
         value = _bool_from_vote(vote)
@@ -531,12 +547,16 @@ def _evaluate_consensus_assertion(
     fail_count = len(parsed) - pass_count
     arbiter_vote = assertion.get("arbiter_vote")
     arbiter = _bool_from_vote({"result": arbiter_vote}) if arbiter_vote is not None else None
+    disagreement = pass_count > 0 and fail_count > 0
     if pass_count == fail_count and arbiter is not None:
         ok = arbiter
         decision = "arbiter"
     else:
         ok = pass_count > fail_count
         decision = "majority"
+    confidence = max(pass_count, fail_count) / len(parsed)
+    if disagreement and decision == "arbiter":
+        confidence = max(confidence, 0.67)
     return _assertion_result(
         assertion=assertion,
         ok=ok,
@@ -546,12 +566,35 @@ def _evaluate_consensus_assertion(
             "pass_votes": pass_count,
             "fail_votes": fail_count,
             "arbiter_vote": arbiter,
+            "disagreement": disagreement,
+            "evidence": assertion.get("evidence", {}),
+            "retry_count": len(assertion.get("retry_votes") or []),
         },
         message=(
             f"Consensus {decision}: {pass_count} pass vote(s), "
             f"{fail_count} fail vote(s)."
         ),
+        confidence=_coerce_confidence(
+            assertion.get("confidence") if "confidence" in assertion else confidence,
+            default=confidence,
+        ),
     )
+
+
+def _collect_consensus_votes(assertion: dict[str, Any]) -> list[dict[str, Any]]:
+    votes = [
+        vote
+        for vote in list(assertion.get("model_votes") or assertion.get("votes") or [])
+        if isinstance(vote, dict)
+    ]
+    parsed = [_bool_from_vote(vote) for vote in votes]
+    has_failure = any(value is False for value in parsed)
+    retry_votes = [
+        vote for vote in list(assertion.get("retry_votes") or []) if isinstance(vote, dict)
+    ]
+    if has_failure and retry_votes:
+        votes.extend(retry_votes)
+    return votes
 
 
 def _evaluate_native_assertion(
@@ -561,7 +604,20 @@ def _evaluate_native_assertion(
 ) -> TesterAssertionResult:
     kind = str(assertion.get("type") or assertion.get("assertion_type") or "").lower()
     if kind in {"model_consensus", "consensus", "ai_consensus"}:
-        return _evaluate_consensus_assertion(assertion)
+        consensus_assertion = dict(assertion)
+        response_evidence = _response_assertion_evidence(
+            response,
+            capture_body=bool(assertion.get("capture_body_evidence")),
+        )
+        existing_evidence = consensus_assertion.get("evidence")
+        if isinstance(existing_evidence, dict):
+            consensus_assertion["evidence"] = {
+                **response_evidence,
+                **existing_evidence,
+            }
+        else:
+            consensus_assertion["evidence"] = response_evidence
+        return _evaluate_consensus_assertion(consensus_assertion)
     if response is None:
         return _assertion_result(
             assertion=assertion,
@@ -611,6 +667,46 @@ def _evaluate_native_assertion(
         actual={"unsupported_type": kind},
         message=f"Unsupported native assertion type: {kind or 'unknown'}.",
     )
+
+
+def _response_assertion_evidence(
+    response: Optional[httpx.Response],
+    *,
+    capture_body: bool = False,
+) -> dict[str, Any]:
+    if response is None:
+        return {"kind": "http_response", "available": False}
+    text = response.text
+    evidence = {
+        "kind": "http_response",
+        "available": True,
+        "url": str(response.url),
+        "status_code": response.status_code,
+        "headers": _redacted_response_headers(dict(response.headers)),
+        "body_capture": bool(capture_body),
+        "body_length": len(text),
+    }
+    if capture_body:
+        evidence["body_excerpt"] = text[:2000]
+    return evidence
+
+
+def _redacted_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    sensitive = {
+        "authorization",
+        "cookie",
+        "set-cookie",
+        "proxy-authorization",
+        "x-csrf-token",
+        "x-xsrf-token",
+    }
+    redacted: dict[str, str] = {}
+    for key, value in headers.items():
+        if key.lower() in sensitive:
+            redacted[key] = "[redacted]"
+        else:
+            redacted[key] = value
+    return redacted
 
 
 def _cache_key_for_step(*, spec: TesterSpec, app_url: str, step: dict[str, Any]) -> str:
@@ -673,6 +769,7 @@ def _run_native_spec(
     app_url: str,
     run_dir: Path,
     log_path: Path,
+    attempt: int = 0,
 ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]], str]:
     artifacts_dir = run_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -700,9 +797,20 @@ def _run_native_spec(
                         app_url=app_url,
                         step=step,
                     )
+                    bypass_cache = (
+                        attempt > 0
+                        or bool(step.get("cache_bypass"))
+                        or bool(step.get("override"))
+                        or step.get("cache") is False
+                    )
+                    cached_for_bypass = (
+                        _load_step_cache(cache_dir, cache_key)
+                        if spec.step_cache_enabled and bypass_cache
+                        else None
+                    )
                     cached = (
                         _load_step_cache(cache_dir, cache_key)
-                        if spec.step_cache_enabled
+                        if spec.step_cache_enabled and not bypass_cache
                         else None
                     )
                     cached_url = ""
@@ -712,8 +820,26 @@ def _run_native_spec(
                             or cached.get("resolved_url")
                             or ""
                         )
+                    bypassed_url = ""
+                    if cached_for_bypass:
+                        bypassed_url = str(
+                            cached_for_bypass.get("effective_url")
+                            or cached_for_bypass.get("resolved_url")
+                            or ""
+                        )
                     use_cached_url = bool(cached_url and cached_url != resolved_url)
                     request_url = cached_url if use_cached_url else resolved_url
+                    if bypass_cache and spec.step_cache_enabled and bypassed_url:
+                        cache_events.append(
+                            TesterStepCacheEvent(
+                                step_id=str(step.get("id") or idx),
+                                cache_key=cache_key,
+                                status="bypass",
+                                cached_url=bypassed_url,
+                                resolved_url=resolved_url,
+                                message="Bypassed step cache for retry or explicit override.",
+                            )
+                        )
                     if use_cached_url:
                         cache_events.append(
                             TesterStepCacheEvent(
@@ -727,9 +853,12 @@ def _run_native_spec(
                         )
                     try:
                         last_response = client.get(request_url)
-                        if use_cached_url and last_response.status_code >= 500:
+                        if use_cached_url and not _cached_step_has_effect(
+                            response=last_response,
+                            step=step,
+                        ):
                             raise httpx.HTTPStatusError(
-                                "Cached step URL returned server error.",
+                                "Cached step URL did not satisfy observable effect.",
                                 request=last_response.request,
                                 response=last_response,
                             )
@@ -932,6 +1061,17 @@ def _run_native_spec(
     )
 
 
+def _cached_step_has_effect(*, response: httpx.Response, step: dict[str, Any]) -> bool:
+    if response.status_code >= 500:
+        return False
+    if "expected_status" in step and response.status_code != int(step["expected_status"]):
+        return False
+    expected_text = str(step.get("expected_text") or step.get("effect_text") or "")
+    if expected_text and expected_text not in response.text:
+        return False
+    return True
+
+
 def run_spec(
     *,
     spec: TesterSpec,
@@ -1004,13 +1144,17 @@ def run_spec(
                     )
 
         if execution_engine == "native":
-            attempts += 1
-            last_exit, artifacts, assertion_results, last_error = _run_native_spec(
-                spec=spec,
-                app_url=app_url,
-                run_dir=run_dir,
-                log_path=harness_log_path,
-            )
+            for attempt in range(max(0, int(max_retries)) + 1):
+                attempts += 1
+                last_exit, artifacts, assertion_results, last_error = _run_native_spec(
+                    spec=spec,
+                    app_url=app_url,
+                    run_dir=run_dir,
+                    log_path=harness_log_path,
+                    attempt=attempt,
+                )
+                if last_exit == 0:
+                    break
         else:
             for attempt in range(max(0, int(max_retries)) + 1):
                 attempts += 1
@@ -1146,3 +1290,98 @@ def load_run_summaries(runs_dir: Path, *, limit: int = 25) -> list[dict[str, Any
         if len(items) >= limit:
             break
     return items
+
+
+def enqueue_spec_run(
+    *,
+    queue_dir: Path,
+    spec_id: str,
+    prompt_override: Optional[str] = None,
+    app_url_override: Optional[str] = None,
+    start_command_override: Optional[str] = None,
+    retries: int = 0,
+) -> dict[str, Any]:
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    job_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        + "-"
+        + uuid.uuid4().hex[:8]
+    )
+    payload = {
+        "job_id": job_id,
+        "spec_id": spec_id,
+        "prompt_override": prompt_override or "",
+        "app_url_override": app_url_override or "",
+        "start_command_override": start_command_override or "",
+        "retries": max(0, int(retries)),
+        "status": "queued",
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    final_path = queue_dir / f"{job_id}.json"
+    temp_path = queue_dir / f".{job_id}.json.tmp"
+    with temp_path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, indent=2) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    temp_path.replace(final_path)
+    return payload
+
+
+def run_queued_spec_once(
+    *,
+    specs_dir: Path,
+    runs_dir: Path,
+    queue_dir: Path,
+    cwd: Optional[Path] = None,
+) -> dict[str, Any] | None:
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    running_dir = queue_dir / "running"
+    done_dir = queue_dir / "done"
+    failed_dir = queue_dir / "failed"
+    running_dir.mkdir(exist_ok=True)
+    done_dir.mkdir(exist_ok=True)
+    failed_dir.mkdir(exist_ok=True)
+    queued = sorted(queue_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    if not queued:
+        return None
+    job_path = queued[0]
+    running_path = running_dir / job_path.name
+    try:
+        job_path.rename(running_path)
+    except FileNotFoundError:
+        return None
+
+    try:
+        job = json.loads(running_path.read_text())
+        spec = load_spec(specs_dir, str(job["spec_id"]))
+        result = run_spec(
+            spec=spec,
+            runs_dir=runs_dir,
+            prompt_override=str(job.get("prompt_override") or "") or None,
+            app_url_override=str(job.get("app_url_override") or "") or None,
+            start_command_override=str(job.get("start_command_override") or "")
+            or None,
+            max_retries=int(job.get("retries") or 0),
+            cwd=cwd,
+        )
+        job.update(
+            {
+                "status": "succeeded" if result.ok else "failed",
+                "updated_at": now_iso(),
+                "result": asdict(result),
+            }
+        )
+        target = done_dir / running_path.name if result.ok else failed_dir / running_path.name
+        running_path.write_text(json.dumps(job, indent=2) + "\n")
+        running_path.rename(target)
+        return job
+    except Exception as exc:
+        try:
+            job = json.loads(running_path.read_text())
+        except Exception:
+            job = {"job_id": running_path.stem, "status": "failed"}
+        job.update({"status": "failed", "updated_at": now_iso(), "error": str(exc)})
+        running_path.write_text(json.dumps(job, indent=2) + "\n")
+        running_path.rename(failed_dir / running_path.name)
+        return job

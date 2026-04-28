@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -10,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import click
 
 from retrace.config import load_config
-from retrace.observability import collect_local_observability
+from retrace.observability import collect_local_observability, record_api_request
 from retrace.replay_api import (
     MAX_REPLAY_BODY_BYTES,
     ReplayIngestError,
@@ -30,8 +32,12 @@ logger = logging.getLogger(__name__)
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
     data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    setattr(handler, "_retrace_response_status", status)
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
+    trace_id = str(getattr(handler, "_retrace_trace_id", "") or "")
+    if trace_id:
+        handler.send_header("X-Retrace-Trace-Id", trace_id)
     _cors_headers(handler)
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
@@ -106,6 +112,39 @@ def _handler(store: Storage) -> type[BaseHTTPRequestHandler]:
     class RetraceAPIHandler(BaseHTTPRequestHandler):
         server_version = "retrace-api/0.1"
 
+        def handle_one_request(self) -> None:
+            self._retrace_trace_id = uuid.uuid4().hex
+            self._retrace_response_status = 500
+            started = time.perf_counter()
+            try:
+                super().handle_one_request()
+            finally:
+                latency_ms = (time.perf_counter() - started) * 1000
+                method = str(getattr(self, "command", "") or "")
+                path = urlsplit(str(getattr(self, "path", "") or "")).path
+                status = int(getattr(self, "_retrace_response_status", 500))
+                if method and path:
+                    record_api_request(
+                        method=method,
+                        path=path,
+                        status=status,
+                        latency_ms=latency_ms,
+                        trace_id=self._retrace_trace_id,
+                    )
+                    logger.info(
+                        json.dumps(
+                            {
+                                "event": "api_request",
+                                "trace_id": self._retrace_trace_id,
+                                "method": method,
+                                "path": path,
+                                "status": status,
+                                "latency_ms": round(latency_ms, 3),
+                            },
+                            separators=(",", ":"),
+                        )
+                    )
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlsplit(self.path)
             if parsed.path == "/healthz":
@@ -131,7 +170,11 @@ def _handler(store: Storage) -> type[BaseHTTPRequestHandler]:
             if parsed.path != "/api/sdk/replay":
                 _json_response(self, 404, {"error": "not_found"})
                 return
+            self._retrace_response_status = 204
             self.send_response(204)
+            trace_id = str(getattr(self, "_retrace_trace_id", "") or "")
+            if trace_id:
+                self.send_header("X-Retrace-Trace-Id", trace_id)
             _cors_headers(self)
             self.send_header("Content-Length", "0")
             self.end_headers()
