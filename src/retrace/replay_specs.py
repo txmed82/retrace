@@ -110,9 +110,22 @@ def _steps_from_events(
     seen_navs: set[str] = set()
     click_count = 0
     input_count = 0
+    unknown_count = 0
     for event in events:
         data = event.get("data")
         if not isinstance(data, dict):
+            unknown_count += 1
+            steps.append(
+                {
+                    "id": f"unknown-{unknown_count}",
+                    "action": "unknown",
+                    "meta": {"rrweb_type": event.get("type"), "data": event.get("data")},
+                    "source": "replay",
+                }
+            )
+            gaps.append(
+                f"unknown-{unknown_count}: rrweb event type {event.get('type')} with non-dict data"
+            )
             continue
         if event.get("type") == 4 and isinstance(data.get("href"), str):
             href = str(data["href"])
@@ -152,6 +165,19 @@ def _steps_from_events(
             )
             gaps.append(
                 f"input-{input_count} needs a durable locator and safe test data"
+            )
+        else:
+            unknown_count += 1
+            steps.append(
+                {
+                    "id": f"unknown-{unknown_count}",
+                    "action": "unknown",
+                    "meta": {"rrweb_type": event.get("type"), "data": data},
+                    "source": "replay",
+                }
+            )
+            gaps.append(
+                f"unknown-{unknown_count}: unsupported rrweb event type {event.get('type')}, source {data.get('source')}, id {data.get('id', 'N/A')}"
             )
     if not steps:
         steps.append({"id": "home", "action": "get", "url": base_url})

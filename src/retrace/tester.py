@@ -629,7 +629,7 @@ def _evaluate_model_backed_consensus_assertion(
     )
     evidence = _response_assertion_evidence(
         response,
-        capture_body=bool(assertion.get("capture_body_evidence", True)),
+        capture_body=bool(assertion.get("capture_body_evidence", False)),
     )
     snapshot = _assertion_snapshot_payload(
         assertion=assertion,
@@ -831,9 +831,22 @@ def _call_assertion_model(
         payload = response.json()
     raw_text = extract_llm_text_content(provider=provider, payload=payload)
     parsed = _parse_model_vote_json(raw_text)
+
+    # Safely coerce "ok" field to boolean
+    ok_val = parsed.get("ok")
+    if isinstance(ok_val, bool):
+        ok = ok_val
+    elif isinstance(ok_val, str):
+        normalized = ok_val.strip().lower()
+        ok = normalized in {"true", "1", "yes"}
+    elif isinstance(ok_val, (int, float)):
+        ok = bool(ok_val)
+    else:
+        ok = False
+
     return {
         "model": model,
-        "ok": bool(parsed.get("ok")),
+        "ok": ok,
         "confidence": _coerce_confidence(parsed.get("confidence"), default=0.5),
         "reasoning": str(parsed.get("reasoning") or ""),
         "retry": retry,
@@ -1449,6 +1462,23 @@ def _run_playwright_spec(
                     page.keyboard.press(str(step.get("key") or "Enter"))
                 elif action == "wait":
                     page.wait_for_timeout(int(step.get("ms") or step.get("timeout_ms") or 500))
+                elif action == "hover":
+                    selector = _selector_for_browser_step(step)
+                    if not selector:
+                        raise ValueError(f"hover step {step.get('id') or idx} needs selector")
+                    page.locator(selector).hover()
+                elif action == "upload":
+                    selector = _selector_for_browser_step(step)
+                    if not selector:
+                        raise ValueError(f"upload step {step.get('id') or idx} needs selector")
+                    file_path = str(step.get("file") or step.get("file_path") or "")
+                    if not file_path:
+                        raise ValueError(f"upload step {step.get('id') or idx} needs file path")
+                    page.locator(selector).set_input_files(file_path)
+                elif action in {"drag", "drop"}:
+                    raise ValueError(
+                        f"{action} step {step.get('id') or idx} is not yet implemented in Playwright runner"
+                    )
                 elif action in {"assert_status", "status_code"}:
                     expected = int(step.get("expected", step.get("status", 200)))
                     assertion_results.append(
@@ -1472,6 +1502,54 @@ def _run_playwright_spec(
                             message=f"Expected page text to contain {expected!r}.",
                         )
                     )
+
+            # Evaluate top-level spec.assertions
+            for assertion in spec.assertions:
+                assertion_type = str(
+                    assertion.get("type") or assertion.get("assertion_type") or ""
+                ).lower()
+                if assertion_type in {"status", "status_code", "assert_status"}:
+                    expected = int(assertion.get("expected", assertion.get("status", 200)))
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion=assertion,
+                            ok=last_status == expected,
+                            expected=expected,
+                            actual=last_status,
+                            message=f"Expected status {expected}, got {last_status}.",
+                        )
+                    )
+                elif assertion_type in {"text_contains", "body_contains", "assert_text", "contains"}:
+                    expected = str(assertion.get("expected", assertion.get("text", "")))
+                    try:
+                        last_text = page.locator("body").inner_text(timeout=3000)
+                    except Exception:
+                        last_text = ""
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion=assertion,
+                            ok=expected in last_text,
+                            expected=expected,
+                            actual={"contains": expected in last_text},
+                            message=f"Expected page text to contain {expected!r}.",
+                        )
+                    )
+                elif assertion_type in {"model_consensus", "consensus", "ai_consensus"}:
+                    # For consensus assertions, we don't have an httpx.Response, so pass None
+                    assertion_results.append(
+                        _evaluate_model_backed_consensus_assertion(assertion, response=None)
+                    )
+                else:
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion=assertion,
+                            ok=False,
+                            expected=assertion.get("expected"),
+                            actual={"unsupported_in_playwright": assertion_type},
+                            message=f"Assertion type {assertion_type} not yet supported in Playwright runner.",
+                        )
+                    )
+
             if not assertion_results:
                 assertion_results.append(
                     _assertion_result(

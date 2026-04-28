@@ -82,8 +82,8 @@ def promote_replay_issue(
         base_url=base_url,
     )
 
-    existing_id = str(issue["external_ticket_id"] or "")
-    existing_url = str(issue["external_ticket_url"] or "")
+    existing_id = str(issue.get(f"external_ticket_id_{provider}") or "")
+    existing_url = str(issue.get(f"external_ticket_url_{provider}") or "")
     if existing_id or existing_url:
         return IssueSinkResult(
             issue_id=str(issue["id"]),
@@ -133,18 +133,30 @@ def _default_external_url(*, provider: str, external_id: str) -> str:
 def _safe_json_list(raw: Any) -> list[Any]:
     import json
 
-    try:
-        value = json.loads(str(raw or "[]"))
-    except json.JSONDecodeError:
-        return []
-    return value if isinstance(value, list) else []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw or "[]")
+            return value if isinstance(value, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
 
 
 def _safe_json_obj(raw: Any) -> dict[str, Any]:
     import json
 
-    try:
-        value = json.loads(str(raw or "{}"))
-    except json.JSONDecodeError:
-        return {}
-    return value if isinstance(value, dict) else {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw or "{}")
+            return value if isinstance(value, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
