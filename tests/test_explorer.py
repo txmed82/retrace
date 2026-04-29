@@ -582,12 +582,13 @@ def test_load_skill_prefix_picks_goal_match_over_recency(tmp_path: Path) -> None
             }
         )
     )
-    # Bump newer's mtime to be later.
+    # Make newer_path strictly newer than `older` without relying on the
+    # filesystem's timestamp granularity — coarse FSes (NFS, FAT) can have
+    # 1-2 second resolution that defeats sleep-based bumps.
     import os
-    import time as _time
 
-    _time.sleep(0.01)
-    os.utime(newer_path, None)
+    older_mtime = older.stat().st_mtime
+    os.utime(newer_path, (older_mtime + 2, older_mtime + 2))
 
     calls, source = load_skill_prefix(
         skills_dir,

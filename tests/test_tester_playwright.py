@@ -163,3 +163,39 @@ def test_playwright_runner_text_matches_regex(
     assert "text_matches" in types
     assert "selector_text" in types
     assert all(a["ok"] for a in assertion_results)
+
+
+def test_playwright_runner_invalid_regex_does_not_crash(
+    chromium_available: bool, tmp_path: Path, html_app: str
+) -> None:
+    """Invalid regex must produce a failed assertion, not raise re.error."""
+    from retrace.tester import _run_playwright_spec
+
+    spec = _spec(
+        app_url=html_app,
+        steps=[{"id": "open", "action": "get", "url": ""}],
+        assertions=[
+            {"type": "text_matches", "expected": "(unclosed"},
+        ],
+        tmp_path=tmp_path,
+    )
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    log_path = run_dir / "harness.log"
+    exit_code, artifacts, assertion_results, error = _run_playwright_spec(
+        spec=spec,
+        app_url=html_app,
+        run_dir=run_dir,
+        log_path=log_path,
+        steps=spec.exact_steps,
+    )
+
+    # The spec ran to completion (no top-level error from a re.error crash);
+    # the regex assertion failed with an explanatory error payload.
+    assert error == "", error
+    matches = [a for a in assertion_results if a["assertion_type"] == "text_matches"]
+    assert len(matches) == 1
+    assert matches[0]["ok"] is False
+    assert "invalid_regex" in matches[0]["actual"].get("error", "")
+    assert exit_code != 0

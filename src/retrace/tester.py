@@ -1800,13 +1800,28 @@ def _run_playwright_spec(
                         last_text = page.locator("body").inner_text(timeout=3000)
                     except Exception:
                         last_text = ""
-                    ok = bool(pattern) and bool(_re.search(pattern, last_text))
+                    if not pattern:
+                        ok = False
+                        actual_payload: dict[str, Any] = {
+                            "matched": False,
+                            "error": "empty_pattern",
+                        }
+                    else:
+                        try:
+                            ok = bool(_re.search(pattern, last_text))
+                            actual_payload = {"matched": ok}
+                        except _re.error as exc:
+                            ok = False
+                            actual_payload = {
+                                "matched": False,
+                                "error": f"invalid_regex: {exc}",
+                            }
                     assertion_results.append(
                         _assertion_result(
                             assertion=assertion,
                             ok=ok,
                             expected=pattern,
-                            actual={"matched": ok},
+                            actual=actual_payload,
                             message=f"Expected page text to match /{pattern}/.",
                         )
                     )
@@ -1868,10 +1883,19 @@ def _selector_for_browser_step(step: dict[str, Any]) -> str:
 
 
 def _drag_target_selector(step: dict[str, Any]) -> str:
+    # `to` may be a string selector or a dict like {"selector": "..."};
+    # do NOT str() a dict here — that produces a literal "{'selector': '#x'}"
+    # which Playwright then tries to parse as a CSS selector.
+    to_value = step.get("to")
+    if isinstance(to_value, dict):
+        from_to_dict = str(to_value.get("selector") or "").strip()
+        if from_to_dict:
+            return from_to_dict
+        to_value = None
     direct = str(
         step.get("target_selector")
         or step.get("destination_selector")
-        or step.get("to")
+        or to_value
         or ""
     ).strip()
     if direct:
