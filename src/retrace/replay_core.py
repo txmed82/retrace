@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -46,6 +45,10 @@ class ReplayJobProcessingResult:
     jobs_failed: int
     sessions_processed: int
     issues_created_or_updated: int
+    issues_inserted: int = 0
+    issues_regressed: int = 0
+    regressed_public_ids: tuple[str, ...] = ()
+    inserted_public_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -520,6 +523,51 @@ def process_replay_session(
     ).issues
 
 
+def make_replay_finalize_handler(
+    *,
+    store: Storage,
+    config: ReplaySignalConfig | None,
+    llm_client: LLMClient | None,
+    accumulator: dict[str, Any],
+):
+    """Return a JobWorker handler that processes a single replay.finalize job.
+
+    `accumulator` is mutated with per-job summary counts so the caller can
+    aggregate results across the worker run without re-querying the DB.
+    """
+    accumulator.setdefault("sessions", 0)
+    accumulator.setdefault("issue_count", 0)
+    accumulator.setdefault("issues_inserted", 0)
+    accumulator.setdefault("issues_regressed", 0)
+    accumulator.setdefault("inserted_ids", [])
+    accumulator.setdefault("regressed_ids", [])
+
+    def handler(job: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(payload.get("session_id") or "").strip()
+        if not session_id:
+            raise ValueError("replay.finalize job is missing session_id")
+        result = process_replay_sessions(
+            store=store,
+            project_id=str(job["project_id"]),
+            environment_id=str(job["environment_id"]),
+            session_ids=[session_id],
+            config=config,
+            llm_client=llm_client,
+        )
+        accumulator["sessions"] += result.sessions_scanned
+        accumulator["issue_count"] += len(result.issues)
+        for upsert in result.issues:
+            if upsert.inserted:
+                accumulator["issues_inserted"] += 1
+                accumulator["inserted_ids"].append(upsert.public_id)
+            elif upsert.regressed:
+                accumulator["issues_regressed"] += 1
+                accumulator["regressed_ids"].append(upsert.public_id)
+        return {"sessions_scanned": result.sessions_scanned}
+
+    return handler
+
+
 def process_queued_replay_jobs(
     *,
     store: Storage,
@@ -528,53 +576,31 @@ def process_queued_replay_jobs(
     config: ReplaySignalConfig | None = None,
     llm_client: LLMClient | None = None,
 ) -> ReplayJobProcessingResult:
-    jobs = store.list_processing_jobs(
-        kind="replay.finalize",
-        status="queued",
-        project_id=project_id,
-        limit=limit,
-    )
-    seen = 0
-    processed = 0
-    failed = 0
-    sessions = 0
-    issue_count = 0
+    from retrace.worker import JobWorker
 
-    for job in jobs:
-        seen += 1
-        job_id = str(job["id"])
-        if not store.claim_processing_job(job_id):
-            continue
-        try:
-            payload = json.loads(str(job["payload_json"] or "{}"))
-            session_id = str(payload.get("session_id") or "").strip()
-            if not session_id:
-                raise ValueError("replay.finalize job is missing session_id")
-            result = process_replay_sessions(
-                store=store,
-                project_id=str(job["project_id"]),
-                environment_id=str(job["environment_id"]),
-                session_ids=[session_id],
-                config=config,
-                llm_client=llm_client,
-            )
-            sessions += result.sessions_scanned
-            issue_count += len(result.issues)
-            store.finish_processing_job(job_id=job_id, status="succeeded")
-            processed += 1
-        except Exception as exc:
-            log.exception("replay finalize job %s failed", job_id)
-            store.finish_processing_job(
-                job_id=job_id,
-                status="failed",
-                error=str(exc),
-            )
-            failed += 1
+    accumulator: dict[str, Any] = {}
+    worker = JobWorker(store)
+    worker.register(
+        "replay.finalize",
+        make_replay_finalize_handler(
+            store=store,
+            config=config,
+            llm_client=llm_client,
+            accumulator=accumulator,
+        ),
+    )
+    summary = worker.run_once(
+        kinds=["replay.finalize"], limit=limit, project_id=project_id
+    )
 
     return ReplayJobProcessingResult(
-        jobs_seen=seen,
-        jobs_processed=processed,
-        jobs_failed=failed,
-        sessions_processed=sessions,
-        issues_created_or_updated=issue_count,
+        jobs_seen=summary.seen,
+        jobs_processed=summary.processed,
+        jobs_failed=summary.failed,
+        sessions_processed=int(accumulator.get("sessions", 0)),
+        issues_created_or_updated=int(accumulator.get("issue_count", 0)),
+        issues_inserted=int(accumulator.get("issues_inserted", 0)),
+        issues_regressed=int(accumulator.get("issues_regressed", 0)),
+        regressed_public_ids=tuple(accumulator.get("regressed_ids", []) or []),
+        inserted_public_ids=tuple(accumulator.get("inserted_ids", []) or []),
     )

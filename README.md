@@ -260,10 +260,92 @@ Supported MCP tools:
 
 Toggle detectors in `config.yaml`.
 
+## Exploratory UI Tester (engine: `explore`)
+
+The exploratory engine drives a real Playwright browser via a small bounded
+tool surface (navigate, click, type, press, wait_for, snapshot, finish) and
+asks the configured LLM, step by step, what to do next given the current
+observation. Successful explorations persist a durable "skill" — the sequence
+of tool calls that worked — under `data/ui-tests/skills/<host>/`, so future
+runs against the same domain start from a known-good prefix.
+
+Create an exploratory spec:
+
+```bash
+retrace tester create \
+  --name "Signup explore" \
+  --engine explore \
+  --app-url http://127.0.0.1:3000 \
+  --prompt "Complete signup and reach the dashboard"
+```
+
+Set `auto` to let Retrace pick: specs with `exact_steps` go native; specs with
+`exploratory_goals` and no exact steps go through the explore engine.
+
+Skills land at `data/ui-tests/skills/<host_slug>/<spec_id>.json` and are
+surfaced to the model on subsequent runs as a "head-start."
+
+## Daily Digest
+
+Roll up replay activity in a window into a markdown report — what's new,
+regressed, resolved, and the top open issues by impact.
+
+```bash
+retrace digest                                 # default 24h window, writes reports/
+retrace digest --lookback-hours 168 --top 10   # weekly digest, top-10 open
+retrace digest --notify                        # also fan out via notification sinks
+retrace digest --format json                   # machine-readable summary
+```
+
+## Verifying Resolved Issues
+
+Re-run repro specs against issues you marked resolved. If the spec still
+fails, the issue transitions back to `regressed` and an `issue.regressed`
+notification fires so the team knows the fix didn't stick.
+
+```bash
+retrace api verify-resolved --limit 10
+retrace api verify-resolved --dry-run     # show plan only
+retrace api resolve-issue bug_xxx         # mark resolved + fire issue.resolved
+```
+
+## Filing Replay Issues to Linear / GitHub
+
+Retrace can promote replay-backed issues directly into Linear or GitHub. Provide
+API keys the same way as PostHog — via `.env` or inline in `config.yaml`.
+
+```bash
+# .env
+RETRACE_LINEAR_API_KEY=lin_api_...
+RETRACE_GITHUB_API_KEY=ghp_...    # or RETRACE_GITHUB_TOKEN, or GITHUB_TOKEN
+```
+
+```yaml
+# config.yaml
+linear:
+  team_key: ENG          # or team_id: <uuid>
+  labels: [retrace]
+
+github_sink:
+  repo: acme/web
+  labels: [retrace]
+```
+
+Promote an issue:
+
+```bash
+retrace api promote-issue --provider linear  bug_xxx
+retrace api promote-issue --provider github  --repo acme/web  bug_xxx
+retrace api promote-issue --provider github  --dry-run  bug_xxx   # stub, no API call
+```
+
+When no API key is configured (or `--dry-run` is passed), Retrace emits a stub
+external ID/URL and dedupes locally — useful for scripted testing.
+
 ## Runtime Data
 
 - `config.yaml` — non-secret config
-- `.env` — secrets (`RETRACE_POSTHOG_API_KEY`, optional `RETRACE_LLM_API_KEY`, optional tester auth secrets)
+- `.env` — secrets (`RETRACE_POSTHOG_API_KEY`, optional `RETRACE_LLM_API_KEY`, optional `RETRACE_LINEAR_API_KEY`, optional `RETRACE_GITHUB_API_KEY` / `RETRACE_GITHUB_TOKEN` / `GITHUB_TOKEN`, optional `RETRACE_NOTIFY_WEBHOOK_URL`, optional `RETRACE_NOTIFY_WEBHOOK_SECRET`, optional `RETRACE_NOTIFY_SLACK_WEBHOOK_URL`, optional tester auth secrets)
 - LLM providers supported: `openai_compatible` (local/custom), `openai`, `anthropic`, `openrouter`
 - `data/retrace.db` — run/session/findings metadata
 - `data/sessions/*.json` — ingested rrweb events
@@ -297,7 +379,14 @@ Notes:
 docker compose up -d
 ```
 
-Uses `RETRACE_CRON` (default every 6 hours).
+The cron container runs four scheduled jobs by default:
+
+- `RETRACE_CRON` (default `0 */6 * * *`) — `retrace run` (PostHog ingest + report)
+- `RETRACE_DIGEST_CRON` (default `0 8 * * *`) — `retrace digest --notify`
+- `RETRACE_VERIFY_CRON` (default `30 8 * * *`) — `retrace api verify-resolved`
+- `RETRACE_SYNC_TICKETS_CRON` (default `15 * * * *`) — `retrace api sync-tickets`
+
+Override any of them via the `cron` service environment in `docker-compose.yml`.
 
 ## Design Docs
 

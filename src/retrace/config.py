@@ -48,12 +48,48 @@ class ClusterConfig(BaseModel):
     min_size: int = 1
 
 
+class LinearConfig(BaseModel):
+    api_key: str = ""
+    team_id: str = ""
+    team_key: str = ""
+    labels: list[str] = Field(default_factory=list)
+    endpoint: str = "https://api.linear.app/graphql"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key.strip())
+
+
+class GitHubSinkConfig(BaseModel):
+    api_key: str = ""
+    repo: str = ""
+    labels: list[str] = Field(default_factory=list)
+    base_url: str = "https://api.github.com"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key.strip())
+
+
+class NotificationConfig(BaseModel):
+    webhook_url: str = ""
+    webhook_secret: str = ""
+    slack_webhook_url: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.webhook_url.strip() or self.slack_webhook_url.strip())
+
+
 class RetraceConfig(BaseModel):
     posthog: PostHogConfig
     llm: LLMConfig
     run: RunConfig = Field(default_factory=RunConfig)
     detectors: DetectorsConfig = Field(default_factory=DetectorsConfig)
     cluster: ClusterConfig = Field(default_factory=ClusterConfig)
+    linear: LinearConfig = Field(default_factory=LinearConfig)
+    github_sink: GitHubSinkConfig = Field(default_factory=GitHubSinkConfig)
+    notifications: NotificationConfig = Field(default_factory=NotificationConfig)
 
 
 def load_config(path: Path) -> RetraceConfig:
@@ -86,5 +122,27 @@ def load_config(path: Path) -> RetraceConfig:
             llm_key_env = os.environ.get(provider_env)
     if llm_key_env:
         raw.setdefault("llm", {})["api_key"] = llm_key_env
+
+    linear_key_env = os.environ.get("RETRACE_LINEAR_API_KEY")
+    if linear_key_env:
+        raw.setdefault("linear", {})["api_key"] = linear_key_env
+
+    github_key_env = (
+        os.environ.get("RETRACE_GITHUB_API_KEY")
+        or os.environ.get("RETRACE_GITHUB_TOKEN")
+        or os.environ.get("GITHUB_TOKEN")
+    )
+    if github_key_env:
+        raw.setdefault("github_sink", {})["api_key"] = github_key_env
+
+    webhook_url_env = os.environ.get("RETRACE_NOTIFY_WEBHOOK_URL")
+    if webhook_url_env:
+        raw.setdefault("notifications", {})["webhook_url"] = webhook_url_env
+    webhook_secret_env = os.environ.get("RETRACE_NOTIFY_WEBHOOK_SECRET")
+    if webhook_secret_env:
+        raw.setdefault("notifications", {})["webhook_secret"] = webhook_secret_env
+    slack_webhook_env = os.environ.get("RETRACE_NOTIFY_SLACK_WEBHOOK_URL")
+    if slack_webhook_env:
+        raw.setdefault("notifications", {})["slack_webhook_url"] = slack_webhook_env
 
     return RetraceConfig.model_validate(raw)
