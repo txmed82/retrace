@@ -337,6 +337,75 @@ def test_initial_navigate_failure_returns_error(tmp_path: Path) -> None:
 # --------------------------- Spec validation ----------------------------
 
 
+def test_explore_engine_rejects_exact_steps(tmp_path: Path) -> None:
+    """Explicit explore specs must not silently ignore exact_steps."""
+    from retrace.tester import (
+        SPEC_SCHEMA_VERSION,
+        TesterSpec,
+        validate_spec,
+    )
+
+    spec = TesterSpec(
+        schema_version=SPEC_SCHEMA_VERSION,
+        spec_id="abc",
+        name="explore-with-steps",
+        mode="describe",
+        prompt="explore",
+        app_url="https://app.example",
+        start_command="",
+        harness_command="",
+        auth_required=False,
+        auth_mode="none",
+        auth_login_url="",
+        auth_username="",
+        auth_password_env="",
+        auth_jwt_env="",
+        auth_headers_env="",
+        created_at="",
+        updated_at="",
+        execution_engine="explore",
+        exploratory_goals=["Sign up"],
+        exact_steps=[{"id": "nav", "action": "get", "url": "/"}],
+    )
+
+    with pytest.raises(ValueError, match="exact_steps/assertions"):
+        validate_spec(spec)
+
+
+def test_explore_engine_rejects_assertions(tmp_path: Path) -> None:
+    from retrace.tester import (
+        SPEC_SCHEMA_VERSION,
+        TesterSpec,
+        validate_spec,
+    )
+
+    spec = TesterSpec(
+        schema_version=SPEC_SCHEMA_VERSION,
+        spec_id="abc",
+        name="explore-with-assertions",
+        mode="describe",
+        prompt="explore",
+        app_url="https://app.example",
+        start_command="",
+        harness_command="",
+        auth_required=False,
+        auth_mode="none",
+        auth_login_url="",
+        auth_username="",
+        auth_password_env="",
+        auth_jwt_env="",
+        auth_headers_env="",
+        created_at="",
+        updated_at="",
+        execution_engine="explore",
+        exploratory_goals=["Sign up"],
+        assertions=[{"id": "x", "type": "status_code", "expected": 200}],
+    )
+
+    with pytest.raises(ValueError, match="exact_steps/assertions"):
+        validate_spec(spec)
+
+
 def test_explore_engine_requires_exploratory_goals(tmp_path: Path) -> None:
     from retrace.tester import (
         TesterSpec,

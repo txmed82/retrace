@@ -260,6 +260,15 @@ def validate_spec(spec: TesterSpec) -> None:
         raise ValueError("native execution does not yet support auth_required specs")
     if explore_selected and not spec.exploratory_goals:
         raise ValueError("explore execution requires at least one exploratory_goal")
+    if spec.execution_engine == "explore" and (
+        spec.exact_steps or spec.assertions
+    ):
+        # The explore engine doesn't read exact_steps or assertions; refuse
+        # specs that set them so the silent-ignore footgun stays closed.
+        raise ValueError(
+            "explore execution does not support exact_steps/assertions; "
+            "use execution_engine='native' or 'auto' for deterministic specs"
+        )
     if needs_harness_command:
         if not spec.harness_command.strip():
             raise ValueError("harness_command is required")
@@ -1608,7 +1617,16 @@ def _run_playwright_spec(
                     selector = _selector_for_browser_step(step)
                     if not selector:
                         raise ValueError(f"select step {step.get('id') or idx} needs selector")
-                    option = step.get("value") or step.get("option") or step.get("text")
+                    # Preserve falsy-but-valid option values (0, "") by
+                    # checking key presence rather than truthiness.
+                    if "value" in step:
+                        option = step["value"]
+                    elif "option" in step:
+                        option = step["option"]
+                    elif "text" in step:
+                        option = step["text"]
+                    else:
+                        option = None
                     if option is None:
                         raise ValueError(f"select step {step.get('id') or idx} needs value/option/text")
                     if isinstance(option, list):
