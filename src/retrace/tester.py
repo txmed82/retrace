@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -27,7 +27,7 @@ DEFAULT_APP_URL = "http://127.0.0.1:3000"
 SPEC_SCHEMA_VERSION = 2
 ALLOWED_MODES = {"describe", "explore_suite"}
 ALLOWED_AUTH_MODES = {"none", "form", "jwt", "headers"}
-ALLOWED_EXECUTION_ENGINES = {"harness", "native", "auto"}
+ALLOWED_EXECUTION_ENGINES = {"harness", "native", "explore", "auto"}
 
 
 @dataclass
@@ -137,6 +137,10 @@ def queue_dir_for_data_dir(data_dir: Path) -> Path:
     return data_dir / "ui-tests" / "queue"
 
 
+def skills_dir_for_data_dir(data_dir: Path) -> Path:
+    return data_dir / "ui-tests" / "skills"
+
+
 def _spec_path(specs_dir: Path, spec_id: str) -> Path:
     # Validate spec_id to prevent path traversal
     if not spec_id or not re.match(r'^[a-zA-Z0-9_-]+$', spec_id):
@@ -240,14 +244,22 @@ def validate_spec(spec: TesterSpec) -> None:
         raise ValueError(
             f"execution_engine must be one of: {sorted(ALLOWED_EXECUTION_ENGINES)}"
         )
+    explore_selected = spec.execution_engine == "explore" or (
+        spec.execution_engine == "auto"
+        and bool(spec.exploratory_goals)
+        and not (spec.exact_steps or spec.assertions)
+    )
     needs_harness_command = spec.execution_engine == "harness" or (
-        spec.execution_engine == "auto" and not (spec.exact_steps or spec.assertions)
+        spec.execution_engine == "auto"
+        and not (spec.exact_steps or spec.assertions or spec.exploratory_goals)
     )
     native_selected = spec.execution_engine == "native" or (
         spec.execution_engine == "auto" and bool(spec.exact_steps or spec.assertions)
     )
     if native_selected and spec.auth_required:
         raise ValueError("native execution does not yet support auth_required specs")
+    if explore_selected and not spec.exploratory_goals:
+        raise ValueError("explore execution requires at least one exploratory_goal")
     if needs_harness_command:
         if not spec.harness_command.strip():
             raise ValueError("harness_command is required")
@@ -1052,6 +1064,103 @@ def _consensus_summary(results: list[TesterAssertionResult]) -> list[dict[str, A
     return summary
 
 
+_EXPLORE_DRIVER_FACTORY: Optional[Callable[..., Any]] = None
+_EXPLORE_LLM_FACTORY: Optional[Callable[..., Any]] = None
+
+
+def set_explore_factories(
+    *,
+    driver_factory: Optional[Callable[..., Any]] = None,
+    llm_factory: Optional[Callable[..., Any]] = None,
+) -> None:
+    """Override the default driver/LLM factories for tests.
+
+    Pass `None` to reset.  Production callers never need this.
+    """
+    global _EXPLORE_DRIVER_FACTORY, _EXPLORE_LLM_FACTORY
+    _EXPLORE_DRIVER_FACTORY = driver_factory
+    _EXPLORE_LLM_FACTORY = llm_factory
+
+
+def _run_explore_spec(
+    *,
+    spec: TesterSpec,
+    app_url: str,
+    run_dir: Path,
+    runs_dir: Path,
+    log_path: Path,
+) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]], str]:
+    from retrace.explorer import run_explorer
+
+    artifacts: list[dict[str, Any]] = []
+    assertion_results: list[dict[str, Any]] = []
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as log_fh:
+        log_fh.write(f"--- explore engine starting for {spec.spec_id} ---\n")
+
+    try:
+        if _EXPLORE_DRIVER_FACTORY is not None:
+            driver = _EXPLORE_DRIVER_FACTORY(browser_settings=spec.browser_settings)
+        else:
+            from retrace.explorer import build_playwright_driver
+
+            driver = build_playwright_driver(browser_settings=spec.browser_settings)
+    except Exception as exc:
+        return 1, artifacts, assertion_results, f"explore driver setup failed: {exc}"
+
+    try:
+        if _EXPLORE_LLM_FACTORY is not None:
+            llm = _EXPLORE_LLM_FACTORY()
+        else:
+            from retrace.config import LLMConfig
+            from retrace.llm.client import LLMClient
+
+            base_cfg = spec.fixtures.get("__llm__")  # tests can stash a config here
+            cfg = base_cfg if isinstance(base_cfg, LLMConfig) else None
+            if cfg is None:
+                raise RuntimeError(
+                    "explore engine requires an LLM; provide one via set_explore_factories "
+                    "or via the calling integration"
+                )
+            llm = LLMClient(cfg)
+    except Exception as exc:
+        try:
+            driver.close()
+        except Exception:
+            pass
+        return 1, artifacts, assertion_results, f"explore llm setup failed: {exc}"
+
+    skills_dir = runs_dir.parent / "skills"
+    explore_max_steps_raw = spec.browser_settings.get("explore_max_steps")
+    try:
+        run_kwargs: dict[str, Any] = {
+            "spec_id": spec.spec_id,
+            "spec_name": spec.name,
+            "app_url": app_url,
+            "exploratory_goals": list(spec.exploratory_goals),
+            "run_dir": run_dir,
+            "driver": driver,
+            "llm": llm,
+            "skills_dir": skills_dir,
+        }
+        if isinstance(explore_max_steps_raw, int) and explore_max_steps_raw > 0:
+            run_kwargs["max_steps"] = explore_max_steps_raw
+        result = run_explorer(**run_kwargs)
+    except Exception as exc:
+        return 1, artifacts, assertion_results, f"explore run failed: {exc}"
+    finally:
+        if hasattr(llm, "close"):
+            try:
+                llm.close()
+            except Exception:
+                pass
+
+    artifacts = list(result.artifacts)
+    error = result.error
+    exit_code = 0 if result.ok else 1
+    return exit_code, artifacts, assertion_results, error
+
+
 def _run_native_spec(
     *,
     spec: TesterSpec,
@@ -1391,7 +1500,19 @@ def _should_use_playwright(spec: TesterSpec, steps: list[dict[str, Any]]) -> boo
     ).strip().lower()
     if runtime == "playwright":
         return True
-    browser_actions = {"click", "type", "keypress", "wait", "hover", "upload", "drag", "drop"}
+    browser_actions = {
+        "click",
+        "type",
+        "keypress",
+        "wait",
+        "wait_for",
+        "hover",
+        "upload",
+        "drag",
+        "drop",
+        "select",
+        "scroll",
+    }
     return any(
         str(step.get("action") or step.get("type") or "").lower() in browser_actions
         and bool(step.get("selector") or step.get("text") or step.get("key"))
@@ -1475,10 +1596,42 @@ def _run_playwright_spec(
                     if not file_path:
                         raise ValueError(f"upload step {step.get('id') or idx} needs file path")
                     page.locator(selector).set_input_files(file_path)
-                elif action in {"drag", "drop"}:
-                    raise ValueError(
-                        f"{action} step {step.get('id') or idx} is not yet implemented in Playwright runner"
-                    )
+                elif action in {"drag", "drop", "drag_and_drop"}:
+                    source_selector = _selector_for_browser_step(step)
+                    target_selector = _drag_target_selector(step)
+                    if not source_selector or not target_selector:
+                        raise ValueError(
+                            f"{action} step {step.get('id') or idx} needs source and target selectors"
+                        )
+                    page.locator(source_selector).drag_to(page.locator(target_selector))
+                elif action == "select":
+                    selector = _selector_for_browser_step(step)
+                    if not selector:
+                        raise ValueError(f"select step {step.get('id') or idx} needs selector")
+                    option = step.get("value") or step.get("option") or step.get("text")
+                    if option is None:
+                        raise ValueError(f"select step {step.get('id') or idx} needs value/option/text")
+                    if isinstance(option, list):
+                        page.locator(selector).select_option(option)
+                    elif isinstance(option, dict):
+                        page.locator(selector).select_option(**option)
+                    else:
+                        page.locator(selector).select_option(str(option))
+                elif action == "scroll":
+                    selector = _selector_for_browser_step(step)
+                    if selector:
+                        page.locator(selector).scroll_into_view_if_needed()
+                    else:
+                        delta_y = int(step.get("y") or step.get("delta_y") or 0)
+                        delta_x = int(step.get("x") or step.get("delta_x") or 0)
+                        page.mouse.wheel(delta_x, delta_y)
+                elif action == "wait_for":
+                    selector = _selector_for_browser_step(step)
+                    if not selector:
+                        raise ValueError(f"wait_for step {step.get('id') or idx} needs selector")
+                    state = str(step.get("state") or "visible")
+                    timeout_ms = int(step.get("timeout_ms") or step.get("ms") or 5000)
+                    page.locator(selector).wait_for(state=state, timeout=timeout_ms)
                 elif action in {"assert_status", "status_code"}:
                     expected = int(step.get("expected", step.get("status", 200)))
                     assertion_results.append(
@@ -1539,6 +1692,97 @@ def _run_playwright_spec(
                     assertion_results.append(
                         _evaluate_model_backed_consensus_assertion(assertion, response=None)
                     )
+                elif assertion_type in {"url_contains", "url"}:
+                    expected = str(assertion.get("expected", assertion.get("value", "")))
+                    current_url = str(page.url or "")
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion=assertion,
+                            ok=expected in current_url,
+                            expected=expected,
+                            actual={"url": current_url},
+                            message=f"Expected URL to contain {expected!r}.",
+                        )
+                    )
+                elif assertion_type in {"selector_visible", "element_visible", "visible"}:
+                    selector = _selector_for_assertion(assertion)
+                    timeout_ms = int(assertion.get("timeout_ms") or 3000)
+                    visible = False
+                    if selector:
+                        try:
+                            page.locator(selector).first.wait_for(
+                                state="visible", timeout=timeout_ms
+                            )
+                            visible = True
+                        except Exception:
+                            visible = False
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion=assertion,
+                            ok=visible,
+                            expected={"selector": selector, "state": "visible"},
+                            actual={"visible": visible},
+                            message=f"Expected selector {selector!r} to be visible.",
+                        )
+                    )
+                elif assertion_type in {"selector_text", "element_text"}:
+                    selector = _selector_for_assertion(assertion)
+                    expected = str(assertion.get("expected", assertion.get("text", "")))
+                    actual_text = ""
+                    ok = False
+                    if selector:
+                        try:
+                            actual_text = page.locator(selector).first.inner_text(
+                                timeout=int(assertion.get("timeout_ms") or 3000)
+                            )
+                            ok = expected in actual_text
+                        except Exception as exc:
+                            actual_text = f"<error: {exc}>"
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion=assertion,
+                            ok=ok,
+                            expected=expected,
+                            actual={"text": actual_text},
+                            message=f"Expected selector {selector!r} text to contain {expected!r}.",
+                        )
+                    )
+                elif assertion_type in {"selector_count", "element_count"}:
+                    selector = _selector_for_assertion(assertion)
+                    expected = int(assertion.get("expected", assertion.get("count", 0)))
+                    actual_count = 0
+                    if selector:
+                        try:
+                            actual_count = page.locator(selector).count()
+                        except Exception:
+                            actual_count = -1
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion=assertion,
+                            ok=actual_count == expected,
+                            expected=expected,
+                            actual={"count": actual_count},
+                            message=f"Expected selector {selector!r} count {expected}, got {actual_count}.",
+                        )
+                    )
+                elif assertion_type in {"text_matches", "regex"}:
+                    import re as _re
+
+                    pattern = str(assertion.get("expected", assertion.get("pattern", "")))
+                    try:
+                        last_text = page.locator("body").inner_text(timeout=3000)
+                    except Exception:
+                        last_text = ""
+                    ok = bool(pattern) and bool(_re.search(pattern, last_text))
+                    assertion_results.append(
+                        _assertion_result(
+                            assertion=assertion,
+                            ok=ok,
+                            expected=pattern,
+                            actual={"matched": ok},
+                            message=f"Expected page text to match /{pattern}/.",
+                        )
+                    )
                 else:
                     assertion_results.append(
                         _assertion_result(
@@ -1591,6 +1835,31 @@ def _selector_for_browser_step(step: dict[str, Any]) -> str:
     if selector:
         return selector
     target = step.get("target")
+    if isinstance(target, dict):
+        return str(target.get("selector") or "").strip()
+    return ""
+
+
+def _drag_target_selector(step: dict[str, Any]) -> str:
+    direct = str(
+        step.get("target_selector")
+        or step.get("destination_selector")
+        or step.get("to")
+        or ""
+    ).strip()
+    if direct:
+        return direct
+    target = step.get("destination") or step.get("drop_target")
+    if isinstance(target, dict):
+        return str(target.get("selector") or "").strip()
+    return ""
+
+
+def _selector_for_assertion(assertion: dict[str, Any]) -> str:
+    selector = str(assertion.get("selector") or "").strip()
+    if selector:
+        return selector
+    target = assertion.get("target")
     if isinstance(target, dict):
         return str(target.get("selector") or "").strip()
     return ""
@@ -1685,9 +1954,12 @@ def run_spec(
     )
     execution_engine = spec.execution_engine
     if execution_engine == "auto":
-        execution_engine = (
-            "native" if spec.exact_steps or spec.assertions else "harness"
-        )
+        if spec.exact_steps or spec.assertions:
+            execution_engine = "native"
+        elif spec.exploratory_goals:
+            execution_engine = "explore"
+        else:
+            execution_engine = "harness"
     harness_cmd = ""
     if execution_engine == "harness":
         harness_cmd = _format_harness_command(
@@ -1736,6 +2008,15 @@ def run_spec(
                 )
                 if last_exit == 0:
                     break
+        elif execution_engine == "explore":
+            attempts += 1
+            last_exit, artifacts, assertion_results, last_error = _run_explore_spec(
+                spec=spec,
+                app_url=app_url,
+                run_dir=run_dir,
+                runs_dir=runs_dir,
+                log_path=harness_log_path,
+            )
         else:
             for attempt in range(max(0, int(max_retries)) + 1):
                 attempts += 1

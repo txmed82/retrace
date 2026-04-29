@@ -80,9 +80,22 @@ def _tester_defaults(config_path: Path) -> dict[str, Any]:
 @click.option(
     "--engine",
     "execution_engine",
-    type=click.Choice(["harness", "native", "auto"], case_sensitive=False),
+    type=click.Choice(["harness", "native", "explore", "auto"], case_sensitive=False),
     default="harness",
     show_default=True,
+)
+@click.option(
+    "--goal",
+    "goals",
+    multiple=True,
+    help="Exploratory goal (repeatable). Routes 'explore' engine.",
+)
+@click.option(
+    "--max-steps",
+    default=0,
+    show_default=False,
+    type=int,
+    help="Max LLM-driven steps for the explore engine (0 keeps the explorer default).",
 )
 def tester_create(
     config_path: Path,
@@ -100,6 +113,8 @@ def tester_create(
     auth_jwt_env: str,
     auth_headers_env: str,
     execution_engine: str,
+    goals: tuple[str, ...],
+    max_steps: int,
 ) -> None:
     cfg = load_config(config_path)
     defaults = _tester_defaults(config_path)
@@ -109,6 +124,10 @@ def tester_create(
         final_prompt = (
             "Systematically explore the app and propose a full regression test suite."
         )
+    exploratory_goals = [g.strip() for g in goals if g.strip()]
+    browser_settings: dict[str, Any] = {}
+    if max_steps > 0:
+        browser_settings["explore_max_steps"] = int(max_steps)
     spec = create_spec(
         specs_dir=specs_dir_for_data_dir(cfg.run.data_dir),
         name=name,
@@ -128,6 +147,8 @@ def tester_create(
         auth_jwt_env=auth_jwt_env,
         auth_headers_env=auth_headers_env,
         execution_engine=execution_engine.lower(),
+        exploratory_goals=exploratory_goals,
+        browser_settings=browser_settings,
     )
     click.echo(f"Created tester spec: {spec.spec_id}")
 
@@ -404,6 +425,34 @@ def tester_run(
             indent=2,
         )
     )
+    if not result.ok and cfg.notifications.enabled:
+        from retrace.notification_sinks import (
+            NotificationEvent,
+            NotificationPayload,
+            build_sinks_from_config,
+            close_sinks,
+            dispatch_notification,
+        )
+
+        sinks = build_sinks_from_config(cfg.notifications)
+        try:
+            dispatch_notification(
+                sinks,
+                NotificationPayload(
+                    event=NotificationEvent.RUN_FAILED.value,
+                    title=f"Tester run failed: {spec.name}",
+                    summary=result.error or f"exit code {result.exit_code}",
+                    public_id=result.run_id,
+                    extra={
+                        "spec_id": result.spec_id,
+                        "execution_engine": result.execution_engine,
+                        "attempts": result.attempts,
+                        "flake_reason": result.flake_reason,
+                    },
+                ),
+            )
+        finally:
+            close_sinks(sinks)
     if not result.ok:
         raise click.ClickException("Tester run failed.")
 
@@ -474,6 +523,33 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
         )
         if job is not None:
             click.echo(json.dumps(job, indent=2))
+            if not job.get("ok", False) and cfg.notifications.enabled:
+                from retrace.notification_sinks import (
+                    NotificationEvent,
+                    NotificationPayload,
+                    build_sinks_from_config,
+                    close_sinks,
+                    dispatch_notification,
+                )
+
+                sinks = build_sinks_from_config(cfg.notifications)
+                try:
+                    dispatch_notification(
+                        sinks,
+                        NotificationPayload(
+                            event=NotificationEvent.RUN_FAILED.value,
+                            title=f"Queued tester run failed: {job.get('spec_id', '')}",
+                            summary=str(job.get("error") or ""),
+                            public_id=str(job.get("run_id") or ""),
+                            extra={
+                                "spec_id": job.get("spec_id"),
+                                "execution_engine": job.get("execution_engine"),
+                                "attempts": job.get("attempts"),
+                            },
+                        ),
+                    )
+                finally:
+                    close_sinks(sinks)
         if once:
             return
         time.sleep(max(1, int(interval)))

@@ -2,6 +2,9 @@
 set -euo pipefail
 
 CRON_SCHEDULE="${RETRACE_CRON:-0 */6 * * *}"
+DIGEST_CRON_SCHEDULE="${RETRACE_DIGEST_CRON:-0 8 * * *}"
+VERIFY_CRON_SCHEDULE="${RETRACE_VERIFY_CRON:-30 8 * * *}"
+SYNC_CRON_SCHEDULE="${RETRACE_SYNC_TICKETS_CRON:-15 * * * *}"
 MODE="${RETRACE_MODE:-cron}"
 
 case "$MODE" in
@@ -22,10 +25,14 @@ case "$MODE" in
     exec retrace tester worker --interval "${RETRACE_BROWSER_RUNNER_INTERVAL_SECONDS:-30}"
     ;;
   cron)
-    # Write a crontab entry that runs `retrace run` on schedule.
+    # Write a crontab entry that runs `retrace run` plus the daily product
+    # loops (digest, verify-resolved, sync-tickets) on their own schedules.
     CRON_FILE=/etc/cron.d/retrace
     cat > "$CRON_FILE" <<CRON
 $CRON_SCHEDULE root cd /app && retrace run >> /app/data/retrace.log 2>&1
+$DIGEST_CRON_SCHEDULE root cd /app && retrace digest --notify >> /app/data/retrace-digest.log 2>&1
+$VERIFY_CRON_SCHEDULE root cd /app && retrace api verify-resolved >> /app/data/retrace-verify.log 2>&1
+$SYNC_CRON_SCHEDULE root cd /app && retrace api sync-tickets >> /app/data/retrace-sync.log 2>&1
 CRON
     chmod 0644 "$CRON_FILE"
     crontab "$CRON_FILE"

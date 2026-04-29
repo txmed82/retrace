@@ -69,6 +69,9 @@ services:
     environment:
       - RETRACE_MODE=cron
       - RETRACE_CRON=0 */6 * * *
+      - RETRACE_DIGEST_CRON=0 8 * * *
+      - RETRACE_VERIFY_CRON=30 8 * * *
+      - RETRACE_SYNC_TICKETS_CRON=15 * * * *
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./.env:/app/.env:ro

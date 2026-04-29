@@ -3,8 +3,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse, urlunparse
 
+from retrace.issue_sink_clients import (
+    CreatedIssue,
+    GitHubClient,
+    IssueSinkError,
+    LinearClient,
+)
 from retrace.storage import Storage
 
 logger = logging.getLogger(__name__)
@@ -59,6 +64,44 @@ def build_issue_sink_payload(
     }
 
 
+def render_issue_markdown(payload: dict[str, Any]) -> str:
+    """Render the sink payload as a Markdown body for Linear/GitHub."""
+    lines: list[str] = []
+    lines.append(str(payload.get("summary") or ""))
+    lines.append("")
+    lines.append(
+        f"**Severity:** {payload.get('severity', 'unknown')}  "
+        f"**Affected sessions:** {payload.get('affected_count', 0)}  "
+        f"**Affected users:** {payload.get('affected_users', 0)}"
+    )
+    cause = str(payload.get("likely_cause") or "")
+    if cause:
+        lines.append("")
+        lines.append("### Likely cause")
+        lines.append(cause)
+    steps = payload.get("reproduction_steps") or []
+    if steps:
+        lines.append("")
+        lines.append("### Reproduction steps")
+        for i, step in enumerate(steps, start=1):
+            lines.append(f"{i}. {step}")
+    replay_links = payload.get("replay_links") or []
+    if replay_links:
+        lines.append("")
+        lines.append("### Replays")
+        for link in replay_links:
+            role = link.get("role") or "session"
+            url = link.get("url") or ""
+            sid = link.get("session_id") or ""
+            lines.append(f"- [{role}] [{sid}]({url})")
+    lines.append("")
+    lines.append("---")
+    lines.append(
+        f"_Filed by Retrace · public id `{payload.get('source_public_id', '')}`._"
+    )
+    return "\n".join(lines).strip() + "\n"
+
+
 def promote_replay_issue(
     *,
     store: Storage,
@@ -69,6 +112,11 @@ def promote_replay_issue(
     base_url: str = "",
     external_id: str = "",
     external_url: str = "",
+    linear_client: LinearClient | None = None,
+    linear_team_id: str = "",
+    github_client: GitHubClient | None = None,
+    github_repo: str = "",
+    labels: list[str] | None = None,
 ) -> IssueSinkResult:
     provider = provider.strip().lower()
     if provider not in {"linear", "github"}:
@@ -101,13 +149,16 @@ def promote_replay_issue(
             payload=payload,
         )
 
-    final_external_id = external_id.strip() or _default_external_id(
+    final_external_id, final_external_url = _resolve_external_target(
         provider=provider,
-        public_id=str(issue["public_id"]),
-    )
-    final_external_url = external_url.strip() or _default_external_url(
-        provider=provider,
-        external_id=final_external_id,
+        payload=payload,
+        explicit_external_id=external_id.strip(),
+        explicit_external_url=external_url.strip(),
+        linear_client=linear_client,
+        linear_team_id=linear_team_id,
+        github_client=github_client,
+        github_repo=github_repo,
+        labels=labels or [],
     )
     success = store.mark_replay_issue_ticket_created(
         str(issue["id"]),
@@ -115,15 +166,10 @@ def promote_replay_issue(
         external_ticket_url=final_external_url,
     )
     if not success:
-        parsed = urlparse(final_external_url)
-        sanitized_url = urlunparse(
-            (parsed.scheme, parsed.netloc, parsed.path, "", "", "")
-        )
         logger.error(
-            "Failed to mark replay issue ticket as created: issue_id=%s, external_ticket_id=%s, external_ticket_url=%s",
+            "Failed to mark replay issue ticket as created: issue_id=%s, external_ticket_id=%s",
             issue["id"],
             final_external_id,
-            sanitized_url,
         )
         return IssueSinkResult(
             issue_id=str(issue["id"]),
@@ -142,6 +188,73 @@ def promote_replay_issue(
         external_url=final_external_url,
         created=True,
         payload=payload,
+    )
+
+
+def _resolve_external_target(
+    *,
+    provider: str,
+    payload: dict[str, Any],
+    explicit_external_id: str,
+    explicit_external_url: str,
+    linear_client: LinearClient | None,
+    linear_team_id: str,
+    github_client: GitHubClient | None,
+    github_repo: str,
+    labels: list[str],
+) -> tuple[str, str]:
+    if explicit_external_id and explicit_external_url:
+        return explicit_external_id, explicit_external_url
+
+    title = str(payload.get("title") or "Retrace replay issue")
+    body = render_issue_markdown(payload)
+    public_id = str(payload.get("source_public_id") or "")
+
+    if provider == "linear" and linear_client is not None:
+        team_id = linear_team_id.strip()
+        if not team_id:
+            raise IssueSinkError(
+                "Linear team id is required when promoting via Linear API"
+            )
+        created = linear_client.create_issue(
+            team_id=team_id,
+            title=title,
+            description=body,
+            labels=labels,
+        )
+        return _merge_explicit(created, explicit_external_id, explicit_external_url)
+
+    if provider == "github" and github_client is not None:
+        repo = github_repo.strip()
+        if not repo:
+            raise IssueSinkError(
+                "GitHub repo is required when promoting via GitHub API"
+            )
+        created = github_client.create_issue(
+            repo=repo,
+            title=title,
+            body=body,
+            labels=labels,
+        )
+        return _merge_explicit(created, explicit_external_id, explicit_external_url)
+
+    final_external_id = explicit_external_id or _default_external_id(
+        provider=provider, public_id=public_id
+    )
+    final_external_url = explicit_external_url or _default_external_url(
+        provider=provider, external_id=final_external_id
+    )
+    return final_external_id, final_external_url
+
+
+def _merge_explicit(
+    created: CreatedIssue,
+    explicit_external_id: str,
+    explicit_external_url: str,
+) -> tuple[str, str]:
+    return (
+        explicit_external_id or created.external_id,
+        explicit_external_url or created.external_url,
     )
 
 

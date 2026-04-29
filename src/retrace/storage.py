@@ -427,6 +427,14 @@ class ReplayIssueUpsertResult:
     issue_id: str
     public_id: str
     inserted: bool
+    previous_status: str = ""
+    current_status: str = ""
+
+    @property
+    def regressed(self) -> bool:
+        return (
+            self.previous_status == "resolved" and self.current_status == "regressed"
+        )
 
 
 @dataclass
@@ -1732,6 +1740,14 @@ class Storage:
         clean_session_ids = list(dict.fromkeys(str(s) for s in session_ids if str(s)))
         representative_session_id = clean_session_ids[0] if clean_session_ids else ""
         with self._conn() as conn:
+            prior_row = conn.execute(
+                """
+                SELECT status FROM replay_issues
+                WHERE project_id = ? AND environment_id = ? AND fingerprint = ?
+                """,
+                (project_id, environment_id, fingerprint),
+            ).fetchone()
+            previous_status = str(prior_row["status"]) if prior_row else ""
             conn.execute(
                 """
                 INSERT INTO replay_issues
@@ -1818,7 +1834,7 @@ class Storage:
             )
             row = conn.execute(
                 """
-                SELECT id, public_id FROM replay_issues
+                SELECT id, public_id, status FROM replay_issues
                 WHERE project_id = ? AND environment_id = ? AND fingerprint = ?
                 """,
                 (project_id, environment_id, fingerprint),
@@ -1827,6 +1843,7 @@ class Storage:
             inserted = str(row["id"]) == issue_id
             issue_id = str(row["id"])
             public_id = str(row["public_id"])
+            current_status = str(row["status"])
             for sid in clean_session_ids:
                 conn.execute(
                     """
@@ -1888,6 +1905,8 @@ class Storage:
             issue_id=issue_id,
             public_id=public_id,
             inserted=inserted,
+            previous_status=previous_status,
+            current_status=current_status,
         )
 
     def list_replay_issues(

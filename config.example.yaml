@@ -25,3 +25,26 @@ detectors:
 
 cluster:
   min_size: 1
+
+# Optional: file Retrace replay-backed issues into Linear.
+# Provide the API key via RETRACE_LINEAR_API_KEY in .env, or inline below.
+# linear:
+#   api_key: ""
+#   team_id: ""        # Linear team UUID (preferred)
+#   team_key: "ENG"    # …or set a team key and Retrace resolves it at promote time
+#   labels: ["retrace"]
+
+# Optional: file Retrace replay-backed issues into GitHub.
+# Provide the API key via RETRACE_GITHUB_API_KEY (or GITHUB_TOKEN) in .env.
+# github_sink:
+#   api_key: ""
+#   repo: "owner/name"
+#   labels: ["retrace"]
+
+# Optional: outbound notifications (generic webhook + Slack incoming webhook).
+# Env equivalents: RETRACE_NOTIFY_WEBHOOK_URL, RETRACE_NOTIFY_WEBHOOK_SECRET,
+# RETRACE_NOTIFY_SLACK_WEBHOOK_URL.
+# notifications:
+#   webhook_url: ""
+#   webhook_secret: ""
+#   slack_webhook_url: ""

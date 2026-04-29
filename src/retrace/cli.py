@@ -6,6 +6,7 @@ from pathlib import Path
 import click
 
 from retrace.commands.api import api_group
+from retrace.commands.digest import digest_command
 from retrace.commands.doctor import doctor_command
 from retrace.commands.github import github_group
 from retrace.commands.init import init_command
@@ -70,3 +71,4 @@ main.add_command(ui_command)
 main.add_command(tester_group)
 main.add_command(mcp_group)
 main.add_command(api_group)
+main.add_command(digest_command)
