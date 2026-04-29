@@ -165,31 +165,22 @@ class LinearClient:
     def get_issue_state(self, identifier: str) -> dict[str, Any]:
         """Look up an issue by identifier (e.g. 'ENG-42') or UUID and return
         its `state` block: {id, name, type}.  Raises IssueSinkError on lookup
-        failure so callers can decide whether to skip vs abort."""
+        failure so callers can decide whether to skip vs abort.
+
+        Linear's GraphQL `issue(id: ...)` accepts both UUIDs and the human
+        identifier form, so a single query handles either input.
+        """
         identifier = identifier.strip()
         if not identifier:
             raise ValueError("identifier is required")
-        # If the value looks like a UUID (no dash-prefix-letters style key),
-        # use it directly.  Otherwise resolve via the identifier filter.
-        if "-" in identifier and identifier.split("-", 1)[0].isalpha():
-            data = self._graphql(
-                """
-                query IssueByIdentifier($id: String!) {
-                  issues(filter: { number: { eq: 0 } }, first: 1) { nodes { id } }
-                  issue(id: $id) { id identifier url state { id name type } }
-                }
-                """,
-                {"id": identifier},
-            )
-        else:
-            data = self._graphql(
-                """
-                query IssueByUuid($id: String!) {
-                  issue(id: $id) { id identifier url state { id name type } }
-                }
-                """,
-                {"id": identifier},
-            )
+        data = self._graphql(
+            """
+            query IssueByIdOrIdentifier($id: String!) {
+              issue(id: $id) { id identifier url state { id name type } }
+            }
+            """,
+            {"id": identifier},
+        )
         issue = data.get("issue") or {}
         if not issue:
             raise IssueSinkError(f"Linear issue not found: {identifier}")

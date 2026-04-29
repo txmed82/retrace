@@ -168,4 +168,7 @@ def test_concurrent_claim_yields_skipped_not_failed(tmp_path: Path) -> None:
     assert summary.outcomes[0].error == "not_claimed"
     # And the actually-running job (claimed by the "other worker") is not
     # touched again — it stays in 'running' state for the real worker to drain.
-    assert job_id  # silences unused-var lint
+    running = store.list_processing_jobs(kind="contended", status="running")
+    assert any(str(row["id"]) == job_id for row in running), (
+        "skipped job should still be claimable by the worker that won the race"
+    )

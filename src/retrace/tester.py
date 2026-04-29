@@ -1614,7 +1614,16 @@ def _run_playwright_spec(
                     if isinstance(option, list):
                         page.locator(selector).select_option(option)
                     elif isinstance(option, dict):
-                        page.locator(selector).select_option(**option)
+                        # Playwright select_option accepts only value/label/index;
+                        # filter to keep us out of pw's "unexpected kwarg" trap.
+                        allowed = {"value", "label", "index"}
+                        filtered = {k: v for k, v in option.items() if k in allowed}
+                        if not filtered:
+                            raise ValueError(
+                                f"select step {step.get('id') or idx} dict must include "
+                                f"value/label/index"
+                            )
+                        page.locator(selector).select_option(**filtered)
                     else:
                         page.locator(selector).select_option(str(option))
                 elif action == "scroll":

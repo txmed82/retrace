@@ -119,23 +119,60 @@ class JobWorker:
             return JobOutcome(
                 job_id=job_id, kind=kind, status="skipped", error="not_claimed"
             )
+        metadata: HandlerResult = {}
+        handler_succeeded = False
         try:
             payload = json.loads(str(job["payload_json"] or "{}"))
             if not isinstance(payload, dict):
-                raise ValueError(f"job payload must be an object, got {type(payload).__name__}")
+                raise ValueError(
+                    f"job payload must be an object, got {type(payload).__name__}"
+                )
             metadata = handler(job, payload)
-            self.store.finish_processing_job(job_id=job_id, status="succeeded")
-            return JobOutcome(
-                job_id=job_id,
-                kind=kind,
-                status="succeeded",
-                metadata=dict(metadata or {}),
-            )
+            handler_succeeded = True
         except Exception as exc:
             log.exception("job %s (kind=%s) failed", job_id, kind)
-            self.store.finish_processing_job(
-                job_id=job_id, status="failed", error=str(exc)
-            )
+            try:
+                self.store.finish_processing_job(
+                    job_id=job_id, status="failed", error=str(exc)
+                )
+            except Exception:
+                # If we can't even mark failure, log loudly; the job stays
+                # 'running' and will need manual recovery (or a stuck-job
+                # sweeper later).  We still return a failed outcome so the
+                # summary reflects reality.
+                log.exception(
+                    "job %s (kind=%s) failed AND finish_processing_job raised",
+                    job_id,
+                    kind,
+                )
             return JobOutcome(
                 job_id=job_id, kind=kind, status="failed", error=str(exc)
             )
+
+        # Handler succeeded; record success.  If finish_processing_job raises
+        # the row stays in 'running' state, but the in-memory outcome reflects
+        # success so the caller can decide whether to act on `metadata`.
+        try:
+            self.store.finish_processing_job(job_id=job_id, status="succeeded")
+        except Exception as finish_exc:
+            log.exception(
+                "job %s (kind=%s) handler succeeded but finish_processing_job failed",
+                job_id,
+                kind,
+            )
+            return JobOutcome(
+                job_id=job_id,
+                kind=kind,
+                status="failed",
+                error=f"handler succeeded but finish failed: {finish_exc}",
+                metadata=dict(metadata or {}),
+            )
+        # Defensive: only reachable when handler_succeeded; explicit branch
+        # documents the contract for readers.
+        assert handler_succeeded
+        return JobOutcome(
+            job_id=job_id,
+            kind=kind,
+            status="succeeded",
+            metadata=dict(metadata or {}),
+        )

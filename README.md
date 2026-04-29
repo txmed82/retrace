@@ -317,7 +317,7 @@ API keys the same way as PostHog — via `.env` or inline in `config.yaml`.
 ```bash
 # .env
 RETRACE_LINEAR_API_KEY=lin_api_...
-RETRACE_GITHUB_API_KEY=ghp_...   # or GITHUB_TOKEN
+RETRACE_GITHUB_API_KEY=ghp_...    # or RETRACE_GITHUB_TOKEN, or GITHUB_TOKEN
 ```
 
 ```yaml
@@ -345,7 +345,7 @@ external ID/URL and dedupes locally — useful for scripted testing.
 ## Runtime Data
 
 - `config.yaml` — non-secret config
-- `.env` — secrets (`RETRACE_POSTHOG_API_KEY`, optional `RETRACE_LLM_API_KEY`, optional `RETRACE_LINEAR_API_KEY`, optional `RETRACE_GITHUB_API_KEY`/`GITHUB_TOKEN`, optional `RETRACE_NOTIFY_WEBHOOK_URL`/`RETRACE_NOTIFY_SLACK_WEBHOOK_URL`, optional tester auth secrets)
+- `.env` — secrets (`RETRACE_POSTHOG_API_KEY`, optional `RETRACE_LLM_API_KEY`, optional `RETRACE_LINEAR_API_KEY`, optional `RETRACE_GITHUB_API_KEY` / `RETRACE_GITHUB_TOKEN` / `GITHUB_TOKEN`, optional `RETRACE_NOTIFY_WEBHOOK_URL`, optional `RETRACE_NOTIFY_WEBHOOK_SECRET`, optional `RETRACE_NOTIFY_SLACK_WEBHOOK_URL`, optional tester auth secrets)
 - LLM providers supported: `openai_compatible` (local/custom), `openai`, `anthropic`, `openrouter`
 - `data/retrace.db` — run/session/findings metadata
 - `data/sessions/*.json` — ingested rrweb events

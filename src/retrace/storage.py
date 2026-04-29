@@ -1999,6 +1999,34 @@ class Storage:
                 (max(1, min(int(limit), 500)),),
             ).fetchall()
 
+    def list_ticketed_replay_issues(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        """Return open replay issues that have an upstream ticket attached.
+
+        Used by the ticket-sync workflow to poll Linear/GitHub for state
+        without re-resolving every replay issue.
+        """
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM replay_issues
+                WHERE project_id = ?
+                  AND environment_id = ?
+                  AND external_ticket_id IS NOT NULL
+                  AND external_ticket_id != ''
+                  AND status != 'resolved'
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (project_id, environment_id, max(1, int(limit))),
+            ).fetchall()
+
     def transition_replay_issue(
         self,
         issue_id: str,

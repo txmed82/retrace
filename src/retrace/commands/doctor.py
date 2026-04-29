@@ -127,8 +127,16 @@ def doctor_command(config_path: Path) -> None:
                 detail = (
                     f"HEAD {cfg.notifications.webhook_url} -> {resp.status_code}"
                 )
-                if resp.status_code < 500:
+                if 200 <= resp.status_code < 400:
                     checks.append(_ok("Notifications: webhook", detail))
+                elif resp.status_code == 405:
+                    checks.append(
+                        _warn(
+                            "Notifications: webhook",
+                            detail
+                            + " (HEAD not allowed; endpoint may still accept POST).",
+                        )
+                    )
                 else:
                     checks.append(_fail("Notifications: webhook", detail))
             except Exception as exc:
@@ -176,6 +184,14 @@ def doctor_command(config_path: Path) -> None:
                     + " (no browser specs configured yet, so this only blocks explore/native browser runs).",
                 )
             )
+    except Exception as exc:
+        # Playwright present but unusable (broken native libs, missing
+        # browsers, etc.) — surface the failure rather than crashing doctor.
+        msg = f"playwright present but failed to import: {exc}"
+        if needs_browser_runtime:
+            checks.append(_fail("Playwright runtime", msg))
+        else:
+            checks.append(_warn("Playwright runtime", msg))
 
     any_fail = False
     for name, status, detail in checks:

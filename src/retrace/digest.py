@@ -77,6 +77,15 @@ def _row_to_digest(row: Any) -> DigestIssueRow:
 
 
 def _within_window(updated_at: str, window_start: datetime) -> bool:
+    """Decide whether an issue's `updated_at` falls inside the digest window.
+
+    Storage writes timestamps via `datetime.now(timezone.utc).isoformat()`, so
+    in practice every value here is tz-aware UTC.  We still keep a defensive
+    fallback that treats naive timestamps as UTC; if a future backend ever
+    starts writing local-time strings, those rows will be off by the local
+    offset and need a timezone-aware migration before the window math is
+    trustworthy.
+    """
     if not updated_at:
         return False
     try:

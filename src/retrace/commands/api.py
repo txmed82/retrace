@@ -771,7 +771,9 @@ def api_sync_tickets(
     pid = project_id.strip() or workspace.project_id
     eid = environment_id.strip() or workspace.environment_id
 
-    rows = _list_ticketed_issues(store, project_id=pid, environment_id=eid, limit=limit)
+    rows = store.list_ticketed_replay_issues(
+        project_id=pid, environment_id=eid, limit=limit
+    )
 
     linear_client: LinearClient | None = None
     github_client: GitHubClient | None = None
@@ -882,23 +884,6 @@ def api_sync_tickets(
     )
 
 
-def _list_ticketed_issues(
-    store: Storage, *, project_id: str, environment_id: str, limit: int
-) -> list[Any]:
-    with store._conn() as conn:  # type: ignore[attr-defined]
-        return conn.execute(
-            """
-            SELECT * FROM replay_issues
-            WHERE project_id = ? AND environment_id = ?
-              AND external_ticket_id IS NOT NULL AND external_ticket_id != ''
-              AND status != 'resolved'
-            ORDER BY updated_at DESC
-            LIMIT ?
-            """,
-            (project_id, environment_id, max(1, int(limit))),
-        ).fetchall()
-
-
 def _classify_ticket_id(ticket_id: str) -> str:
     """Decide whether a stored external_ticket_id points at GitHub or Linear.
 
@@ -913,7 +898,15 @@ def _classify_ticket_id(ticket_id: str) -> str:
 
 
 def _parse_github_ticket_id(ticket_id: str) -> tuple[str, int]:
+    if "#" not in ticket_id:
+        raise ValueError(f"GitHub ticket id must be 'owner/name#N': {ticket_id!r}")
     repo, _, number_str = ticket_id.partition("#")
+    if "/" not in repo:
+        raise ValueError(f"GitHub ticket id repo must be 'owner/name': {ticket_id!r}")
+    if not number_str.isdigit():
+        raise ValueError(
+            f"GitHub ticket id issue number must be numeric: {ticket_id!r}"
+        )
     return repo, int(number_str)
 
 
