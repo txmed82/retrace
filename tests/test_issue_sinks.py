@@ -328,6 +328,33 @@ def test_render_issue_markdown_contains_key_fields() -> None:
     assert "bug_xyz" in body
 
 
+def test_render_issue_markdown_includes_correlation_block() -> None:
+    body = render_issue_markdown(
+        {
+            "summary": "Checkout breaks",
+            "severity": "high",
+            "affected_count": 1,
+            "affected_users": 1,
+            "source_public_id": "bug_corr",
+            "replay_links": [],
+            "correlation": {
+                "distinct_id": "user-9",
+                "trace_ids": ["trace-abc"],
+                "error_issue_ids": ["err-1"],
+                "top_stack_frame": "renderCheckout (checkout.tsx:42)",
+                "error_tracking_url": "https://posthog/example/error/err-1",
+                "logs_url": "https://posthog/example/logs?trace=trace-abc",
+            },
+        }
+    )
+    assert "### Backend correlation" in body
+    assert "`trace-abc`" in body
+    assert "`err-1`" in body
+    assert "(https://posthog/example/error/err-1)" in body
+    assert "(https://posthog/example/logs?trace=trace-abc)" in body
+    assert "renderCheckout (checkout.tsx:42)" in body
+
+
 # ---------- CLI promote-issue ----------
 
 

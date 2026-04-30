@@ -80,7 +80,9 @@ def _tester_defaults(config_path: Path) -> dict[str, Any]:
 @click.option(
     "--engine",
     "execution_engine",
-    type=click.Choice(["harness", "native", "explore", "auto"], case_sensitive=False),
+    type=click.Choice(
+        ["harness", "native", "explore", "visual", "auto"], case_sensitive=False
+    ),
     default="harness",
     show_default=True,
 )
@@ -270,7 +272,9 @@ def tester_show(config_path: Path, spec_id: str) -> None:
     "--engine",
     "execution_engine",
     default=None,
-    type=click.Choice(["harness", "native", "auto"], case_sensitive=False),
+    type=click.Choice(
+        ["harness", "native", "explore", "visual", "auto"], case_sensitive=False
+    ),
 )
 def tester_update(
     config_path: Path,
