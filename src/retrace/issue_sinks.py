@@ -139,6 +139,9 @@ def render_issue_markdown(payload: dict[str, Any]) -> str:
     if correlation:
         lines.append("")
         lines.append("### Backend correlation")
+        distinct_id = correlation.get("distinct_id") or ""
+        if distinct_id:
+            lines.append(f"- Distinct ID: `{distinct_id}`")
         trace_ids = correlation.get("trace_ids") or []
         if trace_ids:
             lines.append(f"- Trace IDs: {', '.join(f'`{t}`' for t in trace_ids)}")

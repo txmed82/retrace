@@ -348,6 +348,7 @@ def test_render_issue_markdown_includes_correlation_block() -> None:
         }
     )
     assert "### Backend correlation" in body
+    assert "`user-9`" in body  # distinct_id is one of the most useful lookup keys
     assert "`trace-abc`" in body
     assert "`err-1`" in body
     assert "(https://posthog/example/error/err-1)" in body

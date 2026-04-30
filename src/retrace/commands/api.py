@@ -121,15 +121,24 @@ def _row_dict(row: Any, *, include_payload: bool = False) -> dict[str, Any]:
 def _build_enricher(cfg: Any, store: Storage) -> CorrelationEnricher | None:
     """Construct a best-effort correlation enricher when PostHog is configured.
 
-    Returns None if no PostHog credentials are available so callers can keep
-    treating enrichment as optional rather than branching on a no-op enricher.
+    Returns None if PostHog credentials are missing OR if construction fails
+    (e.g. malformed host URL).  Replay processing must never block on an
+    optional enrichment feature, so any failure here downgrades to "no
+    enricher" rather than propagating.
     """
     try:
         if not getattr(cfg.posthog, "api_key", "").strip():
             return None
     except AttributeError:
         return None
-    return CorrelationEnricher(cfg, store)
+    try:
+        return CorrelationEnricher(cfg, store)
+    except Exception:
+        logger.warning(
+            "correlation enricher disabled due to invalid PostHog config",
+            exc_info=True,
+        )
+        return None
 
 
 def _handler(

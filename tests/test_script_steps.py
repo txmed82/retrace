@@ -38,6 +38,15 @@ def test_safe_eval_supports_fstring_formatting() -> None:
     assert safe_eval("f'user-{n}'", scope={"n": 7}) == "user-7"
 
 
+def test_safe_eval_honors_fstring_format_spec() -> None:
+    # ast.FormattedValue.format_spec is a JoinedStr, not a Constant, so the
+    # evaluator must recurse through it rather than dropping it silently.
+    assert safe_eval("f'{n:.2f}'", scope={"n": 3.14159}) == "3.14"
+    assert safe_eval("f'{n:05d}'", scope={"n": 42}) == "00042"
+    # And the format spec itself can reference scope vars.
+    assert safe_eval("f'{n:>{w}}'", scope={"n": 7, "w": 4}) == "   7"
+
+
 def test_safe_eval_ternary_and_boolean_ops() -> None:
     assert safe_eval("'x' if cond else 'y'", scope={"cond": True}) == "x"
     assert safe_eval("a and b", scope={"a": 1, "b": 0}) == 0

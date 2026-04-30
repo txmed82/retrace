@@ -60,6 +60,48 @@ def test_enricher_maps_public_ingest_to_private_query_host(tmp_path: Path):
     assert enricher.query_host == "https://us.posthog.com"
 
 
+def test_build_enricher_returns_none_when_construction_raises(tmp_path: Path):
+    """Replay processing must not crash if PostHog config is malformed."""
+    from retrace.commands.api import _build_enricher
+
+    store = Storage(tmp_path / "r.db")
+    store.init_schema()
+
+    class BoomConfig:
+        class _PostHog:
+            api_key = "phx_test"
+
+        posthog = _PostHog()
+
+    # Patch CorrelationEnricher.__init__ to raise so we exercise the
+    # construction-failure branch without depending on a specific malformed
+    # value (the contract is "any exception → None", not "this exact one").
+    import retrace.commands.api as api_module
+
+    original = api_module.CorrelationEnricher
+
+    class ExplodingEnricher(original):
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("malformed posthog host")
+
+    api_module.CorrelationEnricher = ExplodingEnricher
+    try:
+        result = _build_enricher(BoomConfig(), store)
+    finally:
+        api_module.CorrelationEnricher = original
+
+    assert result is None
+
+
+def test_build_enricher_returns_none_without_api_key(tmp_path: Path):
+    from retrace.commands.api import _build_enricher
+
+    store = Storage(tmp_path / "r.db")
+    store.init_schema()
+    result = _build_enricher(_cfg(api_key=""), store)
+    assert result is None
+
+
 def test_enricher_best_effort_without_api_key(tmp_path: Path):
     store = Storage(tmp_path / "r.db")
     store.init_schema()

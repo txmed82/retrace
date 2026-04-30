@@ -1,6 +1,6 @@
 # Visual CUA execution mode
 
-Retrace's tester ships three execution engines:
+Retrace's tester ships four execution engines:
 
 - `harness` — shells out to an external runner.
 - `native` — Python HTTP runner with optional Playwright switch.

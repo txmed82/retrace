@@ -406,7 +406,13 @@ def _eval(node: ast.AST, scope: Mapping[str, Any], helpers: Mapping[str, Callabl
         return "".join(str(_eval(part, scope, helpers)) for part in node.values)
     if isinstance(node, ast.FormattedValue):
         value = _eval(node.value, scope, helpers)
-        return format(value, node.format_spec.s if isinstance(node.format_spec, ast.Constant) else "")
+        # ast.FormattedValue.format_spec is ast.JoinedStr | None - never a
+        # plain Constant - so recurse through the same evaluator to assemble
+        # the spec string (which may itself reference scope vars in f"{x:{w}}").
+        format_spec_str = (
+            _eval(node.format_spec, scope, helpers) if node.format_spec else ""
+        )
+        return format(value, format_spec_str)
     raise ScriptError(f"unhandled expression node: {type(node).__name__}")
 
 
