@@ -96,6 +96,25 @@ def test_safe_eval_rejects_star_unpacking() -> None:
         safe_eval("uuid_str(*[1])", scope={})
 
 
+def test_safe_eval_rejects_dict_unpacking() -> None:
+    # `{**other}` becomes ast.Dict with key=None.  Without explicit verify
+    # rejection the entries were silently dropped, which violates the
+    # "no unpacking" policy already enforced for function calls.
+    with pytest.raises(ScriptError, match="dict literals"):
+        safe_eval("{**other, 'a': 1}", scope={"other": {"b": 2}})
+
+
+def test_safe_eval_wraps_native_runtime_errors_as_script_error() -> None:
+    # ZeroDivisionError used to leak past safe_eval, breaking run_script_step
+    # which only catches ScriptError.  All native runtime errors should be
+    # surfaced as ScriptError so assertions degrade gracefully.
+    with pytest.raises(ScriptError, match="evaluation error"):
+        safe_eval("1 / 0", scope={})
+    # `in` against a non-iterable raises TypeError - must also be wrapped.
+    with pytest.raises(ScriptError, match="evaluation error"):
+        safe_eval("'x' in 5", scope={})
+
+
 # -- run_script_step ----------------------------------------------------------
 
 
@@ -140,6 +159,17 @@ def test_run_script_step_rejects_invalid_variable_names() -> None:
         scope={},
     )
     assert "invalid variable name" in result.error
+
+
+def test_run_script_step_records_runtime_error_as_failed_assertion() -> None:
+    """A divide-by-zero in an assert must not abort the run."""
+    result = run_script_step(
+        {"set": {}, "assert": ["1 / 0 == 0"]},
+        scope={},
+    )
+    assert result.error == ""
+    assert result.assertions[0]["ok"] is False
+    assert "evaluation error" in result.assertions[0]["message"]
 
 
 def test_run_script_step_persists_vars_into_scope_for_subsequent_steps() -> None:

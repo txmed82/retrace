@@ -328,6 +328,34 @@ def test_render_issue_markdown_contains_key_fields() -> None:
     assert "bug_xyz" in body
 
 
+def test_build_issue_sink_payload_skips_correlation_when_row_partial() -> None:
+    """Legacy/partially-migrated rows missing some correlation columns must
+    not crash issue promotion - the correlation block is all-or-nothing."""
+    from retrace.issue_sinks import build_issue_sink_payload
+
+    # Row dict with only one of the six correlation columns present.
+    partial = {
+        "id": "ri_1",
+        "public_id": "bug_1",
+        "title": "t",
+        "severity": "high",
+        "status": "new",
+        "summary": "s",
+        "likely_cause": "",
+        "affected_count": 1,
+        "affected_users": 1,
+        "reproduction_steps_json": "[]",
+        "evidence_json": "{}",
+        "trace_ids_json": '["trace-only"]',
+        # error_issue_ids_json / error_tracking_url / logs_url /
+        # top_stack_frame / distinct_id intentionally absent.
+    }
+    payload = build_issue_sink_payload(
+        issue=partial, sessions=[], provider="linear"
+    )
+    assert "correlation" not in payload
+
+
 def test_render_issue_markdown_includes_correlation_block() -> None:
     body = render_issue_markdown(
         {

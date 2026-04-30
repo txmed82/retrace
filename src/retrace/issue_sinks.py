@@ -68,15 +68,30 @@ def build_issue_sink_payload(
     return payload
 
 
+_CORRELATION_COLUMNS = {
+    "trace_ids_json",
+    "error_issue_ids_json",
+    "error_tracking_url",
+    "logs_url",
+    "top_stack_frame",
+    "distinct_id",
+}
+
+
 def _correlation_block(issue: Any) -> dict[str, Any]:
     """Pull RET-29 correlation fields off the replay issue row, if present.
 
     Older issue rows (or rows from environments without PostHog wired up) are
     expected to have empty values — we omit the block in that case so we don't
     add noise to the sink payload or rendered markdown.
+
+    The migration that introduces these columns adds all six together, but a
+    legacy or half-migrated DB could ship with only some of them.  Treat the
+    block as all-or-nothing so a missing column never raises a KeyError mid
+    promotion.
     """
     cols = _row_keys(issue)
-    if "trace_ids_json" not in cols:
+    if not _CORRELATION_COLUMNS.issubset(cols):
         return {}
     trace_ids = _safe_json_list(issue["trace_ids_json"])
     error_issue_ids = _safe_json_list(issue["error_issue_ids_json"])

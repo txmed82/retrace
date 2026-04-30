@@ -153,7 +153,16 @@ def safe_eval(
     except SyntaxError as exc:
         raise ScriptError(f"syntax error: {exc.msg}") from exc
     _verify(tree)
-    return _eval(tree.body, scope, helpers)
+    # Wrap native runtime errors (ZeroDivisionError, TypeError on `in` against
+    # a non-iterable, etc.) in ScriptError so callers - run_script_step in
+    # particular - can rely on a single exception type for failed assertions
+    # rather than letting the run abort.
+    try:
+        return _eval(tree.body, scope, helpers)
+    except ScriptError:
+        raise
+    except Exception as exc:
+        raise ScriptError(f"evaluation error: {exc}") from exc
 
 
 def render_template(template: str, scope: Mapping[str, Any]) -> str:
@@ -299,6 +308,11 @@ def _verify(tree: ast.AST) -> None:
             for arg in node.args:
                 if isinstance(arg, ast.Starred):
                     raise ScriptError("* unpacking is not allowed in script calls")
+        elif isinstance(node, ast.Dict):
+            # ast.Dict represents `{**other}` as a key=None entry; treat it
+            # the same as ** unpacking on a call so the policy is consistent.
+            if any(k is None for k in node.keys):
+                raise ScriptError("** unpacking is not allowed in dict literals")
 
 
 def _eval(node: ast.AST, scope: Mapping[str, Any], helpers: Mapping[str, Callable[..., Any]]) -> Any:
@@ -385,10 +399,11 @@ def _eval(node: ast.AST, scope: Mapping[str, Any], helpers: Mapping[str, Callabl
     if isinstance(node, ast.Set):
         return {_eval(elt, scope, helpers) for elt in node.elts}
     if isinstance(node, ast.Dict):
+        # _verify rejects key=None (** unpacking) up front, so reaching this
+        # branch with a None key would mean a bug in _verify - fail loud.
         return {
             _eval(k, scope, helpers): _eval(v, scope, helpers)
             for k, v in zip(node.keys, node.values)
-            if k is not None
         }
     if isinstance(node, ast.Call):
         func = _eval(node.func, scope, helpers)
