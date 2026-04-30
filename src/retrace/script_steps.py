@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import secrets
+import string
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -106,9 +107,33 @@ def _contains(haystack: Any, needle: Any) -> bool:
         return False
 
 
+_FORMAT_TEMPLATE_FORMATTER = string.Formatter()
+
+
 def _format_template(template: str, **values: Any) -> str:
+    """Safe wrapper around `str.format` for script steps.
+
+    Plain `str.format` permits attribute and item access in field names, so a
+    script could escape the AST sandbox via `format_template("{x.__class__}",
+    x=1)` and walk dunders to reach arbitrary classes.  Restrict each field to
+    a simple, public identifier (no `.`, `[`, `]`, or leading underscore)
+    before delegating to format.
+    """
+    template_str = str(template)
+    for _, field_name, _, _ in _FORMAT_TEMPLATE_FORMATTER.parse(template_str):
+        if not field_name:
+            continue
+        if (
+            field_name.startswith("_")
+            or any(ch in field_name for ch in ".[]")
+            or not field_name.isidentifier()
+        ):
+            raise ScriptError(
+                "format_template only allows simple placeholder names "
+                f"(got {field_name!r})"
+            )
     try:
-        return str(template).format(**values)
+        return template_str.format(**values)
     except (KeyError, IndexError, ValueError) as exc:
         raise ScriptError(f"format_template error: {exc}") from exc
 
@@ -245,6 +270,10 @@ def run_script_step(
         result.error = "scope['vars'] must be a dict"
         return result
 
+    # Evaluate the whole `set` block before publishing any of it: the scope
+    # is shared with subsequent steps in the same run, so a partial commit
+    # would leak earlier assignments even when a later expression failed.
+    pending_vars: dict[str, Any] = {}
     for name, expr in raw_set.items():
         if not isinstance(name, str) or not name.isidentifier() or name.startswith("_"):
             result.error = f"invalid variable name: {name!r}"
@@ -258,8 +287,10 @@ def run_script_step(
             # Defensive copy so subsequent steps mutating the scope don't
             # bleed back into the source helper's internal state.
             value = _deep_copy_safe(value)
-        result.set_vars[name] = value
-        vars_dict[name] = value
+        pending_vars[name] = value
+
+    result.set_vars.update(pending_vars)
+    vars_dict.update(pending_vars)
 
     for raw in raw_assert:
         record: dict[str, Any] = {

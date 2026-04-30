@@ -104,6 +104,39 @@ def test_safe_eval_rejects_dict_unpacking() -> None:
         safe_eval("{**other, 'a': 1}", scope={"other": {"b": 2}})
 
 
+@pytest.mark.parametrize(
+    "expression",
+    [
+        # Direct dunder traversal - the classic str.format escape pattern.
+        "format_template('{x.__class__}', x=1)",
+        # Nested dunder traversal would reach the int → object → subclasses
+        # chain that hands out arbitrary classes from a plain str.format call.
+        "format_template('{x.__class__.__bases__}', x=1)",
+        # Item subscripts can also walk objects.
+        "format_template('{x[0]}', x='abc')",
+        # Underscore-prefixed names are reserved.
+        "format_template('{_p}', _p=1)",
+    ],
+)
+def test_format_template_blocks_attribute_walks(expression: str) -> None:
+    with pytest.raises(ScriptError, match="format_template"):
+        safe_eval(expression, scope={})
+
+
+def test_format_template_still_works_for_plain_placeholders() -> None:
+    assert (
+        safe_eval("format_template('Hi {name}', name='alice')", scope={})
+        == "Hi alice"
+    )
+    assert (
+        safe_eval(
+            "format_template('{greeting}, {name}!', greeting='hi', name='bob')",
+            scope={},
+        )
+        == "hi, bob!"
+    )
+
+
 def test_safe_eval_wraps_native_runtime_errors_as_script_error() -> None:
     # ZeroDivisionError used to leak past safe_eval, breaking run_script_step
     # which only catches ScriptError.  All native runtime errors should be
@@ -159,6 +192,32 @@ def test_run_script_step_rejects_invalid_variable_names() -> None:
         scope={},
     )
     assert "invalid variable name" in result.error
+
+
+def test_run_script_step_set_block_is_atomic_on_failure() -> None:
+    """A failure mid-`set` must NOT leak earlier assignments into the run scope.
+
+    Steps share the same scope dict across the run, so a partial commit
+    here would mean a later step sees `vars.a` even though the script step
+    that defined it returned an error.
+    """
+    scope: dict = {}
+    result = run_script_step(
+        {
+            "set": {
+                "a": "1",
+                "b": "1 / 0",  # raises ScriptError, must abort the whole set
+                "c": "3",
+            },
+            "assert": [],
+        },
+        scope=scope,
+    )
+    assert result.error.startswith("set b:")
+    assert result.set_vars == {}
+    # The shared scope must be untouched.  `vars` is allowed to exist
+    # (setdefault creates it) but it must not contain `a`.
+    assert scope.get("vars", {}) == {}
 
 
 def test_run_script_step_records_runtime_error_as_failed_assertion() -> None:
