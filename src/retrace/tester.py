@@ -19,7 +19,6 @@ import httpx
 
 from retrace.llm.client import build_llm_http_request, extract_llm_text_content
 from retrace.script_steps import (
-    ScriptStepResult,
     render_template,
     run_script_step,
 )

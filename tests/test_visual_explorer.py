@@ -8,7 +8,6 @@ from typing import Any
 import pytest
 
 from retrace.visual_explorer import (
-    VisualToolCall,
     VisualToolCallError,
     parse_tool_call,
     run_visual_explorer,
