@@ -328,6 +328,62 @@ def test_render_issue_markdown_contains_key_fields() -> None:
     assert "bug_xyz" in body
 
 
+def test_build_issue_sink_payload_skips_correlation_when_row_partial() -> None:
+    """Legacy/partially-migrated rows missing some correlation columns must
+    not crash issue promotion - the correlation block is all-or-nothing."""
+    from retrace.issue_sinks import build_issue_sink_payload
+
+    # Row dict with only one of the six correlation columns present.
+    partial = {
+        "id": "ri_1",
+        "public_id": "bug_1",
+        "title": "t",
+        "severity": "high",
+        "status": "new",
+        "summary": "s",
+        "likely_cause": "",
+        "affected_count": 1,
+        "affected_users": 1,
+        "reproduction_steps_json": "[]",
+        "evidence_json": "{}",
+        "trace_ids_json": '["trace-only"]',
+        # error_issue_ids_json / error_tracking_url / logs_url /
+        # top_stack_frame / distinct_id intentionally absent.
+    }
+    payload = build_issue_sink_payload(
+        issue=partial, sessions=[], provider="linear"
+    )
+    assert "correlation" not in payload
+
+
+def test_render_issue_markdown_includes_correlation_block() -> None:
+    body = render_issue_markdown(
+        {
+            "summary": "Checkout breaks",
+            "severity": "high",
+            "affected_count": 1,
+            "affected_users": 1,
+            "source_public_id": "bug_corr",
+            "replay_links": [],
+            "correlation": {
+                "distinct_id": "user-9",
+                "trace_ids": ["trace-abc"],
+                "error_issue_ids": ["err-1"],
+                "top_stack_frame": "renderCheckout (checkout.tsx:42)",
+                "error_tracking_url": "https://posthog/example/error/err-1",
+                "logs_url": "https://posthog/example/logs?trace=trace-abc",
+            },
+        }
+    )
+    assert "### Backend correlation" in body
+    assert "`user-9`" in body  # distinct_id is one of the most useful lookup keys
+    assert "`trace-abc`" in body
+    assert "`err-1`" in body
+    assert "(https://posthog/example/error/err-1)" in body
+    assert "(https://posthog/example/logs?trace=trace-abc)" in body
+    assert "renderCheckout (checkout.tsx:42)" in body
+
+
 # ---------- CLI promote-issue ----------
 
 

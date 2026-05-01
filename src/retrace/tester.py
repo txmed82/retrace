@@ -18,6 +18,10 @@ from typing import Any, Callable, Optional
 import httpx
 
 from retrace.llm.client import build_llm_http_request, extract_llm_text_content
+from retrace.script_steps import (
+    render_template,
+    run_script_step,
+)
 
 
 DEFAULT_HARNESS_COMMAND = (
@@ -27,7 +31,7 @@ DEFAULT_APP_URL = "http://127.0.0.1:3000"
 SPEC_SCHEMA_VERSION = 2
 ALLOWED_MODES = {"describe", "explore_suite"}
 ALLOWED_AUTH_MODES = {"none", "form", "jwt", "headers"}
-ALLOWED_EXECUTION_ENGINES = {"harness", "native", "explore", "auto"}
+ALLOWED_EXECUTION_ENGINES = {"harness", "native", "explore", "visual", "auto"}
 
 
 @dataclass
@@ -269,6 +273,18 @@ def validate_spec(spec: TesterSpec) -> None:
             "explore execution does not support exact_steps/assertions; "
             "use execution_engine='native' or 'auto' for deterministic specs"
         )
+    if spec.execution_engine == "visual":
+        if not spec.exploratory_goals:
+            raise ValueError(
+                "visual execution requires at least one exploratory_goal"
+            )
+        if spec.exact_steps or spec.assertions:
+            # Same footgun guard as explore — visual mode is exploratory; if
+            # someone wants deterministic steps they should pick native.
+            raise ValueError(
+                "visual execution does not support exact_steps/assertions; "
+                "use execution_engine='native' for deterministic specs"
+            )
     if needs_harness_command:
         if not spec.harness_command.strip():
             raise ValueError("harness_command is required")
@@ -1051,6 +1067,71 @@ def _save_step_cache(cache_dir: Path, cache_key: str, payload: dict[str, Any]) -
     )
 
 
+def _record_script_step(
+    *,
+    step: dict[str, Any],
+    idx: int,
+    scope: dict[str, Any],
+    artifacts_dir: Path,
+    artifacts: list[TesterArtifact],
+    assertion_results: list[TesterAssertionResult],
+) -> None:
+    """Run a `script` step under the safe evaluator and record its outputs.
+
+    Writes one JSON artifact per script step (containing the variables that
+    were set and the per-assertion results) and appends each script
+    assertion to `assertion_results` so the run summary reflects them.
+    """
+    step_id = str(step.get("id") or f"script-{idx}")
+    outcome = run_script_step(step, scope=scope)
+    payload = {
+        "step_id": step_id,
+        "set": outcome.set_vars,
+        "assertions": outcome.assertions,
+        "error": outcome.error,
+    }
+    out_path = artifacts_dir / f"script-{idx}.json"
+    out_path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
+    artifacts.append(
+        TesterArtifact(
+            artifact_id=f"script-{idx}",
+            artifact_type="script_step",
+            path=str(out_path),
+            label=f"Script step {step_id}",
+            metadata={
+                "set_count": len(outcome.set_vars),
+                "assert_count": len(outcome.assertions),
+                "ok": outcome.ok,
+            },
+        )
+    )
+    if outcome.error:
+        assertion_results.append(
+            _assertion_result(
+                assertion={"id": step_id, "type": "script"},
+                ok=False,
+                expected="script_step_ok",
+                actual=outcome.error,
+                message=outcome.error,
+            )
+        )
+        return
+    for record in outcome.assertions:
+        assertion_results.append(
+            _assertion_result(
+                assertion={
+                    "id": str(record.get("id") or step_id),
+                    "type": "script",
+                    "expression": record.get("expression"),
+                },
+                ok=bool(record.get("ok")),
+                expected=True,
+                actual=record.get("ok"),
+                message=str(record.get("message") or ""),
+            )
+        )
+
+
 def _consensus_summary(results: list[TesterAssertionResult]) -> list[dict[str, Any]]:
     groups: dict[str, list[TesterAssertionResult]] = {}
     for result in results:
@@ -1089,6 +1170,99 @@ def set_explore_factories(
     global _EXPLORE_DRIVER_FACTORY, _EXPLORE_LLM_FACTORY
     _EXPLORE_DRIVER_FACTORY = driver_factory
     _EXPLORE_LLM_FACTORY = llm_factory
+
+
+_VISUAL_DRIVER_FACTORY: Optional[Callable[..., Any]] = None
+_VISUAL_LLM_FACTORY: Optional[Callable[..., Any]] = None
+
+
+def set_visual_factories(
+    *,
+    driver_factory: Optional[Callable[..., Any]] = None,
+    llm_factory: Optional[Callable[..., Any]] = None,
+) -> None:
+    """Override visual-mode driver/LLM factories for tests."""
+    global _VISUAL_DRIVER_FACTORY, _VISUAL_LLM_FACTORY
+    _VISUAL_DRIVER_FACTORY = driver_factory
+    _VISUAL_LLM_FACTORY = llm_factory
+
+
+def _run_visual_spec(
+    *,
+    spec: TesterSpec,
+    app_url: str,
+    run_dir: Path,
+    log_path: Path,
+) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]], str]:
+    from retrace.visual_explorer import run_visual_explorer
+
+    artifacts: list[dict[str, Any]] = []
+    assertion_results: list[dict[str, Any]] = []
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as log_fh:
+        log_fh.write(f"--- visual engine starting for {spec.spec_id} ---\n")
+
+    try:
+        if _VISUAL_DRIVER_FACTORY is not None:
+            driver = _VISUAL_DRIVER_FACTORY(browser_settings=spec.browser_settings)
+        else:
+            from retrace.visual_explorer import build_playwright_visual_driver
+
+            driver = build_playwright_visual_driver(
+                browser_settings=spec.browser_settings
+            )
+    except Exception as exc:
+        return 1, artifacts, assertion_results, f"visual driver setup failed: {exc}"
+
+    try:
+        if _VISUAL_LLM_FACTORY is not None:
+            llm = _VISUAL_LLM_FACTORY()
+        else:
+            from retrace.config import LLMConfig
+            from retrace.llm.client import LLMClient
+
+            base_cfg = spec.fixtures.get("__llm__")
+            cfg = base_cfg if isinstance(base_cfg, LLMConfig) else None
+            if cfg is None:
+                raise RuntimeError(
+                    "visual engine requires a multimodal LLM; provide one via "
+                    "set_visual_factories or via the calling integration"
+                )
+            llm = LLMClient(cfg)
+    except Exception as exc:
+        try:
+            driver.close()
+        except Exception:
+            pass
+        return 1, artifacts, assertion_results, f"visual llm setup failed: {exc}"
+
+    visual_max_steps_raw = spec.browser_settings.get("visual_max_steps")
+    try:
+        run_kwargs: dict[str, Any] = {
+            "spec_id": spec.spec_id,
+            "spec_name": spec.name,
+            "app_url": app_url,
+            "exploratory_goals": list(spec.exploratory_goals),
+            "run_dir": run_dir,
+            "driver": driver,
+            "llm": llm,
+        }
+        if isinstance(visual_max_steps_raw, int) and visual_max_steps_raw > 0:
+            run_kwargs["max_steps"] = visual_max_steps_raw
+        result = run_visual_explorer(**run_kwargs)
+    except Exception as exc:
+        return 1, artifacts, assertion_results, f"visual run failed: {exc}"
+    finally:
+        if hasattr(llm, "close"):
+            try:
+                llm.close()
+            except Exception:
+                pass
+
+    artifacts = list(result.artifacts)
+    error = result.error
+    exit_code = 0 if result.ok else 1
+    return exit_code, artifacts, assertion_results, error
 
 
 def _run_explore_spec(
@@ -1187,6 +1361,7 @@ def _run_native_spec(
     timeout = float(spec.browser_settings.get("timeout_seconds") or 10)
     cache_events: list[TesterStepCacheEvent] = []
     cache_dir = run_dir.parent.parent / "cache" / "native-steps"
+    script_scope: dict[str, Any] = {"vars": {}, "env": dict(spec.env_overrides or {})}
 
     steps = spec.exact_steps or [
         {"id": "default-get", "action": "get", "url": app_url}
@@ -1203,9 +1378,23 @@ def _run_native_spec(
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             for idx, step in enumerate(steps):
                 action = str(step.get("action") or step.get("type") or "get").lower()
+                if action == "script":
+                    _record_script_step(
+                        step=step,
+                        idx=idx,
+                        scope=script_scope,
+                        artifacts_dir=artifacts_dir,
+                        artifacts=artifacts,
+                        assertion_results=assertion_results,
+                    )
+                    continue
                 if action in {"visit", "goto", "get", "navigate"}:
                     resolved_url = _join_url(
-                        app_url, str(step.get("url") or step.get("path") or "")
+                        app_url,
+                        render_template(
+                            str(step.get("url") or step.get("path") or ""),
+                            script_scope,
+                        ),
                     )
                     cache_key = _cache_key_for_step(
                         spec=spec,
@@ -1544,6 +1733,7 @@ def _run_playwright_spec(
     error = ""
     last_status: int | None = None
     last_text = ""
+    script_scope: dict[str, Any] = {"vars": {}, "env": dict(spec.env_overrides or {})}
     try:
         from playwright.sync_api import sync_playwright
     except Exception as exc:
@@ -1572,9 +1762,25 @@ def _run_playwright_spec(
             page = context.new_page()
             for idx, step in enumerate(steps):
                 action = str(step.get("action") or step.get("type") or "get").lower()
+                if action == "script":
+                    _record_script_step(
+                        step=step,
+                        idx=idx,
+                        scope=script_scope,
+                        artifacts_dir=artifacts_dir,
+                        artifacts=artifacts,
+                        assertion_results=assertion_results,
+                    )
+                    continue
                 if action in {"visit", "goto", "get", "navigate"}:
                     response = page.goto(
-                        _join_url(app_url, str(step.get("url") or step.get("path") or "")),
+                        _join_url(
+                            app_url,
+                            render_template(
+                                str(step.get("url") or step.get("path") or ""),
+                                script_scope,
+                            ),
+                        ),
                         wait_until="domcontentloaded",
                     )
                     last_status = response.status if response is not None else None
@@ -1587,7 +1793,9 @@ def _run_playwright_spec(
                     selector = _selector_for_browser_step(step)
                     if not selector:
                         raise ValueError(f"type step {step.get('id') or idx} needs selector")
-                    page.locator(selector).fill(str(step.get("text") or ""))
+                    page.locator(selector).fill(
+                        render_template(str(step.get("text") or ""), script_scope)
+                    )
                 elif action == "keypress":
                     page.keyboard.press(str(step.get("key") or "Enter"))
                 elif action == "wait":
@@ -2066,6 +2274,14 @@ def run_spec(
                 app_url=app_url,
                 run_dir=run_dir,
                 runs_dir=runs_dir,
+                log_path=harness_log_path,
+            )
+        elif execution_engine == "visual":
+            attempts += 1
+            last_exit, artifacts, assertion_results, last_error = _run_visual_spec(
+                spec=spec,
+                app_url=app_url,
+                run_dir=run_dir,
                 log_path=harness_log_path,
             )
         else:

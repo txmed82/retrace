@@ -22,6 +22,7 @@ from retrace.notification_sinks import (
     dispatch_notification,
 )
 from retrace.observability import collect_local_observability, record_api_request
+from retrace.enrichment import CorrelationEnricher
 from retrace.replay_api import (
     MAX_REPLAY_BODY_BYTES,
     ReplayIngestError,
@@ -117,7 +118,34 @@ def _row_dict(row: Any, *, include_payload: bool = False) -> dict[str, Any]:
     return out
 
 
-def _handler(store: Storage) -> type[BaseHTTPRequestHandler]:
+def _build_enricher(cfg: Any, store: Storage) -> CorrelationEnricher | None:
+    """Construct a best-effort correlation enricher when PostHog is configured.
+
+    Returns None if PostHog credentials are missing OR if construction fails
+    (e.g. malformed host URL).  Replay processing must never block on an
+    optional enrichment feature, so any failure here downgrades to "no
+    enricher" rather than propagating.
+    """
+    try:
+        if not getattr(cfg.posthog, "api_key", "").strip():
+            return None
+    except AttributeError:
+        return None
+    try:
+        return CorrelationEnricher(cfg, store)
+    except Exception:
+        logger.warning(
+            "correlation enricher disabled due to invalid PostHog config",
+            exc_info=True,
+        )
+        return None
+
+
+def _handler(
+    store: Storage,
+    *,
+    enricher: CorrelationEnricher | None = None,
+) -> type[BaseHTTPRequestHandler]:
     class RetraceAPIHandler(BaseHTTPRequestHandler):
         server_version = "retrace-api/0.1"
 
@@ -314,6 +342,7 @@ def _handler(store: Storage) -> type[BaseHTTPRequestHandler]:
                 store=store,
                 limit=limit,
                 project_id=token.project_id,
+                enricher=enricher,
             )
             _json_response(
                 self,
@@ -510,7 +539,9 @@ def api_serve(config_path: Path, host: str, port: int) -> None:
     cfg = load_config(config_path)
     store = Storage(cfg.run.data_dir / "retrace.db")
     store.init_schema()
-    httpd = ThreadingHTTPServer((host, port), _handler(store))
+    httpd = ThreadingHTTPServer(
+        (host, port), _handler(store, enricher=_build_enricher(cfg, store))
+    )
     click.echo(f"Retrace API running at http://{host}:{port}")
     click.echo("Replay ingest endpoint: POST /api/sdk/replay")
     try:
@@ -535,7 +566,11 @@ def api_process_replays(config_path: Path, limit: int) -> None:
     cfg = load_config(config_path)
     store = Storage(cfg.run.data_dir / "retrace.db")
     store.init_schema()
-    result = process_queued_replay_jobs(store=store, limit=limit)
+    result = process_queued_replay_jobs(
+        store=store,
+        limit=limit,
+        enricher=_build_enricher(cfg, store),
+    )
     if (
         result.issues_inserted or result.issues_regressed
     ) and cfg.notifications.enabled:

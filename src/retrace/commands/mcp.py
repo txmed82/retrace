@@ -7,6 +7,7 @@ from typing import Any
 
 import click
 
+from retrace.commands.api import _build_enricher
 from retrace.config import load_config
 from retrace.replay_core import process_queued_replay_jobs
 from retrace.storage import Storage
@@ -188,7 +189,9 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
     if name == "retrace.process_queued_replays":
         limit = max(1, min(int(args.get("limit", 25) or 25), 100))
-        result = process_queued_replay_jobs(store=store, limit=limit)
+        result = process_queued_replay_jobs(
+            store=store, limit=limit, enricher=_build_enricher(cfg, store)
+        )
         return {
             "jobs_seen": result.jobs_seen,
             "jobs_processed": result.jobs_processed,

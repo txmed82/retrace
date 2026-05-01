@@ -46,7 +46,8 @@ def build_issue_sink_payload(
                 else f"retrace://replay/{session_id}",
             }
         )
-    return {
+    correlation = _correlation_block(issue)
+    payload: dict[str, Any] = {
         "provider": provider,
         "source": "retrace",
         "source_issue_id": str(issue["id"]),
@@ -62,6 +63,61 @@ def build_issue_sink_payload(
         "reproduction_steps": _safe_json_list(issue["reproduction_steps_json"]),
         "evidence": _safe_json_obj(issue["evidence_json"]),
     }
+    if correlation:
+        payload["correlation"] = correlation
+    return payload
+
+
+_CORRELATION_COLUMNS = {
+    "trace_ids_json",
+    "error_issue_ids_json",
+    "error_tracking_url",
+    "logs_url",
+    "top_stack_frame",
+    "distinct_id",
+}
+
+
+def _correlation_block(issue: Any) -> dict[str, Any]:
+    """Pull RET-29 correlation fields off the replay issue row, if present.
+
+    Older issue rows (or rows from environments without PostHog wired up) are
+    expected to have empty values — we omit the block in that case so we don't
+    add noise to the sink payload or rendered markdown.
+
+    The migration that introduces these columns adds all six together, but a
+    legacy or half-migrated DB could ship with only some of them.  Treat the
+    block as all-or-nothing so a missing column never raises a KeyError mid
+    promotion.
+    """
+    cols = _row_keys(issue)
+    if not _CORRELATION_COLUMNS.issubset(cols):
+        return {}
+    trace_ids = _safe_json_list(issue["trace_ids_json"])
+    error_issue_ids = _safe_json_list(issue["error_issue_ids_json"])
+    error_url = str(issue["error_tracking_url"] or "")
+    logs_url = str(issue["logs_url"] or "")
+    top_frame = str(issue["top_stack_frame"] or "")
+    distinct_id = str(issue["distinct_id"] or "")
+    if not any([trace_ids, error_issue_ids, error_url, logs_url, top_frame, distinct_id]):
+        return {}
+    return {
+        "distinct_id": distinct_id,
+        "trace_ids": [str(t) for t in trace_ids],
+        "error_issue_ids": [str(t) for t in error_issue_ids],
+        "top_stack_frame": top_frame,
+        "error_tracking_url": error_url,
+        "logs_url": logs_url,
+    }
+
+
+def _row_keys(issue: Any) -> set[str]:
+    keys = getattr(issue, "keys", None)
+    if callable(keys):
+        return set(keys())
+    if isinstance(issue, dict):
+        return set(issue.keys())
+    return set()
 
 
 def render_issue_markdown(payload: dict[str, Any]) -> str:
@@ -94,6 +150,30 @@ def render_issue_markdown(payload: dict[str, Any]) -> str:
             url = link.get("url") or ""
             sid = link.get("session_id") or ""
             lines.append(f"- [{role}] [{sid}]({url})")
+    correlation = payload.get("correlation") or {}
+    if correlation:
+        lines.append("")
+        lines.append("### Backend correlation")
+        distinct_id = correlation.get("distinct_id") or ""
+        if distinct_id:
+            lines.append(f"- Distinct ID: `{distinct_id}`")
+        trace_ids = correlation.get("trace_ids") or []
+        if trace_ids:
+            lines.append(f"- Trace IDs: {', '.join(f'`{t}`' for t in trace_ids)}")
+        error_ids = correlation.get("error_issue_ids") or []
+        if error_ids:
+            lines.append(
+                f"- Error issues: {', '.join(f'`{t}`' for t in error_ids)}"
+            )
+        error_url = correlation.get("error_tracking_url") or ""
+        if error_url:
+            lines.append(f"- [Error tracking]({error_url})")
+        logs_url = correlation.get("logs_url") or ""
+        if logs_url:
+            lines.append(f"- [Logs]({logs_url})")
+        top_frame = correlation.get("top_stack_frame") or ""
+        if top_frame:
+            lines.append(f"- Top stack frame: `{top_frame}`")
     lines.append("")
     lines.append("---")
     lines.append(

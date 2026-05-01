@@ -282,6 +282,13 @@ retrace tester create \
 Set `auto` to let Retrace pick: specs with `exact_steps` go native; specs with
 `exploratory_goals` and no exact steps go through the explore engine.
 
+For apps where the accessibility tree is sparse or hostile (canvas editors,
+maps, custom shadow-DOM widgets), use `--engine visual`. The visual engine
+drives the browser via screenshots and pixel coordinates instead of
+selectors. It requires a multimodal LLM (Claude 3.5+ Sonnet, GPT-4o, etc.)
+and skips step caching because pixel coords aren't portable. See
+[docs/visual-execution-mode.md](docs/visual-execution-mode.md) for details.
+
 Skills land at `data/ui-tests/skills/<host_slug>/<spec_id>.json` and are
 surfaced to the model on subsequent runs as a "head-start."
 

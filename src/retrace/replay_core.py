@@ -8,6 +8,7 @@ from typing import Any
 
 from retrace.clusterer import cluster_sessions
 from retrace.detectors import Signal, all_detectors
+from retrace.enrichment import CorrelationEnricher
 from retrace.llm.analyst import PROMPT_VERSION, analyze_cluster
 from retrace.llm.client import LLMClient
 from retrace.sinks.base import Cluster, Finding
@@ -283,12 +284,14 @@ class ReplayCoreService:
         environment_id: str,
         config: ReplaySignalConfig | None = None,
         llm_client: LLMClient | None = None,
+        enricher: CorrelationEnricher | None = None,
     ) -> None:
         self.store = store
         self.project_id = project_id
         self.environment_id = environment_id
         self.config = config or ReplaySignalConfig()
         self.llm_client = llm_client
+        self.enricher = enricher
         self.signal_definitions = _definition_map(
             store=store,
             project_id=project_id,
@@ -358,7 +361,11 @@ class ReplayCoreService:
                 events_by_session=events_by_session,
                 signals_by_session=signals_by_session,
             )
-            finding = analysis.finding
+            finding = self._enrich_finding(
+                finding=analysis.finding,
+                cluster=cluster,
+                signals_by_session=signals_by_session,
+            )
             issues.append(
                 self.store.upsert_replay_issue(
                     project_id=self.project_id,
@@ -381,6 +388,12 @@ class ReplayCoreService:
                     analysis_created_at=analysis.created_at,
                     analysis_error=analysis.error,
                     evidence=analysis.evidence,
+                    distinct_id=finding.distinct_id,
+                    error_issue_ids=list(finding.error_issue_ids),
+                    trace_ids=list(finding.trace_ids),
+                    top_stack_frame=finding.top_stack_frame,
+                    error_tracking_url=finding.error_tracking_url,
+                    logs_url=finding.logs_url,
                 )
             )
 
@@ -391,6 +404,36 @@ class ReplayCoreService:
             signals_inserted=signals_inserted,
             issues=issues,
         )
+
+    def _enrich_finding(
+        self,
+        *,
+        finding: Finding,
+        cluster: Cluster,
+        signals_by_session: dict[str, list[Signal]],
+    ) -> Finding:
+        """Best-effort backend correlation for a replay-derived Finding.
+
+        The Finding produced from a cluster is keyed on the *representative*
+        session — that is the one whose backend exceptions, traces, and logs
+        we want to surface against the issue.  Failures inside the enricher
+        must never break replay processing, so we swallow exceptions and
+        return the un-enriched Finding.
+        """
+        if self.enricher is None or not cluster.session_ids:
+            return finding
+        representative_id = cluster.session_ids[0]
+        cluster_signals = list(signals_by_session.get(representative_id, []))
+        try:
+            return self.enricher.enrich(finding, cluster_signals)
+        except Exception as exc:
+            log.warning(
+                "replay correlation failed for cluster %s (session %s): %s",
+                cluster.fingerprint,
+                representative_id,
+                exc,
+            )
+            return finding
 
     def _analyze_or_fallback(
         self,
@@ -494,6 +537,7 @@ def process_replay_sessions(
     session_ids: Iterable[str],
     config: ReplaySignalConfig | None = None,
     llm_client: LLMClient | None = None,
+    enricher: CorrelationEnricher | None = None,
 ) -> ReplayProcessingResult:
     return ReplayCoreService(
         store=store,
@@ -501,6 +545,7 @@ def process_replay_sessions(
         environment_id=environment_id,
         config=config,
         llm_client=llm_client,
+        enricher=enricher,
     ).process_sessions(session_ids)
 
 
@@ -512,6 +557,7 @@ def process_replay_session(
     session_id: str,
     config: ReplaySignalConfig | None = None,
     llm_client: LLMClient | None = None,
+    enricher: CorrelationEnricher | None = None,
 ) -> list[ReplayIssueUpsertResult]:
     return process_replay_sessions(
         store=store,
@@ -520,6 +566,7 @@ def process_replay_session(
         session_ids=[session_id],
         config=config,
         llm_client=llm_client,
+        enricher=enricher,
     ).issues
 
 
@@ -529,6 +576,7 @@ def make_replay_finalize_handler(
     config: ReplaySignalConfig | None,
     llm_client: LLMClient | None,
     accumulator: dict[str, Any],
+    enricher: CorrelationEnricher | None = None,
 ):
     """Return a JobWorker handler that processes a single replay.finalize job.
 
@@ -553,6 +601,7 @@ def make_replay_finalize_handler(
             session_ids=[session_id],
             config=config,
             llm_client=llm_client,
+            enricher=enricher,
         )
         accumulator["sessions"] += result.sessions_scanned
         accumulator["issue_count"] += len(result.issues)
@@ -575,6 +624,7 @@ def process_queued_replay_jobs(
     project_id: str | None = None,
     config: ReplaySignalConfig | None = None,
     llm_client: LLMClient | None = None,
+    enricher: CorrelationEnricher | None = None,
 ) -> ReplayJobProcessingResult:
     from retrace.worker import JobWorker
 
@@ -587,6 +637,7 @@ def process_queued_replay_jobs(
             config=config,
             llm_client=llm_client,
             accumulator=accumulator,
+            enricher=enricher,
         ),
     )
     summary = worker.run_once(

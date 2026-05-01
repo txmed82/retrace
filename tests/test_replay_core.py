@@ -841,3 +841,110 @@ def test_replay_job_project_filter_is_applied_before_limit(tmp_path: Path) -> No
         environment_id=second.environment_id,
     )
     assert second_issues[0]["title"] == "Error: second on replay"
+
+
+class _FakeReplayEnricher:
+    """Minimal stand-in for CorrelationEnricher used in unit tests.
+
+    It does not extend the real class — replay_core only depends on the
+    `enrich(finding, signals)` shape, so mirroring the duck-type keeps the
+    test free from PostHog HTTP plumbing.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[Signal]]] = []
+
+    def enrich(self, finding, signals):
+        from dataclasses import replace
+
+        self.calls.append((finding.session_id, list(signals)))
+        return replace(
+            finding,
+            distinct_id="user-42",
+            error_issue_ids=["err-1", "err-2"],
+            trace_ids=["trace-abc"],
+            top_stack_frame="renderCheckout (checkout.tsx:42)",
+            error_tracking_url="https://posthog/example/error/err-1",
+            logs_url="https://posthog/example/logs?trace=trace-abc",
+        )
+
+
+def test_replay_processing_persists_correlation_when_enricher_provided(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-correlation",
+        sequence=0,
+        events=[
+            _navigation("https://app.example/checkout"),
+            _console_error("TypeError: total is undefined"),
+        ],
+        flush_type="final",
+    )
+
+    enricher = _FakeReplayEnricher()
+    result = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-correlation"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+        enricher=enricher,
+    )
+
+    assert result.sessions_with_signals == 1
+    assert enricher.calls and enricher.calls[0][0] == "sess-correlation"
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    assert json.loads(issue["trace_ids_json"]) == ["trace-abc"]
+    assert json.loads(issue["error_issue_ids_json"]) == ["err-1", "err-2"]
+    assert issue["distinct_id"] == "user-42"
+    assert issue["top_stack_frame"] == "renderCheckout (checkout.tsx:42)"
+    assert (
+        issue["error_tracking_url"]
+        == "https://posthog/example/error/err-1"
+    )
+    assert issue["logs_url"] == "https://posthog/example/logs?trace=trace-abc"
+
+
+def test_replay_processing_swallows_enricher_exceptions(tmp_path: Path) -> None:
+    """A misbehaving enricher must never break replay processing."""
+
+    class ExplodingEnricher:
+        def enrich(self, finding, signals):
+            raise RuntimeError("query api down")
+
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-explode",
+        sequence=0,
+        events=[
+            _navigation("https://app.example/cart"),
+            _console_error("boom"),
+        ],
+        flush_type="final",
+    )
+
+    result = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-explode"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+        enricher=ExplodingEnricher(),
+    )
+
+    assert result.sessions_with_signals == 1
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+    assert json.loads(issue["trace_ids_json"]) == []
+    assert issue["error_tracking_url"] == ""

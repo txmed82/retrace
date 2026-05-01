@@ -250,6 +250,12 @@ CREATE TABLE IF NOT EXISTS replay_issues (
     external_ticket_state TEXT NOT NULL DEFAULT '',
     external_ticket_url TEXT NOT NULL DEFAULT '',
     external_ticket_id TEXT NOT NULL DEFAULT '',
+    distinct_id TEXT NOT NULL DEFAULT '',
+    error_issue_ids_json TEXT NOT NULL DEFAULT '[]',
+    trace_ids_json TEXT NOT NULL DEFAULT '[]',
+    top_stack_frame TEXT NOT NULL DEFAULT '',
+    error_tracking_url TEXT NOT NULL DEFAULT '',
+    logs_url TEXT NOT NULL DEFAULT '',
     first_seen_ms INTEGER NOT NULL DEFAULT 0,
     last_seen_ms INTEGER NOT NULL DEFAULT 0,
     resolved_at TEXT,
@@ -636,6 +642,12 @@ class Storage:
                 "analysis_created_at": "TEXT",
                 "analysis_error": "TEXT NOT NULL DEFAULT ''",
                 "evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+                "distinct_id": "TEXT NOT NULL DEFAULT ''",
+                "error_issue_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                "trace_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                "top_stack_frame": "TEXT NOT NULL DEFAULT ''",
+                "error_tracking_url": "TEXT NOT NULL DEFAULT ''",
+                "logs_url": "TEXT NOT NULL DEFAULT ''",
             }
             for column, ddl in replay_issue_columns.items():
                 if column not in cols_replay_issues:
@@ -1733,6 +1745,12 @@ class Storage:
         analysis_created_at: str = "",
         analysis_error: str = "",
         evidence: Optional[dict[str, Any]] = None,
+        distinct_id: str = "",
+        error_issue_ids: Optional[list[str]] = None,
+        trace_ids: Optional[list[str]] = None,
+        top_stack_frame: str = "",
+        error_tracking_url: str = "",
+        logs_url: str = "",
     ) -> ReplayIssueUpsertResult:
         now = datetime.now(timezone.utc).isoformat()
         public_id = self.make_issue_public_id(project_id, environment_id, fingerprint)
@@ -1756,9 +1774,11 @@ class Storage:
                  likely_cause, reproduction_steps_json, confidence, analysis_status,
                  analysis_model, analysis_prompt_version, analysis_created_at,
                  analysis_error, evidence_json, signal_summary_json, affected_count,
-                 affected_users, representative_session_id, first_seen_ms, last_seen_ms,
-                 updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 affected_users, representative_session_id,
+                 distinct_id, error_issue_ids_json, trace_ids_json,
+                 top_stack_frame, error_tracking_url, logs_url,
+                 first_seen_ms, last_seen_ms, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, environment_id, fingerprint) DO UPDATE SET
                     status = CASE
                         WHEN replay_issues.status = 'resolved' THEN 'regressed'
@@ -1786,6 +1806,32 @@ class Storage:
                     signal_summary_json = excluded.signal_summary_json,
                     affected_count = excluded.affected_count,
                     affected_users = excluded.affected_users,
+                    distinct_id = CASE
+                        WHEN excluded.distinct_id != '' THEN excluded.distinct_id
+                        ELSE replay_issues.distinct_id
+                    END,
+                    error_issue_ids_json = CASE
+                        WHEN excluded.error_issue_ids_json NOT IN ('', '[]')
+                            THEN excluded.error_issue_ids_json
+                        ELSE replay_issues.error_issue_ids_json
+                    END,
+                    trace_ids_json = CASE
+                        WHEN excluded.trace_ids_json NOT IN ('', '[]')
+                            THEN excluded.trace_ids_json
+                        ELSE replay_issues.trace_ids_json
+                    END,
+                    top_stack_frame = CASE
+                        WHEN excluded.top_stack_frame != '' THEN excluded.top_stack_frame
+                        ELSE replay_issues.top_stack_frame
+                    END,
+                    error_tracking_url = CASE
+                        WHEN excluded.error_tracking_url != '' THEN excluded.error_tracking_url
+                        ELSE replay_issues.error_tracking_url
+                    END,
+                    logs_url = CASE
+                        WHEN excluded.logs_url != '' THEN excluded.logs_url
+                        ELSE replay_issues.logs_url
+                    END,
                     representative_session_id = COALESCE(
                         NULLIF(replay_issues.representative_session_id, ''),
                         excluded.representative_session_id
@@ -1827,6 +1873,12 @@ class Storage:
                         session_ids=clean_session_ids,
                     ),
                     representative_session_id,
+                    distinct_id,
+                    json.dumps(error_issue_ids or []),
+                    json.dumps(trace_ids or []),
+                    top_stack_frame,
+                    error_tracking_url,
+                    logs_url,
                     int(first_seen_ms),
                     int(last_seen_ms),
                     now,

@@ -1719,6 +1719,8 @@ def ui_command(
                 return
 
             if path == "/api/replays/process":
+                from retrace.commands.api import _build_enricher
+                from retrace.config import load_config
                 from retrace.replay_core import process_queued_replay_jobs
 
                 body = self._read_json_body()
@@ -1726,7 +1728,13 @@ def ui_command(
                     limit_v = max(1, min(int(body.get("limit") or 25), 100))
                 except (TypeError, ValueError):
                     limit_v = 25
-                result = process_queued_replay_jobs(store=store, limit=limit_v)
+                try:
+                    enricher = _build_enricher(load_config(config_path), store)
+                except Exception:
+                    enricher = None
+                result = process_queued_replay_jobs(
+                    store=store, limit=limit_v, enricher=enricher
+                )
                 self._json(
                     {
                         "ok": True,

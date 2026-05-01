@@ -140,3 +140,72 @@ def test_chat_json_anthropic_raises_on_missing_text_content(httpx_mock: HTTPXMoc
         pytest.raises(LLMError),
     ):
         client.chat_json(system="s", user="u")
+
+
+def test_chat_visual_json_inlines_image_for_openai_compatible(
+    tmp_path, httpx_mock: HTTPXMock
+):
+    """RET-22: visual mode sends a base64-encoded screenshot as image_url."""
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG-fake-bytes")
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:8080/v1/chat/completions",
+        json={"choices": [{"message": {"content": '{"tool":"finish","args":{"status":"success"}}'}}]},
+    )
+    with LLMClient(_cfg(api_key="sk-fake")) as client:
+        out = client.chat_visual_json(
+            system="s", user="u", image_path=str(img)
+        )
+    assert out == {"tool": "finish", "args": {"status": "success"}}
+    req = httpx_mock.get_requests()[-1]
+    body = req.read()
+    # The user content list contains the screenshot inline as a data URL.
+    assert b"image_url" in body
+    assert b"data:image/png;base64," in body
+
+
+def test_chat_visual_json_inlines_image_for_anthropic(
+    tmp_path, httpx_mock: HTTPXMock
+):
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG-fake-bytes")
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.anthropic.com/v1/messages",
+        json={"content": [{"type": "text", "text": '{"tool":"finish","args":{"status":"success"}}'}]},
+    )
+    with LLMClient(
+        _cfg(
+            provider="anthropic",
+            base_url="https://api.anthropic.com/v1",
+            api_key="sk-ant-test",
+        )
+    ) as client:
+        out = client.chat_visual_json(
+            system="s", user="u", image_path=str(img)
+        )
+    assert out == {"tool": "finish", "args": {"status": "success"}}
+    body = httpx_mock.get_requests()[-1].read()
+    # Anthropic uses {"type":"image","source":{"type":"base64",...}}
+    assert b'"type":"image"' in body
+    assert b'"media_type":"image/png"' in body
+
+
+def test_chat_visual_json_falls_back_to_text_when_image_missing(
+    tmp_path, httpx_mock: HTTPXMock
+):
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:8080/v1/chat/completions",
+        json={"choices": [{"message": {"content": '{"ok":true}'}}]},
+    )
+    with LLMClient(_cfg(api_key="sk-fake")) as client:
+        # image_path doesn't exist - the request should still go through with
+        # only text content, so a flaky screenshot doesn't take the run down.
+        out = client.chat_visual_json(
+            system="s", user="u", image_path=str(tmp_path / "missing.png")
+        )
+    assert out == {"ok": True}
+    body = httpx_mock.get_requests()[-1].read()
+    assert b"image_url" not in body

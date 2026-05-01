@@ -578,3 +578,93 @@ def test_harness_retry_terminates_timed_out_process(
     assert len(procs) == 2
     assert getattr(procs[0], "terminated") is True
     assert getattr(procs[0], "killed") is False
+
+
+def test_native_runner_executes_script_step_and_renders_template(tmp_path: Path) -> None:
+    server, app_url = _server_url()
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Script step smoke",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            exact_steps=[
+                {
+                    "id": "compute",
+                    "action": "script",
+                    "set": {
+                        "target": "'/'",
+                        "expected_status": "200",
+                    },
+                    "assert": ["len(target) > 0"],
+                },
+                {"id": "home", "action": "get", "path": "{{ vars.target }}"},
+                {
+                    "id": "verify",
+                    "action": "script",
+                    "set": {},
+                    "assert": ["expected_status == 200"],
+                },
+            ],
+        )
+
+        result = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    run_dir = Path(result.run_dir)
+    run_json = json.loads((run_dir / "run.json").read_text())
+    assert result.ok is True
+    script_artifacts = [
+        item
+        for item in run_json["artifacts"]
+        if item["artifact_type"] == "script_step"
+    ]
+    assert len(script_artifacts) == 2
+    first = json.loads(Path(script_artifacts[0]["path"]).read_text())
+    assert first["set"]["target"] == "/"
+    assert first["set"]["expected_status"] == 200
+    assert first["assertions"][0]["ok"] is True
+    # The verify step's assertion should reference a var set in an earlier step.
+    second = json.loads(Path(script_artifacts[1]["path"]).read_text())
+    assert second["assertions"][0]["ok"] is True
+
+
+def test_native_runner_records_unsafe_script_as_failed_assertion(
+    tmp_path: Path,
+) -> None:
+    server, app_url = _server_url()
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Unsafe script",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            exact_steps=[
+                {
+                    "id": "exfil-attempt",
+                    "action": "script",
+                    "set": {"x": "__import__('os')"},
+                    "assert": [],
+                },
+                {"id": "home", "action": "get", "path": "/"},
+            ],
+        )
+        result = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result.ok is False
+    failed = [a for a in result.assertion_results if not a["ok"]]
+    assert any(
+        a.get("assertion_type") == "script" and "forbidden" in str(a.get("message", ""))
+        for a in failed
+    ), failed
