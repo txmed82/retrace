@@ -19,6 +19,7 @@ import yaml
 
 from retrace.llm.client import build_llm_http_request
 from retrace.reports.parser import parse_report_findings
+from retrace.replay_specs import generate_spec_from_replay_issue
 from retrace.storage import Storage
 from retrace.tester import (
     DEFAULT_APP_URL,
@@ -725,6 +726,43 @@ def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
     return {"issues": issues, "sessions": sessions}
 
 
+def _generate_replay_issue_spec_payload(
+    *,
+    store: Storage,
+    data_dir: Path,
+    issue_id: str,
+    project_id: str,
+    environment_id: str,
+    app_url: str = "",
+) -> tuple[dict[str, Any], int]:
+    try:
+        generated = generate_spec_from_replay_issue(
+            store=store,
+            specs_dir=specs_dir_for_data_dir(data_dir),
+            project_id=project_id,
+            environment_id=environment_id,
+            issue_id=issue_id,
+            app_url=app_url,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        status = 404 if "not found" in message.lower() else 400
+        return {"ok": False, "error": message}, status
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 400
+    return (
+        {
+            "ok": True,
+            "spec": generated.spec.__dict__,
+            "issue_public_id": generated.issue_public_id,
+            "replay_public_id": generated.replay_public_id,
+            "confidence": generated.confidence,
+            "known_gaps": generated.known_gaps,
+        },
+        200,
+    )
+
+
 _INDEX_HTML = """<!doctype html>
 <html>
 <head>
@@ -1010,6 +1048,29 @@ _INDEX_HTML = """<!doctype html>
       await loadTesterPanel();
     }
 
+    async function generateReplayIssueSpec(issue){
+      if(!issue){ return; }
+      const status = byId('replaySpecStatus');
+      if(status) status.textContent = 'Generating...';
+      const res = await fetch('/api/replay-issue/spec', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          issue_id: issue.public_id || issue.id,
+          project_id: issue.project_id,
+          environment_id: issue.environment_id,
+          app_url: byId('testerSpecAppUrl')?.value || '',
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        if(status) status.textContent = `Failed: ${data.error || 'could not generate spec'}`;
+        return;
+      }
+      if(status) status.textContent = `Created ${data.spec.spec_id} (${data.confidence} confidence)`;
+      await loadTesterPanel();
+    }
+
     async function loadTesterPanel(){
       const [specRes, runsRes, settingsRes] = await Promise.all([
         fetch('/api/tester/specs'),
@@ -1142,6 +1203,7 @@ _INDEX_HTML = """<!doctype html>
         <div class="lbl">Summary</div><div>${esc(issue.summary || '')}</div>
         <div class="lbl">Likely Cause</div><div>${esc(issue.likely_cause || '')}</div>
         <div class="lbl">Reproduction Steps</div>${steps ? `<ul>${steps}</ul>` : '<div class="empty">No steps generated yet.</div>'}
+        <div style="margin-top:10px"><button class="btn" id="generateReplaySpecBtn" type="button">Generate Regression Spec</button> <span class="empty" id="replaySpecStatus"></span></div>
         <div class="lbl">Sessions</div>${sessions ? `<ul>${sessions}</ul>` : '<div class="empty">No linked sessions.</div>'}
         <div class="lbl">External Ticket</div>
         <div class="empty">${issue.external_ticket_url ? `<a href="${esc(issue.external_ticket_url)}" target="_blank">${esc(issue.external_ticket_id || issue.external_ticket_url)}</a>` : esc(issue.external_ticket_state || 'none')}</div>
@@ -1150,6 +1212,7 @@ _INDEX_HTML = """<!doctype html>
       root.querySelectorAll('[data-replay-session]').forEach(el => {
         el.addEventListener('click', () => loadFirstPartyReplay(el.dataset.replaySession));
       });
+      byId('generateReplaySpecBtn')?.addEventListener('click', () => generateReplayIssueSpec(issue));
     }
 
     function applyReplayHash(issues, sessions){
@@ -1716,6 +1779,22 @@ def ui_command(
                 )
                 status = 200 if result.ok else 400
                 self._json({"ok": result.ok, "result": result.__dict__}, status=status)
+                return
+
+            if path == "/api/replay-issue/spec":
+                body = self._read_json_body()
+                workspace = store.ensure_workspace(project_name="Default")
+                payload, status = _generate_replay_issue_spec_payload(
+                    store=store,
+                    data_dir=data_dir,
+                    issue_id=str(body.get("issue_id", "")).strip(),
+                    project_id=str(body.get("project_id", "")).strip()
+                    or workspace.project_id,
+                    environment_id=str(body.get("environment_id", "")).strip()
+                    or workspace.environment_id,
+                    app_url=str(body.get("app_url", "")).strip(),
+                )
+                self._json(payload, status=status)
                 return
 
             if path == "/api/replays/process":
