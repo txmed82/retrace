@@ -114,7 +114,10 @@ def _stack_frame_paths(evidence_text: str) -> list[str]:
 
 def _api_routes(evidence_text: str) -> list[str]:
     routes: list[str] = []
-    for match in re.finditer(r"\b(?:GET|POST|PUT|PATCH|DELETE)?\s*(/api/[A-Za-z0-9_./:-]+)", evidence_text):
+    for match in re.finditer(
+        r"(?:\b(?:GET|POST|PUT|PATCH|DELETE)\b\s*)?(/api/[A-Za-z0-9_./:-]+)",
+        evidence_text,
+    ):
         route = match.group(1).rstrip(".,);")
         if route not in routes:
             routes.append(route)
@@ -191,14 +194,15 @@ def _score_file(
     except Exception:
         return 0.0, ""
     text_l = text.lower()
+    server_route_file = rel_l.startswith(("server/", "src/server/", "src/"))
     for route in api_routes:
         route_l = route.lower()
         if route_l in text_l:
-            route_bonus = 14.0 if rel_l.startswith(("server/", "src/server/")) else 5.0
+            route_bonus = 14.0 if server_route_file else 5.0
             score += route_bonus
             hits.append(f"api_route:{route}")
         route_parts = [p for p in route_l.split("/") if p and p != "api"]
-        if rel_l.startswith(("server/", "src/server/")):
+        if server_route_file:
             overlap = sum(1 for part in route_parts if part in rel_l)
             if overlap:
                 score += min(6.0, overlap * 2.0)

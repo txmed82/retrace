@@ -79,3 +79,55 @@ def test_score_repo_for_finding_prioritizes_failed_api_route_handler(tmp_path: P
     assert out
     assert out[0].file_path == "server/routes/auth.ts"
     assert "api_route:/api/auth/signup" in out[0].rationale
+
+
+def test_score_repo_for_finding_extracts_bare_api_route(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / "server/routes").mkdir(parents=True, exist_ok=True)
+    (repo / "client/src/pages").mkdir(parents=True, exist_ok=True)
+
+    (repo / "server/routes/billing.ts").write_text(
+        "router.post('/api/billing/checkout', checkoutHandler);"
+    )
+    (repo / "client/src/pages/billing.tsx").write_text(
+        "export function Billing(){ return fetch('/api/billing/checkout'); }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Checkout request fails",
+        category="functional_error",
+        evidence_text="The failed request to /api/billing/checkout returned 500.",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "server/routes/billing.ts"
+    assert "api_route:/api/billing/checkout" in out[0].rationale
+
+
+def test_score_repo_for_finding_treats_top_level_src_as_server_route(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    (repo / "src/routes").mkdir(parents=True, exist_ok=True)
+    (repo / "client/src/pages").mkdir(parents=True, exist_ok=True)
+
+    (repo / "src/routes/auth.ts").write_text(
+        "router.post('/api/auth/signup', signupHandler);"
+    )
+    (repo / "client/src/pages/signup.tsx").write_text(
+        "export function Signup(){ return fetch('/api/auth/signup'); }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Signup request fails",
+        category="functional_error",
+        evidence_text="POST /api/auth/signup returned 500.",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "src/routes/auth.ts"
+    assert "api_route:/api/auth/signup" in out[0].rationale
