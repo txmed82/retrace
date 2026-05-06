@@ -25,3 +25,135 @@ def test_score_repo_for_finding_ranks_store_files(tmp_path: Path):
 
     assert out
     assert out[0].file_path == "client/src/pages/store.tsx"
+
+
+def test_score_repo_for_finding_prioritizes_top_stack_frame_file(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / "client/src/components").mkdir(parents=True, exist_ok=True)
+    (repo / "client/src/pages").mkdir(parents=True, exist_ok=True)
+
+    (repo / "client/src/components/SignupForm.tsx").write_text(
+        "export function SignupForm(){ throw new Error('Signup crashed'); }"
+    )
+    (repo / "client/src/pages/signup.tsx").write_text(
+        "export default function Signup(){ return <SignupForm />; }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Signup crashes after submit",
+        category="functional_error",
+        evidence_text=(
+            "Correlated evidence:\n"
+            "- Top stack frame: client/src/components/SignupForm.tsx:42:13\n"
+            "TypeError: Cannot read properties of undefined"
+        ),
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "client/src/components/SignupForm.tsx"
+    assert "stack_frame" in out[0].rationale
+
+
+def test_score_repo_for_finding_prioritizes_failed_api_route_handler(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / "server/routes").mkdir(parents=True, exist_ok=True)
+    (repo / "client/src/pages").mkdir(parents=True, exist_ok=True)
+
+    (repo / "server/routes/auth.ts").write_text(
+        "router.post('/api/auth/signup', async function signupHandler(req, res) { return res.status(500); });"
+    )
+    (repo / "client/src/pages/signup.tsx").write_text(
+        "export function Signup(){ return fetch('/api/auth/signup'); }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Signup submit returns 500",
+        category="functional_error",
+        evidence_text="Network 5xx near failure: POST /api/auth/signup returned 500",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "server/routes/auth.ts"
+    assert "api_route:/api/auth/signup" in out[0].rationale
+
+
+def test_score_repo_for_finding_extracts_bare_api_route(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / "server/routes").mkdir(parents=True, exist_ok=True)
+    (repo / "client/src/pages").mkdir(parents=True, exist_ok=True)
+
+    (repo / "server/routes/billing.ts").write_text(
+        "router.post('/api/billing/checkout', checkoutHandler);"
+    )
+    (repo / "client/src/pages/billing.tsx").write_text(
+        "export function Billing(){ return fetch('/api/billing/checkout'); }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Checkout request fails",
+        category="functional_error",
+        evidence_text="The failed request to /api/billing/checkout returned 500.",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "server/routes/billing.ts"
+    assert "api_route:/api/billing/checkout" in out[0].rationale
+
+
+def test_score_repo_for_finding_treats_top_level_src_as_server_route(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    (repo / "src/routes").mkdir(parents=True, exist_ok=True)
+    (repo / "client/src/pages").mkdir(parents=True, exist_ok=True)
+
+    (repo / "src/routes/auth.ts").write_text(
+        "router.post('/api/auth/signup', signupHandler);"
+    )
+    (repo / "client/src/pages/signup.tsx").write_text(
+        "export function Signup(){ return fetch('/api/auth/signup'); }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Signup request fails",
+        category="functional_error",
+        evidence_text="POST /api/auth/signup returned 500.",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "src/routes/auth.ts"
+    assert "api_route:/api/auth/signup" in out[0].rationale
+
+
+def test_score_repo_for_finding_does_not_treat_all_src_as_server_route(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    (repo / "src/routes").mkdir(parents=True, exist_ok=True)
+    (repo / "src/components").mkdir(parents=True, exist_ok=True)
+
+    (repo / "src/routes/profile.ts").write_text(
+        "router.get('/api/profile', profileHandler);"
+    )
+    (repo / "src/components/ProfileButton.tsx").write_text(
+        "export function ProfileButton(){ return fetch('/api/profile'); }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Profile request fails",
+        category="functional_error",
+        evidence_text="GET /api/profile returned 500.",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "src/routes/profile.ts"
