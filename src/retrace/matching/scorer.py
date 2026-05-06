@@ -100,6 +100,27 @@ def _keywords(title: str, category: str, evidence_text: str) -> list[str]:
     return out[:40]
 
 
+def _stack_frame_paths(evidence_text: str) -> list[str]:
+    paths: list[str] = []
+    for match in re.finditer(
+        r"((?:client|server|shared|src)/[A-Za-z0-9_./-]+\.(?:tsx?|jsx?|py|go|java|rb|php))(?::\d+)?(?::\d+)?",
+        evidence_text,
+    ):
+        value = match.group(1).strip()
+        if value not in paths:
+            paths.append(value)
+    return paths[:10]
+
+
+def _api_routes(evidence_text: str) -> list[str]:
+    routes: list[str] = []
+    for match in re.finditer(r"\b(?:GET|POST|PUT|PATCH|DELETE)?\s*(/api/[A-Za-z0-9_./:-]+)", evidence_text):
+        route = match.group(1).rstrip(".,);")
+        if route not in routes:
+            routes.append(route)
+    return routes[:10]
+
+
 def _iter_source_files(repo_path: Path) -> list[Path]:
     files: list[Path] = []
     allow_prefixes = ("client/", "server/", "shared/", "src/")
@@ -131,13 +152,27 @@ def _iter_source_files(repo_path: Path) -> list[Path]:
 
 
 def _score_file(
-    repo_path: Path, file_path: Path, terms: list[str]
+    repo_path: Path,
+    file_path: Path,
+    terms: list[str],
+    *,
+    stack_paths: list[str],
+    api_routes: list[str],
 ) -> tuple[float, str]:
     rel = file_path.relative_to(repo_path).as_posix()
     score = 0.0
     hits: list[str] = []
 
     rel_l = rel.lower()
+    for stack_path in stack_paths:
+        stack_l = stack_path.lower()
+        if rel_l == stack_l or rel_l.endswith("/" + stack_l):
+            score += 35.0
+            hits.append(f"stack_frame:{stack_path}")
+        elif file_path.name.lower() == Path(stack_path).name.lower():
+            score += 12.0
+            hits.append(f"stack_name:{Path(stack_path).name}")
+
     for d, bonus in _DIR_BONUS.items():
         if rel_l.startswith(d):
             score += bonus
@@ -156,6 +191,18 @@ def _score_file(
     except Exception:
         return 0.0, ""
     text_l = text.lower()
+    for route in api_routes:
+        route_l = route.lower()
+        if route_l in text_l:
+            route_bonus = 14.0 if rel_l.startswith(("server/", "src/server/")) else 5.0
+            score += route_bonus
+            hits.append(f"api_route:{route}")
+        route_parts = [p for p in route_l.split("/") if p and p != "api"]
+        if rel_l.startswith(("server/", "src/server/")):
+            overlap = sum(1 for part in route_parts if part in rel_l)
+            if overlap:
+                score += min(6.0, overlap * 2.0)
+                hits.append("api_route_path")
     for t in terms:
         count = text_l.count(t)
         if count:
@@ -196,9 +243,17 @@ def score_repo_for_finding(
     top_n: int = 8,
 ) -> list[CodeCandidate]:
     terms = _keywords(title, category, evidence_text)
+    stack_paths = _stack_frame_paths(evidence_text)
+    api_routes = _api_routes(evidence_text)
     scored: list[CodeCandidate] = []
     for p in _iter_source_files(repo_path):
-        s, rationale = _score_file(repo_path, p, terms)
+        s, rationale = _score_file(
+            repo_path,
+            p,
+            terms,
+            stack_paths=stack_paths,
+            api_routes=api_routes,
+        )
         if s <= 0:
             continue
         scored.append(
