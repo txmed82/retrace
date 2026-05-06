@@ -62,6 +62,7 @@ From the UI you can:
 - Replay stored rrweb events
 - Inspect first-party replay sessions and replay-backed issues
 - Process queued first-party replay batches into signals and issues
+- Generate native regression specs from replay-backed issues
 - Inspect likely culprit files and copy Codex/Claude prompts
 
 ## Fix Suggestions Workflow
@@ -145,6 +146,16 @@ Queue a spec for the self-host browser runner:
 retrace tester enqueue <spec_id>
 retrace tester worker --once
 ```
+
+Generate a native regression spec from a replay-backed issue:
+
+```bash
+retrace tester from-replay-issue <bug_public_id>
+```
+
+The local UI also exposes this from each replay issue detail view with
+**Generate Regression Spec**. Generated specs keep links back to the source issue
+and replay in their fixtures so resolved issues can later be re-verified.
 
 Spec and run artifacts are stored under:
 
