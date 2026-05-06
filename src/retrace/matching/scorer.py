@@ -194,7 +194,17 @@ def _score_file(
     except Exception:
         return 0.0, ""
     text_l = text.lower()
-    server_route_file = rel_l.startswith(("server/", "src/server/", "src/"))
+    server_route_file = rel_l.startswith(
+        (
+            "server/",
+            "src/server/",
+            "src/routes/",
+            "src/controllers/",
+            "src/api/",
+            "src/pages/api/",
+            "src/app/api/",
+        )
+    )
     for route in api_routes:
         route_l = route.lower()
         if route_l in text_l:

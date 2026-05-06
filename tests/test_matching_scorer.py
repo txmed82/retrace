@@ -131,3 +131,29 @@ def test_score_repo_for_finding_treats_top_level_src_as_server_route(
     assert out
     assert out[0].file_path == "src/routes/auth.ts"
     assert "api_route:/api/auth/signup" in out[0].rationale
+
+
+def test_score_repo_for_finding_does_not_treat_all_src_as_server_route(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    (repo / "src/routes").mkdir(parents=True, exist_ok=True)
+    (repo / "src/components").mkdir(parents=True, exist_ok=True)
+
+    (repo / "src/routes/profile.ts").write_text(
+        "router.get('/api/profile', profileHandler);"
+    )
+    (repo / "src/components/ProfileButton.tsx").write_text(
+        "export function ProfileButton(){ return fetch('/api/profile'); }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Profile request fails",
+        category="functional_error",
+        evidence_text="GET /api/profile returned 500.",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "src/routes/profile.ts"
