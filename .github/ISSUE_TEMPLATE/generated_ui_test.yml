@@ -1,0 +1,49 @@
+name: Generated UI test issue
+description: Report a replay-to-spec or UI test runner problem.
+title: "[Generated Test]: "
+labels: ["ui-test", "bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What did the generated spec or runner do incorrectly?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Replay-to-spec generation
+        - Native runner
+        - Playwright/browser runner
+        - Visual runner
+        - Flake classification
+        - Verification of resolved issue
+    validations:
+      required: true
+  - type: textarea
+    id: spec
+    attributes:
+      label: Generated Spec
+      description: Include sanitized spec JSON or relevant fields.
+      render: json
+  - type: textarea
+    id: runner_output
+    attributes:
+      label: Runner Output
+      description: Include sanitized run JSON, logs, assertion output, or screenshots description.
+      render: shell
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should the generated test have done instead?
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy Check
+      options:
+        - label: I removed API keys, service tokens, user PII, and sensitive replay data.
+          required: true
