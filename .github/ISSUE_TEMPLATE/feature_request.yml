@@ -31,6 +31,8 @@ body:
         - Local UI
         - Self-host operations
         - Other
+    validations:
+      required: true
   - type: textarea
     id: alternatives
     attributes:

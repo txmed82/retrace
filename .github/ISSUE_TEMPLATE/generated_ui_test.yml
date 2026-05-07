@@ -40,6 +40,8 @@ body:
     attributes:
       label: Expected Behavior
       description: What should the generated test have done instead?
+    validations:
+      required: true
   - type: checkboxes
     id: privacy
     attributes:
