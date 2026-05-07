@@ -44,6 +44,26 @@ def test_connect_github_repo_payload_rejects_bad_repo_name(tmp_path: Path) -> No
     assert status == 400
     assert payload == {"ok": False, "error": "Repo must use owner/name format."}
 
+    payload, status = _connect_github_repo_payload(
+        store=store,
+        repo_full_name="owner/name/extra",
+        default_branch="main",
+        local_path="",
+    )
+
+    assert status == 400
+    assert payload == {"ok": False, "error": "Repo must use owner/name format."}
+
+    payload, status = _connect_github_repo_payload(
+        store=store,
+        repo_full_name="owner//name",
+        default_branch="main",
+        local_path="",
+    )
+
+    assert status == 400
+    assert payload == {"ok": False, "error": "Repo must use owner/name format."}
+
 
 def test_connect_github_repo_payload_rejects_missing_local_path(
     tmp_path: Path,

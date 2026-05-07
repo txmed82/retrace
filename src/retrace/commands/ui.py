@@ -878,7 +878,8 @@ def _connect_github_repo_payload(
     repo = repo_full_name.strip()
     branch = default_branch.strip() or "main"
     path_value = local_path.strip()
-    if "/" not in repo or repo.startswith("/") or repo.endswith("/"):
+    parts = repo.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
         return {"ok": False, "error": "Repo must use owner/name format."}, 400
     if path_value:
         repo_path = Path(path_value).expanduser()
