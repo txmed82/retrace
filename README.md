@@ -82,6 +82,17 @@ Report output:
 
 - `./reports/YYYY-MM-DD-HHMMSS.md`
 
+Try the replay-backed workflow without production traffic:
+
+```bash
+retrace demo seed
+retrace tester from-replay-issue <issue_public_id>
+retrace ui
+```
+
+`retrace demo seed` creates a local replay-backed checkout failure, processes it
+through deterministic detectors, and writes a replay-derived UI regression spec.
+
 ## Local UI (Onboarding + Replay + Prompts)
 
 ```bash
@@ -153,6 +164,7 @@ Artifacts:
 - `retrace init` — interactive setup + validation
 - `retrace doctor` — health checks for config/services
 - `retrace run` — one-shot ingestion, detection, clustering, report write
+- `retrace demo seed` — seed a local replay-backed issue and generated spec
 - `retrace ui` — local browser UI and onboarding/settings
 - `retrace tester ...` — describe tests or generate suite drafts with Browser Harness
 - `retrace mcp serve` — single MCP server with multiple tools (findings + tester)

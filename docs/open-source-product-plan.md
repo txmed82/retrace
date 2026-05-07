@@ -172,13 +172,16 @@ Required quality standards:
 The project is working-quality open source when the demo path below works from a
 fresh checkout:
 
-1. Start Retrace locally with `retrace ui` or Docker Compose.
-2. Create an SDK key and install `@retrace/browser` in a sample app.
-3. Trigger a UI failure in the browser.
-4. Process the replay into a replay-backed issue.
-5. Generate a UI regression spec from that issue.
-6. Connect a GitHub/local checkout.
-7. Generate fix prompts with likely source files.
-8. Apply a fix with a coding agent.
-9. Run the generated UI spec in CI or locally.
-10. Mark the issue resolved and verify it does not regress.
+1. Run `retrace demo seed` from a fresh checkout to create a local replay-backed
+   issue and generated UI regression spec without external services.
+2. Start Retrace locally with `retrace ui` or Docker Compose and inspect the
+   replay-backed issue.
+3. Create an SDK key and install `@retrace/browser` in a sample app.
+4. Trigger a real UI failure in the browser.
+5. Process the replay into a replay-backed issue.
+6. Generate a UI regression spec from that issue.
+7. Connect a GitHub/local checkout.
+8. Generate fix prompts with likely source files.
+9. Apply a fix with a coding agent.
+10. Run the generated UI spec in CI or locally.
+11. Mark the issue resolved and verify it does not regress.
