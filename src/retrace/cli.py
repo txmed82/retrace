@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
 
 import click
 
@@ -57,11 +58,18 @@ def run(config_path: Path) -> None:
         llm_client.close()
 
     click.echo(
+        f"Status {summary.status}. "
         f"Scanned {summary.sessions_scanned} sessions. "
         f"{summary.sessions_with_signals} flagged into "
         f"{summary.clusters_found} cluster(s). "
+        f"Session errors {summary.sessions_errored}. "
+        f"Detector errors {summary.detector_errors}. "
         f"Report written to {cfg.run.output_dir}/"
     )
+    if summary.error:
+        click.echo(f"Error: {summary.error}")
+    if summary.status == "error":
+        sys.exit(1)
 
 
 main.add_command(init_command)

@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, event_data, iter_with_url, register
+from retrace.detectors.base import (
+    Signal,
+    event_data,
+    event_timestamp_ms,
+    iter_with_url,
+    register,
+)
 
 
 FOLLOWUP_WINDOW_MS = 2000
@@ -40,11 +46,11 @@ class DeadClickDetector:
         for i, (url, e) in enumerate(enum):
             if not _is_click(e):
                 continue
-            click_ts = int(e.get("timestamp") or 0)
+            click_ts = event_timestamp_ms(e)
             tid = event_data(e).get("id")
             had_followup = False
             for _u2, e2 in enum[i + 1 :]:
-                ts2 = int(e2.get("timestamp") or 0)
+                ts2 = event_timestamp_ms(e2)
                 if ts2 - click_ts > FOLLOWUP_WINDOW_MS:
                     break
                 if _is_dom_mutation(e2) or _is_network(e2):

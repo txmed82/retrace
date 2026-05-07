@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, event_data, register
+from retrace.detectors.base import (
+    Signal,
+    event_data,
+    event_timestamp_ms,
+    normalize_event,
+    register,
+)
 
 
 MIN_DWELL_MS = 2000
@@ -50,8 +56,11 @@ class BlankRenderDetector:
                     )
                 )
 
-        for e in events:
-            ts = int(e.get("timestamp") or 0)
+        last_ts = 0
+        for raw in events:
+            e = normalize_event(raw)
+            ts = event_timestamp_ms(e)
+            last_ts = ts
             t = e.get("type")
             if t == 4:
                 _maybe_emit(ts)
@@ -64,7 +73,7 @@ class BlankRenderDetector:
                 root = event_data(e).get("node") or {}
                 last_node_count = _count_element_nodes(root)
         if events:
-            _maybe_emit(int(events[-1].get("timestamp") or 0))
+            _maybe_emit(last_ts)
         return out
 
 

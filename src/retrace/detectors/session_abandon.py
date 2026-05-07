@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, event_data, iter_with_url, register
+from retrace.detectors.base import (
+    Signal,
+    event_data,
+    event_timestamp_ms,
+    iter_with_url,
+    register,
+)
 
 
 ABANDON_WINDOW_MS = 5000
@@ -32,11 +38,11 @@ class SessionAbandonDetector:
     def detect(self, session_id: str, events: list[dict[str, Any]]) -> list[Signal]:
         if not events:
             return []
-        last_ts = int(events[-1].get("timestamp") or 0)
+        last_ts = event_timestamp_ms(events[-1])
         out: list[Signal] = []
         for url, e in iter_with_url(events):
             if _is_error_ish(e):
-                ts = int(e.get("timestamp") or 0)
+                ts = event_timestamp_ms(e)
                 if last_ts - ts <= ABANDON_WINDOW_MS:
                     out.append(
                         Signal(

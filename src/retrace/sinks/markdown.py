@@ -78,10 +78,16 @@ class MarkdownSink(Sink):
             f"{summary.sessions_with_signals} flagged into "
             f"{summary.clusters_found} cluster(s)."
         )
+        if summary.status != "ok":
+            summary_line += f"  Status: {summary.status}."
         if summary.sessions_errored:
             summary_line += f"  Errored {summary.sessions_errored}."
+        if summary.detector_errors:
+            summary_line += f"  Detector errors {summary.detector_errors}."
         if summary.cap_hit:
             summary_line += "  (batch cap hit — more sessions pending)"
+        if summary.error:
+            summary_line += f"  Error: {summary.error}"
         out.append(summary_line + "\n")
 
         for sev in _SEVERITY_ORDER:

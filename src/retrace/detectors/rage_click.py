@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, event_data, iter_with_url, register
+from retrace.detectors.base import (
+    Signal,
+    event_data,
+    event_timestamp_ms,
+    iter_with_url,
+    register,
+)
 
 
 WINDOW_MS = 1000
@@ -32,12 +38,12 @@ class RageClickDetector:
             window = [idx]
             base_url, base_ev = enumerated[idx]
             base_tid = event_data(base_ev).get("id")
-            base_ts = int(base_ev.get("timestamp") or 0)
+            base_ts = event_timestamp_ms(base_ev)
             for j in range(i + 1, len(click_indices)):
                 jdx = click_indices[j]
                 _u, ev = enumerated[jdx]
                 tid = event_data(ev).get("id")
-                ts = int(ev.get("timestamp") or 0)
+                ts = event_timestamp_ms(ev)
                 if tid != base_tid:
                     break
                 if ts - base_ts > WINDOW_MS:

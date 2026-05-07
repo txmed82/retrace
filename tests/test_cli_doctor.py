@@ -1,4 +1,5 @@
 from pathlib import Path
+import httpx
 from click.testing import CliRunner
 from pytest_httpx import HTTPXMock
 
@@ -73,6 +74,31 @@ def test_doctor_reports_failure_when_llm_unreachable(
 
     assert result.exit_code != 0
     assert "FAIL" in result.output or "fail" in result.output.lower()
+
+
+def test_doctor_reports_network_errors_without_low_level_dns_noise(
+    tmp_path: Path, httpx_mock: HTTPXMock, monkeypatch
+):
+    (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
+    (tmp_path / ".env").write_text("RETRACE_POSTHOG_API_KEY=phx_test\n")
+
+    httpx_mock.add_exception(
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known"),
+        method="GET",
+        url="https://us.i.posthog.com/api/projects/42/",
+    )
+    httpx_mock.add_exception(
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known"),
+        method="POST",
+        url="http://localhost:8080/v1/chat/completions",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code != 0
+    assert "network unavailable or host could not be resolved" in result.output
+    assert "nodename nor servname" not in result.output
 
 
 _CONFIG_WITH_SINKS = """posthog:

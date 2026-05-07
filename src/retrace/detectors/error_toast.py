@@ -4,7 +4,13 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.detectors.base import Signal, event_data, iter_with_url, register
+from retrace.detectors.base import (
+    Signal,
+    event_data,
+    event_timestamp_ms,
+    iter_with_url,
+    register,
+)
 
 
 _CLASS_RE = re.compile(r"\b(toast|snackbar|error|alert|notification)\b", re.IGNORECASE)
@@ -62,7 +68,7 @@ class ErrorToastDetector:
                         Signal(
                             session_id=session_id,
                             detector=self.name,
-                            timestamp_ms=int(e.get("timestamp") or 0),
+                            timestamp_ms=event_timestamp_ms(e),
                             url=url,
                             details={"text": text[:200]},
                         )
