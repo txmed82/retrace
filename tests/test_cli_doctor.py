@@ -101,6 +101,59 @@ def test_doctor_reports_network_errors_without_low_level_dns_noise(
     assert "nodename nor servname" not in result.output
 
 
+def test_doctor_reports_timeout_errors_without_traceback(
+    tmp_path: Path, httpx_mock: HTTPXMock, monkeypatch
+):
+    (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
+    (tmp_path / ".env").write_text("RETRACE_POSTHOG_API_KEY=phx_test\n")
+
+    httpx_mock.add_exception(
+        httpx.ReadTimeout("timed out"),
+        method="GET",
+        url="https://us.i.posthog.com/api/projects/42/",
+    )
+    httpx_mock.add_exception(
+        httpx.ReadTimeout("timed out"),
+        method="POST",
+        url="http://localhost:8080/v1/chat/completions",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code != 0
+    assert "network request timed out" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_doctor_reports_auth_errors_without_query_leak(
+    tmp_path: Path, httpx_mock: HTTPXMock, monkeypatch
+):
+    (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
+    (tmp_path / ".env").write_text("RETRACE_POSTHOG_API_KEY=phx_test\n")
+
+    httpx_mock.add_response(
+        method="GET",
+        url="https://us.i.posthog.com/api/projects/42/",
+        status_code=401,
+        json={"detail": "bad key"},
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:8080/v1/chat/completions",
+        status_code=401,
+        json={"error": "bad key"},
+    )
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code != 0
+    assert "HTTP 401 from https://us.i.posthog.com/api/projects/42/" in result.output
+    assert "HTTP 401 from http://localhost:8080/v1/chat/completions" in result.output
+    assert "?" not in result.output
+
+
 _CONFIG_WITH_SINKS = """posthog:
   host: https://us.i.posthog.com
   project_id: "42"
