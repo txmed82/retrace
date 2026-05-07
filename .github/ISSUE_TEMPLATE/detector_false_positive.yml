@@ -1,0 +1,65 @@
+name: Detector false positive or false negative
+description: Report incorrect replay failure detection.
+title: "[Detector]: "
+labels: ["detectors"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this when Retrace detected a failure that was not real, or missed a real UI failure.
+  - type: dropdown
+    id: detector
+    attributes:
+      label: Detector
+      options:
+        - console_error
+        - network_4xx
+        - network_5xx
+        - rage_click
+        - dead_click
+        - blank_render
+        - error_toast
+        - session_abandon_on_error
+        - clustering / replay issue grouping
+        - unsure
+    validations:
+      required: true
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Incorrect outcome
+      options:
+        - False positive
+        - False negative
+        - Wrong severity
+        - Wrong grouping
+    validations:
+      required: true
+  - type: textarea
+    id: replay_context
+    attributes:
+      label: Replay context
+      description: Include replay issue ID, session ID, detector signal details, and timestamps if available.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected detector behavior
+      description: Explain what Retrace should have emitted or ignored.
+    validations:
+      required: true
+  - type: textarea
+    id: artifact
+    attributes:
+      label: Minimal fixture or artifact
+      description: Attach or paste a minimal rrweb/event fixture if you can. Redact user data and secrets.
+      render: json
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed API keys, service tokens, user PII, and sensitive replay data.
+          required: true

@@ -207,6 +207,12 @@ Artifacts:
 
 Retrace is available under the MIT License. See [LICENSE](LICENSE).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and the
+GitHub issue templates for project-specific bug reports, detector feedback,
+generated-test failures, feature requests, and pull request validation.
+
 ## Local UI Tester (Browser Harness First)
 
 Retrace now includes a local-first tester workflow built around Browser Harness.

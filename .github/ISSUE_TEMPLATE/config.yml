@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Security vulnerability
-    url: https://github.com/txmed82/retrace/security
-    about: Please use private disclosure for security issues when available.
+  - name: Security report
+    url: https://github.com/txmed82/retrace/security/policy
+    about: Please report vulnerabilities through the security policy, not public issues.
