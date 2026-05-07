@@ -125,6 +125,7 @@ From the UI you can:
   matching
 - Create write-only browser SDK keys and copy `@retrace/browser` install/init
   snippets for first-party replay capture
+- Send a test replay with the generated SDK key to verify first-party ingest
 - Browse findings from latest report
 - Replay stored rrweb events
 - Inspect first-party replay sessions and replay-backed issues

@@ -1334,11 +1334,74 @@ const retrace = init({
         <div class="lbl">Initialize Capture</div>
         <pre>${esc(initSnippet)}</pre>
         <button class="btn" id="copySdkInitBtn" type="button">Copy Init</button>
+        <button class="btn" id="sendSdkSmokeReplayBtn" type="button">Send Test Replay</button>
+        <span class="empty" id="sdkSmokeReplayStatus"></span>
         <div class="empty" style="margin-top:8px">Project: <code>${esc(data.project_id)}</code> · Environment: <code>${esc(data.environment_id)}</code></div>
       `;
       byId('copySdkKeyBtn')?.addEventListener('click', () => copyText(data.key));
       byId('copySdkInstallBtn')?.addEventListener('click', () => copyText(installSnippet));
       byId('copySdkInitBtn')?.addEventListener('click', () => copyText(initSnippet));
+      byId('sendSdkSmokeReplayBtn')?.addEventListener('click', () => sendSdkSmokeReplay(data.key, ingestUrl));
+    }
+
+    async function sendSdkSmokeReplay(apiKey, ingestUrl){
+      const status = byId('sdkSmokeReplayStatus');
+      if(status) status.textContent = 'Sending...';
+      const now = Date.now();
+      const sessionId = `ui-smoke-${now}-${Math.random().toString(36).slice(2)}`;
+      const payload = {
+        sessionId,
+        sequence: 0,
+        flushType: 'final',
+        distinctId: 'retrace-ui-smoke',
+        metadata: {
+          source: 'retrace-ui',
+          smoke_test: true,
+        },
+        events: [
+          {
+            type: 4,
+            timestamp: now,
+            data: { href: window.location.href },
+          },
+          {
+            type: 6,
+            timestamp: now + 1,
+            data: {
+              plugin: 'retrace/console@1',
+              payload: {
+                level: 'error',
+                payload: ['Retrace UI smoke replay'],
+                url: window.location.href,
+              },
+            },
+          },
+        ],
+      };
+      try {
+        const res = await fetch(ingestUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Retrace-Key': apiKey,
+          },
+          body: JSON.stringify(payload),
+        });
+        let data = {};
+        try {
+          data = await res.json();
+        } catch(_err) {
+          data = {};
+        }
+        if(!res.ok || data.accepted !== true){
+          if(status) status.textContent = `Failed: ${data.error || data.message || 'ingest rejected'}`;
+          return;
+        }
+        if(status) status.textContent = `Accepted ${data.event_count || payload.events.length} event(s) for ${sessionId}.`;
+        await loadReplayDashboard('Test replay accepted. Process queued replays to create a replay-backed issue.');
+      } catch(err) {
+        if(status) status.textContent = `Failed: ${err?.message || err}`;
+      }
     }
 
     async function loadOnboarding(){
