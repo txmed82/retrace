@@ -163,6 +163,18 @@ Or generate fix suggestions directly from a replay-backed issue:
 retrace suggest-fixes --replay-issue <bug_public_id> --repo <org/name> --out ./reports/fix-prompts
 ```
 
+For multi-project installs, include the replay issue scope printed by the API or
+`retrace demo seed`:
+
+```bash
+retrace suggest-fixes \
+  --replay-issue <bug_public_id> \
+  --project-id <project_id> \
+  --environment-id <environment_id> \
+  --repo <org/name> \
+  --out ./reports/fix-prompts
+```
+
 Artifacts:
 
 - `reports/fix-prompts/*.json`

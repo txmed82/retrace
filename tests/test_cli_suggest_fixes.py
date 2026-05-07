@@ -158,3 +158,74 @@ def test_suggest_fixes_generates_from_replay_issue(tmp_path: Path, monkeypatch):
     assert '"repo": "acme/widgets"' in artifact
     assert "checkout.tsx" in artifact
     assert issue_id in codex_files[0].read_text()
+
+
+def test_suggest_fixes_replay_issue_honors_project_environment_scope(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    seeded = runner.invoke(
+        main,
+        [
+            "demo",
+            "seed",
+            "--project",
+            "Scoped App",
+            "--environment",
+            "staging",
+        ],
+    )
+    assert seeded.exit_code == 0, seeded.output
+    seed_payload = json.loads(seeded.output)
+    issue_id = seed_payload["issue_public_id"]
+
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "checkout.tsx").write_text(
+        "export function Checkout(){ return <button data-testid='checkout-pay'>Pay now</button> }"
+    )
+
+    connected = runner.invoke(
+        main,
+        [
+            "github",
+            "connect",
+            "--repo",
+            "acme/widgets",
+            "--local-path",
+            str(tmp_path),
+        ],
+    )
+    assert connected.exit_code == 0, connected.output
+
+    result = runner.invoke(
+        main,
+        [
+            "suggest-fixes",
+            "--replay-issue",
+            issue_id,
+            "--project-id",
+            seed_payload["project_id"],
+            "--environment-id",
+            seed_payload["environment_id"],
+            "--repo",
+            "acme/widgets",
+            "--out",
+            "./reports/fix-prompts",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"Parsed 1 findings from replay issue {issue_id}" in result.output
+    out_dir = tmp_path / "reports" / "fix-prompts"
+    json_files = list(out_dir.glob("replay-*.json"))
+    codex_files = list(out_dir.glob("replay-*.codex.md"))
+    claude_files = list(out_dir.glob("replay-*.claude.md"))
+    assert len(json_files) == 1
+    assert len(codex_files) == 1
+    assert len(claude_files) == 1
+    artifact = json_files[0].read_text()
+    assert '"repo": "acme/widgets"' in artifact
+    assert "checkout.tsx" in artifact
