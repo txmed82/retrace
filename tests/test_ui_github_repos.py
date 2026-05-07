@@ -30,9 +30,45 @@ def test_connect_github_repo_payload_stores_repo_with_local_path(
     assert listed["repos"][0]["default_branch"] == "main"
 
 
+def test_connect_github_repo_payload_stores_path_only_local_codebase(
+    tmp_path: Path,
+) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    repo_dir = tmp_path / "Checkout App"
+    repo_dir.mkdir()
+
+    payload, status = _connect_github_repo_payload(
+        store=store,
+        repo_full_name="",
+        default_branch="main",
+        local_path=str(repo_dir),
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["repos"][0]["repo_full_name"] == "local/checkout-app"
+    assert payload["repos"][0]["provider"] == "local"
+    assert payload["repos"][0]["remote_url"] == ""
+    assert payload["repos"][0]["local_path"] == str(repo_dir)
+
+
 def test_connect_github_repo_payload_rejects_bad_repo_name(tmp_path: Path) -> None:
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
+
+    payload, status = _connect_github_repo_payload(
+        store=store,
+        repo_full_name="",
+        default_branch="main",
+        local_path="",
+    )
+
+    assert status == 400
+    assert payload == {
+        "ok": False,
+        "error": "Enter an owner/name repo or a local checkout path.",
+    }
 
     payload, status = _connect_github_repo_payload(
         store=store,

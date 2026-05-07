@@ -1038,9 +1038,8 @@ def _connect_github_repo_payload(
     repo = repo_full_name.strip()
     branch = default_branch.strip() or "main"
     path_value = local_path.strip()
-    parts = repo.split("/")
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        return {"ok": False, "error": "Repo must use owner/name format."}, 400
+    provider = "github"
+    remote_url = ""
     if path_value:
         repo_path = Path(path_value).expanduser()
         if not repo_path.exists() or not repo_path.is_dir():
@@ -1049,12 +1048,25 @@ def _connect_github_repo_payload(
                 "error": f"Local path is not a directory: {path_value}",
             }, 400
         path_value = str(repo_path)
+        if not repo:
+            repo = f"local/{slugify(repo_path.name or 'codebase')}"
+            provider = "local"
+    if not repo:
+        return {
+            "ok": False,
+            "error": "Enter an owner/name repo or a local checkout path.",
+        }, 400
+    parts = repo.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return {"ok": False, "error": "Repo must use owner/name format."}, 400
+    if provider == "github":
+        remote_url = f"https://github.com/{repo}.git"
     store.upsert_github_repo(
         repo_full_name=repo,
         default_branch=branch,
-        remote_url=f"https://github.com/{repo}.git",
+        remote_url=remote_url,
         local_path=path_value,
-        provider="github",
+        provider=provider,
     )
     return {"ok": True, **_github_repos_payload(store)}, 200
 
@@ -1424,7 +1436,7 @@ const retrace = init({
         : llmProvider === 'openrouter' ? 'OpenRouter'
         : 'OpenAI-compatible';
       const repoRows = repos.map(r => `
-        <li><code>${esc(r.repo_full_name)}</code> · branch=<code>${esc(r.default_branch || 'main')}</code>${r.local_path ? ` · path=<code>${esc(r.local_path)}</code>` : ''}</li>
+        <li><code>${esc(r.repo_full_name)}</code> · provider=<code>${esc(r.provider || 'github')}</code> · branch=<code>${esc(r.default_branch || 'main')}</code>${r.local_path ? ` · path=<code>${esc(r.local_path)}</code>` : ''}</li>
       `).join('');
       byId('onboarding').innerHTML = `
         <h3>Onboarding & Settings</h3>
@@ -1489,8 +1501,8 @@ const retrace = init({
         <form id=\"repoConnectForm\" style=\"margin-top:8px\">
           <div class=\"grid\">
             <div>
-              <div class=\"lbl\">Repo</div>
-              <input id=\"repoFullName\" value=\"${esc(repos[0]?.repo_full_name || '')}\" placeholder=\"owner/name\" />
+              <div class=\"lbl\">Repo Label</div>
+              <input id=\"repoFullName\" value=\"${esc(repos[0]?.provider === 'local' ? '' : (repos[0]?.repo_full_name || ''))}\" placeholder=\"owner/name or leave blank for local path\" />
             </div>
             <div>
               <div class=\"lbl\">Branch</div>
