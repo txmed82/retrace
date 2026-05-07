@@ -8,6 +8,7 @@ from unittest.mock import patch
 from retrace.commands.ui import (
     _create_sdk_key_payload,
     _generate_replay_issue_fix_prompts_payload,
+    _INDEX_HTML,
     _replay_api_check,
     _generate_replay_issue_spec_payload,
     _transition_replay_issue_payload,
@@ -76,6 +77,11 @@ def test_replay_api_check_reports_unreachable_server() -> None:
     assert payload["url"] == "http://127.0.0.1:9"
     assert payload["commands"]["serve"] == "retrace api serve"
     assert payload["detail"]
+
+
+def test_index_html_escape_helper_escapes_single_quotes() -> None:
+    assert "[&<>\"']" in _INDEX_HTML
+    assert '"\'":\'&#39;\'' in _INDEX_HTML
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(

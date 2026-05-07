@@ -1165,7 +1165,7 @@ _INDEX_HTML = """<!doctype html>
     const CLOUD_PROVIDERS = new Set(['openai', 'anthropic', 'openrouter']);
     const CUSTOM_MODEL = '__custom__';
 
-    function esc(s){ return String(s || \"\").replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c])); }
+    function esc(s){ return String(s || \"\").replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c])); }
     function byId(id){ return document.getElementById(id); }
 
     function copyText(s){ navigator.clipboard.writeText(String(s || \"\")); }
