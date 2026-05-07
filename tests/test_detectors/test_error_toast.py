@@ -59,3 +59,27 @@ def test_error_toast_ignores_unrelated_div():
         _add_node_event(ts=100, tag="div", attrs={"class": "content"}, text="hello"),
     ]
     assert detector.detect("s", events) == []
+
+
+def test_error_toast_ignores_nodes_with_string_attributes():
+    from retrace.detectors.error_toast import detector
+
+    events = [
+        meta(ts=0),
+        _add_node_event(ts=100, tag="div", attrs="toast error", text="Saved"),
+    ]
+    assert detector.detect("s", events) == []
+
+
+def test_error_toast_ignores_string_add_entries():
+    from retrace.detectors.error_toast import detector
+
+    events = [
+        meta(ts=0),
+        {
+            "type": 3,
+            "timestamp": 100,
+            "data": {"source": 0, "adds": ["not-a-node"]},
+        },
+    ]
+    assert detector.detect("s", events) == []
