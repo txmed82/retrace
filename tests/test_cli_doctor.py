@@ -149,9 +149,12 @@ def test_doctor_reports_auth_errors_without_query_leak(
     result = CliRunner().invoke(main, ["doctor"])
 
     assert result.exit_code != 0
-    assert "HTTP 401 from https://us.i.posthog.com/api/projects/42/" in result.output
-    assert "HTTP 401 from http://localhost:8080/v1/chat/completions" in result.output
-    assert "?" not in result.output
+    posthog_url = "https://us.i.posthog.com/api/projects/42/"
+    llm_url = "http://localhost:8080/v1/chat/completions"
+    assert f"HTTP 401 from {posthog_url}" in result.output
+    assert f"HTTP 401 from {llm_url}" in result.output
+    assert "?" not in posthog_url
+    assert "?" not in llm_url
 
 
 _CONFIG_WITH_SINKS = """posthog:
