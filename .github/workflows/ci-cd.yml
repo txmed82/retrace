@@ -73,10 +73,34 @@ jobs:
         working-directory: packages/browser
         run: npm run build
 
+  playwright-runner:
+    name: Playwright Runner Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install browser test dependencies
+        run: uv pip install --system -e ".[dev,browser]"
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Playwright runner tests
+        run: pytest tests/test_tester_playwright.py -q
+
   cd-ghcr:
     name: Publish Docker Image (GHCR)
     runs-on: ubuntu-latest
-    needs: [ci, docker-build, browser-sdk]
+    needs: [ci, docker-build, browser-sdk, playwright-runner]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     permissions:
       contents: read
