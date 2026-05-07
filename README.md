@@ -6,7 +6,35 @@
 
 Your real users are your QA team. Retrace finds the bugs they hit.
 
-Retrace pulls PostHog session recordings, detects likely breakage with heuristic detectors, clusters similar failures, generates clear bug summaries, and outputs actionable fix prompts with likely culprit files.
+Retrace is an open-source UI reliability loop for teams that want real user
+failure capture and automated UI regression testing in one self-hosted tool. It
+pulls PostHog session recordings or ingests first-party browser SDK replays,
+detects likely breakage, clusters repeated failures, generates replay-backed
+regression specs, matches issues to likely source files, and outputs actionable
+fix prompts for coding agents.
+
+## What Retrace Is Supposed To Be
+
+Retrace turns production UI failures into verified fixes:
+
+1. Capture live user browser sessions from PostHog or the `@retrace/browser`
+   SDK.
+2. Detect UX failures such as console errors, failed network calls, rage clicks,
+   dead clicks, blank renders, error toasts, and abandonment after errors.
+3. Cluster repeated failures into replay-backed issues with severity, affected
+   users, session links, and evidence.
+4. Generate deterministic UI regression specs from real replay interactions so
+   failures become testable behavior, not anecdotes.
+5. Link each issue to a GitHub or local checkout, rank likely source files, and
+   produce Codex/Claude prompts that include replay evidence and candidate code.
+6. Re-run generated tests after fixes and track issues as `new`, `ongoing`,
+   `regressed`, or `resolved`.
+
+The intended end state is a BYOK, self-hostable open-source product that closes
+the loop between live user UI errors, automated UX testing, automated UI
+regression testing, and coding-agent repair workflows. See
+[docs/open-source-product-plan.md](docs/open-source-product-plan.md) for the
+full proposal and quality bar.
 
 ## What You Get
 
@@ -17,6 +45,22 @@ Retrace pulls PostHog session recordings, detects likely breakage with heuristic
 - GitHub repo matching via CLI-connected repo metadata
 - Local Browser Harness UI tester with saved reusable specs
 - Regression-state tracking for replay findings (`new`, `ongoing`, `regressed`, `resolved`)
+
+## End-to-End Workflow
+
+1. Run `retrace init` or `retrace ui` and provide your own PostHog, LLM, and
+   optional GitHub keys.
+2. Ingest live user sessions through PostHog (`retrace run`) or first-party SDK
+   replay batches (`retrace api serve` plus `@retrace/browser`).
+3. Process replays into signals and replay-backed issues.
+4. Generate replay-derived regression specs with `retrace tester
+   from-replay-issue <bug_public_id>` or the local UI.
+5. Connect a repository with `retrace github connect --repo <org/name>
+   --local-path /path/to/repo`.
+6. Run `retrace suggest-fixes --latest --repo <org/name>` to produce likely
+   source files and coding-agent prompts.
+7. Apply fixes, run the generated UI specs plus the normal test suite, then
+   mark issues resolved and let verification catch regressions.
 
 ## Quickstart
 
@@ -64,6 +108,25 @@ From the UI you can:
 - Process queued first-party replay batches into signals and issues
 - Generate native regression specs from replay-backed issues
 - Inspect likely culprit files and copy Codex/Claude prompts
+
+## BYOK Model
+
+Retrace is designed for bring-your-own-key operation. Runtime secrets live in
+`.env` or your deployment environment; `config.yaml` stores non-secret settings.
+
+Common secret variables:
+
+- `RETRACE_POSTHOG_API_KEY` for PostHog session recording ingestion
+- `RETRACE_LLM_API_KEY` for OpenAI-compatible local or hosted providers
+- `RETRACE_OPENAI_API_KEY`, `RETRACE_ANTHROPIC_API_KEY`, or
+  `RETRACE_OPENROUTER_API_KEY` for named hosted providers
+- `RETRACE_GITHUB_API_KEY`, `RETRACE_GITHUB_TOKEN`, or `GITHUB_TOKEN` for
+  GitHub issue filing and repository metadata
+- `RETRACE_LINEAR_API_KEY` for Linear issue filing
+
+First-party browser capture uses write-only public SDK keys generated with
+`retrace api create-sdk-key`. Those keys can submit replay batches but cannot
+read replay data or issues.
 
 ## Fix Suggestions Workflow
 
@@ -408,5 +471,6 @@ Override any of them via the `cron` service environment in `docker-compose.yml`.
 
 ## Design Docs
 
+- `docs/open-source-product-plan.md`
 - `docs/superpowers/specs/2026-04-19-retrace-design.md`
 - `docs/superpowers/plans/2026-04-19-retrace-plan-a-vertical-slice.md`
