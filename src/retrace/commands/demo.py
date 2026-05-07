@@ -8,6 +8,12 @@ from typing import Any
 import click
 
 from retrace.config import load_config
+from retrace.fix_suggestions import (
+    generate_fix_suggestions,
+    parsed_finding_from_replay_issue,
+    replay_issue_report_key,
+    slugify,
+)
 from retrace.replay_core import ReplaySignalConfig, process_replay_sessions
 from retrace.replay_specs import generate_spec_from_replay_issue
 from retrace.storage import Storage
@@ -30,8 +36,22 @@ def demo_group() -> None:
 @click.option("--app-url", default="https://demo.retrace.local", show_default=True)
 @click.option("--session-id", default="demo-checkout-crash", show_default=True)
 @click.option("--project", "project_name", default="Default", show_default=True)
-@click.option("--environment", "environment_name", default="production", show_default=True)
+@click.option(
+    "--environment", "environment_name", default="production", show_default=True
+)
 @click.option("--generate-spec/--no-generate-spec", default=True, show_default=True)
+@click.option(
+    "--generate-fix-prompts/--no-generate-fix-prompts",
+    default=True,
+    show_default=True,
+)
+@click.option("--demo-repo", default="local/demo-checkout", show_default=True)
+@click.option(
+    "--demo-repo-path",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Directory for the generated local demo source tree.",
+)
 def seed_demo(
     config_path: Path,
     app_url: str,
@@ -39,10 +59,14 @@ def seed_demo(
     project_name: str,
     environment_name: str,
     generate_spec: bool,
+    generate_fix_prompts: bool,
+    demo_repo: str,
+    demo_repo_path: Path | None,
 ) -> None:
-    """Create a replay-backed demo issue and optional regression spec."""
+    """Create a replay-backed demo issue, regression spec, and fix prompts."""
     _write_demo_config_if_missing(config_path)
-    data_dir = _data_dir_from_config(config_path)
+    cfg = load_config(config_path)
+    data_dir = cfg.run.data_dir
     store = Storage(data_dir / "retrace.db")
     store.init_schema()
     workspace = store.ensure_workspace(
@@ -78,6 +102,7 @@ def seed_demo(
 
     issue = processed.issues[0]
     generated_payload: dict[str, Any] = {}
+    fix_prompts_payload: dict[str, Any] = {}
     if generate_spec:
         generated = generate_spec_from_replay_issue(
             store=store,
@@ -94,6 +119,53 @@ def seed_demo(
             "known_gaps": generated.known_gaps,
         }
 
+    if generate_fix_prompts:
+        repo_path = demo_repo_path or (data_dir / "demo-repo")
+        _write_demo_repo(repo_path)
+        repo_id = store.upsert_github_repo(
+            repo_full_name=demo_repo,
+            default_branch="main",
+            remote_url=f"https://github.com/{demo_repo}.git",
+            local_path=str(repo_path),
+            provider="github",
+        )
+        repo = store.get_github_repo(demo_repo)
+        if repo is None:
+            raise click.ClickException(f"Demo repo could not be connected: {repo_id}")
+        issue_row = store.get_replay_issue(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            issue_id=issue.public_id,
+        )
+        if issue_row is None:
+            raise click.ClickException(f"Demo replay issue missing: {issue.public_id}")
+        suggestions = generate_fix_suggestions(
+            store=store,
+            repo=repo,
+            repo_path=repo_path,
+            out_dir=cfg.run.output_dir / "fix-prompts",
+            report_key=replay_issue_report_key(issue.public_id),
+            source_label=f"replay issue {issue.public_id}",
+            artifact_stem=f"replay-{slugify(issue.public_id)}",
+            findings=[parsed_finding_from_replay_issue(issue_row)],
+        )
+        artifact = suggestions.artifacts[0] if suggestions.artifacts else None
+        fix_prompts_payload = {
+            "repo": suggestions.repo_full_name,
+            "repo_path": suggestions.repo_path,
+            "out_dir": str(suggestions.out_dir),
+            "artifact_json": artifact.artifact_json if artifact else "",
+            "prompt_files": artifact.prompt_files if artifact else {},
+            "candidates": [
+                {
+                    "file_path": c.file_path,
+                    "score": c.score,
+                    "rationale": c.rationale,
+                }
+                for c in (artifact.candidates if artifact else [])
+            ],
+        }
+
     click.echo(
         json.dumps(
             {
@@ -108,22 +180,22 @@ def seed_demo(
                 "issue_inserted": issue.inserted,
                 "issue_regressed": issue.regressed,
                 "tester_spec": generated_payload or None,
+                "fix_prompts": fix_prompts_payload or None,
                 "next_commands": [
                     "retrace tester from-replay-issue "
                     f"--config {shlex.quote(str(config_path))} {issue.public_id}",
+                    "retrace suggest-fixes "
+                    f"--config {shlex.quote(str(config_path))} "
+                    f"--replay-issue {issue.public_id} "
+                    f"--project-id {workspace.project_id} "
+                    f"--environment-id {workspace.environment_id} "
+                    f"--repo {shlex.quote(demo_repo)}",
                     f"retrace ui --config {shlex.quote(str(config_path))}",
                 ],
             },
             indent=2,
         )
     )
-
-
-def _data_dir_from_config(config_path: Path) -> Path:
-    if config_path.exists():
-        return load_config(config_path).run.data_dir
-    return Path("./data")
-
 
 def _write_demo_config_if_missing(config_path: Path) -> None:
     if config_path.exists():
@@ -191,9 +263,31 @@ def _demo_checkout_events(base_url: str) -> list[dict[str, Any]]:
                 "payload": {
                     "level": "error",
                     "payload": [
-                        "TypeError: Cannot read properties of undefined (reading 'total')"
+                        "TypeError: Cannot read properties of undefined "
+                        "(reading 'total') at src/checkout.tsx:8"
                     ],
                 },
             },
         },
     ]
+
+
+def _write_demo_repo(repo_path: Path) -> None:
+    src_dir = repo_path / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "checkout.tsx").write_text(
+        """export function Checkout({ cart }: { cart?: { total?: number } }) {
+  const total = cart!.total!.toFixed(2);
+  return (
+    <button data-testid="checkout-pay" onClick={() => submitPayment(total)}>
+      Pay now
+    </button>
+  );
+}
+
+function submitPayment(total: string) {
+  return fetch("/api/payments", { method: "POST", body: JSON.stringify({ total }) });
+}
+""",
+        encoding="utf-8",
+    )
