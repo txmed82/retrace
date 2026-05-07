@@ -91,11 +91,13 @@ retrace ui
 ```
 
 `retrace demo seed` creates a local replay-backed checkout failure, processes it
-through deterministic detectors, writes a replay-derived UI regression spec, and
-prints the `issue_public_id` for follow-up commands. Use `retrace tester list`
-to inspect the generated spec; run `retrace tester from-replay-issue
-<issue_public_id>` only when you want to generate another spec from the same
-issue.
+through deterministic detectors, writes a replay-derived UI regression spec,
+creates a tiny local demo source tree, connects it as `local/demo-checkout`, and
+writes Codex/Claude fix prompts under `reports/fix-prompts`. Use `retrace
+tester list` to inspect the generated spec; run `retrace tester
+from-replay-issue <issue_public_id>` only when you want to generate another spec
+from the same issue. Pass `--no-generate-fix-prompts` if you only want replay
+and regression-test seed data.
 
 ## Local UI (Onboarding + Replay + Prompts)
 

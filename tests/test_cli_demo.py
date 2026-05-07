@@ -27,8 +27,22 @@ def test_demo_seed_creates_replay_issue_and_spec_without_config(
     assert payload["tester_spec"]["spec_id"]
     assert payload["tester_spec"]["confidence"] == "high"
     assert payload["tester_spec"]["known_gaps"] == []
+    assert payload["fix_prompts"]["repo"] == "local/demo-checkout"
+    assert payload["fix_prompts"]["candidates"][0]["file_path"] == "src/checkout.tsx"
     assert (
         tmp_path / "data" / "ui-tests" / "specs" / f"{payload['tester_spec']['spec_id']}.json"
+    ).exists()
+    assert (
+        tmp_path
+        / "reports"
+        / "fix-prompts"
+        / payload["fix_prompts"]["artifact_json"]
+    ).exists()
+    assert (
+        tmp_path
+        / "reports"
+        / "fix-prompts"
+        / payload["fix_prompts"]["prompt_files"]["codex"]
     ).exists()
 
     store = Storage(tmp_path / "data" / "retrace.db")
@@ -60,7 +74,23 @@ def test_demo_seed_can_skip_spec_generation(tmp_path: Path, monkeypatch) -> None
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["tester_spec"] is None
+    assert payload["fix_prompts"]["repo"] == "local/demo-checkout"
     assert not (tmp_path / "data" / "ui-tests" / "specs").exists()
+
+
+def test_demo_seed_can_skip_fix_prompt_generation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["demo", "seed", "--no-generate-fix-prompts"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["tester_spec"]["spec_id"]
+    assert payload["fix_prompts"] is None
+    assert not (tmp_path / "reports" / "fix-prompts").exists()
 
 
 def test_demo_seed_next_commands_preserve_custom_config(
