@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from unittest.mock import patch
 
 from retrace.commands.ui import (
     _create_sdk_key_payload,
     _generate_replay_issue_fix_prompts_payload,
+    _replay_api_check,
     _generate_replay_issue_spec_payload,
     _transition_replay_issue_payload,
     _verify_resolved_issues_payload,
@@ -30,6 +33,49 @@ def _workspace(tmp_path: Path):
         environment_name="production",
     )
     return store, workspace
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/healthz":
+            body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+        return
+
+
+def test_replay_api_check_reports_reachable_server() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HealthHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        payload = _replay_api_check(f"http://{host}:{port}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert payload["reachable"] is True
+    assert payload["detail"] == "OK (200)"
+    assert payload["commands"]["serve"] == "retrace api serve"
+
+
+def test_replay_api_check_reports_unreachable_server() -> None:
+    payload = _replay_api_check("http://127.0.0.1:9")
+
+    assert payload["reachable"] is False
+    assert payload["url"] == "http://127.0.0.1:9"
+    assert payload["commands"]["serve"] == "retrace api serve"
+    assert payload["detail"]
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(

@@ -377,6 +377,36 @@ def _posthog_check(host: str, project_id: str, api_key: str) -> dict[str, Any]:
         return {"configured": True, "reachable": False, "detail": str(exc)}
 
 
+def _replay_api_check(base_url: str = "http://127.0.0.1:8788") -> dict[str, Any]:
+    url = base_url.rstrip("/") + "/healthz"
+    try:
+        with httpx.Client(timeout=2) as c:
+            response = c.get(url)
+        if response.status_code // 100 == 2:
+            return {
+                "configured": True,
+                "reachable": True,
+                "detail": f"OK ({response.status_code})",
+                "url": base_url.rstrip("/"),
+                "commands": {"serve": "retrace api serve"},
+            }
+        return {
+            "configured": True,
+            "reachable": False,
+            "detail": f"HTTP {response.status_code}",
+            "url": base_url.rstrip("/"),
+            "commands": {"serve": "retrace api serve"},
+        }
+    except Exception as exc:
+        return {
+            "configured": True,
+            "reachable": False,
+            "detail": str(exc),
+            "url": base_url.rstrip("/"),
+            "commands": {"serve": "retrace api serve"},
+        }
+
+
 def _truthy_env(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -1324,6 +1354,7 @@ const retrace = init({
       const gh = checks.gh || {};
       const ph = checks.posthog || {};
       const llm = checks.llm || {};
+      const replayApi = checks.replay_api || {};
       const llmProvider = settings.llm_provider || 'openai_compatible';
       const llmProviderLabel = llmProvider === 'openai' ? 'OpenAI'
         : llmProvider === 'anthropic' ? 'Anthropic'
@@ -1426,6 +1457,8 @@ const retrace = init({
         <div id=\"sdkKeyResult\"></div>
         <div class=\"empty\">PostHog check: <span class=\"${ph.reachable===true?'ok':(ph.reachable===false?'bad':'')}\">${ph.reachable===true?'reachable':(ph.reachable===false?'unreachable':'not configured')}</span> ${esc(ph.detail || '')}</div>
         <div class=\"empty\">LLM check (${esc(llmProviderLabel)}): <span class=\"${llm.reachable===true?'ok':(llm.reachable===false?'bad':'')}\">${llm.reachable===true?'reachable':(llm.reachable===false?'unreachable':'not configured')}</span> ${esc(llm.detail || '')}</div>
+        <div class=\"empty\">Replay ingest API: <span class=\"${replayApi.reachable===true?'ok':'bad'}\">${replayApi.reachable===true?'reachable':'unreachable'}</span> at <code>${esc(replayApi.url || 'http://127.0.0.1:8788')}</code> ${esc(replayApi.detail || '')}</div>
+        ${replayApi.reachable !== true ? `<div class=\"empty\">Run in terminal: <code>${esc(replayApi.commands?.serve || 'retrace api serve')}</code> <button class=\"btn\" onclick=\"copyText('${esc(replayApi.commands?.serve || 'retrace api serve')}')\">Copy</button></div>` : ''}
         ${!gh.installed ? `<div class=\"empty\">Run in terminal: <code>${esc(gh.commands?.install || 'brew install gh')}</code> <button class=\"btn\" onclick=\"copyText('${esc(gh.commands?.install || 'brew install gh')}')\">Copy</button></div>` : ''}
         ${gh.installed && !gh.authed ? `<div class=\"empty\">Run in terminal: <code>${esc(gh.commands?.login || 'gh auth login')}</code> <button class=\"btn\" onclick=\"copyText('${esc(gh.commands?.login || 'gh auth login')}')\">Copy</button></div>` : ''}
       `;
@@ -2056,6 +2089,7 @@ def ui_command(
                             s["llm_model"],
                             s["llm_api_key"],
                         ),
+                        "replay_api": _replay_api_check(),
                     }
                 )
                 return
