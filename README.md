@@ -118,7 +118,9 @@ From the UI you can:
   - PostHog connectivity
   - LLM connectivity
   - `gh` installed/authenticated
+  - first-party replay ingest API readiness
 - Copy suggested terminal commands when `gh` is missing/not authed
+- Copy the `retrace api serve` command when the ingest API is down
 - Connect a GitHub-style `owner/name` repo and local checkout path for code
   matching
 - Create write-only browser SDK keys and copy `@retrace/browser` install/init
