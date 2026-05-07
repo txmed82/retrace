@@ -26,7 +26,8 @@ def _gather_text(node: dict[str, Any]) -> str:
 def _is_error_like(node: dict[str, Any]) -> tuple[bool, str]:
     if not isinstance(node, dict) or node.get("type") != 2:
         return False, ""
-    attrs = node.get("attributes") or {}
+    attrs_raw = node.get("attributes") or {}
+    attrs = attrs_raw if isinstance(attrs_raw, dict) else {}
     role = str(attrs.get("role", ""))
     klass = str(attrs.get("class", ""))
     text = _gather_text(node).strip()
@@ -53,7 +54,8 @@ class ErrorToastDetector:
                 continue
             adds = data.get("adds") or []
             for add in adds:
-                node = (add or {}).get("node") or {}
+                node = add.get("node") if isinstance(add, dict) else {}
+                node = node or {}
                 matched, text = _is_error_like(node)
                 if matched:
                     out.append(
