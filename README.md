@@ -119,6 +119,8 @@ From the UI you can:
   - LLM connectivity
   - `gh` installed/authenticated
 - Copy suggested terminal commands when `gh` is missing/not authed
+- Connect a GitHub-style `owner/name` repo and local checkout path for code
+  matching
 - Browse findings from latest report
 - Replay stored rrweb events
 - Inspect first-party replay sessions and replay-backed issues
@@ -147,7 +149,7 @@ read replay data or issues.
 
 ## Fix Suggestions Workflow
 
-1. Connect repo metadata (CLI):
+1. Connect repo metadata from the local UI or CLI:
 
 ```bash
 retrace github connect --repo <org/name> --branch main --local-path /path/to/repo

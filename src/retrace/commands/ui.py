@@ -852,6 +852,53 @@ def _generate_replay_issue_fix_prompts_payload(
     )
 
 
+def _github_repos_payload(store: Storage) -> dict[str, Any]:
+    return {
+        "repos": [
+            {
+                "repo_full_name": repo.repo_full_name,
+                "default_branch": repo.default_branch,
+                "remote_url": repo.remote_url,
+                "local_path": repo.local_path,
+                "provider": repo.provider,
+                "connected_at": repo.connected_at.isoformat(),
+            }
+            for repo in store.list_github_repos()
+        ]
+    }
+
+
+def _connect_github_repo_payload(
+    *,
+    store: Storage,
+    repo_full_name: str,
+    default_branch: str = "main",
+    local_path: str = "",
+) -> tuple[dict[str, Any], int]:
+    repo = repo_full_name.strip()
+    branch = default_branch.strip() or "main"
+    path_value = local_path.strip()
+    parts = repo.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return {"ok": False, "error": "Repo must use owner/name format."}, 400
+    if path_value:
+        repo_path = Path(path_value).expanduser()
+        if not repo_path.exists() or not repo_path.is_dir():
+            return {
+                "ok": False,
+                "error": f"Local path is not a directory: {path_value}",
+            }, 400
+        path_value = str(repo_path)
+    store.upsert_github_repo(
+        repo_full_name=repo,
+        default_branch=branch,
+        remote_url=f"https://github.com/{repo}.git",
+        local_path=path_value,
+        provider="github",
+    )
+    return {"ok": True, **_github_repos_payload(store)}, 200
+
+
 _INDEX_HTML = """<!doctype html>
 <html>
 <head>
@@ -1013,10 +1060,38 @@ _INDEX_HTML = """<!doctype html>
       await bootFindings();
     }
 
+    async function connectGithubRepo(ev){
+      ev.preventDefault();
+      const status = byId('repoConnectStatus');
+      if(status) status.textContent = 'Saving...';
+      const res = await fetch('/api/github/repos', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          repo: byId('repoFullName').value,
+          branch: byId('repoDefaultBranch').value,
+          local_path: byId('repoLocalPath').value,
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        if(status) status.textContent = data.error || 'Repo save failed';
+        return;
+      }
+      if(status) status.textContent = 'Saved.';
+      await loadOnboarding();
+    }
+
     async function loadOnboarding(){
-      const [sRes, cRes] = await Promise.all([fetch('/api/settings'), fetch('/api/system-checks')]);
+      const [sRes, cRes, rRes] = await Promise.all([
+        fetch('/api/settings'),
+        fetch('/api/system-checks'),
+        fetch('/api/github/repos'),
+      ]);
       const settings = await sRes.json();
       const checks = await cRes.json();
+      const repoData = await rRes.json();
+      const repos = repoData.repos || [];
       const gh = checks.gh || {};
       const ph = checks.posthog || {};
       const llm = checks.llm || {};
@@ -1025,6 +1100,9 @@ _INDEX_HTML = """<!doctype html>
         : llmProvider === 'anthropic' ? 'Anthropic'
         : llmProvider === 'openrouter' ? 'OpenRouter'
         : 'OpenAI-compatible';
+      const repoRows = repos.map(r => `
+        <li><code>${esc(r.repo_full_name)}</code> · branch=<code>${esc(r.default_branch || 'main')}</code>${r.local_path ? ` · path=<code>${esc(r.local_path)}</code>` : ''}</li>
+      `).join('');
       byId('onboarding').innerHTML = `
         <h3>Onboarding & Settings</h3>
         <form id=\"settingsForm\">
@@ -1083,6 +1161,23 @@ _INDEX_HTML = """<!doctype html>
           <div style=\"margin-top:10px\"><button class=\"btn\" type=\"submit\">Save Settings</button></div>
         </form>
         <div style=\"margin-top:10px\" class=\"empty\">GitHub CLI: <span class=\"${gh.installed?'ok':'bad'}\">${gh.installed?'installed':'missing'}</span> · auth: <span class=\"${gh.authed?'ok':'bad'}\">${gh.authed?'ok':'not authed'}</span></div>
+        <div class=\"lbl\">Connected Code Repository</div>
+        ${repoRows ? `<ul>${repoRows}</ul>` : '<div class=\"empty\">No connected repos yet.</div>'}
+        <form id=\"repoConnectForm\" style=\"margin-top:8px\">
+          <div class=\"grid\">
+            <div>
+              <div class=\"lbl\">Repo</div>
+              <input id=\"repoFullName\" value=\"${esc(repos[0]?.repo_full_name || '')}\" placeholder=\"owner/name\" />
+            </div>
+            <div>
+              <div class=\"lbl\">Branch</div>
+              <input id=\"repoDefaultBranch\" value=\"${esc(repos[0]?.default_branch || 'main')}\" />
+            </div>
+          </div>
+          <div class=\"lbl\">Local Checkout Path</div>
+          <input id=\"repoLocalPath\" value=\"${esc(repos[0]?.local_path || '')}\" placeholder=\"/path/to/repo\" />
+          <div style=\"margin-top:8px\"><button class=\"btn\" type=\"submit\">Connect Repo</button> <span class=\"empty\" id=\"repoConnectStatus\"></span></div>
+        </form>
         <div class=\"empty\">PostHog check: <span class=\"${ph.reachable===true?'ok':(ph.reachable===false?'bad':'')}\">${ph.reachable===true?'reachable':(ph.reachable===false?'unreachable':'not configured')}</span> ${esc(ph.detail || '')}</div>
         <div class=\"empty\">LLM check (${esc(llmProviderLabel)}): <span class=\"${llm.reachable===true?'ok':(llm.reachable===false?'bad':'')}\">${llm.reachable===true?'reachable':(llm.reachable===false?'unreachable':'not configured')}</span> ${esc(llm.detail || '')}</div>
         ${!gh.installed ? `<div class=\"empty\">Run in terminal: <code>${esc(gh.commands?.install || 'brew install gh')}</code> <button class=\"btn\" onclick=\"copyText('${esc(gh.commands?.install || 'brew install gh')}')\">Copy</button></div>` : ''}
@@ -1093,6 +1188,7 @@ _INDEX_HTML = """<!doctype html>
       byId('llmModelPicker').addEventListener('change', onModelPick);
       syncProviderUI(false);
       byId('settingsForm').addEventListener('submit', saveSettings);
+      byId('repoConnectForm').addEventListener('submit', connectGithubRepo);
     }
 
     async function createTesterSpec(ev){
@@ -1635,6 +1731,10 @@ def ui_command(
                 self._json(current_settings())
                 return
 
+            if path == "/api/github/repos":
+                self._json(_github_repos_payload(store))
+                return
+
             if path == "/api/system-checks":
                 s = current_settings(include_secrets=True)
                 self._json(
@@ -1836,6 +1936,17 @@ def ui_command(
                 _write_env(env_path, env)
 
                 self._json({"ok": True, "settings": current_settings()})
+                return
+
+            if path == "/api/github/repos":
+                body = self._read_json_body()
+                payload, status = _connect_github_repo_payload(
+                    store=store,
+                    repo_full_name=str(body.get("repo", "")).strip(),
+                    default_branch=str(body.get("branch", "")).strip(),
+                    local_path=str(body.get("local_path", "")).strip(),
+                )
+                self._json(payload, status=status)
                 return
 
             if path == "/api/llm/models":
