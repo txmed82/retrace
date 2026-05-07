@@ -116,8 +116,16 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     if (!(target instanceof Element)) {
       return {};
     }
+    const testIdAttrName = ["data-testid", "data-test", "data-qa"].find((attr) =>
+      target.getAttribute(attr),
+    );
+    const testIdValue = testIdAttrName
+      ? target.getAttribute(testIdAttrName) || undefined
+      : undefined;
     const description: Record<string, unknown> = {
       tagName: target.tagName.toLowerCase(),
+      testIdAttrName,
+      testIdValue,
       id: target.id || undefined,
       className: typeof target.className === "string" ? target.className : undefined,
       name: target.getAttribute("name") || undefined,

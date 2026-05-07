@@ -51,6 +51,36 @@ def _console_error(message: str, ts: int = 1000) -> dict[str, object]:
     }
 
 
+def _sdk_click(target: dict[str, object], ts: int = 100) -> dict[str, object]:
+    return {
+        "type": 6,
+        "timestamp": ts,
+        "data": {
+            "plugin": "retrace/click@1",
+            "payload": {
+                "button": 0,
+                "target": target,
+                "url": "https://app.example/checkout",
+            },
+        },
+    }
+
+
+def _sdk_input(target: dict[str, object], ts: int = 200) -> dict[str, object]:
+    return {
+        "type": 6,
+        "timestamp": ts,
+        "data": {
+            "plugin": "retrace/input@1",
+            "payload": {
+                "target": target,
+                "valueMasked": True,
+                "url": "https://app.example/checkout",
+            },
+        },
+    }
+
+
 class FailingLLM:
     def chat_json(self, *, system: str, user: str) -> dict[str, Any]:
         raise RuntimeError("offline")
@@ -579,6 +609,130 @@ def test_generate_spec_from_replay_issue_preserves_public_ids(
     assert generated.spec.exact_steps[1]["action"] == "click"
     assert generated.spec.fixtures["issue_public_id"] == issue_public_id
     assert (tmp_path / "specs" / f"{generated.spec.spec_id}.json").exists()
+
+
+def test_generate_spec_prefers_sdk_target_selectors_over_rrweb_ids(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-sdk-spec",
+        sequence=0,
+        events=[
+            _navigation("https://app.example/checkout"),
+            _click(9, ts=100),
+            _sdk_click(
+                {
+                    "tagName": "button",
+                    "testIdAttrName": "data-test",
+                    "testIdValue": "pay-button",
+                    "text": "Pay now",
+                },
+                ts=101,
+            ),
+            _sdk_input(
+                {
+                    "tagName": "input",
+                    "name": "email",
+                    "ariaLabel": "Email address",
+                },
+                ts=200,
+            ),
+            _sdk_click(
+                {
+                    "tagName": "button",
+                    "testIdAttrName": "data-qa",
+                    "testIdValue": "coupon-toggle",
+                },
+                ts=300,
+            ),
+            _console_error("TypeError: total is undefined", ts=1000),
+        ],
+        flush_type="final",
+    )
+    processed = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-sdk-spec"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+
+    generated = generate_spec_from_replay_issue(
+        store=store,
+        specs_dir=tmp_path / "specs",
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=processed.issues[0].public_id,
+    )
+
+    assert generated.spec.exact_steps[1] == {
+        "id": "click-1",
+        "action": "click",
+            "target": {
+                "tagName": "button",
+                "testIdAttrName": "data-test",
+                "testIdValue": "pay-button",
+                "text": "Pay now",
+                "selector": '[data-test="pay-button"]',
+            },
+        "source": "retrace_browser_sdk",
+    }
+    assert generated.spec.exact_steps[2]["target"]["selector"] == 'input[name="email"]'
+    assert generated.spec.exact_steps[3]["target"]["selector"] == '[data-qa="coupon-toggle"]'
+    assert all("rrweb node" not in gap for gap in generated.known_gaps)
+    assert generated.known_gaps == ["input-1 needs safe test data"]
+    assert generated.confidence == "medium"
+
+
+def test_generate_spec_keeps_rrweb_fallbacks_not_near_sdk_events(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-mixed-spec",
+        sequence=0,
+        events=[
+            _navigation("https://app.example/checkout"),
+            _click(9, ts=100),
+            _sdk_click(
+                {
+                    "tagName": "button",
+                    "testIdAttrName": "data-testid",
+                    "testIdValue": "pay-button",
+                },
+                ts=120,
+            ),
+            _click(77, ts=1000),
+            _console_error("TypeError: total is undefined", ts=1200),
+        ],
+        flush_type="final",
+    )
+    processed = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-mixed-spec"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+
+    generated = generate_spec_from_replay_issue(
+        store=store,
+        specs_dir=tmp_path / "specs",
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=processed.issues[0].public_id,
+    )
+
+    assert generated.spec.exact_steps[1]["target"]["selector"] == '[data-testid="pay-button"]'
+    assert generated.spec.exact_steps[2]["target"] == {"rrweb_id": 77}
+    assert generated.known_gaps == [
+        "click-2 needs a durable locator for rrweb node 77"
+    ]
 
 
 def test_promote_replay_issue_dedupes_external_ticket(
