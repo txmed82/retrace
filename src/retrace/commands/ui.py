@@ -17,10 +17,16 @@ import click
 import httpx
 import yaml
 
+from retrace.fix_suggestions import (
+    generate_fix_suggestions,
+    parsed_finding_from_replay_issue,
+    replay_issue_report_key,
+    slugify,
+)
 from retrace.llm.client import build_llm_http_request
 from retrace.reports.parser import parse_report_findings
 from retrace.replay_specs import generate_spec_from_replay_issue
-from retrace.storage import Storage
+from retrace.storage import GitHubRepoRow, Storage
 from retrace.tester import (
     DEFAULT_APP_URL,
     DEFAULT_HARNESS_COMMAND,
@@ -763,6 +769,89 @@ def _generate_replay_issue_spec_payload(
     )
 
 
+def _select_repo(
+    *, store: Storage, repo_full_name: str = ""
+) -> tuple[GitHubRepoRow | None, str]:
+    repos = store.list_github_repos()
+    requested = repo_full_name.strip()
+    if requested:
+        repo = store.get_github_repo(requested)
+        if repo is None:
+            return None, (
+                f"Repo not connected: {requested}. "
+                "Run `retrace github connect --repo org/name` first."
+            )
+        return repo, ""
+    if not repos:
+        return None, "No connected repo. Run `retrace github connect --repo org/name` first."
+    return repos[0], ""
+
+
+def _generate_replay_issue_fix_prompts_payload(
+    *,
+    store: Storage,
+    output_dir: Path,
+    issue_id: str,
+    project_id: str,
+    environment_id: str,
+    repo_full_name: str = "",
+) -> tuple[dict[str, Any], int]:
+    repo, error = _select_repo(store=store, repo_full_name=repo_full_name)
+    if repo is None:
+        return {"ok": False, "error": error}, 400
+
+    try:
+        issue = store.get_replay_issue(
+            project_id=project_id,
+            environment_id=environment_id,
+            issue_id=issue_id,
+        )
+        if issue is None:
+            return {"ok": False, "error": f"Replay issue not found: {issue_id}"}, 404
+        finding = parsed_finding_from_replay_issue(issue)
+        repo_path = Path(repo.local_path) if repo.local_path else None
+        result = generate_fix_suggestions(
+            store=store,
+            repo=repo,
+            repo_path=repo_path,
+            out_dir=output_dir / "fix-prompts",
+            report_key=replay_issue_report_key(str(issue["public_id"])),
+            source_label=f"replay issue {issue['public_id']}",
+            artifact_stem=f"replay-{slugify(str(issue['public_id']))}",
+            findings=[finding],
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 400
+
+    artifact = result.artifacts[0] if result.artifacts else None
+    return (
+        {
+            "ok": True,
+            "issue_public_id": str(issue["public_id"]),
+            "repo": result.repo_full_name,
+            "repo_path": result.repo_path,
+            "out_dir": str(result.out_dir),
+            "stored": result.stored,
+            "generated": result.generated,
+            "regression_counts": result.regression_counts,
+            "finding_hash": artifact.finding_hash if artifact else "",
+            "candidates": [
+                {
+                    "file_path": c.file_path,
+                    "symbol": c.symbol,
+                    "score": c.score,
+                    "rationale": c.rationale,
+                }
+                for c in (artifact.candidates if artifact else [])
+            ],
+            "prompts": artifact.prompts if artifact else {},
+            "prompt_files": artifact.prompt_files if artifact else {},
+            "artifact_json": artifact.artifact_json if artifact else "",
+        },
+        200,
+    )
+
+
 _INDEX_HTML = """<!doctype html>
 <html>
 <head>
@@ -1071,6 +1160,55 @@ _INDEX_HTML = """<!doctype html>
       await loadTesterPanel();
     }
 
+    async function generateReplayIssueFixPrompts(issue){
+      if(!issue){ return; }
+      const status = byId('replayFixPromptStatus');
+      if(status) status.textContent = 'Generating...';
+      const res = await fetch('/api/replay-issue/fix-prompts', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          issue_id: issue.public_id || issue.id,
+          project_id: issue.project_id,
+          environment_id: issue.environment_id,
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        if(status) status.textContent = `Failed: ${data.error || 'could not generate prompts'}`;
+        return;
+      }
+      if(status) status.textContent = `Wrote ${data.generated || 0} prompt set(s) for ${data.repo || 'repo'}`;
+      renderReplayFixSuggestions(data);
+    }
+
+    function renderReplayFixSuggestions(data){
+      const root = byId('replayFixPrompts');
+      if(!root){ return; }
+      const cands = (data.candidates || []).map(c =>
+        `<li><code>${esc(c.file_path)}</code>${c.symbol ? ` · <code>${esc(c.symbol)}</code>` : ''} (score=${esc(c.score)})<br><span class="empty">${esc(c.rationale)}</span></li>`
+      ).join('');
+      const codex = data.prompts?.codex || '';
+      const claude = data.prompts?.claude_code || '';
+      root.innerHTML = `
+        <div class="grid">
+          <div class="card"><h3>Likely Culprits</h3>${cands ? `<ul>${cands}</ul>` : '<div class="empty">No code candidates found. Connect a repo with a local path for file matching.</div>'}</div>
+          <div class="card"><h3>Artifacts</h3>
+            <div class="empty">Repo: <code>${esc(data.repo || '')}</code></div>
+            <div class="empty">Output: <code>${esc(data.out_dir || '')}</code></div>
+            <div class="empty">JSON: <code>${esc(data.artifact_json || '')}</code></div>
+          </div>
+        </div>
+        <div style="height:12px"></div>
+        <div class="grid">
+          <div class="card"><h3>Codex Prompt <button class="btn" id="copyReplayCodexPrompt" type="button">Copy</button></h3><pre>${esc(codex)}</pre></div>
+          <div class="card"><h3>Claude Prompt <button class="btn" id="copyReplayClaudePrompt" type="button">Copy</button></h3><pre>${esc(claude)}</pre></div>
+        </div>
+      `;
+      byId('copyReplayCodexPrompt')?.addEventListener('click', () => copyText(codex));
+      byId('copyReplayClaudePrompt')?.addEventListener('click', () => copyText(claude));
+    }
+
     async function loadTesterPanel(){
       const [specRes, runsRes, settingsRes] = await Promise.all([
         fetch('/api/tester/specs'),
@@ -1203,7 +1341,16 @@ _INDEX_HTML = """<!doctype html>
         <div class="lbl">Summary</div><div>${esc(issue.summary || '')}</div>
         <div class="lbl">Likely Cause</div><div>${esc(issue.likely_cause || '')}</div>
         <div class="lbl">Reproduction Steps</div>${steps ? `<ul>${steps}</ul>` : '<div class="empty">No steps generated yet.</div>'}
-        <div style="margin-top:10px"><button class="btn" id="generateReplaySpecBtn" type="button">Generate Regression Spec</button> <span class="empty" id="replaySpecStatus"></span></div>
+        <div style="margin-top:10px">
+          <button class="btn" id="generateReplaySpecBtn" type="button">Generate Regression Spec</button>
+          <span class="empty" id="replaySpecStatus"></span>
+        </div>
+        <div style="margin-top:10px">
+          <button class="btn" id="generateReplayFixPromptsBtn" type="button">Generate Fix Prompts</button>
+          <span class="empty" id="replayFixPromptStatus"></span>
+        </div>
+        <div style="height:10px"></div>
+        <div id="replayFixPrompts"></div>
         <div class="lbl">Sessions</div>${sessions ? `<ul>${sessions}</ul>` : '<div class="empty">No linked sessions.</div>'}
         <div class="lbl">External Ticket</div>
         <div class="empty">${issue.external_ticket_url ? `<a href="${esc(issue.external_ticket_url)}" target="_blank">${esc(issue.external_ticket_id || issue.external_ticket_url)}</a>` : esc(issue.external_ticket_state || 'none')}</div>
@@ -1213,6 +1360,7 @@ _INDEX_HTML = """<!doctype html>
         el.addEventListener('click', () => loadFirstPartyReplay(el.dataset.replaySession));
       });
       byId('generateReplaySpecBtn')?.addEventListener('click', () => generateReplayIssueSpec(issue));
+      byId('generateReplayFixPromptsBtn')?.addEventListener('click', () => generateReplayIssueFixPrompts(issue));
     }
 
     function applyReplayHash(issues, sessions){
@@ -1793,6 +1941,24 @@ def ui_command(
                     environment_id=str(body.get("environment_id", "")).strip()
                     or workspace.environment_id,
                     app_url=str(body.get("app_url", "")).strip(),
+                )
+                self._json(payload, status=status)
+                return
+
+            if path == "/api/replay-issue/fix-prompts":
+                body = self._read_json_body()
+                workspace = store.ensure_workspace(project_name="Default")
+                payload, status = _generate_replay_issue_fix_prompts_payload(
+                    store=store,
+                    output_dir=output_dir,
+                    issue_id=str(body.get("issue_id", "")).strip(),
+                    project_id=str(body.get("project_id", "")).strip()
+                    or workspace.project_id,
+                    environment_id=str(body.get("environment_id", "")).strip()
+                    or workspace.environment_id,
+                    repo_full_name=str(body.get("repo", "")).strip()
+                    or repo_full_name
+                    or "",
                 )
                 self._json(payload, status=status)
                 return

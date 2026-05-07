@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from retrace.commands.ui import _generate_replay_issue_spec_payload
+from retrace.commands.ui import (
+    _generate_replay_issue_fix_prompts_payload,
+    _generate_replay_issue_spec_payload,
+)
 from retrace.replay_core import ReplaySignalConfig, process_replay_sessions
 from retrace.storage import Storage
 from retrace.tester import specs_dir_for_data_dir
@@ -97,3 +100,75 @@ def test_generate_replay_issue_spec_payload_reports_missing_issue(
 
     assert status == 404
     assert payload == {"ok": False, "error": "Replay issue not found: bug_missing"}
+
+
+def test_generate_replay_issue_fix_prompts_payload_creates_agent_prompts(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    repo_dir = tmp_path / "repo"
+    src_dir = repo_dir / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "checkout.tsx").write_text(
+        "export function Checkout(){ throw new Error('Checkout crashed') }\n",
+        encoding="utf-8",
+    )
+    store.upsert_github_repo(
+        repo_full_name="acme/widgets",
+        default_branch="main",
+        local_path=str(repo_dir),
+    )
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-ui-prompts",
+        sequence=0,
+        events=[
+            {
+                "type": 4,
+                "timestamp": 0,
+                "data": {"href": "https://app.example/checkout"},
+            },
+            {
+                "type": 6,
+                "timestamp": 200,
+                "data": {
+                    "plugin": "retrace/console@1",
+                    "payload": {
+                        "level": "error",
+                        "payload": ["Checkout crashed in src/checkout.tsx"],
+                    },
+                },
+            },
+        ],
+        flush_type="final",
+    )
+    processed = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-ui-prompts"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    issue_public_id = processed.issues[0].public_id
+
+    payload, status = _generate_replay_issue_fix_prompts_payload(
+        store=store,
+        output_dir=tmp_path / "reports",
+        issue_id=issue_public_id,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        repo_full_name="acme/widgets",
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["issue_public_id"] == issue_public_id
+    assert payload["repo"] == "acme/widgets"
+    assert payload["generated"] == 1
+    assert payload["candidates"][0]["file_path"] == "src/checkout.tsx"
+    assert issue_public_id in payload["prompts"]["codex"]
+    assert "src/checkout.tsx" in payload["prompts"]["claude_code"]
+    out_dir = tmp_path / "reports" / "fix-prompts"
+    assert (out_dir / payload["artifact_json"]).exists()
+    assert (out_dir / payload["prompt_files"]["codex"]).exists()
