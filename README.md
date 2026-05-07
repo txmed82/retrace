@@ -86,13 +86,16 @@ Try the replay-backed workflow without production traffic:
 
 ```bash
 retrace demo seed
-retrace tester from-replay-issue <issue_public_id>
+retrace tester list
 retrace ui
 ```
 
 `retrace demo seed` creates a local replay-backed checkout failure, processes it
 through deterministic detectors, writes a replay-derived UI regression spec, and
-prints the `issue_public_id` for follow-up commands.
+prints the `issue_public_id` for follow-up commands. Use `retrace tester list`
+to inspect the generated spec; run `retrace tester from-replay-issue
+<issue_public_id>` only when you want to generate another spec from the same
+issue.
 
 ## Local UI (Onboarding + Replay + Prompts)
 

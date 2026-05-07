@@ -19,6 +19,7 @@ def test_demo_seed_creates_replay_issue_and_spec_without_config(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
+    assert payload["config_path"] == "config.yaml"
     assert payload["session_id"] == "demo-checkout-crash"
     assert (tmp_path / "config.yaml").exists()
     assert payload["signals_detected"] == 1
@@ -60,3 +61,19 @@ def test_demo_seed_can_skip_spec_generation(tmp_path: Path, monkeypatch) -> None
     payload = json.loads(result.output)
     assert payload["tester_spec"] is None
     assert not (tmp_path / "data" / "ui-tests" / "specs").exists()
+
+
+def test_demo_seed_next_commands_preserve_custom_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    config_path = tmp_path / "custom config.yaml"
+
+    result = runner.invoke(main, ["demo", "seed", "--config", str(config_path)])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["config_path"] == str(config_path)
+    assert str(config_path) in payload["next_commands"][0]
+    assert str(config_path) in payload["next_commands"][1]

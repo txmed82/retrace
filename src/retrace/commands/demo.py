@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,7 @@ def seed_demo(
     click.echo(
         json.dumps(
             {
+                "config_path": str(config_path),
                 "project_id": workspace.project_id,
                 "environment_id": workspace.environment_id,
                 "session_id": session_id,
@@ -107,8 +109,9 @@ def seed_demo(
                 "issue_regressed": issue.regressed,
                 "tester_spec": generated_payload or None,
                 "next_commands": [
-                    f"retrace tester from-replay-issue {issue.public_id}",
-                    "retrace ui",
+                    "retrace tester from-replay-issue "
+                    f"--config {shlex.quote(str(config_path))} {issue.public_id}",
+                    f"retrace ui --config {shlex.quote(str(config_path))}",
                 ],
             },
             indent=2,
