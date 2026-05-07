@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 import click
 
 from retrace.config import load_config
 from retrace.matching import score_repo_for_finding
 from retrace.prompts import build_claude_code_prompt, build_codex_prompt
-from retrace.reports.parser import parse_report_findings
+from retrace.reports.parser import ParsedFinding, parse_report_findings
 from retrace.storage import Storage
 
 
@@ -41,6 +42,14 @@ def _latest_report(report_dir: Path) -> Path:
     help="Use latest markdown report.",
 )
 @click.option(
+    "--replay-issue",
+    "replay_issue_id",
+    default="",
+    help="Generate prompts directly from a replay-backed issue public ID or row ID.",
+)
+@click.option("--project-id", default="", help="Project ID override for --replay-issue.")
+@click.option("--environment-id", default="", help="Environment ID override for --replay-issue.")
+@click.option(
     "--repo", "repo_full_name", required=True, help="Connected repo in org/name format."
 )
 @click.option(
@@ -67,13 +76,21 @@ def suggest_fixes_command(
     *,
     report_path: Path | None,
     use_latest: bool,
+    replay_issue_id: str,
+    project_id: str,
+    environment_id: str,
     repo_full_name: str,
     repo_path: Path | None,
     out_dir: Path,
     config_path: Path,
 ) -> None:
-    if bool(report_path) == bool(use_latest):
-        raise click.ClickException("Provide exactly one of --report or --latest.")
+    source_count = sum(
+        1 for enabled in (bool(report_path), bool(use_latest), bool(replay_issue_id.strip())) if enabled
+    )
+    if source_count != 1:
+        raise click.ClickException(
+            "Provide exactly one of --report, --latest, or --replay-issue."
+        )
 
     cfg = load_config(config_path)
     store = Storage(cfg.run.data_dir / "retrace.db")
@@ -84,9 +101,6 @@ def suggest_fixes_command(
         raise click.ClickException(
             f"Repo not connected: {repo_full_name}. Run `retrace github connect --repo {repo_full_name}` first."
         )
-
-    target_report = _latest_report(cfg.run.output_dir) if use_latest else report_path
-    assert target_report is not None
 
     effective_repo_path = repo_path or (
         Path(repo.local_path) if repo.local_path else None
@@ -101,9 +115,33 @@ def suggest_fixes_command(
         )
         repo = store.get_github_repo(repo_full_name) or repo
 
-    findings = parse_report_findings(target_report)
+    source_label = ""
+    artifact_stem = ""
+    if replay_issue_id.strip():
+        workspace = store.ensure_workspace(project_name="Default")
+        effective_project_id = project_id.strip() or workspace.project_id
+        effective_environment_id = environment_id.strip() or workspace.environment_id
+        issue = store.get_replay_issue(
+            project_id=effective_project_id,
+            environment_id=effective_environment_id,
+            issue_id=replay_issue_id.strip(),
+        )
+        if issue is None:
+            raise click.ClickException(f"Replay issue not found: {replay_issue_id}")
+        findings = [_parsed_finding_from_replay_issue(issue)]
+        source_label = f"replay issue {issue['public_id']}"
+        artifact_stem = f"replay-{_slugify(str(issue['public_id']))}"
+        report_key = f"replay://issue/{issue['public_id']}"
+    else:
+        target_report = _latest_report(cfg.run.output_dir) if use_latest else report_path
+        assert target_report is not None
+        findings = parse_report_findings(target_report)
+        source_label = str(target_report)
+        artifact_stem = target_report.stem
+        report_key = str(target_report)
+
     if not findings:
-        click.echo(f"No findings parsed from {target_report}")
+        click.echo(f"No findings parsed from {source_label}")
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +153,7 @@ def suggest_fixes_command(
         f_hash = f.finding_hash()
         finding_hashes.append(f_hash)
         finding_id = store.upsert_report_finding(
-            report_path=str(target_report),
+            report_path=report_key,
             finding_hash=f_hash,
             title=f.title,
             severity=f.severity,
@@ -186,18 +224,18 @@ def suggest_fixes_command(
                 for c in candidates
             ],
             "prompt_files": {
-                "codex": f"{target_report.stem}-{idx:02d}-{_slugify(f.title)}.codex.md",
-                "claude_code": f"{target_report.stem}-{idx:02d}-{_slugify(f.title)}.claude.md",
+                "codex": f"{artifact_stem}-{idx:02d}-{_slugify(f.title)}.codex.md",
+                "claude_code": f"{artifact_stem}-{idx:02d}-{_slugify(f.title)}.claude.md",
             },
         }
-        base = f"{target_report.stem}-{idx:02d}-{_slugify(f.title)}"
+        base = f"{artifact_stem}-{idx:02d}-{_slugify(f.title)}"
         (out_dir / f"{base}.json").write_text(json.dumps(artifact, indent=2) + "\n")
         (out_dir / f"{base}.codex.md").write_text(codex_prompt + "\n")
         (out_dir / f"{base}.claude.md").write_text(claude_prompt + "\n")
         generated += 1
 
     regression = store.reconcile_regression_states(
-        report_path=str(target_report),
+        report_path=report_key,
         finding_hashes=finding_hashes,
     )
     new_count = sum(1 for state, _ in regression.values() if state == "new")
@@ -205,7 +243,56 @@ def suggest_fixes_command(
     ongoing_count = sum(1 for state, _ in regression.values() if state == "ongoing")
 
     click.echo(
-        f"Parsed {len(findings)} findings from {target_report}. "
+        f"Parsed {len(findings)} findings from {source_label}. "
         f"Stored {stored} findings. Wrote {generated} fix-prompt artifact set(s) to {out_dir}. "
         f"Regression states: new={new_count}, ongoing={ongoing_count}, regressed={regressed_count}."
     )
+
+
+def _parsed_finding_from_replay_issue(issue: Any) -> ParsedFinding:
+    signal_summary = _json_obj(issue["signal_summary_json"])
+    evidence = _json_obj(issue["evidence_json"])
+    reproduction_steps = _json_list(issue["reproduction_steps_json"])
+    representative_session_id = str(issue["representative_session_id"] or "")
+    evidence_text = json.dumps(
+        {
+            "issue_public_id": str(issue["public_id"] or ""),
+            "summary": str(issue["summary"] or ""),
+            "likely_cause": str(issue["likely_cause"] or ""),
+            "reproduction_steps": reproduction_steps,
+            "signal_summary": signal_summary,
+            "evidence": evidence,
+        },
+        sort_keys=True,
+    )
+    return ParsedFinding(
+        title=str(issue["title"] or "Replay issue"),
+        severity=str(issue["severity"] or "medium"),
+        category="replay_issue",
+        session_url=f"retrace://replay/{representative_session_id}",
+        evidence_text=evidence_text,
+        distinct_id=str(issue["distinct_id"] or "") or None,
+        error_issue_ids=_json_list(issue["error_issue_ids_json"]),
+        trace_ids=_json_list(issue["trace_ids_json"]),
+        top_stack_frame=str(issue["top_stack_frame"] or "") or None,
+        error_tracking_url=str(issue["error_tracking_url"] or "") or None,
+        logs_url=str(issue["logs_url"] or "") or None,
+    )
+
+
+def _json_obj(raw: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(raw or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_list(raw: Any) -> list[str]:
+    try:
+        parsed = json.loads(str(raw or "[]"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if str(item)]

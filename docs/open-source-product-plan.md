@@ -181,7 +181,7 @@ fresh checkout:
 5. Process the replay into a replay-backed issue.
 6. Generate a UI regression spec from that issue.
 7. Connect a GitHub/local checkout.
-8. Generate fix prompts with likely source files.
+8. Generate fix prompts with likely source files from the replay-backed issue.
 9. Apply a fix with a coding agent.
 10. Run the generated UI spec in CI or locally.
 11. Mark the issue resolved and verify it does not regress.
