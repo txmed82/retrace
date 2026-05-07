@@ -123,6 +123,7 @@ From the UI you can:
 - Copy the `retrace api serve` command when the ingest API is down
 - Connect a GitHub-style `owner/name` repo and local checkout path for code
   matching
+- Connect a path-only local codebase when the source is not hosted on GitHub
 - Create write-only browser SDK keys and copy `@retrace/browser` install/init
   snippets for first-party replay capture
 - Send a test replay with the generated SDK key to verify first-party ingest
