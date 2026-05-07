@@ -1458,9 +1458,9 @@ const retrace = init({
         <div class=\"empty\">PostHog check: <span class=\"${ph.reachable===true?'ok':(ph.reachable===false?'bad':'')}\">${ph.reachable===true?'reachable':(ph.reachable===false?'unreachable':'not configured')}</span> ${esc(ph.detail || '')}</div>
         <div class=\"empty\">LLM check (${esc(llmProviderLabel)}): <span class=\"${llm.reachable===true?'ok':(llm.reachable===false?'bad':'')}\">${llm.reachable===true?'reachable':(llm.reachable===false?'unreachable':'not configured')}</span> ${esc(llm.detail || '')}</div>
         <div class=\"empty\">Replay ingest API: <span class=\"${replayApi.reachable===true?'ok':'bad'}\">${replayApi.reachable===true?'reachable':'unreachable'}</span> at <code>${esc(replayApi.url || 'http://127.0.0.1:8788')}</code> ${esc(replayApi.detail || '')}</div>
-        ${replayApi.reachable !== true ? `<div class=\"empty\">Run in terminal: <code>${esc(replayApi.commands?.serve || 'retrace api serve')}</code> <button class=\"btn\" onclick=\"copyText('${esc(replayApi.commands?.serve || 'retrace api serve')}')\">Copy</button></div>` : ''}
-        ${!gh.installed ? `<div class=\"empty\">Run in terminal: <code>${esc(gh.commands?.install || 'brew install gh')}</code> <button class=\"btn\" onclick=\"copyText('${esc(gh.commands?.install || 'brew install gh')}')\">Copy</button></div>` : ''}
-        ${gh.installed && !gh.authed ? `<div class=\"empty\">Run in terminal: <code>${esc(gh.commands?.login || 'gh auth login')}</code> <button class=\"btn\" onclick=\"copyText('${esc(gh.commands?.login || 'gh auth login')}')\">Copy</button></div>` : ''}
+        ${replayApi.reachable !== true ? `<div class=\"empty\">Run in terminal: <code>${esc(replayApi.commands?.serve || 'retrace api serve')}</code> <button class=\"btn\" id=\"copyReplayServeBtn\" data-copy-text=\"${esc(replayApi.commands?.serve || 'retrace api serve')}\">Copy</button></div>` : ''}
+        ${!gh.installed ? `<div class=\"empty\">Run in terminal: <code>${esc(gh.commands?.install || 'brew install gh')}</code> <button class=\"btn\" id=\"copyGhInstallBtn\" data-copy-text=\"${esc(gh.commands?.install || 'brew install gh')}\">Copy</button></div>` : ''}
+        ${gh.installed && !gh.authed ? `<div class=\"empty\">Run in terminal: <code>${esc(gh.commands?.login || 'gh auth login')}</code> <button class=\"btn\" id=\"copyGhLoginBtn\" data-copy-text=\"${esc(gh.commands?.login || 'gh auth login')}\">Copy</button></div>` : ''}
       `;
       byId('llmProvider').addEventListener('change', () => syncProviderUI(true));
       byId('fetchModelsBtn').addEventListener('click', fetchModels);
@@ -1469,6 +1469,9 @@ const retrace = init({
       byId('settingsForm').addEventListener('submit', saveSettings);
       byId('repoConnectForm').addEventListener('submit', connectGithubRepo);
       byId('sdkKeyForm').addEventListener('submit', createSdkKey);
+      byId('copyReplayServeBtn')?.addEventListener('click', ev => copyText(ev.currentTarget.dataset.copyText));
+      byId('copyGhInstallBtn')?.addEventListener('click', ev => copyText(ev.currentTarget.dataset.copyText));
+      byId('copyGhLoginBtn')?.addEventListener('click', ev => copyText(ev.currentTarget.dataset.copyText));
     }
 
     async function createTesterSpec(ev){
@@ -1903,9 +1906,11 @@ const retrace = init({
         </div>
         <div style=\"height:12px\"></div>
         <div class=\"grid\">
-          <div class=\"card\"><h3>Codex Prompt <button class=\"btn\" onclick=\"copyPrompt('codex')\">Copy</button></h3><pre>${esc(codex)}</pre></div>
-          <div class=\"card\"><h3>Claude Prompt <button class=\"btn\" onclick=\"copyPrompt('claude_code')\">Copy</button></h3><pre>${esc(claude)}</pre></div>
+          <div class=\"card\"><h3>Codex Prompt <button class=\"btn\" id=\"copyFindingCodexPrompt\" type=\"button\">Copy</button></h3><pre>${esc(codex)}</pre></div>
+          <div class=\"card\"><h3>Claude Prompt <button class=\"btn\" id=\"copyFindingClaudePrompt\" type=\"button\">Copy</button></h3><pre>${esc(claude)}</pre></div>
         </div>`;
+      byId('copyFindingCodexPrompt')?.addEventListener('click', () => copyPrompt('codex'));
+      byId('copyFindingClaudePrompt')?.addEventListener('click', () => copyPrompt('claude_code'));
       loadReplay(active.session_id);
     }
 

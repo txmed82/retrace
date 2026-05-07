@@ -82,6 +82,7 @@ def test_replay_api_check_reports_unreachable_server() -> None:
 def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "[&<>\"']" in _INDEX_HTML
     assert '"\'":\'&#39;\'' in _INDEX_HTML
+    assert "onclick=" not in _INDEX_HTML
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(
