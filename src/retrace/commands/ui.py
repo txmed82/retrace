@@ -665,6 +665,37 @@ def _json_field(row: Any, key: str, fallback: Any) -> Any:
         return fallback
 
 
+def _replay_issue_payload(
+    row: Any, *, sessions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "public_id": str(row["public_id"]),
+        "project_id": str(row["project_id"]),
+        "environment_id": str(row["environment_id"]),
+        "status": str(row["status"]),
+        "priority": str(row["priority"]),
+        "severity": str(row["severity"]),
+        "title": str(row["title"]),
+        "summary": str(row["summary"]),
+        "likely_cause": str(row["likely_cause"]),
+        "reproduction_steps": _json_field(row, "reproduction_steps_json", []),
+        "signal_summary": _json_field(row, "signal_summary_json", {}),
+        "evidence": _json_field(row, "evidence_json", {}),
+        "affected_count": int(row["affected_count"]),
+        "affected_users": int(row["affected_users"]),
+        "representative_session_id": str(row["representative_session_id"]),
+        "external_ticket_state": str(row["external_ticket_state"]),
+        "external_ticket_url": str(row["external_ticket_url"]),
+        "external_ticket_id": str(row["external_ticket_id"]),
+        "first_seen_ms": int(row["first_seen_ms"]),
+        "last_seen_ms": int(row["last_seen_ms"]),
+        "updated_at": str(row["updated_at"]),
+        "sessions": sessions,
+        "share_url": f"#issue={str(row['public_id'])}",
+    }
+
+
 def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
     issues = []
     issue_rows = store.list_recent_replay_issues(limit=50)
@@ -682,34 +713,10 @@ def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
         )
     for row in issue_rows:
         issues.append(
-            {
-                "id": str(row["id"]),
-                "public_id": str(row["public_id"]),
-                "project_id": str(row["project_id"]),
-                "environment_id": str(row["environment_id"]),
-                "status": str(row["status"]),
-                "priority": str(row["priority"]),
-                "severity": str(row["severity"]),
-                "title": str(row["title"]),
-                "summary": str(row["summary"]),
-                "likely_cause": str(row["likely_cause"]),
-                "reproduction_steps": _json_field(
-                    row, "reproduction_steps_json", []
-                ),
-                "signal_summary": _json_field(row, "signal_summary_json", {}),
-                "evidence": _json_field(row, "evidence_json", {}),
-                "affected_count": int(row["affected_count"]),
-                "affected_users": int(row["affected_users"]),
-                "representative_session_id": str(row["representative_session_id"]),
-                "external_ticket_state": str(row["external_ticket_state"]),
-                "external_ticket_url": str(row["external_ticket_url"]),
-                "external_ticket_id": str(row["external_ticket_id"]),
-                "first_seen_ms": int(row["first_seen_ms"]),
-                "last_seen_ms": int(row["last_seen_ms"]),
-                "updated_at": str(row["updated_at"]),
-                "sessions": issue_sessions_by_id.get(str(row["id"]), []),
-                "share_url": f"#issue={str(row['public_id'])}",
-            }
+            _replay_issue_payload(
+                row,
+                sessions=issue_sessions_by_id.get(str(row["id"]), []),
+            )
         )
     sessions = []
     for row in store.list_recent_replay_sessions(limit=50):
@@ -847,6 +854,45 @@ def _generate_replay_issue_fix_prompts_payload(
             "prompts": artifact.prompts if artifact else {},
             "prompt_files": artifact.prompt_files if artifact else {},
             "artifact_json": artifact.artifact_json if artifact else "",
+        },
+        200,
+    )
+
+
+def _transition_replay_issue_payload(
+    *,
+    store: Storage,
+    issue_id: str,
+    project_id: str,
+    environment_id: str,
+    status: str,
+) -> tuple[dict[str, Any], int]:
+    if status not in {"resolved", "unresolved"}:
+        return {"ok": False, "error": "status must be resolved or unresolved"}, 400
+    issue = store.get_replay_issue(
+        project_id=project_id,
+        environment_id=environment_id,
+        issue_id=issue_id,
+    )
+    if issue is None:
+        return {"ok": False, "error": f"Replay issue not found: {issue_id}"}, 404
+    try:
+        updated = store.transition_replay_issue(str(issue["id"]), status=status)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}, 400
+    refreshed = store.get_replay_issue(
+        project_id=project_id,
+        environment_id=environment_id,
+        issue_id=issue_id,
+    )
+    return (
+        {
+            "ok": True,
+            "updated": updated,
+            "issue": _replay_issue_payload(
+                refreshed if refreshed is not None else issue,
+                sessions=[],
+            ),
         },
         200,
     )
@@ -1278,6 +1324,32 @@ _INDEX_HTML = """<!doctype html>
       renderReplayFixSuggestions(data);
     }
 
+    async function transitionReplayIssue(issue, statusValue){
+      if(!issue){ return; }
+      const status = byId('replayLifecycleStatus');
+      if(status) status.textContent = 'Saving...';
+      const res = await fetch('/api/replay-issue/status', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          issue_id: issue.public_id || issue.id,
+          project_id: issue.project_id,
+          environment_id: issue.environment_id,
+          status: statusValue,
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        if(status) status.textContent = `Failed: ${data.error || 'could not update issue'}`;
+        return;
+      }
+      const updated = data.issue || issue;
+      Object.assign(issue, updated);
+      if(status) status.textContent = `Status: ${updated.status}`;
+      await loadReplayDashboard(`Updated ${updated.public_id || issue.public_id} to ${updated.status}.`);
+      renderReplayIssueDetail(updated);
+    }
+
     function renderReplayFixSuggestions(data){
       const root = byId('replayFixPrompts');
       if(!root){ return; }
@@ -1438,6 +1510,11 @@ _INDEX_HTML = """<!doctype html>
         <div class="lbl">Likely Cause</div><div>${esc(issue.likely_cause || '')}</div>
         <div class="lbl">Reproduction Steps</div>${steps ? `<ul>${steps}</ul>` : '<div class="empty">No steps generated yet.</div>'}
         <div style="margin-top:10px">
+          <button class="btn" id="resolveReplayIssueBtn" type="button">Mark Resolved</button>
+          <button class="btn" id="unresolveReplayIssueBtn" type="button">Mark Unresolved</button>
+          <span class="empty" id="replayLifecycleStatus"></span>
+        </div>
+        <div style="margin-top:10px">
           <button class="btn" id="generateReplaySpecBtn" type="button">Generate Regression Spec</button>
           <span class="empty" id="replaySpecStatus"></span>
         </div>
@@ -1455,6 +1532,8 @@ _INDEX_HTML = """<!doctype html>
       root.querySelectorAll('[data-replay-session]').forEach(el => {
         el.addEventListener('click', () => loadFirstPartyReplay(el.dataset.replaySession));
       });
+      byId('resolveReplayIssueBtn')?.addEventListener('click', () => transitionReplayIssue(issue, 'resolved'));
+      byId('unresolveReplayIssueBtn')?.addEventListener('click', () => transitionReplayIssue(issue, 'unresolved'));
       byId('generateReplaySpecBtn')?.addEventListener('click', () => generateReplayIssueSpec(issue));
       byId('generateReplayFixPromptsBtn')?.addEventListener('click', () => generateReplayIssueFixPrompts(issue));
     }
@@ -2070,6 +2149,21 @@ def ui_command(
                     repo_full_name=str(body.get("repo", "")).strip()
                     or repo_full_name
                     or "",
+                )
+                self._json(payload, status=status)
+                return
+
+            if path == "/api/replay-issue/status":
+                body = self._read_json_body()
+                workspace = store.ensure_workspace(project_name="Default")
+                payload, status = _transition_replay_issue_payload(
+                    store=store,
+                    issue_id=str(body.get("issue_id", "")).strip(),
+                    project_id=str(body.get("project_id", "")).strip()
+                    or workspace.project_id,
+                    environment_id=str(body.get("environment_id", "")).strip()
+                    or workspace.environment_id,
+                    status=str(body.get("status", "")).strip(),
                 )
                 self._json(payload, status=status)
                 return

@@ -5,6 +5,7 @@ from pathlib import Path
 from retrace.commands.ui import (
     _generate_replay_issue_fix_prompts_payload,
     _generate_replay_issue_spec_payload,
+    _transition_replay_issue_payload,
 )
 from retrace.replay_core import ReplaySignalConfig, process_replay_sessions
 from retrace.storage import Storage
@@ -172,3 +173,92 @@ def test_generate_replay_issue_fix_prompts_payload_creates_agent_prompts(
     out_dir = tmp_path / "reports" / "fix-prompts"
     assert (out_dir / payload["artifact_json"]).exists()
     assert (out_dir / payload["prompt_files"]["codex"]).exists()
+
+
+def test_transition_replay_issue_payload_marks_resolved_and_unresolved(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-ui-lifecycle",
+        sequence=0,
+        events=[
+            {
+                "type": 6,
+                "timestamp": 200,
+                "data": {
+                    "plugin": "retrace/console@1",
+                    "payload": {"level": "error", "payload": ["Lifecycle crashed"]},
+                },
+            },
+        ],
+        flush_type="final",
+    )
+    processed = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-ui-lifecycle"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    issue_public_id = processed.issues[0].public_id
+
+    payload, status = _transition_replay_issue_payload(
+        store=store,
+        issue_id=issue_public_id,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        status="resolved",
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["issue"]["public_id"] == issue_public_id
+    assert payload["issue"]["status"] == "resolved"
+
+    payload, status = _transition_replay_issue_payload(
+        store=store,
+        issue_id=issue_public_id,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        status="unresolved",
+    )
+
+    assert status == 200
+    assert payload["issue"]["status"] == "unresolved"
+
+
+def test_transition_replay_issue_payload_reports_missing_issue(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+
+    payload, status = _transition_replay_issue_payload(
+        store=store,
+        issue_id="bug_missing",
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        status="resolved",
+    )
+
+    assert status == 404
+    assert payload == {"ok": False, "error": "Replay issue not found: bug_missing"}
+
+
+def test_transition_replay_issue_payload_rejects_unknown_status(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+
+    payload, status = _transition_replay_issue_payload(
+        store=store,
+        issue_id="bug_missing",
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        status="closed",
+    )
+
+    assert status == 400
+    assert payload == {"ok": False, "error": "status must be resolved or unresolved"}
