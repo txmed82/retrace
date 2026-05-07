@@ -203,6 +203,10 @@ Artifacts:
 - `retrace github ...` — repo metadata management
 - `retrace suggest-fixes ...` — candidate matching + prompt generation
 
+## License
+
+Retrace is available under the MIT License. See [LICENSE](LICENSE).
+
 ## Local UI Tester (Browser Harness First)
 
 Retrace now includes a local-first tester workflow built around Browser Harness.
