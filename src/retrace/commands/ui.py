@@ -26,6 +26,7 @@ from retrace.fix_suggestions import (
 from retrace.llm.client import build_llm_http_request
 from retrace.reports.parser import parse_report_findings
 from retrace.replay_specs import generate_spec_from_replay_issue
+from retrace.sdk_keys import create_sdk_key
 from retrace.storage import GitHubRepoRow, Storage
 from retrace.tester import (
     DEFAULT_APP_URL,
@@ -1028,6 +1029,48 @@ def _connect_github_repo_payload(
     return {"ok": True, **_github_repos_payload(store)}, 200
 
 
+def _create_sdk_key_payload(
+    *,
+    store: Storage,
+    project_name: str = "Default",
+    environment_name: str = "production",
+    name: str = "Browser SDK",
+) -> tuple[dict[str, Any], int]:
+    project = project_name.strip() or "Default"
+    environment = environment_name.strip() or "production"
+    key_name = name.strip() or "Browser SDK"
+    try:
+        workspace = store.ensure_workspace(
+            project_name=project,
+            environment_name=environment,
+        )
+        created = create_sdk_key(
+            store,
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            name=key_name,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 400
+    return (
+        {
+            "ok": True,
+            "id": created.id,
+            "project_id": workspace.project_id,
+            "environment_id": workspace.environment_id,
+            "project": project,
+            "environment": environment,
+            "name": key_name,
+            "key": created.key,
+            "prefix": created.prefix,
+            "last4": created.last4,
+            "ingest_path": "/api/sdk/replay",
+            "ingest_url": "http://127.0.0.1:8788/api/sdk/replay",
+        },
+        200,
+    )
+
+
 _INDEX_HTML = """<!doctype html>
 <html>
 <head>
@@ -1211,6 +1254,63 @@ _INDEX_HTML = """<!doctype html>
       await loadOnboarding();
     }
 
+    async function createSdkKey(ev){
+      ev.preventDefault();
+      const status = byId('sdkKeyStatus');
+      const result = byId('sdkKeyResult');
+      if(status) status.textContent = 'Creating...';
+      if(result) result.innerHTML = '';
+      const res = await fetch('/api/sdk-keys', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          project: byId('sdkProjectName').value,
+          environment: byId('sdkEnvironmentName').value,
+          name: byId('sdkKeyName').value,
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        if(status) status.textContent = data.error || 'SDK key creation failed';
+        return;
+      }
+      if(status) status.textContent = `Created ${data.id} ending in ${data.last4}.`;
+      renderSdkKeyResult(data);
+    }
+
+    function renderSdkKeyResult(data){
+      const root = byId('sdkKeyResult');
+      if(!root){ return; }
+      const ingestUrl = data.ingest_url || 'http://127.0.0.1:8788/api/sdk/replay';
+      const installSnippet = 'npm install @retrace/browser';
+      const initSnippet = `import { init } from "@retrace/browser";
+
+const retrace = init({
+  apiKey: "${data.key}",
+  ingestUrl: "${ingestUrl}",
+  privacy: {
+    maskAllInputs: true,
+    blockSelector: "[data-retrace-block]",
+    maskTextSelector: "[data-retrace-mask]",
+  },
+});`;
+      root.innerHTML = `
+        <div class="lbl">Browser SDK Key (shown once)</div>
+        <pre>${esc(data.key)}</pre>
+        <button class="btn" id="copySdkKeyBtn" type="button">Copy Key</button>
+        <div class="lbl">Install</div>
+        <pre>${esc(installSnippet)}</pre>
+        <button class="btn" id="copySdkInstallBtn" type="button">Copy Install</button>
+        <div class="lbl">Initialize Capture</div>
+        <pre>${esc(initSnippet)}</pre>
+        <button class="btn" id="copySdkInitBtn" type="button">Copy Init</button>
+        <div class="empty" style="margin-top:8px">Project: <code>${esc(data.project_id)}</code> · Environment: <code>${esc(data.environment_id)}</code></div>
+      `;
+      byId('copySdkKeyBtn')?.addEventListener('click', () => copyText(data.key));
+      byId('copySdkInstallBtn')?.addEventListener('click', () => copyText(installSnippet));
+      byId('copySdkInitBtn')?.addEventListener('click', () => copyText(initSnippet));
+    }
+
     async function loadOnboarding(){
       const [sRes, cRes, rRes] = await Promise.all([
         fetch('/api/settings'),
@@ -1307,6 +1407,23 @@ _INDEX_HTML = """<!doctype html>
           <input id=\"repoLocalPath\" value=\"${esc(repos[0]?.local_path || '')}\" placeholder=\"/path/to/repo\" />
           <div style=\"margin-top:8px\"><button class=\"btn\" type=\"submit\">Connect Repo</button> <span class=\"empty\" id=\"repoConnectStatus\"></span></div>
         </form>
+        <div class=\"lbl\" style=\"margin-top:12px\">Browser Replay Capture Key</div>
+        <form id=\"sdkKeyForm\" style=\"margin-top:8px\">
+          <div class=\"grid\">
+            <div>
+              <div class=\"lbl\">Project</div>
+              <input id=\"sdkProjectName\" value=\"Default\" />
+            </div>
+            <div>
+              <div class=\"lbl\">Environment</div>
+              <input id=\"sdkEnvironmentName\" value=\"production\" />
+            </div>
+          </div>
+          <div class=\"lbl\">Key Name</div>
+          <input id=\"sdkKeyName\" value=\"Browser SDK\" />
+          <div style=\"margin-top:8px\"><button class=\"btn\" type=\"submit\">Create SDK Key</button> <span class=\"empty\" id=\"sdkKeyStatus\"></span></div>
+        </form>
+        <div id=\"sdkKeyResult\"></div>
         <div class=\"empty\">PostHog check: <span class=\"${ph.reachable===true?'ok':(ph.reachable===false?'bad':'')}\">${ph.reachable===true?'reachable':(ph.reachable===false?'unreachable':'not configured')}</span> ${esc(ph.detail || '')}</div>
         <div class=\"empty\">LLM check (${esc(llmProviderLabel)}): <span class=\"${llm.reachable===true?'ok':(llm.reachable===false?'bad':'')}\">${llm.reachable===true?'reachable':(llm.reachable===false?'unreachable':'not configured')}</span> ${esc(llm.detail || '')}</div>
         ${!gh.installed ? `<div class=\"empty\">Run in terminal: <code>${esc(gh.commands?.install || 'brew install gh')}</code> <button class=\"btn\" onclick=\"copyText('${esc(gh.commands?.install || 'brew install gh')}')\">Copy</button></div>` : ''}
@@ -1318,6 +1435,7 @@ _INDEX_HTML = """<!doctype html>
       syncProviderUI(false);
       byId('settingsForm').addEventListener('submit', saveSettings);
       byId('repoConnectForm').addEventListener('submit', connectGithubRepo);
+      byId('sdkKeyForm').addEventListener('submit', createSdkKey);
     }
 
     async function createTesterSpec(ev){
@@ -2132,6 +2250,17 @@ def ui_command(
                     repo_full_name=str(body.get("repo", "")).strip(),
                     default_branch=str(body.get("branch", "")).strip(),
                     local_path=str(body.get("local_path", "")).strip(),
+                )
+                self._json(payload, status=status)
+                return
+
+            if path == "/api/sdk-keys":
+                body = self._read_json_body()
+                payload, status = _create_sdk_key_payload(
+                    store=store,
+                    project_name=str(body.get("project", "")).strip(),
+                    environment_name=str(body.get("environment", "")).strip(),
+                    name=str(body.get("name", "")).strip(),
                 )
                 self._json(payload, status=status)
                 return
