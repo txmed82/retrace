@@ -91,7 +91,8 @@ retrace ui
 ```
 
 `retrace demo seed` creates a local replay-backed checkout failure, processes it
-through deterministic detectors, and writes a replay-derived UI regression spec.
+through deterministic detectors, writes a replay-derived UI regression spec, and
+prints the `issue_public_id` for follow-up commands.
 
 ## Local UI (Onboarding + Replay + Prompts)
 
