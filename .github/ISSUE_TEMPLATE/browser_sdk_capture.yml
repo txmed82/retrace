@@ -1,0 +1,49 @@
+name: Browser SDK capture issue
+description: Report a problem with @retrace/browser capture or ingest.
+title: "[SDK]: "
+labels: ["sdk", "bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What did the SDK capture incorrectly or fail to send?
+    validations:
+      required: true
+  - type: input
+    id: sdk_version
+    attributes:
+      label: SDK Version
+      placeholder: "@retrace/browser version or commit"
+    validations:
+      required: true
+  - type: dropdown
+    id: framework
+    attributes:
+      label: App Framework
+      options:
+        - React
+        - Next.js
+        - Vue
+        - Svelte
+        - Plain browser app
+        - Other
+  - type: textarea
+    id: init_options
+    attributes:
+      label: Init Options
+      description: Include sanitized SDK init options.
+      render: ts
+  - type: textarea
+    id: replay_payload
+    attributes:
+      label: Replay or Network Evidence
+      description: Include sanitized request/response details, event snippets, or API errors.
+      render: json
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy Check
+      options:
+        - label: I removed SDK keys, service tokens, user PII, and sensitive replay data.
+          required: true
