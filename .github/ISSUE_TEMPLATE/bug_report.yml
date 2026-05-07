@@ -1,13 +1,17 @@
 name: Bug report
-description: Report a CLI, API, UI, storage, or workflow defect.
+description: Report a reproducible Retrace bug.
 title: "[Bug]: "
 labels: ["bug"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for bugs in the CLI, local UI, replay API, browser SDK, storage, or generated artifacts.
   - type: textarea
     id: summary
     attributes:
       label: Summary
-      description: What failed, and what did you expect instead?
+      description: What went wrong, and what did you expect instead?
     validations:
       required: true
   - type: dropdown
@@ -18,39 +22,50 @@ body:
         - CLI
         - Local UI
         - Replay API
-        - Worker or cron
-        - Storage
-        - Docker/self-host
-        - GitHub or Linear sink
-        - Other
+        - Browser SDK
+        - Detectors
+        - Replay issue processing
+        - Test generation
+        - Code matching
+        - Fix prompts
+        - Docker/self-hosting
+        - Documentation
     validations:
       required: true
   - type: textarea
     id: steps
     attributes:
-      label: Reproduction Steps
-      description: Include commands, config shape, and any sample replay IDs.
-      value: |
-        1.
-        2.
-        3.
+      label: Steps to reproduce
+      description: Include commands, UI actions, and fixture/demo data if possible.
+      placeholder: |
+        1. Run `retrace demo seed`
+        2. Start `retrace ui`
+        3. Click ...
     validations:
       required: true
   - type: textarea
     id: evidence
     attributes:
       label: Evidence
-      description: Logs, trace IDs, screenshots, or JSON output with secrets removed.
-      render: shell
-  - type: input
-    id: version
+      description: Paste relevant logs, tracebacks, HTTP responses, screenshots, or generated artifact paths. Redact secrets.
+      render: text
+  - type: textarea
+    id: environment
     attributes:
-      label: Version or Commit
-      placeholder: commit SHA, tag, or Docker image
+      label: Environment
+      description: Include OS, Python version, browser, package version, and deployment mode.
+      placeholder: |
+        - OS:
+        - Python:
+        - Browser:
+        - Retrace version or commit:
+        - Install mode: editable / Docker / package
+    validations:
+      required: true
   - type: checkboxes
     id: privacy
     attributes:
-      label: Privacy Check
+      label: Privacy check
       options:
         - label: I removed API keys, service tokens, user PII, and sensitive replay data.
           required: true
