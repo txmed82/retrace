@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from retrace.commands.ui import (
+    _create_sdk_key_payload,
     _generate_replay_issue_fix_prompts_payload,
     _generate_replay_issue_spec_payload,
     _transition_replay_issue_payload,
     _verify_resolved_issues_payload,
 )
 from retrace.replay_core import ReplaySignalConfig, process_replay_sessions
+from retrace.sdk_keys import authenticate_sdk_key
 from retrace.storage import Storage
 from retrace.tester import (
     DEFAULT_HARNESS_COMMAND,
@@ -27,6 +29,36 @@ def _workspace(tmp_path: Path):
         environment_name="production",
     )
     return store, workspace
+
+
+def test_create_sdk_key_payload_creates_browser_ingest_key(
+    tmp_path: Path,
+) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+
+    payload, status = _create_sdk_key_payload(
+        store=store,
+        project_name="Web",
+        environment_name="production",
+        name="Website capture",
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["name"] == "Website capture"
+    assert payload["project"] == "Web"
+    assert payload["environment"] == "production"
+    assert payload["key"].startswith("rtpk_")
+    assert payload["last4"] == payload["key"][-4:]
+    assert payload["ingest_path"] == "/api/sdk/replay"
+    assert payload["ingest_url"] == "http://127.0.0.1:8788/api/sdk/replay"
+
+    row = authenticate_sdk_key(store, payload["key"])
+    assert row is not None
+    assert row.id == payload["id"]
+    assert row.project_id == payload["project_id"]
+    assert row.environment_id == payload["environment_id"]
 
 
 def test_generate_replay_issue_spec_payload_creates_native_spec(

@@ -121,6 +121,8 @@ From the UI you can:
 - Copy suggested terminal commands when `gh` is missing/not authed
 - Connect a GitHub-style `owner/name` repo and local checkout path for code
   matching
+- Create write-only browser SDK keys and copy `@retrace/browser` install/init
+  snippets for first-party replay capture
 - Browse findings from latest report
 - Replay stored rrweb events
 - Inspect first-party replay sessions and replay-backed issues
@@ -143,9 +145,9 @@ Common secret variables:
   GitHub issue filing and repository metadata
 - `RETRACE_LINEAR_API_KEY` for Linear issue filing
 
-First-party browser capture uses write-only public SDK keys generated with
-`retrace api create-sdk-key`. Those keys can submit replay batches but cannot
-read replay data or issues.
+First-party browser capture uses write-only public SDK keys generated from the
+local UI or `retrace api create-sdk-key`. Those keys can submit replay batches
+but cannot read replay data or issues.
 
 ## Fix Suggestions Workflow
 
@@ -278,7 +280,7 @@ UI support:
 
 Retrace can ingest browser SDK replays directly and process them into replay-backed issues.
 
-Create an SDK key:
+Create an SDK key from the local UI or CLI:
 
 ```bash
 retrace api create-sdk-key --project Web --environment production
