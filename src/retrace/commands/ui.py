@@ -1039,16 +1039,19 @@ def _create_sdk_key_payload(
     project = project_name.strip() or "Default"
     environment = environment_name.strip() or "production"
     key_name = name.strip() or "Browser SDK"
-    workspace = store.ensure_workspace(
-        project_name=project,
-        environment_name=environment,
-    )
-    created = create_sdk_key(
-        store,
-        project_id=workspace.project_id,
-        environment_id=workspace.environment_id,
-        name=key_name,
-    )
+    try:
+        workspace = store.ensure_workspace(
+            project_name=project,
+            environment_name=environment,
+        )
+        created = create_sdk_key(
+            store,
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            name=key_name,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 400
     return (
         {
             "ok": True,

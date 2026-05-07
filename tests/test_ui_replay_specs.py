@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 from retrace.commands.ui import (
     _create_sdk_key_payload,
@@ -59,6 +60,22 @@ def test_create_sdk_key_payload_creates_browser_ingest_key(
     assert row.id == payload["id"]
     assert row.project_id == payload["project_id"]
     assert row.environment_id == payload["environment_id"]
+
+
+def test_create_sdk_key_payload_reports_creation_error(
+    tmp_path: Path,
+) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+
+    with patch(
+        "retrace.commands.ui.create_sdk_key",
+        side_effect=RuntimeError("database locked"),
+    ):
+        payload, status = _create_sdk_key_payload(store=store)
+
+    assert status == 400
+    assert payload == {"ok": False, "error": "database locked"}
 
 
 def test_generate_replay_issue_spec_payload_creates_native_spec(
