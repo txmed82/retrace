@@ -898,6 +898,89 @@ def _transition_replay_issue_payload(
     )
 
 
+def _verify_resolved_issues_payload(
+    *,
+    store: Storage,
+    data_dir: Path,
+    cwd: Path,
+    project_id: str,
+    environment_id: str,
+    limit: int = 10,
+    dry_run: bool = False,
+) -> tuple[dict[str, Any], int]:
+    try:
+        limit_v = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        limit_v = 10
+    specs_by_issue: dict[str, Any] = {}
+    for spec in list_specs(specs_dir_for_data_dir(data_dir)):
+        public_id = str(spec.fixtures.get("issue_public_id") or "").strip()
+        if not public_id:
+            continue
+        existing = specs_by_issue.get(public_id)
+        if existing is None or spec.updated_at > existing.updated_at:
+            specs_by_issue[public_id] = spec
+
+    resolved = store.list_replay_issues(
+        project_id=project_id,
+        environment_id=environment_id,
+        status="resolved",
+    )
+    plan: list[dict[str, Any]] = []
+    for row in resolved[:limit_v]:
+        public_id = str(row["public_id"])
+        spec = specs_by_issue.get(public_id)
+        plan.append(
+            {
+                "public_id": public_id,
+                "issue_id": str(row["id"]),
+                "title": str(row["title"] or "Replay issue"),
+                "spec_id": spec.spec_id if spec else "",
+                "has_spec": spec is not None,
+            }
+        )
+
+    if dry_run:
+        return {"ok": True, "plan": plan, "verified": [], "regressed": []}, 200
+
+    verified: list[str] = []
+    regressed: list[dict[str, str]] = []
+    for entry in plan:
+        spec_id = entry["spec_id"]
+        if not spec_id:
+            continue
+        spec = specs_by_issue[entry["public_id"]]
+        try:
+            result = run_spec(
+                spec=spec,
+                runs_dir=runs_dir_for_data_dir(data_dir),
+                cwd=cwd,
+            )
+        except Exception as exc:
+            regressed.append(
+                {
+                    "public_id": entry["public_id"],
+                    "issue_id": entry["issue_id"],
+                    "error": f"run_spec raised: {exc}",
+                }
+            )
+            continue
+        if result.ok:
+            verified.append(entry["public_id"])
+            continue
+        store.transition_replay_issue(entry["issue_id"], status="regressed")
+        regressed.append(
+            {
+                "public_id": entry["public_id"],
+                "issue_id": entry["issue_id"],
+                "run_id": result.run_id,
+                "exit_code": str(result.exit_code),
+                "error": result.error,
+            }
+        )
+    return {"ok": True, "plan": plan, "verified": verified, "regressed": regressed}, 200
+
+
 def _github_repos_payload(store: Storage) -> dict[str, Any]:
     return {
         "repos": [
@@ -1435,6 +1518,25 @@ _INDEX_HTML = """<!doctype html>
       await loadReplayDashboard(`Processed ${data.result.jobs_processed} job(s), updated ${data.result.issues_created_or_updated} issue(s).`);
     }
 
+    async function verifyResolvedReplayIssues(){
+      const status = byId('verifyResolvedStatus');
+      if(status) status.textContent = 'Verifying...';
+      const res = await fetch('/api/replay-issues/verify-resolved', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({limit: 10}),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        if(status) status.textContent = data.error || 'Verification failed';
+        return;
+      }
+      const verified = (data.verified || []).length;
+      const regressed = (data.regressed || []).length;
+      const planned = (data.plan || []).length;
+      await loadReplayDashboard(`Verified ${verified}/${planned} resolved issue(s); regressed=${regressed}.`);
+    }
+
     async function loadReplayDashboard(processStatus = ''){
       const res = await fetch('/api/replay-dashboard');
       const data = await res.json();
@@ -1456,7 +1558,12 @@ _INDEX_HTML = """<!doctype html>
         </li>`).join('');
       byId('replayDashboard').innerHTML = `
         <h3>Replay Dashboard</h3>
-        <div><button class="btn" id="processReplayJobsBtn" type="button">Process Queued Replays</button> <span class="empty" id="replayProcessStatus">${esc(processStatus)}</span></div>
+        <div>
+          <button class="btn" id="processReplayJobsBtn" type="button">Process Queued Replays</button>
+          <button class="btn" id="verifyResolvedBtn" type="button">Verify Resolved Issues</button>
+          <span class="empty" id="replayProcessStatus">${esc(processStatus)}</span>
+          <span class="empty" id="verifyResolvedStatus"></span>
+        </div>
         <div class="grid" style="margin-top:10px">
           <div><div class="lbl">Replay-backed Issues</div>
             <select id="issueStatusFilter" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
@@ -1477,6 +1584,7 @@ _INDEX_HTML = """<!doctype html>
         <div class="rr"><div id="firstPartyReplay"><div class="empty">Select a first-party replay session.</div></div></div>
       `;
       byId('processReplayJobsBtn').addEventListener('click', processReplayJobs);
+      byId('verifyResolvedBtn').addEventListener('click', verifyResolvedReplayIssues);
       byId('replayDashboard').querySelectorAll('[data-replay-session]').forEach(el => {
         el.addEventListener('click', () => loadFirstPartyReplay(el.dataset.replaySession));
       });
@@ -2164,6 +2272,27 @@ def ui_command(
                     environment_id=str(body.get("environment_id", "")).strip()
                     or workspace.environment_id,
                     status=str(body.get("status", "")).strip(),
+                )
+                self._json(payload, status=status)
+                return
+
+            if path == "/api/replay-issues/verify-resolved":
+                body = self._read_json_body()
+                workspace = store.ensure_workspace(project_name="Default")
+                try:
+                    limit_v = int(body.get("limit") or 10)
+                except (TypeError, ValueError):
+                    limit_v = 10
+                payload, status = _verify_resolved_issues_payload(
+                    store=store,
+                    data_dir=data_dir,
+                    cwd=config_path.parent,
+                    project_id=str(body.get("project_id", "")).strip()
+                    or workspace.project_id,
+                    environment_id=str(body.get("environment_id", "")).strip()
+                    or workspace.environment_id,
+                    limit=limit_v,
+                    dry_run=bool(body.get("dry_run") or False),
                 )
                 self._json(payload, status=status)
                 return

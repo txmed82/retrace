@@ -6,10 +6,16 @@ from retrace.commands.ui import (
     _generate_replay_issue_fix_prompts_payload,
     _generate_replay_issue_spec_payload,
     _transition_replay_issue_payload,
+    _verify_resolved_issues_payload,
 )
 from retrace.replay_core import ReplaySignalConfig, process_replay_sessions
 from retrace.storage import Storage
-from retrace.tester import specs_dir_for_data_dir
+from retrace.tester import (
+    DEFAULT_HARNESS_COMMAND,
+    TesterRunResult as RetraceTesterRunResult,
+    create_spec,
+    specs_dir_for_data_dir,
+)
 
 
 def _workspace(tmp_path: Path):
@@ -262,3 +268,125 @@ def test_transition_replay_issue_payload_rejects_unknown_status(
 
     assert status == 400
     assert payload == {"ok": False, "error": "status must be resolved or unresolved"}
+
+
+def test_verify_resolved_issues_payload_dry_run_lists_linked_specs(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    issue_public_id = _resolved_replay_issue(store, workspace)
+    create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Replay regression",
+        prompt="",
+        app_url="https://app.example",
+        start_command="",
+        harness_command=DEFAULT_HARNESS_COMMAND,
+        execution_engine="native",
+        exact_steps=[{"action": "navigate", "url": "https://app.example"}],
+        fixtures={"issue_public_id": issue_public_id},
+    )
+
+    payload, status = _verify_resolved_issues_payload(
+        store=store,
+        data_dir=tmp_path,
+        cwd=tmp_path,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        dry_run=True,
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["plan"][0]["public_id"] == issue_public_id
+    assert payload["plan"][0]["has_spec"] is True
+    assert payload["verified"] == []
+    assert payload["regressed"] == []
+
+
+def test_verify_resolved_issues_payload_marks_failed_specs_regressed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    issue_public_id = _resolved_replay_issue(store, workspace)
+    create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Replay regression",
+        prompt="",
+        app_url="https://app.example",
+        start_command="",
+        harness_command=DEFAULT_HARNESS_COMMAND,
+        execution_engine="native",
+        exact_steps=[{"action": "navigate", "url": "https://app.example"}],
+        fixtures={"issue_public_id": issue_public_id},
+    )
+
+    def fake_run_spec(**_: object) -> RetraceTesterRunResult:
+        return RetraceTesterRunResult(
+            run_id="run_failed",
+            spec_id="spec_failed",
+            ok=False,
+            exit_code=1,
+            run_dir=str(tmp_path / "run_failed"),
+            harness_log_path="",
+            app_log_path="",
+            command="",
+            final_prompt="",
+            attempts=1,
+            flaky=False,
+            flake_reason="",
+            status="failed",
+            error="still broken",
+            execution_engine="native",
+        )
+
+    monkeypatch.setattr("retrace.commands.ui.run_spec", fake_run_spec)
+
+    payload, status = _verify_resolved_issues_payload(
+        store=store,
+        data_dir=tmp_path,
+        cwd=tmp_path,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+
+    assert status == 200
+    assert payload["verified"] == []
+    assert payload["regressed"][0]["public_id"] == issue_public_id
+    row = store.get_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=issue_public_id,
+    )
+    assert row is not None
+    assert row["status"] == "regressed"
+
+
+def _resolved_replay_issue(store: Storage, workspace: object) -> str:
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-ui-verify",
+        sequence=0,
+        events=[
+            {
+                "type": 6,
+                "timestamp": 200,
+                "data": {
+                    "plugin": "retrace/console@1",
+                    "payload": {"level": "error", "payload": ["Verify crashed"]},
+                },
+            },
+        ],
+        flush_type="final",
+    )
+    processed = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-ui-verify"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    issue_public_id = processed.issues[0].public_id
+    store.transition_replay_issue(processed.issues[0].issue_id, status="resolved")
+    return issue_public_id
