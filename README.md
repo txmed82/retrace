@@ -157,6 +157,12 @@ retrace github connect --repo <org/name> --branch main --local-path /path/to/rep
 retrace suggest-fixes --latest --repo <org/name> --out ./reports/fix-prompts
 ```
 
+Or generate fix suggestions directly from a replay-backed issue:
+
+```bash
+retrace suggest-fixes --replay-issue <bug_public_id> --repo <org/name> --out ./reports/fix-prompts
+```
+
 Artifacts:
 
 - `reports/fix-prompts/*.json`

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -102,3 +103,58 @@ Scanned 9 sessions.  2 flagged into 2 cluster(s).
     rows = store.list_report_findings()
     assert len(rows) == 1
     assert rows[0].title == "Unresponsive buttons in store"
+
+
+def test_suggest_fixes_generates_from_replay_issue(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    seeded = runner.invoke(main, ["demo", "seed"])
+    assert seeded.exit_code == 0, seeded.output
+    issue_id = json.loads(seeded.output)["issue_public_id"]
+
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "checkout.tsx").write_text(
+        "export function Checkout(){ return <button data-testid='checkout-pay'>Pay now</button> }"
+    )
+
+    connected = runner.invoke(
+        main,
+        [
+            "github",
+            "connect",
+            "--repo",
+            "acme/widgets",
+            "--local-path",
+            str(tmp_path),
+        ],
+    )
+    assert connected.exit_code == 0, connected.output
+
+    result = runner.invoke(
+        main,
+        [
+            "suggest-fixes",
+            "--replay-issue",
+            issue_id,
+            "--repo",
+            "acme/widgets",
+            "--out",
+            "./reports/fix-prompts",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"Parsed 1 findings from replay issue {issue_id}" in result.output
+    out_dir = tmp_path / "reports" / "fix-prompts"
+    json_files = list(out_dir.glob("replay-*.json"))
+    codex_files = list(out_dir.glob("replay-*.codex.md"))
+    claude_files = list(out_dir.glob("replay-*.claude.md"))
+    assert len(json_files) == 1
+    assert len(codex_files) == 1
+    assert len(claude_files) == 1
+    artifact = json_files[0].read_text()
+    assert '"repo": "acme/widgets"' in artifact
+    assert "checkout.tsx" in artifact
+    assert issue_id in codex_files[0].read_text()
