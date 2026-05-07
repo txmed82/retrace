@@ -229,6 +229,53 @@ def test_run_pipeline_counts_detector_failure_as_partial_without_advancing_curso
     assert "Detector errors 1" in text
 
 
+def test_run_pipeline_does_not_advance_cursor_when_report_write_fails(
+    tmp_path: Path, monkeypatch
+):
+    cfg = _make_cfg(tmp_path)
+    store = Storage(tmp_path / "data" / "retrace.db")
+    store.init_schema()
+
+    previous_cursor = datetime(2026, 4, 19, 12, 0, tzinfo=timezone.utc)
+    store.set_last_run_cursor(previous_cursor)
+    _seed_session(store, "sess-1", datetime(2026, 4, 19, 13, 0, tzinfo=timezone.utc))
+
+    ingester = MagicMock()
+    ingester.fetch_since.return_value = ["sess-1"]
+    ingester.load_events.return_value = _error_session_events()
+
+    llm_client = MagicMock()
+    llm_client.chat_json.return_value = _llm_happy_path_response()
+
+    class BrokenSink:
+        def __init__(self, output_dir: Path):
+            self.output_dir = output_dir
+
+        def write(self, summary, findings) -> None:
+            raise OSError("reports unwritable")
+
+    monkeypatch.setattr("retrace.pipeline.MarkdownSink", BrokenSink)
+
+    summary = run_pipeline(
+        cfg=cfg,
+        store=store,
+        ingester=ingester,
+        llm_client=llm_client,
+        now=datetime(2026, 4, 19, 14, 0, tzinfo=timezone.utc),
+    )
+
+    assert summary.status == "error"
+    assert "reports unwritable" in summary.error
+    assert store.get_last_run_cursor() == previous_cursor
+
+    with store._conn() as conn:
+        row = conn.execute(
+            "SELECT status, error FROM runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row["status"] == "error"
+    assert "reports unwritable" in (row["error"] or "")
+
+
 def test_run_pipeline_cap_hit_rewinds_cursor_to_oldest_processed(tmp_path: Path):
     cfg = _make_cfg(tmp_path, max_sessions=2)
     store = Storage(tmp_path / "data" / "retrace.db")

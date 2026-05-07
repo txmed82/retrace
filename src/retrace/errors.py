@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import httpx
+from urllib.parse import urlsplit, urlunsplit
 
 
 def format_user_error(exc: BaseException) -> str:
@@ -12,5 +13,7 @@ def format_user_error(exc: BaseException) -> str:
         return f"network transport error: {exc.__class__.__name__}"
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
-        return f"HTTP {status} from {exc.request.url}"
+        parts = urlsplit(str(exc.request.url))
+        safe_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        return f"HTTP {status} from {safe_url}"
     return str(exc)

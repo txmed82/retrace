@@ -72,6 +72,7 @@ def run_pipeline(
     detector_errors = 0
     cap_hit = False
     sessions_with_signals = 0
+    next_cursor: datetime | None = None
 
     try:
         cursor = store.get_last_run_cursor() or (
@@ -160,7 +161,6 @@ def run_pipeline(
                 next_cursor = min(processed_started_at)
             else:
                 next_cursor = started_at
-            store.set_last_run_cursor(next_cursor)
 
         summary.status = status
         summary.error = error_msg or ""
@@ -168,6 +168,8 @@ def run_pipeline(
         try:
             sink = MarkdownSink(output_dir=cfg.run.output_dir)
             sink.write(summary, findings)
+            if next_cursor is not None:
+                store.set_last_run_cursor(next_cursor)
         except Exception as exc:
             error_msg = f"sink write failed: {exc}"
             status = "error"

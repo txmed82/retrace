@@ -16,7 +16,7 @@ def test_format_user_error_summarizes_timeout():
 
 
 def test_format_user_error_summarizes_http_status():
-    request = httpx.Request("GET", "https://api.example.test/x")
+    request = httpx.Request("GET", "https://api.example.test/x?token=secret")
     response = httpx.Response(401, request=request)
     exc = httpx.HTTPStatusError("bad credentials", request=request, response=response)
 
