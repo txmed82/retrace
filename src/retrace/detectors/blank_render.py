@@ -108,9 +108,9 @@ class BlankRenderDetector:
             elif t == 2:
                 root = event_data(e).get("node") or {}
                 node_count = _count_element_nodes(root)
-                loading_state = _looks_like_loading(root)
                 was_low = last_node_count is not None and last_node_count < MAX_NODES
                 is_low = node_count < MAX_NODES
+                loading_state = _looks_like_loading(root) if is_low else False
                 if not is_low:
                     low_state_start_ts = None
                 elif not was_low or loading_state != last_loading_state:
