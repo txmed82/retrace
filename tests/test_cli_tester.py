@@ -103,6 +103,7 @@ def test_tester_run_retries_and_marks_flaky(tmp_path: Path, monkeypatch) -> None
     assert ran.exit_code == 0, ran.output
     assert '"status": "flaky_passed"' in ran.output
     assert '"flaky": true' in ran.output
+    assert '"failure_classification": "timeout"' in ran.output
 
 
 def test_tester_enqueue_and_worker_runs_queued_spec(

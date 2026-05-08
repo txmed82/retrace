@@ -134,6 +134,7 @@ def test_failure_test_links_track_latest_run_state(tmp_path: Path) -> None:
         flaky=False,
         flake_reason="",
         status="failed",
+        failure_classification="app_bug",
         error="button still dead",
     )
     links = store.update_failure_test_link_run(
@@ -143,6 +144,7 @@ def test_failure_test_links_track_latest_run_state(tmp_path: Path) -> None:
     )
     assert links[0].coverage_state == "covered_failing"
     assert links[0].latest_run_id == "run_1"
+    assert links[0].latest_run_classification == "app_bug"
     assert links[0].latest_run_ok is False
     assert store.coverage_state_for_failure(failure_id) == "covered_failing"
 
@@ -160,6 +162,7 @@ def test_failure_test_links_track_latest_run_state(tmp_path: Path) -> None:
         flaky=False,
         flake_reason="",
         status="passed",
+        failure_classification="unknown",
         error="",
     )
     links = store.update_failure_test_link_run(
@@ -169,6 +172,7 @@ def test_failure_test_links_track_latest_run_state(tmp_path: Path) -> None:
     )
     assert links[0].coverage_state == "covered_passing"
     assert links[0].latest_run_id == "run_2"
+    assert links[0].latest_run_classification == "unknown"
     assert links[0].latest_run_ok is True
     assert store.coverage_state_for_failure(failure_id) == "covered_passing"
 
@@ -273,6 +277,12 @@ def test_failure_test_run_update_can_target_exact_link(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="link_id is required"):
         store.update_failure_test_link_run(
             spec_id="shared-regression",
+            run_result=result,
+        )
+    with pytest.raises(ValueError, match="unknown failure_test_link"):
+        store.update_failure_test_link_run(
+            spec_id="different-regression",
+            link_id=first_link_id,
             run_result=result,
         )
 
@@ -396,6 +406,7 @@ def test_test_run_failure_can_be_represented_as_canonical_failure() -> None:
         flaky=False,
         flake_reason="",
         status="failed",
+        failure_classification="app_bug",
         error="Missing checkout confirmation",
         execution_engine="harness",
         artifacts=[{"artifact_id": "log_1"}],
@@ -413,6 +424,8 @@ def test_test_run_failure_can_be_represented_as_canonical_failure() -> None:
     assert failure.source_external_id == "run_1"
     assert failure.status == "new"
     assert failure.linked_tests == ["checkout-smoke"]
+    assert failure.title == "Tester run failed (app_bug): Checkout smoke"
+    assert failure.metadata["failure_classification"] == "app_bug"
     assert failure.metadata["assertion_results"] == [
         {"assertion_id": "a1", "ok": False}
     ]

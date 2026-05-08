@@ -442,6 +442,7 @@ def tester_run(
                 "status": result.status,
                 "flaky": result.flaky,
                 "flake_reason": result.flake_reason,
+                "failure_classification": result.failure_classification,
                 "error": result.error,
                 "execution_engine": result.execution_engine,
                 "artifacts": result.artifacts,
@@ -473,6 +474,7 @@ def tester_run(
                         "execution_engine": result.execution_engine,
                         "attempts": result.attempts,
                         "flake_reason": result.flake_reason,
+                        "failure_classification": result.failure_classification,
                     },
                 ),
             )
@@ -547,15 +549,23 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
             cwd=config_path.parent,
         )
         if job is not None:
+            result_payload = (
+                job.get("result") if isinstance(job.get("result"), dict) else None
+            )
+            run_ok = (
+                bool(result_payload["ok"])
+                if result_payload is not None and "ok" in result_payload
+                else job.get("status") == "succeeded"
+            )
             try:
                 store = Storage(cfg.run.data_dir / "retrace.db")
                 store.init_schema()
                 spec_id = str(job.get("spec_id") or "")
                 link_id = _single_failure_test_link_id(store, spec_id)
-                if link_id:
+                if link_id and result_payload is not None:
                     store.update_failure_test_link_run(
                         spec_id=spec_id,
-                        run_result=SimpleNamespace(**job),
+                        run_result=SimpleNamespace(**result_payload),
                         link_id=link_id,
                     )
             except Exception as exc:
@@ -564,7 +574,7 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
                     err=True,
                 )
             click.echo(json.dumps(job, indent=2))
-            if not job.get("ok", False) and cfg.notifications.enabled:
+            if not run_ok and cfg.notifications.enabled:
                 from retrace.notification_sinks import (
                     NotificationEvent,
                     NotificationPayload,
@@ -580,12 +590,21 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
                         NotificationPayload(
                             event=NotificationEvent.RUN_FAILED.value,
                             title=f"Queued tester run failed: {job.get('spec_id', '')}",
-                            summary=str(job.get("error") or ""),
-                            public_id=str(job.get("run_id") or ""),
+                            summary=str(
+                                (result_payload or {}).get("error")
+                                or job.get("error")
+                                or ""
+                            ),
+                            public_id=str((result_payload or {}).get("run_id") or ""),
                             extra={
                                 "spec_id": job.get("spec_id"),
-                                "execution_engine": job.get("execution_engine"),
-                                "attempts": job.get("attempts"),
+                                "execution_engine": (result_payload or {}).get(
+                                    "execution_engine"
+                                ),
+                                "attempts": (result_payload or {}).get("attempts"),
+                                "failure_classification": (result_payload or {}).get(
+                                    "failure_classification"
+                                ),
                             },
                         ),
                     )

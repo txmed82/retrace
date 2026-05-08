@@ -302,6 +302,7 @@ CREATE TABLE IF NOT EXISTS failure_test_links (
     coverage_state TEXT NOT NULL DEFAULT 'covered_unverified',
     latest_run_id TEXT NOT NULL DEFAULT '',
     latest_run_status TEXT NOT NULL DEFAULT '',
+    latest_run_classification TEXT NOT NULL DEFAULT '',
     latest_run_ok INTEGER,
     latest_run_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -568,6 +569,7 @@ class FailureTestLinkRow:
     coverage_state: str
     latest_run_id: str
     latest_run_status: str
+    latest_run_classification: str
     latest_run_ok: Optional[bool]
     latest_run_at: Optional[datetime]
     created_at: datetime
@@ -829,6 +831,14 @@ class Storage:
             if "role" not in cols_replay_issue_sessions:
                 conn.execute(
                     "ALTER TABLE replay_issue_sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'supporting'"
+                )
+            cols_failure_test_links = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(failure_test_links)").fetchall()
+            ]
+            if "latest_run_classification" not in cols_failure_test_links:
+                conn.execute(
+                    "ALTER TABLE failure_test_links ADD COLUMN latest_run_classification TEXT NOT NULL DEFAULT ''"
                 )
             rows = conn.execute(
                 """
@@ -1670,22 +1680,40 @@ class Storage:
         coverage_state = self._coverage_state_from_run_result(run_result)
         run_id = str(getattr(run_result, "run_id", "") or "")
         run_status = str(getattr(run_result, "status", "") or "")
+        run_classification = str(
+            getattr(run_result, "failure_classification", "") or ""
+        )
         run_ok = 1 if bool(getattr(run_result, "ok", False)) else 0
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE failure_test_links
                 SET coverage_state = ?,
                     latest_run_id = ?,
                     latest_run_status = ?,
+                    latest_run_classification = ?,
                     latest_run_ok = ?,
                     latest_run_at = ?,
                     updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND spec_id = ?
                 """,
-                (coverage_state, run_id, run_status, run_ok, now, now, link_id),
+                (
+                    coverage_state,
+                    run_id,
+                    run_status,
+                    run_classification,
+                    run_ok,
+                    now,
+                    now,
+                    link_id,
+                    spec_id,
+                ),
             )
+            if int(cursor.rowcount) == 0:
+                raise ValueError(
+                    f"unknown failure_test_link id={link_id} spec_id={spec_id}"
+                )
             rows = conn.execute(
                 """
                 SELECT *
@@ -1722,8 +1750,9 @@ class Storage:
                     INSERT INTO failure_test_links
                     (id, failure_id, spec_id, spec_name, spec_path, source,
                      coverage_state, latest_run_id, latest_run_status,
-                     latest_run_ok, latest_run_at, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'legacy', ?, ?, ?, ?, ?, ?, ?)
+                     latest_run_classification, latest_run_ok, latest_run_at,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 'legacy', ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(failure_id, spec_id) DO NOTHING
                     """,
                     (
@@ -1735,6 +1764,7 @@ class Storage:
                         link["coverage_state"],
                         link["latest_run_id"],
                         link["latest_run_status"],
+                        link["latest_run_classification"],
                         link["latest_run_ok"],
                         link["latest_run_at"],
                         now,
@@ -1777,6 +1807,9 @@ class Storage:
                     "coverage_state": state,
                     "latest_run_id": str(item.get("latest_run_id") or ""),
                     "latest_run_status": str(item.get("latest_run_status") or ""),
+                    "latest_run_classification": str(
+                        item.get("latest_run_classification") or ""
+                    ),
                     "latest_run_ok": latest_run_ok,
                     "latest_run_at": item.get("latest_run_at"),
                 }
@@ -1789,6 +1822,7 @@ class Storage:
                     "coverage_state": "covered_unverified",
                     "latest_run_id": "",
                     "latest_run_status": "",
+                    "latest_run_classification": "",
                     "latest_run_ok": None,
                     "latest_run_at": None,
                 }
@@ -1871,6 +1905,7 @@ class Storage:
             coverage_state=str(row["coverage_state"] or "covered_unverified"),
             latest_run_id=str(row["latest_run_id"] or ""),
             latest_run_status=str(row["latest_run_status"] or ""),
+            latest_run_classification=str(row["latest_run_classification"] or ""),
             latest_run_ok=latest_run_ok,
             latest_run_at=self._dt(row["latest_run_at"]),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),

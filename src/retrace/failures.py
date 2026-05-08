@@ -141,10 +141,14 @@ def canonical_failure_from_test_run(
     spec_id = str(getattr(run_result, "spec_id", "") or "")
     exit_code = _safe_int(getattr(run_result, "exit_code", 0))
     status = str(getattr(run_result, "status", "") or "")
+    failure_classification = str(
+        getattr(run_result, "failure_classification", "") or "unknown"
+    )
     fingerprint_payload = {
         "spec_id": spec_id,
         "status": status,
         "exit_code": exit_code,
+        "failure_classification": failure_classification,
         "error": str(getattr(run_result, "error", "") or ""),
         "execution_engine": str(getattr(run_result, "execution_engine", "") or ""),
     }
@@ -162,7 +166,10 @@ def canonical_failure_from_test_run(
         source_type="test_run",
         source_external_id=source_external_id,
         fingerprint=fingerprint,
-        title=f"Tester run failed: {spec_name or spec_id or source_external_id}",
+        title=(
+            f"Tester run failed ({failure_classification}): "
+            f"{spec_name or spec_id or source_external_id}"
+        ),
         summary=str(getattr(run_result, "error", "") or f"exit code {exit_code}"),
         severity="medium",
         confidence="high" if not ok else "low",
@@ -175,6 +182,7 @@ def canonical_failure_from_test_run(
             "status": status,
             "flaky": bool(getattr(run_result, "flaky", False)),
             "flake_reason": str(getattr(run_result, "flake_reason", "") or ""),
+            "failure_classification": failure_classification,
             "execution_engine": str(getattr(run_result, "execution_engine", "") or ""),
             "artifacts": list(getattr(run_result, "artifacts", []) or []),
             "assertion_results": list(
