@@ -676,23 +676,84 @@ def test_generate_spec_prefers_sdk_target_selectors_over_rrweb_ids(
         issue_id=processed.issues[0].public_id,
     )
 
-    assert generated.spec.exact_steps[1] == {
-        "id": "click-1",
-        "action": "click",
-            "target": {
-                "tagName": "button",
-                "testIdAttrName": "data-test",
-                "testIdValue": "pay-button",
-                "text": "Pay now",
-                "selector": '[data-test="pay-button"]',
-            },
-        "source": "retrace_browser_sdk",
+    click_target = generated.spec.exact_steps[1]["target"]
+    assert generated.spec.exact_steps[1]["action"] == "click"
+    assert click_target["selector"] == '[data-test="pay-button"]'
+    assert click_target["selector_candidates"][0] == {
+        "selector": '[data-test="pay-button"]',
+        "strategy": "test_id",
+        "score": 100,
+        "rationale": "data-test is the most stable captured test selector.",
     }
-    assert generated.spec.exact_steps[2]["target"]["selector"] == 'input[name="email"]'
+    assert click_target["selector_candidates"][1]["selector"] == (
+        'role=button[name="Pay now"]'
+    )
+    assert click_target["selector_rationale"] == (
+        "data-test is the most stable captured test selector."
+    )
+    input_step = generated.spec.exact_steps[2]
+    assert input_step["text"] == "[redacted-replay-input]"
+    assert input_step["target"]["selector"] == 'role=textbox[name="Email address"]'
+    assert input_step["target"]["selector_candidates"][0]["strategy"] == "role_name"
+    assert "value" not in input_step
     assert generated.spec.exact_steps[3]["target"]["selector"] == '[data-qa="coupon-toggle"]'
     assert all("rrweb node" not in gap for gap in generated.known_gaps)
     assert generated.known_gaps == ["input-1 needs safe test data"]
     assert generated.confidence == "medium"
+
+
+def test_generate_spec_ranks_semantic_selectors_before_stable_ids(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-semantic-selector",
+        sequence=0,
+        events=[
+            _navigation("https://app.example/checkout"),
+            _sdk_click(
+                {
+                    "tagName": "button",
+                    "id": "pay_123",
+                    "role": "button",
+                    "text": "Pay now",
+                    "className": "Button_root__abc primary",
+                },
+                ts=100,
+            ),
+            _console_error("TypeError: total is undefined", ts=1000),
+        ],
+        flush_type="final",
+    )
+    processed = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-semantic-selector"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+
+    generated = generate_spec_from_replay_issue(
+        store=store,
+        specs_dir=tmp_path / "specs",
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=processed.issues[0].public_id,
+    )
+
+    target = generated.spec.exact_steps[1]["target"]
+    assert target["selector"] == 'role=button[name="Pay now"]'
+    assert [candidate["strategy"] for candidate in target["selector_candidates"]] == [
+        "role_name",
+        "id",
+        "text",
+        "class",
+    ]
+    assert target["selector_candidates"][-1]["rationale"] == (
+        "Class names are brittle and are only used as a last resort."
+    )
 
 
 def test_generate_spec_keeps_rrweb_fallbacks_not_near_sdk_events(
