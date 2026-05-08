@@ -52,6 +52,7 @@ def generate_spec_from_replay_issue(
     if playback is None:
         raise ValueError(f"Replay session not found: {representative_session_id}")
 
+    canonical_failure_id = str(issue["canonical_failure_id"] or "")
     base_url = app_url.strip() or _infer_base_url(playback.events) or "http://127.0.0.1:3000"
     exact_steps, gaps = _steps_from_events(playback.events, base_url=base_url)
     assertions = _assertions_from_issue(issue)
@@ -73,12 +74,23 @@ def generate_spec_from_replay_issue(
             "source": "replay_issue",
             "issue_id": str(issue["id"]),
             "issue_public_id": str(issue["public_id"]),
+            "canonical_failure_id": canonical_failure_id,
             "replay_id": str(playback.session["id"]),
             "replay_public_id": str(playback.session["public_id"]),
             "session_id": representative_session_id,
         },
         data_extraction=[],
     )
+    if canonical_failure_id:
+        store.upsert_failure_test_link(
+            failure_id=canonical_failure_id,
+            issue_id=str(issue["id"]),
+            issue_public_id=str(issue["public_id"]),
+            spec_id=spec.spec_id,
+            spec_name=spec.name,
+            spec_path=str(specs_dir / f"{spec.spec_id}.json"),
+            source="replay_issue",
+        )
     return GeneratedReplaySpec(
         spec=spec,
         issue_public_id=str(issue["public_id"]),

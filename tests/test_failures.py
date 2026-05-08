@@ -79,20 +79,94 @@ def test_replay_issue_status_is_normalized_for_canonical_failure(
     )
     assert regressed.current_status == "regressed"
 
+
+def test_failure_test_links_track_latest_run_state(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    created = store.upsert_replay_issue(
+        project_id="proj_1",
+        environment_id="env_1",
+        fingerprint="checkout-button-dead",
+        session_ids=["sess_1"],
+        signal_summary={"dead_click": 1},
+        first_seen_ms=100,
+        last_seen_ms=100,
+    )
     issue = store.get_replay_issue(
         project_id="proj_1",
         environment_id="env_1",
         issue_id=created.public_id,
     )
     assert issue is not None
+    failure_id = str(issue["canonical_failure_id"])
+
+    assert store.coverage_state_for_failure(failure_id) == "not_covered"
+    store.upsert_failure_test_link(
+        failure_id=failure_id,
+        issue_id=str(issue["id"]),
+        issue_public_id=str(issue["public_id"]),
+        spec_id="checkout-regression",
+        spec_name="Checkout regression",
+        source="replay_issue",
+    )
     failure = store.get_failure(
         project_id="proj_1",
         environment_id="env_1",
-        failure_id=str(issue["canonical_failure_id"]),
+        failure_id=failure_id,
     )
     assert failure is not None
-    assert failure.status == "regressed"
-    assert failure.affected_sessions == 2
+    assert failure.linked_tests == ["checkout-regression"]
+    assert store.coverage_state_for_failure(failure_id) == "covered_unverified"
+
+    failing = RunResult(
+        run_id="run_1",
+        spec_id="checkout-regression",
+        ok=False,
+        exit_code=1,
+        run_dir="",
+        harness_log_path="",
+        app_log_path="",
+        command="",
+        final_prompt="",
+        attempts=1,
+        flaky=False,
+        flake_reason="",
+        status="failed",
+        error="button still dead",
+    )
+    links = store.update_failure_test_link_run(
+        spec_id="checkout-regression",
+        run_result=failing,
+    )
+    assert links[0].coverage_state == "covered_failing"
+    assert links[0].latest_run_id == "run_1"
+    assert links[0].latest_run_ok is False
+    assert store.coverage_state_for_failure(failure_id) == "covered_failing"
+
+    passing = RunResult(
+        run_id="run_2",
+        spec_id="checkout-regression",
+        ok=True,
+        exit_code=0,
+        run_dir="",
+        harness_log_path="",
+        app_log_path="",
+        command="",
+        final_prompt="",
+        attempts=1,
+        flaky=False,
+        flake_reason="",
+        status="passed",
+        error="",
+    )
+    links = store.update_failure_test_link_run(
+        spec_id="checkout-regression",
+        run_result=passing,
+    )
+    assert links[0].coverage_state == "covered_passing"
+    assert links[0].latest_run_id == "run_2"
+    assert links[0].latest_run_ok is True
+    assert store.coverage_state_for_failure(failure_id) == "covered_passing"
 
 
 def test_test_run_failure_can_be_represented_as_canonical_failure() -> None:

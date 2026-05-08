@@ -16,6 +16,13 @@ from retrace.evidence import (
 )
 from retrace.failures import CanonicalFailure, canonical_failure_from_replay_issue
 
+FAILURE_TEST_COVERAGE_STATES = (
+    "not_covered",
+    "covered_unverified",
+    "covered_passing",
+    "covered_failing",
+    "covered_flaky",
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -283,6 +290,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_failure_evidence_dedupe
 ON failure_evidence(failure_id, dedupe_key)
 WHERE dedupe_key != '';
 
+CREATE TABLE IF NOT EXISTS failure_test_links (
+    id TEXT PRIMARY KEY,
+    failure_id TEXT NOT NULL,
+    issue_id TEXT NOT NULL DEFAULT '',
+    issue_public_id TEXT NOT NULL DEFAULT '',
+    spec_id TEXT NOT NULL,
+    spec_name TEXT NOT NULL DEFAULT '',
+    spec_path TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'manual',
+    coverage_state TEXT NOT NULL DEFAULT 'covered_unverified',
+    latest_run_id TEXT NOT NULL DEFAULT '',
+    latest_run_status TEXT NOT NULL DEFAULT '',
+    latest_run_ok INTEGER,
+    latest_run_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(failure_id, spec_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_failure_test_links_failure
+ON failure_test_links(failure_id, coverage_state, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_failure_test_links_issue
+ON failure_test_links(issue_public_id, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_failure_test_links_spec
+ON failure_test_links(spec_id, updated_at);
+
 CREATE TABLE IF NOT EXISTS replay_issues (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -518,6 +553,25 @@ class EvidenceRow:
     @property
     def safe_for_prompts(self) -> bool:
         return self.redaction_state in PROMPT_SAFE_REDACTION_STATES
+
+
+@dataclass
+class FailureTestLinkRow:
+    id: str
+    failure_id: str
+    issue_id: str
+    issue_public_id: str
+    spec_id: str
+    spec_name: str
+    spec_path: str
+    source: str
+    coverage_state: str
+    latest_run_id: str
+    latest_run_status: str
+    latest_run_ok: Optional[bool]
+    latest_run_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass
@@ -1448,6 +1502,230 @@ class Storage:
                 params,
             ).fetchall()
         return [self._evidence_from_row(row) for row in rows]
+
+    def upsert_failure_test_link(
+        self,
+        *,
+        failure_id: str,
+        spec_id: str,
+        issue_id: str = "",
+        issue_public_id: str = "",
+        spec_name: str = "",
+        spec_path: str = "",
+        source: str = "manual",
+    ) -> str:
+        if not failure_id.strip():
+            raise ValueError("failure_id is required")
+        if not spec_id.strip():
+            raise ValueError("spec_id is required")
+        now = datetime.now(timezone.utc).isoformat()
+        link_id = self._id("ftl")
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO failure_test_links
+                (id, failure_id, issue_id, issue_public_id, spec_id, spec_name,
+                 spec_path, source, coverage_state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'covered_unverified', ?, ?)
+                ON CONFLICT(failure_id, spec_id) DO UPDATE SET
+                    issue_id = CASE
+                        WHEN excluded.issue_id != '' THEN excluded.issue_id
+                        ELSE failure_test_links.issue_id
+                    END,
+                    issue_public_id = CASE
+                        WHEN excluded.issue_public_id != '' THEN excluded.issue_public_id
+                        ELSE failure_test_links.issue_public_id
+                    END,
+                    spec_name = CASE
+                        WHEN excluded.spec_name != '' THEN excluded.spec_name
+                        ELSE failure_test_links.spec_name
+                    END,
+                    spec_path = CASE
+                        WHEN excluded.spec_path != '' THEN excluded.spec_path
+                        ELSE failure_test_links.spec_path
+                    END,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    link_id,
+                    failure_id.strip(),
+                    issue_id.strip(),
+                    issue_public_id.strip(),
+                    spec_id.strip(),
+                    spec_name.strip(),
+                    spec_path.strip(),
+                    source.strip() or "manual",
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT id
+                FROM failure_test_links
+                WHERE failure_id = ? AND spec_id = ?
+                """,
+                (failure_id.strip(), spec_id.strip()),
+            ).fetchone()
+            assert row is not None
+            self._add_linked_test_to_failure(conn, failure_id=failure_id, spec_id=spec_id)
+            return str(row["id"])
+
+    def list_failure_test_links(
+        self,
+        *,
+        failure_id: Optional[str] = None,
+        issue_public_id: Optional[str] = None,
+        spec_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[FailureTestLinkRow]:
+        where: list[str] = []
+        params: list[object] = []
+        if failure_id is not None:
+            where.append("failure_id = ?")
+            params.append(failure_id)
+        if issue_public_id is not None:
+            where.append("issue_public_id = ?")
+            params.append(issue_public_id)
+        if spec_id is not None:
+            where.append("spec_id = ?")
+            params.append(spec_id)
+        params.append(max(1, min(int(limit), 500)))
+        clause = " AND ".join(where) if where else "1 = 1"
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM failure_test_links
+                WHERE {clause}
+                ORDER BY updated_at DESC, created_at DESC, id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._failure_test_link_from_row(row) for row in rows]
+
+    def coverage_state_for_failure(self, failure_id: str) -> str:
+        links = self.list_failure_test_links(failure_id=failure_id, limit=500)
+        if not links:
+            return "not_covered"
+        states = {link.coverage_state for link in links}
+        for state in (
+            "covered_failing",
+            "covered_flaky",
+            "covered_passing",
+            "covered_unverified",
+        ):
+            if state in states:
+                return state
+        return "covered_unverified"
+
+    def update_failure_test_link_run(
+        self,
+        *,
+        spec_id: str,
+        run_result: object,
+    ) -> list[FailureTestLinkRow]:
+        spec_id = spec_id.strip()
+        if not spec_id:
+            raise ValueError("spec_id is required")
+        coverage_state = self._coverage_state_from_run_result(run_result)
+        run_id = str(getattr(run_result, "run_id", "") or "")
+        run_status = str(getattr(run_result, "status", "") or "")
+        run_ok = 1 if bool(getattr(run_result, "ok", False)) else 0
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE failure_test_links
+                SET coverage_state = ?,
+                    latest_run_id = ?,
+                    latest_run_status = ?,
+                    latest_run_ok = ?,
+                    latest_run_at = ?,
+                    updated_at = ?
+                WHERE spec_id = ?
+                """,
+                (coverage_state, run_id, run_status, run_ok, now, now, spec_id),
+            )
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM failure_test_links
+                WHERE spec_id = ?
+                ORDER BY updated_at DESC, id
+                """,
+                (spec_id,),
+            ).fetchall()
+        return [self._failure_test_link_from_row(row) for row in rows]
+
+    @staticmethod
+    def _coverage_state_from_run_result(run_result: object) -> str:
+        state: str
+        if bool(getattr(run_result, "flaky", False)):
+            state = "covered_flaky"
+        elif bool(getattr(run_result, "ok", False)):
+            state = "covered_passing"
+        else:
+            status = str(getattr(run_result, "status", "") or "").lower()
+            state = "covered_flaky" if "flaky" in status else "covered_failing"
+        assert state in FAILURE_TEST_COVERAGE_STATES
+        return state
+
+    def _add_linked_test_to_failure(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        failure_id: str,
+        spec_id: str,
+    ) -> None:
+        row = conn.execute(
+            "SELECT linked_tests_json FROM failures WHERE id = ?",
+            (failure_id.strip(),),
+        ).fetchone()
+        if row is None:
+            return
+        spec_id = spec_id.strip()
+        linked = self._parse_string_list_json(row["linked_tests_json"])
+        if spec_id not in linked:
+            linked.append(spec_id)
+            conn.execute(
+                """
+                UPDATE failures
+                SET linked_tests_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(linked, sort_keys=True),
+                    datetime.now(timezone.utc).isoformat(),
+                    failure_id.strip(),
+                ),
+            )
+
+    def _failure_test_link_from_row(self, row: sqlite3.Row) -> FailureTestLinkRow:
+        latest_run_ok: Optional[bool]
+        if row["latest_run_ok"] is None:
+            latest_run_ok = None
+        else:
+            latest_run_ok = bool(row["latest_run_ok"])
+        return FailureTestLinkRow(
+            id=str(row["id"]),
+            failure_id=str(row["failure_id"]),
+            issue_id=str(row["issue_id"] or ""),
+            issue_public_id=str(row["issue_public_id"] or ""),
+            spec_id=str(row["spec_id"]),
+            spec_name=str(row["spec_name"] or ""),
+            spec_path=str(row["spec_path"] or ""),
+            source=str(row["source"] or ""),
+            coverage_state=str(row["coverage_state"] or "covered_unverified"),
+            latest_run_id=str(row["latest_run_id"] or ""),
+            latest_run_status=str(row["latest_run_status"] or ""),
+            latest_run_ok=latest_run_ok,
+            latest_run_at=self._dt(row["latest_run_at"]),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
 
     def _backfill_replay_issue_evidence(
         self,
