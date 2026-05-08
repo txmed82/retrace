@@ -41,3 +41,25 @@ def test_rage_click_ignores_different_targets():
         click_event(ts=300, x=10, y=20, target_id=3),
     ]
     assert detector.detect("sess-1", events) == []
+
+
+def test_rage_click_downgrades_disabled_explained_controls():
+    from retrace.detectors.rage_click import detector
+
+    events = [meta(ts=0)]
+    for ts in [100, 200, 300]:
+        click = click_event(ts=ts, x=10, y=20, target_id=7)
+        click["data"]["target"] = {
+            "attributes": {
+                "disabled": "",
+                "title": "Complete required fields first",
+            }
+        }
+        events.append(click)
+
+    signals = detector.detect("sess-1", events)
+
+    assert len(signals) == 1
+    assert signals[0].confidence == "low"
+    assert signals[0].details["disabled_explained"] is True
+    assert "rage_click.disabled_explained_control" in signals[0].reason_codes

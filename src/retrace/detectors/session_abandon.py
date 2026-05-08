@@ -27,7 +27,7 @@ def _is_error_ish(e: dict[str, Any]) -> bool:
         return payload.get("level") in {"error", "assert"}
     if "network" in plugin:
         status = payload.get("status_code") or payload.get("status")
-        return isinstance(status, int) and 400 <= status < 600
+        return isinstance(status, int) and 400 <= status < 600 and status not in {401, 499}
     return False
 
 

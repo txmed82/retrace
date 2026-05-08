@@ -16,6 +16,32 @@ WINDOW_MS = 1000
 MIN_CLICKS = 3
 
 
+def _target_attrs(e: dict[str, Any]) -> dict[str, Any]:
+    target = event_data(e).get("target")
+    if not isinstance(target, dict):
+        return {}
+    attrs = target.get("attributes")
+    return attrs if isinstance(attrs, dict) else {}
+
+
+def _is_disabled_explained(e: dict[str, Any]) -> bool:
+    attrs = _target_attrs(e)
+    disabled = (
+        "disabled" in attrs
+        and str(attrs.get("disabled") or "").strip().lower()
+        in {"", "1", "true", "disabled", "yes"}
+    ) or str(attrs.get("aria-disabled") or "").strip().lower() == "true"
+    if not disabled:
+        return False
+    explanation = (
+        attrs.get("title")
+        or attrs.get("aria-label")
+        or attrs.get("data-disabled-reason")
+        or attrs.get("data-tooltip")
+    )
+    return bool(str(explanation or "").strip())
+
+
 def _is_click(e: dict[str, Any]) -> bool:
     if e.get("type") != 3:
         return False
@@ -51,6 +77,10 @@ class RageClickDetector:
                 window.append(jdx)
             if len(window) >= MIN_CLICKS:
                 emitted_indices.update(window)
+                disabled_explained = _is_disabled_explained(base_ev)
+                reason_codes = ["rage_click.repeated_same_target"]
+                if disabled_explained:
+                    reason_codes.append("rage_click.disabled_explained_control")
                 out.append(
                     Signal(
                         session_id=session_id,
@@ -60,9 +90,10 @@ class RageClickDetector:
                         details={
                             "click_count": len(window),
                             "target_id": base_tid,
+                            "disabled_explained": disabled_explained,
                         },
-                        confidence="medium",
-                        reason_codes=("rage_click.repeated_same_target",),
+                        confidence="low" if disabled_explained else "medium",
+                        reason_codes=tuple(reason_codes),
                     )
                 )
         return out

@@ -208,6 +208,8 @@ def promote_replay_issue(
     )
     if issue is None:
         raise ValueError(f"Replay issue not found: {issue_id}")
+    if str(issue["status"] or "") == "ignored":
+        raise IssueSinkError(f"Replay issue is ignored: {issue_id}")
     sessions = store.list_replay_issue_sessions(str(issue["id"]))
     payload = build_issue_sink_payload(
         issue=issue,

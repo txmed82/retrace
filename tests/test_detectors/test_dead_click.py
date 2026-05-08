@@ -1,3 +1,5 @@
+import pytest
+
 from tests.fixtures.events import click_event, meta, network_event
 
 
@@ -41,3 +43,22 @@ def test_dead_click_suppressed_by_network_request():
         network_event(ts=1500, url="https://api/x", status=200),
     ]
     assert detector.detect("s", events) == []
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"attributes": {"disabled": ""}},
+        {"attributes": {"aria-disabled": "true"}},
+        {"attributes": {"data-retrace-ignore": "true"}},
+        {"attributes": {"href": "#"}},
+        {"attributes": {"href": "JavaScript:void(0);"}},
+    ],
+)
+def test_dead_click_suppresses_benign_targets(target: dict):
+    from retrace.detectors.dead_click import detector
+
+    click = click_event(ts=1000, x=0, y=0, target_id=7)
+    click["data"]["target"] = target
+
+    assert detector.detect("s", [meta(ts=0), click]) == []
