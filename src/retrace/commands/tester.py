@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import click
@@ -407,6 +408,9 @@ def tester_run(
         max_retries=retries_v,
         cwd=config_path.parent,
     )
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    store.update_failure_test_link_run(spec_id=result.spec_id, run_result=result)
     click.echo(
         json.dumps(
             {
@@ -526,6 +530,12 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
             cwd=config_path.parent,
         )
         if job is not None:
+            store = Storage(cfg.run.data_dir / "retrace.db")
+            store.init_schema()
+            store.update_failure_test_link_run(
+                spec_id=str(job.get("spec_id") or ""),
+                run_result=SimpleNamespace(**job),
+            )
             click.echo(json.dumps(job, indent=2))
             if not job.get("ok", False) and cfg.notifications.enabled:
                 from retrace.notification_sinks import (
