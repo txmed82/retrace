@@ -92,6 +92,8 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "Reasons:" in _INDEX_HTML
     assert 'data-view="issues"' in _INDEX_HTML
     assert "linkedFailureTests" in _INDEX_HTML
+    assert 'role="button" tabindex="0"' in _INDEX_HTML
+    assert 'rel="noopener noreferrer"' in _INDEX_HTML
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(

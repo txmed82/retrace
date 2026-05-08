@@ -1212,6 +1212,7 @@ _INDEX_HTML = """<!doctype html>
     .finding.active { background:#162033; border-left:3px solid var(--acc); }
     .issue-row { padding:10px 12px; border-bottom:1px solid #182235; cursor:pointer; }
     .issue-row:hover { background:#111a2b; }
+    .issue-row:focus { outline:2px solid var(--acc); outline-offset:-2px; }
     .issue-row.active { background:#162033; border-left:3px solid var(--acc); }
     .sev { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing: .08em; }
     .title { font-size:14px; line-height:1.35; margin-top:4px; }
@@ -1331,6 +1332,23 @@ _INDEX_HTML = """<!doctype html>
       if(v.includes('pass') || v === 'resolved' || v === 'covered_passing') return 'ok';
       if(v.includes('fail') || v.includes('regressed') || v === 'unresolved' || v === 'covered_failing') return 'bad';
       return '';
+    }
+
+    function openReplayIssue(issueId){
+      const issue = replayState.issues.find(i => i.public_id === issueId);
+      renderReplayIssueDetail(issue);
+      switchView('issues');
+    }
+
+    function bindReplayIssueRows(root = document){
+      root.querySelectorAll('[data-replay-issue]').forEach(el => {
+        el.addEventListener('click', () => openReplayIssue(el.dataset.replayIssue));
+        el.addEventListener('keydown', ev => {
+          if(ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
+          ev.preventDefault();
+          openReplayIssue(el.dataset.replayIssue);
+        });
+      });
     }
 
     function llmKeyLabel(provider){
@@ -1939,7 +1957,7 @@ const retrace = init({
       const sessionOptions = [...new Set(sessions.map(s => s.status || 'unknown'))].sort()
         .map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
       const issueRows = issues.map(i => `
-        <div class="issue-row ${replayState.activeIssueId === i.public_id ? 'active' : ''}" data-issue-status="${esc(i.status)}" data-replay-issue="${esc(i.public_id)}">
+        <div class="issue-row ${replayState.activeIssueId === i.public_id ? 'active' : ''}" role="button" tabindex="0" data-issue-status="${esc(i.status)}" data-replay-issue="${esc(i.public_id)}">
           <div class="sev">${esc(i.status)} · ${esc(i.severity)} · ${esc(i.confidence || 'medium')} confidence</div>
           <div class="title">${esc(i.title || 'Untitled issue')}</div>
           <div class="empty">${esc(i.public_id)} · affected=${esc(i.affected_count)} · tests=${esc((i.test_links || []).length)}</div>
@@ -1971,7 +1989,7 @@ const retrace = init({
           <div class="metric"><strong>${esc(covered)}</strong><span class="empty">with linked tests</span></div>
           <div class="metric"><strong>${esc(high)}</strong><span class="empty">high priority/severity</span></div>
         </div>
-        <div class="card"><h3>Next Issues</h3>${issues.slice(0, 6).map(i => `<div class="issue-row" data-replay-issue="${esc(i.public_id)}"><div class="sev">${esc(i.status)} · ${esc(i.severity)}</div><div class="title">${esc(i.title || 'Untitled issue')}</div><div class="empty">${esc(i.public_id)} · timeline=${esc((i.timeline || []).length)} · tests=${esc((i.test_links || []).length)}</div></div>`).join('') || '<div class="empty">No issues yet.</div>'}</div>
+        <div class="card"><h3>Next Issues</h3>${issues.slice(0, 6).map(i => `<div class="issue-row" role="button" tabindex="0" data-replay-issue="${esc(i.public_id)}"><div class="sev">${esc(i.status)} · ${esc(i.severity)}</div><div class="title">${esc(i.title || 'Untitled issue')}</div><div class="empty">${esc(i.public_id)} · timeline=${esc((i.timeline || []).length)} · tests=${esc((i.test_links || []).length)}</div></div>`).join('') || '<div class="empty">No issues yet.</div>'}</div>
       `;
       byId('replaySessionsPanel').innerHTML = `
         <div class="card">
@@ -1983,18 +2001,12 @@ const retrace = init({
         </div>
       `;
       if(byId('replayProcessStatus')) byId('replayProcessStatus').textContent = processStatus;
-      byId('processReplayJobsBtn').addEventListener('click', processReplayJobs);
-      byId('verifyResolvedBtn').addEventListener('click', verifyResolvedReplayIssues);
+      byId('processReplayJobsBtn').onclick = processReplayJobs;
+      byId('verifyResolvedBtn').onclick = verifyResolvedReplayIssues;
       document.querySelectorAll('[data-replay-session]').forEach(el => {
-        el.addEventListener('click', () => loadFirstPartyReplay(el.dataset.replaySession));
+        el.onclick = () => loadFirstPartyReplay(el.dataset.replaySession);
       });
-      document.querySelectorAll('[data-replay-issue]').forEach(el => {
-        el.addEventListener('click', () => {
-          const issue = issues.find(i => i.public_id === el.dataset.replayIssue);
-          renderReplayIssueDetail(issue);
-          switchView('issues');
-        });
-      });
+      bindReplayIssueRows();
       document.querySelectorAll('[data-view-jump]').forEach(el => el.addEventListener('click', () => switchView(el.dataset.viewJump)));
       byId('issueStatusFilter')?.addEventListener('change', ev => filterReplayRows('replayIssueList', 'issueStatus', ev.target.value));
       byId('sessionStatusFilter')?.addEventListener('change', ev => filterReplayRows('replaySessionList', 'sessionStatus', ev.target.value));
@@ -2081,10 +2093,13 @@ const retrace = init({
 
     function renderExternalLinks(issue){
       const links = [];
-      if(issue.external_ticket_url) links.push(`<a href="${esc(issue.external_ticket_url)}" target="_blank">${esc(issue.external_ticket_id || 'External ticket')}</a>`);
+      if(issue.external_ticket_url) links.push(`<a href="${esc(issue.external_ticket_url)}" target="_blank" rel="noopener noreferrer">${esc(issue.external_ticket_id || 'External ticket')}</a>`);
       if(issue.share_url) links.push(`<a href="${esc(issue.share_url)}">Issue permalink</a>`);
       for(const session of issue.sessions || []){
-        links.push(`<a href="#replay=${esc(session.session_id)}" data-replay-session="${esc(session.session_id)}">Replay ${esc(session.session_id)}</a>`);
+        const replay = replayState.sessions.find(s => s.stable_id === session.session_id || s.public_id === session.public_id) || {};
+        const replayId = replay.public_id || session.public_id || session.session_id;
+        const playerId = replay.stable_id || session.stable_id || session.session_id;
+        links.push(`<a href="#replay=${esc(replayId)}" data-replay-session="${esc(playerId)}">Replay ${esc(replayId)}</a>`);
       }
       return links.length ? `<ul>${links.map(link => `<li>${link}</li>`).join('')}</ul>` : `<div class="empty">${esc(issue.external_ticket_state || 'No external links yet.')}</div>`;
     }
@@ -2105,12 +2120,7 @@ const retrace = init({
         }
       }
       root.innerHTML = rows.length ? `<ul>${rows.join('')}</ul>` : '<div class="empty">No linked failures yet. Generate a regression spec from an issue to create coverage.</div>';
-      root.querySelectorAll('[data-replay-issue]').forEach(el => {
-        el.addEventListener('click', () => {
-          renderReplayIssueDetail(replayState.issues.find(i => i.public_id === el.dataset.replayIssue));
-          switchView('issues');
-        });
-      });
+      bindReplayIssueRows(root);
     }
 
     function renderReplayIssueDetail(issue){
@@ -2121,9 +2131,12 @@ const retrace = init({
         el.classList.toggle('active', el.dataset.replayIssue === issue.public_id);
       });
       const steps = (issue.reproduction_steps || []).map(s => `<li>${esc(s)}</li>`).join('');
-      const sessions = (issue.sessions || []).map(s =>
-        `<li><button class="btn" type="button" data-replay-session="${esc(s.session_id)}">Play</button> <code>${esc(s.session_id)}</code> · ${esc(s.role)}</li>`
-      ).join('');
+      const sessions = (issue.sessions || []).map(s => {
+        const replay = replayState.sessions.find(session => session.stable_id === s.session_id || session.public_id === s.public_id) || {};
+        const playerId = replay.stable_id || s.stable_id || s.session_id;
+        const replayId = replay.public_id || s.public_id || s.session_id;
+        return `<li><button class="btn" type="button" data-replay-session="${esc(playerId)}">Play</button> <a href="#replay=${esc(replayId)}"><code>${esc(replayId)}</code></a> · ${esc(s.role)}</li>`;
+      }).join('');
       root.innerHTML = `
         <div class="view-head">
           <div>
