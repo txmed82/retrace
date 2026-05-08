@@ -896,6 +896,10 @@ class Storage:
             return None
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
+    @staticmethod
+    def _now_iso_microseconds() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
     def ensure_workspace(
         self,
         *,
@@ -1384,7 +1388,7 @@ class Storage:
         except (TypeError, ValueError) as exc:
             raise ValueError("evidence payload must be JSON-serializable") from exc
         evidence_id = self._id("ev")
-        created_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        created_at = self._now_iso_microseconds()
         conn.execute(
             """
             INSERT OR IGNORE INTO failure_evidence
@@ -1436,7 +1440,10 @@ class Storage:
                 SELECT *
                 FROM failure_evidence
                 WHERE {where}
-                ORDER BY occurred_at_ms, created_at, id
+                ORDER BY
+                    occurred_at_ms,
+                    replace(replace(created_at, ' ', 'T'), '+00:00', 'Z'),
+                    id
                 """,
                 params,
             ).fetchall()
