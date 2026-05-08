@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 
 import pytest
 
@@ -39,6 +40,49 @@ def test_append_and_list_failure_evidence_chronologically(tmp_path: Path) -> Non
     rows = store.list_failure_evidence(failure_id=failure_id)
     assert [row.evidence_type for row in rows] == ["network_request", "console_log"]
     assert rows[0].payload == {"status": 500}
+
+
+def test_failure_evidence_preserves_append_order_for_same_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    failure_id = store.upsert_failure(
+        _failure(
+            project_id="proj_1",
+            environment_id="env_1",
+            source_external_id="manual-same-time",
+        )
+    )
+    ids = iter(["ev_z", "ev_a"])
+    monkeypatch.setattr(store, "_id", lambda prefix: next(ids))
+
+    store.append_failure_evidence(
+        EvidenceItem(
+            failure_id=failure_id,
+            evidence_type="console_log",
+            occurred_at_ms=100,
+            source="manual",
+            redaction_state="raw",
+            payload={"message": "first"},
+        )
+    )
+    time.sleep(0.001)
+    store.append_failure_evidence(
+        EvidenceItem(
+            failure_id=failure_id,
+            evidence_type="console_log",
+            occurred_at_ms=100,
+            source="manual",
+            redaction_state="raw",
+            payload={"message": "second"},
+        )
+    )
+
+    rows = store.list_failure_evidence(failure_id=failure_id)
+    assert [row.id for row in rows] == ["ev_z", "ev_a"]
+    assert [row.payload["message"] for row in rows] == ["first", "second"]
 
 
 def test_sensitive_evidence_can_be_excluded_for_prompts(tmp_path: Path) -> None:

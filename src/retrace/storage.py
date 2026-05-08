@@ -273,7 +273,7 @@ CREATE TABLE IF NOT EXISTS failure_evidence (
     payload_json TEXT NOT NULL DEFAULT '{}',
     artifact_path TEXT NOT NULL DEFAULT '',
     dedupe_key TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_failure_evidence_failure_time
@@ -1384,12 +1384,13 @@ class Storage:
         except (TypeError, ValueError) as exc:
             raise ValueError("evidence payload must be JSON-serializable") from exc
         evidence_id = self._id("ev")
+        created_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         conn.execute(
             """
             INSERT OR IGNORE INTO failure_evidence
             (id, failure_id, evidence_type, occurred_at_ms, source, redaction_state,
-             payload_json, artifact_path, dedupe_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             payload_json, artifact_path, dedupe_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 evidence_id,
@@ -1401,6 +1402,7 @@ class Storage:
                 payload_json,
                 evidence.artifact_path,
                 evidence.dedupe_key,
+                created_at,
             ),
         )
         if evidence.dedupe_key:
