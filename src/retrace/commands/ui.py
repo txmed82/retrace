@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import platform
 import re
@@ -39,6 +40,8 @@ from retrace.tester import (
     runs_dir_for_data_dir,
     specs_dir_for_data_dir,
 )
+
+logger = logging.getLogger(__name__)
 
 _CLOUD_LLM_PROVIDERS = {"openai", "anthropic", "openrouter"}
 
@@ -1002,10 +1005,6 @@ def _verify_resolved_issues_payload(
                 runs_dir=runs_dir_for_data_dir(data_dir),
                 cwd=cwd,
             )
-            store.update_failure_test_link_run(
-                spec_id=result.spec_id,
-                run_result=result,
-            )
         except Exception as exc:
             regressed.append(
                 {
@@ -1015,6 +1014,18 @@ def _verify_resolved_issues_payload(
                 }
             )
             continue
+        try:
+            store.update_failure_test_link_run(
+                spec_id=result.spec_id,
+                run_result=result,
+                link_id=str(entry.get("coverage_link_id") or ""),
+            )
+        except Exception:
+            logger.warning(
+                "failed to persist failure_test_link run metadata",
+                extra={"spec_id": result.spec_id, "run_id": result.run_id},
+                exc_info=True,
+            )
         if result.ok:
             verified.append(entry["public_id"])
             continue
@@ -2485,10 +2496,17 @@ def ui_command(
                     },
                     cwd=config_path.parent,
                 )
-                store.update_failure_test_link_run(
-                    spec_id=result.spec_id,
-                    run_result=result,
-                )
+                try:
+                    store.update_failure_test_link_run(
+                        spec_id=result.spec_id,
+                        run_result=result,
+                    )
+                except Exception:
+                    logger.warning(
+                        "failed to persist failure_test_link run metadata",
+                        extra={"spec_id": result.spec_id, "run_id": result.run_id},
+                        exc_info=True,
+                    )
                 status = 200 if result.ok else 400
                 self._json({"ok": result.ok, "result": result.__dict__}, status=status)
                 return

@@ -168,6 +168,104 @@ def test_failure_test_links_track_latest_run_state(tmp_path: Path) -> None:
     assert links[0].latest_run_ok is True
     assert store.coverage_state_for_failure(failure_id) == "covered_passing"
 
+    store.upsert_replay_issue(
+        project_id="proj_1",
+        environment_id="env_1",
+        fingerprint="checkout-button-dead",
+        session_ids=["sess_1", "sess_2"],
+        signal_summary={"dead_click": 2},
+        first_seen_ms=100,
+        last_seen_ms=200,
+    )
+    refreshed_failure = store.get_failure(
+        project_id="proj_1",
+        environment_id="env_1",
+        failure_id=failure_id,
+    )
+    assert refreshed_failure is not None
+    assert refreshed_failure.linked_tests == ["checkout-regression"]
+
+
+def test_failure_test_run_update_can_target_exact_link(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    first = store.upsert_replay_issue(
+        project_id="proj_1",
+        environment_id="env_1",
+        fingerprint="checkout-button-dead",
+        session_ids=["sess_1"],
+        signal_summary={"dead_click": 1},
+        first_seen_ms=100,
+        last_seen_ms=100,
+    )
+    second = store.upsert_replay_issue(
+        project_id="proj_1",
+        environment_id="env_1",
+        fingerprint="cart-api-500",
+        session_ids=["sess_2"],
+        signal_summary={"network_5xx": 1},
+        first_seen_ms=200,
+        last_seen_ms=200,
+    )
+    first_issue = store.get_replay_issue(
+        project_id="proj_1",
+        environment_id="env_1",
+        issue_id=first.public_id,
+    )
+    second_issue = store.get_replay_issue(
+        project_id="proj_1",
+        environment_id="env_1",
+        issue_id=second.public_id,
+    )
+    assert first_issue is not None
+    assert second_issue is not None
+    first_link_id = store.upsert_failure_test_link(
+        failure_id=str(first_issue["canonical_failure_id"]),
+        issue_id=str(first_issue["id"]),
+        issue_public_id=str(first_issue["public_id"]),
+        spec_id="shared-regression",
+    )
+    second_link_id = store.upsert_failure_test_link(
+        failure_id=str(second_issue["canonical_failure_id"]),
+        issue_id=str(second_issue["id"]),
+        issue_public_id=str(second_issue["public_id"]),
+        spec_id="shared-regression",
+    )
+    result = RunResult(
+        run_id="run_exact",
+        spec_id="shared-regression",
+        ok=False,
+        exit_code=1,
+        run_dir="",
+        harness_log_path="",
+        app_log_path="",
+        command="",
+        final_prompt="",
+        attempts=1,
+        flaky=False,
+        flake_reason="",
+        status="failed",
+        error="still broken",
+    )
+
+    links = store.update_failure_test_link_run(
+        spec_id="shared-regression",
+        link_id=first_link_id,
+        run_result=result,
+    )
+
+    assert [link.id for link in links] == [first_link_id]
+    first_link = store.list_failure_test_links(
+        failure_id=str(first_issue["canonical_failure_id"])
+    )[0]
+    second_link = store.list_failure_test_links(
+        failure_id=str(second_issue["canonical_failure_id"])
+    )[0]
+    assert first_link.coverage_state == "covered_failing"
+    assert first_link.latest_run_id == "run_exact"
+    assert second_link.id == second_link_id
+    assert second_link.coverage_state == "covered_unverified"
+
 
 def test_test_run_failure_can_be_represented_as_canonical_failure() -> None:
     result = RunResult(

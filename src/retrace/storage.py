@@ -1266,6 +1266,26 @@ class Storage:
         now: str,
         failure_id: str,
     ) -> str:
+        existing = conn.execute(
+            """
+            SELECT linked_tests_json
+            FROM failures
+            WHERE project_id = ? AND environment_id = ?
+              AND source_type = ? AND source_external_id = ?
+            """,
+            (
+                failure.project_id,
+                failure.environment_id,
+                failure.source_type,
+                failure.source_external_id,
+            ),
+        ).fetchone()
+        linked_tests = self._merge_string_lists(
+            self._parse_string_list_json(existing["linked_tests_json"])
+            if existing is not None
+            else [],
+            failure.linked_tests,
+        )
         conn.execute(
             """
             INSERT INTO failures
@@ -1319,7 +1339,7 @@ class Storage:
                 int(failure.last_seen_ms),
                 failure.related_deploy_sha,
                 failure.related_pr_number,
-                json.dumps(failure.linked_tests, sort_keys=True),
+                json.dumps(linked_tests, sort_keys=True),
                 failure.linked_repair_task_id,
                 failure.linked_external_thread_id,
                 json.dumps(failure.metadata, sort_keys=True),
@@ -1626,18 +1646,22 @@ class Storage:
         *,
         spec_id: str,
         run_result: object,
+        link_id: str = "",
     ) -> list[FailureTestLinkRow]:
         spec_id = spec_id.strip()
-        if not spec_id:
-            raise ValueError("spec_id is required")
+        link_id = link_id.strip()
+        if not spec_id and not link_id:
+            raise ValueError("spec_id or link_id is required")
         coverage_state = self._coverage_state_from_run_result(run_result)
         run_id = str(getattr(run_result, "run_id", "") or "")
         run_status = str(getattr(run_result, "status", "") or "")
         run_ok = 1 if bool(getattr(run_result, "ok", False)) else 0
         now = datetime.now(timezone.utc).isoformat()
+        where = "id = ?" if link_id else "spec_id = ?"
+        where_value = link_id or spec_id
         with self._conn() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE failure_test_links
                 SET coverage_state = ?,
                     latest_run_id = ?,
@@ -1645,18 +1669,18 @@ class Storage:
                     latest_run_ok = ?,
                     latest_run_at = ?,
                     updated_at = ?
-                WHERE spec_id = ?
+                WHERE {where}
                 """,
-                (coverage_state, run_id, run_status, run_ok, now, now, spec_id),
+                (coverage_state, run_id, run_status, run_ok, now, now, where_value),
             )
             rows = conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM failure_test_links
-                WHERE spec_id = ?
+                WHERE {where}
                 ORDER BY updated_at DESC, id
                 """,
-                (spec_id,),
+                (where_value,),
             ).fetchall()
         return [self._failure_test_link_from_row(row) for row in rows]
 
@@ -1687,9 +1711,11 @@ class Storage:
         if row is None:
             return
         spec_id = spec_id.strip()
-        linked = self._parse_string_list_json(row["linked_tests_json"])
-        if spec_id not in linked:
-            linked.append(spec_id)
+        linked = self._merge_string_lists(
+            self._parse_string_list_json(row["linked_tests_json"]),
+            [spec_id],
+        )
+        if linked != self._parse_string_list_json(row["linked_tests_json"]):
             conn.execute(
                 """
                 UPDATE failures
@@ -1702,6 +1728,18 @@ class Storage:
                     failure_id.strip(),
                 ),
             )
+
+    @staticmethod
+    def _merge_string_lists(*values: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for value_list in values:
+            for value in value_list:
+                item = str(value or "").strip()
+                if item and item not in seen:
+                    seen.add(item)
+                    merged.append(item)
+        return merged
 
     def _failure_test_link_from_row(self, row: sqlite3.Row) -> FailureTestLinkRow:
         latest_run_ok: Optional[bool]

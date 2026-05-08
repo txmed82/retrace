@@ -1061,10 +1061,6 @@ def api_verify_resolved(
                     runs_dir=runs_dir,
                     cwd=config_path.parent,
                 )
-                store.update_failure_test_link_run(
-                    spec_id=result.spec_id,
-                    run_result=result,
-                )
             except Exception as exc:
                 regressed.append(
                     {
@@ -1074,6 +1070,18 @@ def api_verify_resolved(
                     }
                 )
                 continue
+            try:
+                store.update_failure_test_link_run(
+                    spec_id=result.spec_id,
+                    run_result=result,
+                    link_id=str(entry.get("coverage_link_id") or ""),
+                )
+            except Exception:
+                logger.warning(
+                    "failed to persist failure_test_link run metadata",
+                    extra={"spec_id": result.spec_id, "run_id": result.run_id},
+                    exc_info=True,
+                )
             if result.ok:
                 verified.append(entry["public_id"])
                 continue
