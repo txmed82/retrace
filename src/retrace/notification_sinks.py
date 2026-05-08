@@ -237,6 +237,11 @@ class SlackSink:
             text_lines.append(f"`{payload.public_id}`")
         if payload.url:
             text_lines.append(f"<{payload.url}|Open in Retrace>")
+        issue_cards = _issue_cards_from_payload(payload)
+        for card in issue_cards[:5]:
+            text_lines.extend(_slack_issue_card_lines(card))
+        if len(issue_cards) > 5:
+            text_lines.append(f"_+{len(issue_cards) - 5} more issue(s)._")
         text = "\n".join(text_lines)
         return {
             "text": text,
@@ -244,6 +249,50 @@ class SlackSink:
                 {"type": "section", "text": {"type": "mrkdwn", "text": text}},
             ],
         }
+
+
+def _issue_cards_from_payload(payload: NotificationPayload) -> list[dict[str, Any]]:
+    cards = payload.extra.get("issue_cards")
+    if isinstance(cards, list):
+        return [dict(card) for card in cards if isinstance(card, dict)]
+    card = payload.extra.get("issue_card")
+    if isinstance(card, dict):
+        return [dict(card)]
+    return []
+
+
+def _slack_issue_card_lines(card: dict[str, Any]) -> list[str]:
+    public_id = str(card.get("public_id") or "").strip()
+    title = str(card.get("title") or "Replay issue").strip()
+    severity = str(card.get("severity") or "unknown").strip()
+    confidence = str(card.get("confidence") or "unknown").strip()
+    affected = card.get("affected_count", 0)
+    replay_url = str(card.get("replay_url") or "").strip()
+    timeline = str(card.get("timeline_summary") or "").strip()
+    test_status = str(card.get("generated_test_status") or "").strip()
+    files = [str(item) for item in card.get("likely_files") or [] if str(item).strip()]
+    actions = card.get("actions") if isinstance(card.get("actions"), dict) else {}
+    lines = [
+        "",
+        f"*{public_id}* — {title}" if public_id else f"*{title}*",
+        f"Severity `{severity}` · Confidence `{confidence}` · Affected `{affected}`",
+    ]
+    if timeline:
+        lines.append(f"Timeline: {timeline}")
+    if test_status:
+        lines.append(f"Generated test: `{test_status}`")
+    if files:
+        lines.append("Likely files: " + ", ".join(f"`{item}`" for item in files[:3]))
+    links: list[str] = []
+    if replay_url:
+        links.append(f"<{replay_url}|Replay>")
+    for label in ("repair", "tests", "open_retrace"):
+        url = str(actions.get(label) or "").strip()
+        if url:
+            links.append(f"<{url}|{label.replace('_', ' ').title()}>")
+    if links:
+        lines.append("Actions: " + " · ".join(links))
+    return lines
 
 
 # ----------------------------------------------------------------------------

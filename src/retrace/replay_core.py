@@ -50,6 +50,7 @@ class ReplayJobProcessingResult:
     issues_regressed: int = 0
     regressed_public_ids: tuple[str, ...] = ()
     inserted_public_ids: tuple[str, ...] = ()
+    regressed_details: tuple[dict[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -649,6 +650,7 @@ def make_replay_finalize_handler(
     accumulator.setdefault("issues_regressed", 0)
     accumulator.setdefault("inserted_ids", [])
     accumulator.setdefault("regressed_ids", [])
+    accumulator.setdefault("regressed_details", [])
 
     def handler(job: Any, payload: dict[str, Any]) -> dict[str, Any]:
         session_id = str(payload.get("session_id") or "").strip()
@@ -672,6 +674,12 @@ def make_replay_finalize_handler(
             elif upsert.regressed:
                 accumulator["issues_regressed"] += 1
                 accumulator["regressed_ids"].append(upsert.public_id)
+                accumulator["regressed_details"].append(
+                    {
+                        "public_id": upsert.public_id,
+                        "previous_resolved_at": upsert.previous_resolved_at,
+                    }
+                )
         return {"sessions_scanned": result.sessions_scanned}
 
     return handler
@@ -714,4 +722,5 @@ def process_queued_replay_jobs(
         issues_regressed=int(accumulator.get("issues_regressed", 0)),
         regressed_public_ids=tuple(accumulator.get("regressed_ids", []) or []),
         inserted_public_ids=tuple(accumulator.get("inserted_ids", []) or []),
+        regressed_details=tuple(accumulator.get("regressed_details", []) or []),
     )
