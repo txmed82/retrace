@@ -71,6 +71,8 @@ class ErrorToastDetector:
                             timestamp_ms=event_timestamp_ms(e),
                             url=url,
                             details={"text": text[:200]},
+                            confidence="medium",
+                            reason_codes=("error_toast.error_like_dom_added",),
                         )
                     )
                     break

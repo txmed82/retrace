@@ -42,6 +42,8 @@ class Network5xxDetector:
                         "request_url": payload.get("url", ""),
                         "method": payload.get("method", "GET"),
                     },
+                    confidence="high",
+                    reason_codes=("network_5xx.status_5xx",),
                 )
             )
         return out

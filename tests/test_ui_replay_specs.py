@@ -88,6 +88,8 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "X-Retrace-Key" in _INDEX_HTML
     assert "copyEvidenceBundle" in _INDEX_HTML
     assert "timelineTypeFilter" in _INDEX_HTML
+    assert "Confidence:" in _INDEX_HTML
+    assert "Reasons:" in _INDEX_HTML
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(
@@ -136,6 +138,8 @@ def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> N
                 {
                     "detector": "network_5xx",
                     "timestamp_ms": 300,
+                    "confidence": "high",
+                    "reason_codes": ["network_5xx.status_5xx"],
                     "details": {
                         "method": "POST",
                         "request_url": "/api/checkout",
@@ -172,6 +176,8 @@ def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> N
     assert timeline[2]["kind"] == "network"
     assert timeline[2]["summary"] == "POST /api/checkout returned 500 in 42ms"
     assert timeline[2]["detector_hit"] is True
+    assert timeline[2]["confidence"] == "high"
+    assert timeline[2]["reason_codes"] == ["network_5xx.status_5xx"]
     assert timeline[3]["summary"] == "Checkout total is undefined"
 
 

@@ -64,6 +64,8 @@ class DeadClickDetector:
                         timestamp_ms=click_ts,
                         url=url,
                         details={"target_id": tid},
+                        confidence="medium",
+                        reason_codes=("dead_click.no_followup_dom_or_network",),
                     )
                 )
         return out

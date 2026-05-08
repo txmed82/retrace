@@ -1011,7 +1011,11 @@ def test_replay_core_uses_deterministic_fallback_when_llm_fails(tmp_path: Path) 
     assert issue["analysis_prompt_version"] == "replay-analysis-v1"
     assert issue["analysis_error"] == "offline"
     assert "console_error across 1 replay session(s)" in issue["summary"]
+    assert "Reason codes: console_error.error_level." in issue["summary"]
     assert issue["likely_cause"].startswith("Generated from replay signals")
+    evidence = json.loads(issue["evidence_json"])
+    assert evidence["signals"][0]["confidence"] == "medium"
+    assert evidence["signals"][0]["reason_codes"] == ["console_error.error_level"]
     assert json.loads(issue["reproduction_steps_json"]) == [
         "Open https://app.example/cart",
         "Click element id 7",
@@ -1040,6 +1044,7 @@ def test_replay_summary_severity_uses_all_cluster_signals() -> None:
                     detector="dead_click",
                     timestamp_ms=10,
                     url="https://example.com",
+                    reason_codes=("dead_click.no_followup_dom_or_network",),
                 )
             ],
             "high": [
@@ -1049,12 +1054,17 @@ def test_replay_summary_severity_uses_all_cluster_signals() -> None:
                     timestamp_ms=20,
                     url="https://example.com/api",
                     details={"request_url": "/api/save", "status": 500},
+                    confidence="high",
+                    reason_codes=("network_5xx.status_5xx",),
                 )
             ],
         },
     )
 
     assert finding.severity == "high"
+    assert finding.confidence == "high"
+    assert "dead_click.no_followup_dom_or_network" in finding.what_happened
+    assert "network_5xx.status_5xx" in finding.what_happened
 
 
 def test_replay_core_processes_queued_finalize_jobs(tmp_path: Path) -> None:

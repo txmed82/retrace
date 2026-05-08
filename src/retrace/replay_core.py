@@ -133,6 +133,36 @@ def _signal_sentence(signal: Signal) -> str:
     return signal.detector.replace("_", " ")
 
 
+def _signal_reason_codes(signals: list[Signal]) -> list[str]:
+    codes: list[str] = []
+    seen: set[str] = set()
+    for signal in signals:
+        for code in signal.reason_codes:
+            if code and code not in seen:
+                codes.append(code)
+                seen.add(code)
+    return codes
+
+
+def _confidence_rank(confidence: str) -> int:
+    return {"low": 0, "medium": 1, "high": 2}.get(str(confidence), 1)
+
+
+def _signal_confidence(signals: list[Signal]) -> str:
+    if not signals:
+        return "low"
+    return max((signal.confidence for signal in signals), key=_confidence_rank)
+
+
+def _summary_with_reason_codes(summary: str, reason_codes: list[str]) -> str:
+    if not reason_codes:
+        return summary
+    suffix = f"Reason codes: {', '.join(reason_codes)}."
+    if suffix in summary:
+        return summary
+    return f"{summary.rstrip()} {suffix}".strip()
+
+
 def _severity(signals: list[Signal]) -> str:
     names = {s.detector for s in signals}
     if "network_5xx" in names or "blank_render" in names:
@@ -169,6 +199,8 @@ def _signal_evidence(signal: Signal) -> dict[str, Any]:
         "detector": signal.detector,
         "timestamp_ms": signal.timestamp_ms,
         "url": signal.url,
+        "confidence": signal.confidence,
+        "reason_codes": list(signal.reason_codes),
         "details": signal.details,
     }
 
@@ -258,16 +290,18 @@ def summarize_replay_issue(
         f"{cluster.affected_count} replay session(s). The representative replay "
         f"shows the issue around {cluster.first_seen_ms}ms."
     )
+    reason_codes = _signal_reason_codes(signals)
+    confidence = _signal_confidence(signals)
     return Finding(
         session_id=session_id,
         session_url=f"retrace://replay/{session_id}",
         title=title,
         severity=_severity(signals),
         category="functional_error",
-        what_happened=what_happened,
+        what_happened=_summary_with_reason_codes(what_happened, reason_codes),
         likely_cause="Generated from replay signals; confirm with source traces or code ownership data.",
         reproduction_steps=_action_steps(events_by_session.get(session_id, [])),
-        confidence="medium" if signals else "low",
+        confidence=confidence,
         detector_signals=detector_names,
         affected_count=cluster.affected_count,
         first_seen_ms=cluster.first_seen_ms,
@@ -361,8 +395,13 @@ class ReplayCoreService:
                 events_by_session=events_by_session,
                 signals_by_session=signals_by_session,
             )
-            finding = self._enrich_finding(
+            finding = self._with_signal_reason_summary(
                 finding=analysis.finding,
+                cluster=cluster,
+                signals_by_session=signals_by_session,
+            )
+            finding = self._enrich_finding(
+                finding=finding,
                 cluster=cluster,
                 signals_by_session=signals_by_session,
             )
@@ -404,6 +443,27 @@ class ReplayCoreService:
             signals_inserted=signals_inserted,
             issues=issues,
         )
+
+    def _with_signal_reason_summary(
+        self,
+        *,
+        finding: Finding,
+        cluster: Cluster,
+        signals_by_session: dict[str, list[Signal]],
+    ) -> Finding:
+        signals = [
+            signal
+            for session_id in cluster.session_ids
+            for signal in signals_by_session.get(session_id, [])
+        ]
+        reason_codes = _signal_reason_codes(signals)
+        finding.what_happened = _summary_with_reason_codes(
+            finding.what_happened,
+            reason_codes,
+        )
+        if finding.confidence not in {"low", "medium", "high"}:
+            finding.confidence = _signal_confidence(signals)
+        return finding
 
     def _enrich_finding(
         self,

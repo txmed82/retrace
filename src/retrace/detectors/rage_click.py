@@ -61,6 +61,8 @@ class RageClickDetector:
                             "click_count": len(window),
                             "target_id": base_tid,
                         },
+                        confidence="medium",
+                        reason_codes=("rage_click.repeated_same_target",),
                     )
                 )
         return out
