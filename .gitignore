@@ -14,3 +14,4 @@ reports/
 src/retrace/reports/__pycache__/
 src/retrace/reports/*.pyc
 .DS_Store
+.codex/config.toml

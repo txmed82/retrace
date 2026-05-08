@@ -525,6 +525,7 @@ Override any of them via the `cron` service environment in `docker-compose.yml`.
 
 ## Design Docs
 
+- `docs/ai-qa-suite-source-of-truth.md`
 - `docs/open-source-product-plan.md`
 - `docs/superpowers/specs/2026-04-19-retrace-design.md`
 - `docs/superpowers/plans/2026-04-19-retrace-plan-a-vertical-slice.md`
