@@ -549,10 +549,12 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
             cwd=config_path.parent,
         )
         if job is not None:
-            result_payload = job.get("result") if isinstance(job.get("result"), dict) else {}
+            result_payload = (
+                job.get("result") if isinstance(job.get("result"), dict) else None
+            )
             run_ok = (
-                bool(result_payload.get("ok"))
-                if result_payload
+                bool(result_payload["ok"])
+                if result_payload is not None and "ok" in result_payload
                 else job.get("status") == "succeeded"
             )
             try:
@@ -560,7 +562,7 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
                 store.init_schema()
                 spec_id = str(job.get("spec_id") or "")
                 link_id = _single_failure_test_link_id(store, spec_id)
-                if link_id and result_payload:
+                if link_id and result_payload is not None:
                     store.update_failure_test_link_run(
                         spec_id=spec_id,
                         run_result=SimpleNamespace(**result_payload),
@@ -589,16 +591,18 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
                             event=NotificationEvent.RUN_FAILED.value,
                             title=f"Queued tester run failed: {job.get('spec_id', '')}",
                             summary=str(
-                                result_payload.get("error") or job.get("error") or ""
+                                (result_payload or {}).get("error")
+                                or job.get("error")
+                                or ""
                             ),
-                            public_id=str(result_payload.get("run_id") or ""),
+                            public_id=str((result_payload or {}).get("run_id") or ""),
                             extra={
                                 "spec_id": job.get("spec_id"),
-                                "execution_engine": result_payload.get(
+                                "execution_engine": (result_payload or {}).get(
                                     "execution_engine"
                                 ),
-                                "attempts": result_payload.get("attempts"),
-                                "failure_classification": result_payload.get(
+                                "attempts": (result_payload or {}).get("attempts"),
+                                "failure_classification": (result_payload or {}).get(
                                     "failure_classification"
                                 ),
                             },
