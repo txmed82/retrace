@@ -8,6 +8,7 @@ import click
 import httpx
 
 from retrace.config import load_config
+from retrace.errors import format_user_error
 from retrace.llm.client import build_llm_http_request
 
 
@@ -50,7 +51,7 @@ def doctor_command(config_path: Path) -> None:
             resp.raise_for_status()
         checks.append(_ok("PostHog", f"reached {url}"))
     except Exception as exc:
-        checks.append(_fail("PostHog", str(exc)))
+        checks.append(_fail("PostHog", format_user_error(exc)))
 
     try:
         url, headers, body = build_llm_http_request(
@@ -69,7 +70,7 @@ def doctor_command(config_path: Path) -> None:
             resp.raise_for_status()
         checks.append(_ok("LLM", f"{cfg.llm.provider} reached {url}"))
     except Exception as exc:
-        checks.append(_fail("LLM", str(exc)))
+        checks.append(_fail("LLM", format_user_error(exc)))
 
     try:
         cfg.run.output_dir.mkdir(parents=True, exist_ok=True)
@@ -98,7 +99,7 @@ def doctor_command(config_path: Path) -> None:
             viewer = (payload.get("data") or {}).get("viewer") or {}
             checks.append(_ok("Linear sink", f"viewer={viewer.get('name', '?')}"))
         except Exception as exc:
-            checks.append(_fail("Linear sink", str(exc)))
+            checks.append(_fail("Linear sink", format_user_error(exc)))
 
     if cfg.github_sink.enabled:
         try:
@@ -115,7 +116,7 @@ def doctor_command(config_path: Path) -> None:
                 user = resp.json()
             checks.append(_ok("GitHub sink", f"login={user.get('login', '?')}"))
         except Exception as exc:
-            checks.append(_fail("GitHub sink", str(exc)))
+            checks.append(_fail("GitHub sink", format_user_error(exc)))
 
     if cfg.notifications.enabled:
         if cfg.notifications.webhook_url.strip():
@@ -140,7 +141,7 @@ def doctor_command(config_path: Path) -> None:
                 else:
                     checks.append(_fail("Notifications: webhook", detail))
             except Exception as exc:
-                checks.append(_fail("Notifications: webhook", str(exc)))
+                checks.append(_fail("Notifications: webhook", format_user_error(exc)))
         if cfg.notifications.slack_webhook_url.strip():
             url = cfg.notifications.slack_webhook_url
             if url.startswith("https://hooks.slack.com/"):

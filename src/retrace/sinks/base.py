@@ -52,7 +52,10 @@ class RunSummary:
     sessions_with_signals: int
     clusters_found: int
     sessions_errored: int = 0
+    detector_errors: int = 0
     cap_hit: bool = False
+    status: str = "ok"
+    error: str = ""
 
 
 class Sink(Protocol):

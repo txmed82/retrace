@@ -4,10 +4,13 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
+
 from retrace.clusterer import cluster_sessions
 from retrace.config import RetraceConfig
 from retrace.detectors import Signal, all_detectors
 from retrace.enrichment import CorrelationEnricher
+from retrace.errors import format_user_error
 from retrace.ingester import PostHogIngester
 from retrace.llm.analyst import analyze_cluster
 from retrace.llm.client import LLMClient
@@ -66,8 +69,10 @@ def run_pipeline(
     ids: list[str] = []
     findings: list[Finding] = []
     errors = 0
+    detector_errors = 0
     cap_hit = False
     sessions_with_signals = 0
+    next_cursor: datetime | None = None
 
     try:
         cursor = store.get_last_run_cursor() or (
@@ -97,6 +102,7 @@ def run_pipeline(
                     try:
                         session_signals.extend(d.detect(sid, events))
                     except Exception as exc:
+                        detector_errors += 1
                         log.warning(
                             "detector %s failed on session %s: %s", d.name, sid, exc
                         )
@@ -138,30 +144,60 @@ def run_pipeline(
             sessions_with_signals=sessions_with_signals,
             clusters_found=len(findings),
             sessions_errored=errors,
+            detector_errors=detector_errors,
             cap_hit=cap_hit,
         )
+
+        if errors or detector_errors:
+            status = "partial"
+            parts = []
+            if errors:
+                parts.append(f"session/cluster errors: {errors}")
+            if detector_errors:
+                parts.append(f"detector failures: {detector_errors}")
+            error_msg = "; ".join(parts)
+        else:
+            if cap_hit and processed_started_at:
+                next_cursor = min(processed_started_at)
+            else:
+                next_cursor = started_at
+
+        summary.status = status
+        summary.error = error_msg or ""
 
         try:
             sink = MarkdownSink(output_dir=cfg.run.output_dir)
             sink.write(summary, findings)
+            if next_cursor is not None:
+                store.set_last_run_cursor(next_cursor)
         except Exception as exc:
             error_msg = f"sink write failed: {exc}"
             status = "error"
+            summary.status = status
+            summary.error = error_msg
             log.error(error_msg)
 
-        if cap_hit and processed_started_at:
-            next_cursor = min(processed_started_at)
-        else:
-            next_cursor = started_at
-        store.set_last_run_cursor(next_cursor)
-
-        if errors and status == "ok":
-            status = "partial"
-
         return summary
+    except httpx.TransportError as exc:
+        status = "error"
+        error_msg = format_user_error(exc)
+        log.error("pipeline aborted: %s", error_msg)
+        finished_at = datetime.now(timezone.utc)
+        return RunSummary(
+            started_at=started_at,
+            finished_at=finished_at,
+            sessions_scanned=len(ids),
+            sessions_with_signals=sessions_with_signals,
+            clusters_found=len(findings),
+            sessions_errored=errors,
+            detector_errors=detector_errors,
+            cap_hit=cap_hit,
+            status=status,
+            error=error_msg,
+        )
     except Exception as exc:
         status = "error"
-        error_msg = str(exc)
+        error_msg = format_user_error(exc)
         log.exception("pipeline aborted")
         finished_at = datetime.now(timezone.utc)
         return RunSummary(
@@ -171,7 +207,10 @@ def run_pipeline(
             sessions_with_signals=sessions_with_signals,
             clusters_found=len(findings),
             sessions_errored=errors,
+            detector_errors=detector_errors,
             cap_hit=cap_hit,
+            status=status,
+            error=error_msg,
         )
     finally:
         store.finish_run(

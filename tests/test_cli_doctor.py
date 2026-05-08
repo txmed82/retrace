@@ -1,4 +1,5 @@
 from pathlib import Path
+import httpx
 from click.testing import CliRunner
 from pytest_httpx import HTTPXMock
 
@@ -73,6 +74,87 @@ def test_doctor_reports_failure_when_llm_unreachable(
 
     assert result.exit_code != 0
     assert "FAIL" in result.output or "fail" in result.output.lower()
+
+
+def test_doctor_reports_network_errors_without_low_level_dns_noise(
+    tmp_path: Path, httpx_mock: HTTPXMock, monkeypatch
+):
+    (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
+    (tmp_path / ".env").write_text("RETRACE_POSTHOG_API_KEY=phx_test\n")
+
+    httpx_mock.add_exception(
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known"),
+        method="GET",
+        url="https://us.i.posthog.com/api/projects/42/",
+    )
+    httpx_mock.add_exception(
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known"),
+        method="POST",
+        url="http://localhost:8080/v1/chat/completions",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code != 0
+    assert "network unavailable or host could not be resolved" in result.output
+    assert "nodename nor servname" not in result.output
+
+
+def test_doctor_reports_timeout_errors_without_traceback(
+    tmp_path: Path, httpx_mock: HTTPXMock, monkeypatch
+):
+    (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
+    (tmp_path / ".env").write_text("RETRACE_POSTHOG_API_KEY=phx_test\n")
+
+    httpx_mock.add_exception(
+        httpx.ReadTimeout("timed out"),
+        method="GET",
+        url="https://us.i.posthog.com/api/projects/42/",
+    )
+    httpx_mock.add_exception(
+        httpx.ReadTimeout("timed out"),
+        method="POST",
+        url="http://localhost:8080/v1/chat/completions",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code != 0
+    assert "network request timed out" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_doctor_reports_auth_errors_without_query_leak(
+    tmp_path: Path, httpx_mock: HTTPXMock, monkeypatch
+):
+    (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
+    (tmp_path / ".env").write_text("RETRACE_POSTHOG_API_KEY=phx_test\n")
+
+    httpx_mock.add_response(
+        method="GET",
+        url="https://us.i.posthog.com/api/projects/42/",
+        status_code=401,
+        json={"detail": "bad key"},
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:8080/v1/chat/completions",
+        status_code=401,
+        json={"error": "bad key"},
+    )
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code != 0
+    posthog_url = "https://us.i.posthog.com/api/projects/42/"
+    llm_url = "http://localhost:8080/v1/chat/completions"
+    assert f"HTTP 401 from {posthog_url}" in result.output
+    assert f"HTTP 401 from {llm_url}" in result.output
+    assert "?" not in posthog_url
+    assert "?" not in llm_url
 
 
 _CONFIG_WITH_SINKS = """posthog:
