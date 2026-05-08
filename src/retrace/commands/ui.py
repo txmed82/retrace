@@ -700,6 +700,29 @@ def _json_field(row: Any, key: str, fallback: Any) -> Any:
         return fallback
 
 
+def _failure_test_link_payload(link: Any) -> dict[str, Any]:
+    return {
+        "id": link.id,
+        "failure_id": link.failure_id,
+        "issue_id": link.issue_id,
+        "issue_public_id": link.issue_public_id,
+        "spec_id": link.spec_id,
+        "spec_name": link.spec_name,
+        "spec_path": link.spec_path,
+        "source": link.source,
+        "coverage_state": link.coverage_state,
+        "latest_run_id": link.latest_run_id,
+        "latest_run_status": link.latest_run_status,
+        "latest_run_classification": link.latest_run_classification,
+        "latest_run_ok": link.latest_run_ok,
+        "latest_run_at": (
+            link.latest_run_at.isoformat() if link.latest_run_at is not None else ""
+        ),
+        "created_at": link.created_at.isoformat(),
+        "updated_at": link.updated_at.isoformat(),
+    }
+
+
 def _replay_issue_payload(
     row: Any, *, sessions: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -712,6 +735,7 @@ def _replay_issue_payload(
         "status": str(row["status"]),
         "priority": str(row["priority"]),
         "severity": str(row["severity"]),
+        "confidence": str(row["confidence"]),
         "title": str(row["title"]),
         "summary": str(row["summary"]),
         "likely_cause": str(row["likely_cause"]),
@@ -732,6 +756,7 @@ def _replay_issue_payload(
         "updated_at": str(row["updated_at"]),
         "sessions": sessions,
         "timeline": [],
+        "test_links": [],
         "share_url": f"#issue={str(row['public_id'])}",
     }
 
@@ -761,6 +786,10 @@ def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
             payload["timeline"] = build_evidence_timeline(
                 store.list_failure_evidence(failure_id=failure_id)
             )
+            payload["test_links"] = [
+                _failure_test_link_payload(link)
+                for link in store.list_failure_test_links(failure_id=failure_id)
+            ]
         issues.append(payload)
     sessions = []
     for row in store.list_recent_replay_sessions(limit=50):
@@ -1165,19 +1194,36 @@ _INDEX_HTML = """<!doctype html>
   <title>Retrace UI</title>
   <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/style.css\" />
   <style>
-    :root { --bg:#0f172a; --panel:#111827; --text:#e5e7eb; --muted:#9ca3af; --acc:#22d3ee; }
+    :root { --bg:#0f172a; --panel:#111827; --panel2:#0b1220; --line:#1f2937; --text:#e5e7eb; --muted:#9ca3af; --acc:#22d3ee; }
     body { margin:0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; background:var(--bg); color:var(--text); }
-    .wrap { display:grid; grid-template-columns: 340px 1fr; height:100vh; }
-    .left { border-right:1px solid #1f2937; overflow:auto; background:#0b1220; }
-    .right { overflow:auto; padding:16px; }
-    .hdr { padding:12px 14px; border-bottom:1px solid #1f2937; position:sticky; top:0; background:#0b1220; z-index:2; }
+    .app-shell { display:grid; grid-template-columns: 212px minmax(320px, 380px) minmax(0, 1fr); height:100vh; }
+    .nav { border-right:1px solid var(--line); background:#08111f; padding:14px 12px; overflow:auto; }
+    .brand { font-size:15px; font-weight:700; margin-bottom:14px; }
+    .nav-btn { display:block; width:100%; text-align:left; margin:4px 0; background:transparent; color:var(--text); border:1px solid transparent; border-radius:8px; padding:9px 10px; cursor:pointer; font-size:13px; }
+    .nav-btn:hover { background:#111a2b; }
+    .nav-btn.active { background:#162033; border-color:#244158; color:#cffafe; }
+    .rail { border-right:1px solid var(--line); overflow:auto; background:var(--panel2); }
+    .main { overflow:auto; padding:16px; }
+    .hdr { padding:12px 14px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--panel2); z-index:2; }
+    .view { display:none; }
+    .view.active { display:block; }
     .finding { padding:10px 12px; border-bottom:1px solid #182235; cursor:pointer; }
     .finding:hover { background:#111a2b; }
     .finding.active { background:#162033; border-left:3px solid var(--acc); }
+    .issue-row { padding:10px 12px; border-bottom:1px solid #182235; cursor:pointer; }
+    .issue-row:hover { background:#111a2b; }
+    .issue-row.active { background:#162033; border-left:3px solid var(--acc); }
     .sev { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing: .08em; }
     .title { font-size:14px; line-height:1.35; margin-top:4px; }
+    .view-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:12px; }
+    .view-head h2 { margin:0; font-size:19px; letter-spacing:0; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .metric-grid { display:grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap:12px; margin-bottom:14px; }
+    .metric { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; }
+    .metric strong { display:block; font-size:24px; margin-bottom:4px; }
+    .detail-grid { display:grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr); gap:14px; align-items:start; }
     .grid { display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
-    .card { background:var(--panel); border:1px solid #1f2937; border-radius:10px; padding:12px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; }
     .card h3 { margin:0 0 8px 0; font-size:13px; color:#93c5fd; text-transform:uppercase; letter-spacing:.08em; }
     .lbl { font-size:12px; color:var(--muted); margin-top:8px; }
     input { width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px; }
@@ -1196,28 +1242,65 @@ _INDEX_HTML = """<!doctype html>
     .timeline-kind { color:#93c5fd; text-transform:uppercase; font-size:11px; letter-spacing:.08em; }
     .timeline-summary { color:var(--muted); margin-top:2px; overflow-wrap:anywhere; }
     .ok { color:#86efac; } .bad { color:#fca5a5; }
+    @media (max-width: 980px) {
+      .app-shell { grid-template-columns: 1fr; height:auto; min-height:100vh; }
+      .nav { position:sticky; top:0; z-index:3; border-right:0; border-bottom:1px solid var(--line); }
+      .nav-btn { display:inline-block; width:auto; margin-right:4px; }
+      .rail { border-right:0; border-bottom:1px solid var(--line); max-height:42vh; }
+      .main { padding:12px; }
+      .metric-grid, .detail-grid, .grid { grid-template-columns: 1fr; }
+      .timeline-row { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <div class=\"wrap\">
-    <div class=\"left\">
-      <div class=\"hdr\"><strong>Retrace Findings</strong><div class=\"empty\" id=\"reportMeta\"></div></div>
-      <div id=\"findings\"></div>
-    </div>
-    <div class=\"right\" id=\"detail\">
-      <div class=\"card\" id=\"onboarding\"></div>
-      <div style=\"height:12px\"></div>
-      <div class=\"card\" id=\"tester\"></div>
-      <div style=\"height:12px\"></div>
-      <div class=\"card\" id=\"replayDashboard\"></div>
-      <div style=\"height:12px\"></div>
-      <div id=\"findingDetail\"><div class=\"empty\">Select a finding.</div></div>
-    </div>
+  <div class=\"app-shell\">
+    <nav class=\"nav\">
+      <div class=\"brand\">Retrace QA</div>
+      <button class=\"nav-btn active\" type=\"button\" data-view=\"dashboard\">Dashboard</button>
+      <button class=\"nav-btn\" type=\"button\" data-view=\"issues\">Issues</button>
+      <button class=\"nav-btn\" type=\"button\" data-view=\"replays\">Replays</button>
+      <button class=\"nav-btn\" type=\"button\" data-view=\"tests\">Tests</button>
+      <button class=\"nav-btn\" type=\"button\" data-view=\"runs\">Runs</button>
+      <button class=\"nav-btn\" type=\"button\" data-view=\"settings\">Settings</button>
+    </nav>
+    <aside class=\"rail\">
+      <div class=\"hdr\"><strong id=\"railTitle\">Issues</strong><div class=\"empty\" id=\"reportMeta\"></div></div>
+      <div id=\"issueWorkflowList\"></div>
+      <div id=\"findings\" style=\"display:none\"></div>
+    </aside>
+    <main class=\"main\" id=\"detail\">
+      <section class=\"view active\" id=\"view-dashboard\"><div id=\"dashboardView\"></div></section>
+      <section class=\"view\" id=\"view-issues\">
+        <div class=\"view-head\">
+          <div><h2>Issue Detail</h2><div class=\"empty\">Replay-backed failures are the primary workflow surface.</div></div>
+          <div class=\"actions\">
+            <button class=\"btn\" id=\"processReplayJobsBtn\" type=\"button\">Process Queued Replays</button>
+            <button class=\"btn\" id=\"verifyResolvedBtn\" type=\"button\">Verify Resolved Issues</button>
+          </div>
+        </div>
+        <div class=\"empty\" id=\"replayProcessStatus\"></div>
+        <div class=\"empty\" id=\"verifyResolvedStatus\"></div>
+        <div id=\"replayIssueDetail\"><div class=\"empty\">Select a replay-backed issue.</div></div>
+      </section>
+      <section class=\"view\" id=\"view-replays\">
+        <div class=\"view-head\"><div><h2>Replays</h2><div class=\"empty\">Recent captured sessions and playback.</div></div></div>
+        <div id=\"replaySessionsPanel\"></div>
+        <div style=\"height:10px\"></div>
+        <div class=\"rr\"><div id=\"firstPartyReplay\"><div class=\"empty\">Select a first-party replay session.</div></div></div>
+      </section>
+      <section class=\"view\" id=\"view-tests\"><div id=\"tester\"></div></section>
+      <section class=\"view\" id=\"view-runs\"><div id=\"runsView\"></div></section>
+      <section class=\"view\" id=\"view-settings\"><div class=\"card\" id=\"onboarding\"></div></section>
+      <section class=\"view\" id=\"view-findings\"><div id=\"findingDetail\"><div class=\"empty\">Select a finding.</div></div></section>
+      <div id=\"replayDashboard\" style=\"display:none\"></div>
+    </main>
   </div>
   <script src=\"https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/index.js\"></script>
   <script>
     let findings = [];
     let active = null;
+    let replayState = { issues: [], sessions: [], activeIssueId: null };
     const LLM_DEFAULTS = {
       openai_compatible: { base_url: 'http://localhost:8080/v1', model: 'llama-3.1-8b-instruct' },
       openai: { base_url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
@@ -1232,6 +1315,23 @@ _INDEX_HTML = """<!doctype html>
 
     function copyText(s){ navigator.clipboard.writeText(String(s || \"\")); }
     function copyPrompt(key){ if(active?.prompts?.[key]) copyText(active.prompts[key]); }
+
+    function switchView(view){
+      document.querySelectorAll('.view').forEach(el => el.classList.toggle('active', el.id === `view-${view}`));
+      document.querySelectorAll('.nav-btn').forEach(el => el.classList.toggle('active', el.dataset.view === view));
+      const title = byId('railTitle');
+      if(title) title.textContent = view === 'findings' ? 'Report Findings' : 'Issues';
+      if(byId('issueWorkflowList')) byId('issueWorkflowList').style.display = view === 'findings' ? 'none' : '';
+      if(byId('findings')) byId('findings').style.display = view === 'findings' ? '' : 'none';
+    }
+    document.querySelectorAll('.nav-btn').forEach(el => el.addEventListener('click', () => switchView(el.dataset.view)));
+
+    function statusClass(value){
+      const v = String(value || '').toLowerCase();
+      if(v.includes('pass') || v === 'resolved' || v === 'covered_passing') return 'ok';
+      if(v.includes('fail') || v.includes('regressed') || v === 'unresolved' || v === 'covered_failing') return 'bad';
+      return '';
+    }
 
     function llmKeyLabel(provider){
       if(provider === 'openai') return 'OpenAI API Key';
@@ -1757,32 +1857,43 @@ const retrace = init({
         `<li><code>${esc(r.run_id || '')}</code> · ${r.ok ? '<span class="ok">ok</span>' : '<span class="bad">fail</span>'} · <code>${esc(r.status || '')}</code> · attempts=<code>${esc(r.attempts || 1)}</code>${r.failure_classification ? ` · class=<code>${esc(r.failure_classification)}</code>` : ''}${r.flake_reason ? ` · flake=<code>${esc(r.flake_reason)}</code>` : ''} · <code>${esc(r.spec_id || '')}</code><br><span class="empty">${esc(r.run_dir || '')}</span></li>`
       ).join('');
       byId('tester').innerHTML = `
-        <h3>Local UI Tester (Describe + Suite Explore)</h3>
-        <form id="testerCreateForm">
-          <div class="lbl">Test Name</div>
-          <input id="testerName" value="" placeholder="Checkout happy path" />
-          <div class="lbl">Mode</div>
-          <select id="testerMode" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
-            <option value="describe">Describe Test</option>
-            <option value="explore_suite">AI Explore Full Suite</option>
-          </select>
-          <div class="lbl">Prompt / Task</div>
-          <input id="testerPrompt" value="" placeholder="Describe a specific test. Leave blank for suite exploration mode." />
-          <div class="lbl">App URL (override)</div>
-          <input id="testerSpecAppUrl" value="${esc(settings.tester_app_url || 'http://127.0.0.1:3000')}" />
-          <div style="margin-top:10px"><button class="btn" type="submit">Save Test Spec</button></div>
-        </form>
-        <div style="height:10px"></div>
-        <div class="lbl">Run Saved Spec</div>
-        <select id="testerSpecSelect" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
-          ${specOptions || '<option value="">No specs yet</option>'}
-        </select>
-        <div style="margin-top:8px"><button class="btn" id="runTesterBtn" type="button">Run Selected Test</button> <span class="empty" id="testerRunStatus"></span></div>
-        <div class="lbl" style="margin-top:10px">Recent Runs</div>
-        ${runRows ? `<ul>${runRows}</ul>` : '<div class="empty">No runs yet.</div>'}
+        <div class="view-head"><div><h2>Tests</h2><div class="empty">Create local specs, run saved checks, and verify linked failures.</div></div></div>
+        <div class="detail-grid">
+          <div class="card">
+            <h3>Local UI Tester</h3>
+            <form id="testerCreateForm">
+              <div class="lbl">Test Name</div>
+              <input id="testerName" value="" placeholder="Checkout happy path" />
+              <div class="lbl">Mode</div>
+              <select id="testerMode" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
+                <option value="describe">Describe Test</option>
+                <option value="explore_suite">AI Explore Full Suite</option>
+              </select>
+              <div class="lbl">Prompt / Task</div>
+              <input id="testerPrompt" value="" placeholder="Describe a specific test. Leave blank for suite exploration mode." />
+              <div class="lbl">App URL (override)</div>
+              <input id="testerSpecAppUrl" value="${esc(settings.tester_app_url || 'http://127.0.0.1:3000')}" />
+              <div style="margin-top:10px"><button class="btn" type="submit">Save Test Spec</button></div>
+            </form>
+            <div class="lbl" style="margin-top:12px">Run Saved Spec</div>
+            <select id="testerSpecSelect" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
+              ${specOptions || '<option value="">No specs yet</option>'}
+            </select>
+            <div style="margin-top:8px"><button class="btn" id="runTesterBtn" type="button">Run Selected Test</button> <span class="empty" id="testerRunStatus"></span></div>
+          </div>
+          <div class="card">
+            <h3>Linked Failures</h3>
+            <div id="linkedFailureTests"><div class="empty">Loading linked failures...</div></div>
+          </div>
+        </div>
+      `;
+      byId('runsView').innerHTML = `
+        <div class="view-head"><div><h2>Runs</h2><div class="empty">Recent local tester results.</div></div></div>
+        <div class="card">${runRows ? `<ul>${runRows}</ul>` : '<div class="empty">No runs yet.</div>'}</div>
       `;
       byId('testerCreateForm').addEventListener('submit', createTesterSpec);
       byId('runTesterBtn').addEventListener('click', runTesterSpec);
+      renderLinkedFailureTests();
     }
 
     async function processReplayJobs(){
@@ -1821,64 +1932,83 @@ const retrace = init({
       const data = await res.json();
       const issues = data.issues || [];
       const sessions = data.sessions || [];
+      replayState.issues = issues;
+      replayState.sessions = sessions;
       const issueOptions = [...new Set(issues.map(i => i.status || 'unknown'))].sort()
         .map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
       const sessionOptions = [...new Set(sessions.map(s => s.status || 'unknown'))].sort()
         .map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
       const issueRows = issues.map(i => `
-        <li data-issue-status="${esc(i.status)}"><button class="btn" type="button" data-replay-issue="${esc(i.public_id)}">Inspect</button>
-          <a href="${esc(i.share_url)}"><code>${esc(i.public_id)}</code></a> · <strong>${esc(i.title || 'Untitled issue')}</strong><br>
-          <span class="empty">${esc(i.status)} · ${esc(i.severity)} · affected=${esc(i.affected_count)} · users=${esc(i.affected_users)} · ticket=${esc(i.external_ticket_state || 'none')}</span>
-        </li>`).join('');
+        <div class="issue-row ${replayState.activeIssueId === i.public_id ? 'active' : ''}" data-issue-status="${esc(i.status)}" data-replay-issue="${esc(i.public_id)}">
+          <div class="sev">${esc(i.status)} · ${esc(i.severity)} · ${esc(i.confidence || 'medium')} confidence</div>
+          <div class="title">${esc(i.title || 'Untitled issue')}</div>
+          <div class="empty">${esc(i.public_id)} · affected=${esc(i.affected_count)} · tests=${esc((i.test_links || []).length)}</div>
+        </div>`).join('');
       const sessionRows = sessions.map(s => `
         <li data-session-status="${esc(s.status)}"><button class="btn" type="button" data-replay-session="${esc(s.stable_id)}">Play</button>
           <a href="${esc(s.share_url)}"><code>${esc(s.public_id)}</code></a> · ${esc(s.stable_id)}<br>
           <span class="empty">${esc(s.status)} · events=${esc(s.event_count)} · ${esc(s.last_seen_at)} · ${esc(JSON.stringify(s.preview || {}))}</span>
         </li>`).join('');
-      byId('replayDashboard').innerHTML = `
-        <h3>Replay Dashboard</h3>
-        <div>
-          <button class="btn" id="processReplayJobsBtn" type="button">Process Queued Replays</button>
-          <button class="btn" id="verifyResolvedBtn" type="button">Verify Resolved Issues</button>
-          <span class="empty" id="replayProcessStatus">${esc(processStatus)}</span>
-          <span class="empty" id="verifyResolvedStatus"></span>
+      const unresolved = issues.filter(i => i.status !== 'resolved' && i.status !== 'ignored').length;
+      const covered = issues.filter(i => (i.test_links || []).length > 0).length;
+      const high = issues.filter(i => i.severity === 'high' || i.priority === 'high').length;
+      byId('issueWorkflowList').innerHTML = `
+        <div class="hdr">
+          <select id="issueStatusFilter" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
+            <option value="">All statuses</option>${issueOptions}
+          </select>
         </div>
-        <div class="grid" style="margin-top:10px">
-          <div><div class="lbl">Replay-backed Issues</div>
-            <select id="issueStatusFilter" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
-              <option value="">All statuses</option>${issueOptions}
-            </select>
-            ${issueRows ? `<ul id="replayIssueList">${issueRows}</ul>` : '<div class="empty">No replay issues yet.</div>'}
-          </div>
-          <div><div class="lbl">Recent Sessions</div>
-            <select id="sessionStatusFilter" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
-              <option value="">All statuses</option>${sessionOptions}
-            </select>
-            ${sessionRows ? `<ul id="replaySessionList">${sessionRows}</ul>` : '<div class="empty">No first-party replay sessions yet.</div>'}
-          </div>
-        </div>
-        <div style="height:10px"></div>
-        <div id="replayIssueDetail"><div class="empty">Select a replay-backed issue.</div></div>
-        <div style="height:10px"></div>
-        <div class="rr"><div id="firstPartyReplay"><div class="empty">Select a first-party replay session.</div></div></div>
+        <div id="replayIssueList">${issueRows || '<div class="empty" style="padding:12px">No replay issues yet.</div>'}</div>
       `;
+      byId('dashboardView').innerHTML = `
+        <div class="view-head">
+          <div><h2>Dashboard</h2><div class="empty">Local-first QA workflow across issues, replays, generated tests, and repair prompts.</div></div>
+          <div class="actions"><button class="btn" type="button" data-view-jump="issues">Open Issue Detail</button></div>
+        </div>
+        <div class="metric-grid">
+          <div class="metric"><strong>${esc(issues.length)}</strong><span class="empty">total issues</span></div>
+          <div class="metric"><strong>${esc(unresolved)}</strong><span class="empty">active issues</span></div>
+          <div class="metric"><strong>${esc(covered)}</strong><span class="empty">with linked tests</span></div>
+          <div class="metric"><strong>${esc(high)}</strong><span class="empty">high priority/severity</span></div>
+        </div>
+        <div class="card"><h3>Next Issues</h3>${issues.slice(0, 6).map(i => `<div class="issue-row" data-replay-issue="${esc(i.public_id)}"><div class="sev">${esc(i.status)} · ${esc(i.severity)}</div><div class="title">${esc(i.title || 'Untitled issue')}</div><div class="empty">${esc(i.public_id)} · timeline=${esc((i.timeline || []).length)} · tests=${esc((i.test_links || []).length)}</div></div>`).join('') || '<div class="empty">No issues yet.</div>'}</div>
+      `;
+      byId('replaySessionsPanel').innerHTML = `
+        <div class="card">
+          <h3>Recent Sessions</h3>
+          <select id="sessionStatusFilter" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
+            <option value="">All statuses</option>${sessionOptions}
+          </select>
+          ${sessionRows ? `<ul id="replaySessionList">${sessionRows}</ul>` : '<div class="empty">No first-party replay sessions yet.</div>'}
+        </div>
+      `;
+      if(byId('replayProcessStatus')) byId('replayProcessStatus').textContent = processStatus;
       byId('processReplayJobsBtn').addEventListener('click', processReplayJobs);
       byId('verifyResolvedBtn').addEventListener('click', verifyResolvedReplayIssues);
-      byId('replayDashboard').querySelectorAll('[data-replay-session]').forEach(el => {
+      document.querySelectorAll('[data-replay-session]').forEach(el => {
         el.addEventListener('click', () => loadFirstPartyReplay(el.dataset.replaySession));
       });
-      byId('replayDashboard').querySelectorAll('[data-replay-issue]').forEach(el => {
-        el.addEventListener('click', () => renderReplayIssueDetail(issues.find(i => i.public_id === el.dataset.replayIssue)));
+      document.querySelectorAll('[data-replay-issue]').forEach(el => {
+        el.addEventListener('click', () => {
+          const issue = issues.find(i => i.public_id === el.dataset.replayIssue);
+          renderReplayIssueDetail(issue);
+          switchView('issues');
+        });
       });
+      document.querySelectorAll('[data-view-jump]').forEach(el => el.addEventListener('click', () => switchView(el.dataset.viewJump)));
       byId('issueStatusFilter')?.addEventListener('change', ev => filterReplayRows('replayIssueList', 'issueStatus', ev.target.value));
       byId('sessionStatusFilter')?.addEventListener('change', ev => filterReplayRows('replaySessionList', 'sessionStatus', ev.target.value));
       applyReplayHash(issues, sessions);
+      if(!replayState.activeIssueId && issues[0]){
+        renderReplayIssueDetail(issues[0]);
+      }
+      renderLinkedFailureTests();
     }
 
     function filterReplayRows(listId, dataKey, value){
       const list = byId(listId);
       if(!list) return;
-      list.querySelectorAll('li').forEach(row => {
+      list.querySelectorAll('li, .issue-row').forEach(row => {
         row.style.display = !value || row.dataset[dataKey] === value ? '' : 'none';
       });
     }
@@ -1937,40 +2067,111 @@ const retrace = init({
       if(status) status.textContent = 'Copied';
     }
 
+    function renderTestLinks(issue){
+      const links = issue.test_links || [];
+      const rows = links.map(link => `
+        <li>
+          <code>${esc(link.spec_id)}</code>${link.spec_name ? ` · ${esc(link.spec_name)}` : ''}
+          <br><span class="empty">coverage=<code class="${statusClass(link.coverage_state)}">${esc(link.coverage_state)}</code>${link.latest_run_status ? ` · latest=<code class="${statusClass(link.latest_run_status)}">${esc(link.latest_run_status)}</code>` : ''}${link.latest_run_classification ? ` · class=<code>${esc(link.latest_run_classification)}</code>` : ''}</span>
+          ${link.spec_path ? `<br><span class="empty">${esc(link.spec_path)}</span>` : ''}
+        </li>
+      `).join('');
+      return rows ? `<ul>${rows}</ul>` : '<div class="empty">No linked regression tests yet.</div>';
+    }
+
+    function renderExternalLinks(issue){
+      const links = [];
+      if(issue.external_ticket_url) links.push(`<a href="${esc(issue.external_ticket_url)}" target="_blank">${esc(issue.external_ticket_id || 'External ticket')}</a>`);
+      if(issue.share_url) links.push(`<a href="${esc(issue.share_url)}">Issue permalink</a>`);
+      for(const session of issue.sessions || []){
+        links.push(`<a href="#replay=${esc(session.session_id)}" data-replay-session="${esc(session.session_id)}">Replay ${esc(session.session_id)}</a>`);
+      }
+      return links.length ? `<ul>${links.map(link => `<li>${link}</li>`).join('')}</ul>` : `<div class="empty">${esc(issue.external_ticket_state || 'No external links yet.')}</div>`;
+    }
+
+    function renderLinkedFailureTests(){
+      const root = byId('linkedFailureTests');
+      if(!root){ return; }
+      const rows = [];
+      for(const issue of replayState.issues || []){
+        for(const link of issue.test_links || []){
+          rows.push(`
+            <li>
+              <button class="btn" type="button" data-replay-issue="${esc(issue.public_id)}">Open</button>
+              <code>${esc(link.spec_id)}</code> · <span class="${statusClass(link.coverage_state)}">${esc(link.coverage_state)}</span>
+              <br><span class="empty">${esc(issue.public_id)} · ${esc(issue.title || 'Replay issue')}${link.latest_run_status ? ` · latest=${esc(link.latest_run_status)}` : ''}</span>
+            </li>
+          `);
+        }
+      }
+      root.innerHTML = rows.length ? `<ul>${rows.join('')}</ul>` : '<div class="empty">No linked failures yet. Generate a regression spec from an issue to create coverage.</div>';
+      root.querySelectorAll('[data-replay-issue]').forEach(el => {
+        el.addEventListener('click', () => {
+          renderReplayIssueDetail(replayState.issues.find(i => i.public_id === el.dataset.replayIssue));
+          switchView('issues');
+        });
+      });
+    }
+
     function renderReplayIssueDetail(issue){
       const root = byId('replayIssueDetail');
       if(!root || !issue){ return; }
+      replayState.activeIssueId = issue.public_id;
+      document.querySelectorAll('[data-replay-issue]').forEach(el => {
+        el.classList.toggle('active', el.dataset.replayIssue === issue.public_id);
+      });
       const steps = (issue.reproduction_steps || []).map(s => `<li>${esc(s)}</li>`).join('');
       const sessions = (issue.sessions || []).map(s =>
         `<li><button class="btn" type="button" data-replay-session="${esc(s.session_id)}">Play</button> <code>${esc(s.session_id)}</code> · ${esc(s.role)}</li>`
       ).join('');
       root.innerHTML = `
-        <h3>${esc(issue.public_id)} · ${esc(issue.title || 'Replay issue')}</h3>
-        <div class="empty">${esc(issue.status)} · ${esc(issue.severity)} · affected=${esc(issue.affected_count)} · users=${esc(issue.affected_users)}</div>
-        <div class="lbl">Summary</div><div>${esc(issue.summary || '')}</div>
-        <div class="lbl">Likely Cause</div><div>${esc(issue.likely_cause || '')}</div>
-        <div class="lbl">Reproduction Steps</div>${steps ? `<ul>${steps}</ul>` : '<div class="empty">No steps generated yet.</div>'}
-        ${renderIssueTimeline(issue)}
-        <div style="margin-top:10px">
-          <button class="btn" id="resolveReplayIssueBtn" type="button">Mark Resolved</button>
-          <button class="btn" id="unresolveReplayIssueBtn" type="button">Mark Unresolved</button>
-          <button class="btn" id="ignoreReplayIssueBtn" type="button">Ignore Fingerprint</button>
-          <span class="empty" id="replayLifecycleStatus"></span>
+        <div class="view-head">
+          <div>
+            <h2>${esc(issue.public_id)} · ${esc(issue.title || 'Replay issue')}</h2>
+            <div class="empty">${esc(issue.status)} · ${esc(issue.severity)} · ${esc(issue.confidence || 'medium')} confidence · affected=${esc(issue.affected_count)} · users=${esc(issue.affected_users)}</div>
+          </div>
+          <div class="actions">
+            <button class="btn" id="resolveReplayIssueBtn" type="button">Mark Resolved</button>
+            <button class="btn" id="unresolveReplayIssueBtn" type="button">Mark Unresolved</button>
+            <button class="btn" id="ignoreReplayIssueBtn" type="button">Ignore Fingerprint</button>
+          </div>
         </div>
-        <div style="margin-top:10px">
-          <button class="btn" id="generateReplaySpecBtn" type="button">Generate Regression Spec</button>
-          <span class="empty" id="replaySpecStatus"></span>
+        <div class="empty" id="replayLifecycleStatus"></div>
+        <div class="detail-grid">
+          <div>
+            <div class="card">
+              <h3>Failure Narrative</h3>
+              <div class="lbl">Summary</div><div>${esc(issue.summary || '')}</div>
+              <div class="lbl">Likely Cause</div><div>${esc(issue.likely_cause || '')}</div>
+              <div class="lbl">Reproduction Steps</div>${steps ? `<ul>${steps}</ul>` : '<div class="empty">No steps generated yet.</div>'}
+            </div>
+            <div style="height:12px"></div>
+            <div class="card">${renderIssueTimeline(issue)}</div>
+            <div style="height:12px"></div>
+            <div class="card">
+              <h3>Repair Task</h3>
+              <button class="btn" id="generateReplayFixPromptsBtn" type="button">Generate Fix Prompts</button>
+              <span class="empty" id="replayFixPromptStatus"></span>
+              <div style="height:10px"></div>
+              <div id="replayFixPrompts"></div>
+            </div>
+          </div>
+          <div>
+            <div class="card"><h3>Replay</h3>${sessions ? `<ul>${sessions}</ul>` : '<div class="empty">No linked sessions.</div>'}</div>
+            <div style="height:12px"></div>
+            <div class="card">
+              <h3>Generated Test</h3>
+              <button class="btn" id="generateReplaySpecBtn" type="button">Generate Regression Spec</button>
+              <span class="empty" id="replaySpecStatus"></span>
+              <div style="height:8px"></div>
+              ${renderTestLinks(issue)}
+            </div>
+            <div style="height:12px"></div>
+            <div class="card"><h3>External Links</h3>${renderExternalLinks(issue)}</div>
+            <div style="height:12px"></div>
+            <div class="card"><h3>Signals</h3><pre>${esc(JSON.stringify(issue.signal_summary || {}, null, 2))}</pre></div>
+          </div>
         </div>
-        <div style="margin-top:10px">
-          <button class="btn" id="generateReplayFixPromptsBtn" type="button">Generate Fix Prompts</button>
-          <span class="empty" id="replayFixPromptStatus"></span>
-        </div>
-        <div style="height:10px"></div>
-        <div id="replayFixPrompts"></div>
-        <div class="lbl">Sessions</div>${sessions ? `<ul>${sessions}</ul>` : '<div class="empty">No linked sessions.</div>'}
-        <div class="lbl">External Ticket</div>
-        <div class="empty">${issue.external_ticket_url ? `<a href="${esc(issue.external_ticket_url)}" target="_blank">${esc(issue.external_ticket_id || issue.external_ticket_url)}</a>` : esc(issue.external_ticket_state || 'none')}</div>
-        <div class="lbl">Signals</div><pre>${esc(JSON.stringify(issue.signal_summary || {}, null, 2))}</pre>
       `;
       root.querySelectorAll('[data-replay-session]').forEach(el => {
         el.addEventListener('click', () => loadFirstPartyReplay(el.dataset.replaySession));
@@ -1990,10 +2191,12 @@ const retrace = init({
       const replayId = hash.get('replay');
       if(issueId){
         renderReplayIssueDetail(issues.find(i => i.public_id === issueId));
+        switchView('issues');
       }
       if(replayId){
         const session = sessions.find(s => s.public_id === replayId);
         if(session) loadFirstPartyReplay(session.stable_id);
+        switchView('replays');
       }
     }
 

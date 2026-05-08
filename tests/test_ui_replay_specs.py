@@ -90,6 +90,8 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "timelineTypeFilter" in _INDEX_HTML
     assert "Confidence:" in _INDEX_HTML
     assert "Reasons:" in _INDEX_HTML
+    assert 'data-view="issues"' in _INDEX_HTML
+    assert "linkedFailureTests" in _INDEX_HTML
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(
@@ -124,7 +126,7 @@ def test_create_sdk_key_payload_creates_browser_ingest_key(
 
 def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> None:
     store, workspace = _workspace(tmp_path)
-    store.upsert_replay_issue(
+    created = store.upsert_replay_issue(
         project_id=workspace.project_id,
         environment_id=workspace.environment_id,
         fingerprint="checkout-network-500",
@@ -162,6 +164,42 @@ def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> N
             ],
         },
     )
+    issue_row = store.get_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=created.public_id,
+    )
+    assert issue_row is not None
+    link_id = store.upsert_failure_test_link(
+        failure_id=str(issue_row["canonical_failure_id"]),
+        issue_id=str(issue_row["id"]),
+        issue_public_id=str(issue_row["public_id"]),
+        spec_id="checkout-replay-regression",
+        spec_name="Checkout replay regression",
+        spec_path="specs/checkout-replay-regression.json",
+        source="replay_issue",
+    )
+    store.update_failure_test_link_run(
+        spec_id="checkout-replay-regression",
+        link_id=link_id,
+        run_result=RetraceTesterRunResult(
+            run_id="run_checkout_1",
+            spec_id="checkout-replay-regression",
+            ok=False,
+            exit_code=1,
+            run_dir="",
+            harness_log_path="",
+            app_log_path="",
+            command="",
+            final_prompt="",
+            attempts=1,
+            flaky=False,
+            flake_reason="",
+            status="failed",
+            failure_classification="app_bug",
+            error="Checkout still returns 500",
+        ),
+    )
 
     payload = _to_replay_dashboard_payload(store)
     issue = payload["issues"][0]
@@ -179,6 +217,11 @@ def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> N
     assert timeline[2]["confidence"] == "high"
     assert timeline[2]["reason_codes"] == ["network_5xx.status_5xx"]
     assert timeline[3]["summary"] == "Checkout total is undefined"
+    assert issue["confidence"] == "medium"
+    assert issue["test_links"][0]["spec_id"] == "checkout-replay-regression"
+    assert issue["test_links"][0]["coverage_state"] == "covered_failing"
+    assert issue["test_links"][0]["latest_run_status"] == "failed"
+    assert issue["test_links"][0]["latest_run_classification"] == "app_bug"
 
 
 def test_create_sdk_key_payload_reports_creation_error(
