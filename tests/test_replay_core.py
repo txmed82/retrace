@@ -699,6 +699,9 @@ def test_generate_spec_prefers_sdk_target_selectors_over_rrweb_ids(
     assert generated.spec.exact_steps[3]["target"]["selector"] == '[data-qa="coupon-toggle"]'
     assert all("rrweb node" not in gap for gap in generated.known_gaps)
     assert generated.known_gaps == ["input-1 needs safe test data"]
+    assert (
+        generated.spec.fixtures["generation"]["unsupported_step_warnings"] == []
+    )
     assert generated.confidence == "medium"
 
 
@@ -870,6 +873,8 @@ def test_generate_spec_adds_signal_assertions_and_generation_notes(
     }
     assert assertions_by_id["network-error-ui-absent"]["type"] == "selector_count"
     assert assertions_by_id["network-error-ui-absent"]["expected"] == 0
+    assert '[role="alert"],' not in assertions_by_id["network-error-ui-absent"]["selector"]
+    assert "error" in assertions_by_id["network-error-ui-absent"]["selector"]
     assert assertions_by_id["page-not-blank"]["type"] == "selector_visible"
     assert assertions_by_id["visible-content-present"]["type"] == "text_matches"
     assert assertions_by_id["error-toast-absent"]["type"] == "selector_count"

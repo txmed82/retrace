@@ -548,8 +548,13 @@ def _error_ui_absent_assertion(assertion_id: str) -> dict[str, Any]:
         "id": assertion_id,
         "type": "selector_count",
         "selector": (
-            '[role="alert"], [data-testid*="toast"], [data-test*="toast"], '
-            '[data-qa*="toast"], .toast, .Toastify__toast'
+            '[role="alert"][data-error]:visible, '
+            '[role="alert"][aria-label*="error" i]:visible, '
+            '[data-testid*="error" i]:visible, '
+            '[data-test*="error" i]:visible, '
+            '[data-qa*="error" i]:visible, '
+            '.Toastify__toast--error:visible, '
+            '[class*="toast" i][class*="error" i]:visible'
         ),
         "expected": 0,
         "source": "replay_generator",
@@ -581,6 +586,11 @@ def _generation_notes(
     exact_steps: list[dict[str, Any]],
     gaps: list[str],
 ) -> dict[str, Any]:
+    unsupported_step_warnings = [
+        gap
+        for gap in gaps
+        if gap.startswith("unknown-") or "unsupported rrweb event" in gap
+    ]
     return {
         "human_readable_steps": _human_readable_steps(exact_steps),
         "preconditions": [
@@ -592,7 +602,7 @@ def _generation_notes(
             "Replay input values are redacted; replace placeholders with safe test data.",
             "Selectors are generated from SDK metadata when available.",
         ],
-        "unsupported_step_warnings": list(gaps),
+        "unsupported_step_warnings": unsupported_step_warnings,
     }
 
 
