@@ -2455,6 +2455,8 @@ def _classify_failure(
         for k in [
             "needs selector",
             "unsupported_in_playwright",
+            "unsupported native assertion type",
+            "unsupported native step action",
             "invalid_regex",
             "unknown action",
             "malformed",
@@ -2511,10 +2513,6 @@ def _failed_selector_assertion(items: list[dict[str, Any]]) -> bool:
             "selector_visible",
             "element_visible",
             "visible",
-            "selector_text",
-            "element_text",
-            "selector_count",
-            "element_count",
         }:
             return True
     return False

@@ -550,6 +550,11 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
         )
         if job is not None:
             result_payload = job.get("result") if isinstance(job.get("result"), dict) else {}
+            run_ok = (
+                bool(result_payload.get("ok"))
+                if result_payload
+                else job.get("status") == "succeeded"
+            )
             try:
                 store = Storage(cfg.run.data_dir / "retrace.db")
                 store.init_schema()
@@ -567,7 +572,7 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
                     err=True,
                 )
             click.echo(json.dumps(job, indent=2))
-            if not job.get("ok", False) and cfg.notifications.enabled:
+            if not run_ok and cfg.notifications.enabled:
                 from retrace.notification_sinks import (
                     NotificationEvent,
                     NotificationPayload,

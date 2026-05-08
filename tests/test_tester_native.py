@@ -142,6 +142,50 @@ def test_failure_classifier_reads_failed_assertion_payload(tmp_path: Path) -> No
     assert classification == "test_bug"
 
 
+def test_failure_classifier_marks_unsupported_native_steps_as_test_bug(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "harness.log"
+    log_path.write_text("")
+
+    classification = _classify_failure(
+        harness_log_path=log_path,
+        error="",
+        exit_code=1,
+        assertion_results=[
+            {
+                "assertion_type": "step",
+                "ok": False,
+                "message": "Unsupported native step action: teleport.",
+            }
+        ],
+    )
+
+    assert classification == "test_bug"
+
+
+def test_failure_classifier_treats_selector_text_mismatch_as_app_bug(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "harness.log"
+    log_path.write_text("")
+
+    classification = _classify_failure(
+        harness_log_path=log_path,
+        error="",
+        exit_code=1,
+        assertion_results=[
+            {
+                "assertion_type": "selector_text",
+                "ok": False,
+                "actual": {"text": "Checkout failed"},
+            }
+        ],
+    )
+
+    assert classification == "app_bug"
+
+
 def test_failure_classifier_prefers_auth_for_forbidden_response(
     tmp_path: Path,
 ) -> None:
