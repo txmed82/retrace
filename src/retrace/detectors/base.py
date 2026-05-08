@@ -5,6 +5,32 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 
+CONFIDENCE_LEVELS = frozenset({"low", "medium", "high"})
+
+
+def normalize_confidence(value: object) -> str:
+    confidence = str(value or "medium").strip().lower()
+    return confidence if confidence in CONFIDENCE_LEVELS else "medium"
+
+
+def normalize_reason_codes(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        raw = [value]
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        raw = []
+    codes: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        code = str(item or "").strip()
+        if not code or code in seen:
+            continue
+        codes.append(code)
+        seen.add(code)
+    return tuple(codes)
+
+
 @dataclass(frozen=True)
 class Signal:
     session_id: str
@@ -12,6 +38,23 @@ class Signal:
     timestamp_ms: int
     url: str
     details: dict[str, Any] = field(default_factory=dict)
+    confidence: str = "medium"
+    reason_codes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        details = dict(self.details or {})
+        confidence = normalize_confidence(details.get("confidence") or self.confidence)
+        reason_codes = normalize_reason_codes(
+            self.reason_codes
+            or details.get("reason_codes")
+            or details.get("reason_code")
+            or (f"{self.detector}.matched",)
+        )
+        details["confidence"] = confidence
+        details["reason_codes"] = list(reason_codes)
+        object.__setattr__(self, "details", details)
+        object.__setattr__(self, "confidence", confidence)
+        object.__setattr__(self, "reason_codes", reason_codes)
 
 
 class Detector(Protocol):

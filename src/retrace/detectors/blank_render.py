@@ -53,6 +53,8 @@ class BlankRenderDetector:
                             "node_count": last_node_count,
                             "dwell_ms": end_ts - nav_ts,
                         },
+                        confidence="high",
+                        reason_codes=("blank_render.low_node_count_after_dwell",),
                     )
                 )
 

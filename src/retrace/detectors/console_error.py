@@ -46,6 +46,8 @@ class ConsoleErrorDetector:
                     timestamp_ms=event_timestamp_ms(e),
                     url=url,
                     details={"message": message, "level": level},
+                    confidence="medium",
+                    reason_codes=("console_error.error_level",),
                 )
             )
         return out

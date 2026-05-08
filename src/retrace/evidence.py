@@ -145,6 +145,10 @@ def _timeline_event_from_row(row: Any) -> dict[str, Any]:
     detail_map = {**payload, **details}
     title, summary, kind = _timeline_copy(evidence_type, detail_map)
     detector = str(payload.get("detector") or detail_map.get("detector") or "")
+    confidence = _first_str(detail_map, "confidence", default="")
+    reason_codes = _string_list(
+        payload.get("reason_codes") or detail_map.get("reason_codes")
+    )
     return {
         "id": str(getattr(row, "id", "") or ""),
         "type": evidence_type,
@@ -155,6 +159,8 @@ def _timeline_event_from_row(row: Any) -> dict[str, Any]:
         "summary": summary,
         "detector": detector,
         "detector_hit": bool(detector) or evidence_type != "replay_event",
+        "confidence": confidence,
+        "reason_codes": reason_codes,
         "artifact_path": str(getattr(row, "artifact_path", "") or ""),
         "payload": payload,
     }
@@ -230,6 +236,23 @@ def _console_message(value: object) -> str:
     if isinstance(value, list):
         return " ".join(str(item) for item in value if str(item).strip())
     return str(value or "").strip()
+
+
+def _string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        raw = [value]
+    elif isinstance(value, list):
+        raw = value
+    else:
+        raw = []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        text = str(item or "").strip()
+        if text and text not in seen:
+            out.append(text)
+            seen.add(text)
+    return out
 
 
 def _signal_evidence_type(signal: dict[str, Any]) -> str:

@@ -51,6 +51,8 @@ class SessionAbandonDetector:
                             timestamp_ms=ts,
                             url=url,
                             details={"time_to_end_ms": last_ts - ts},
+                            confidence="medium",
+                            reason_codes=("session_abandon.error_near_session_end",),
                         )
                     )
                     break

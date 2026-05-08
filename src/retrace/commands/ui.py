@@ -1885,16 +1885,21 @@ const retrace = init({
       const timeline = issue.timeline || [];
       const types = [...new Set(timeline.map(ev => ev.type || 'evidence'))].sort();
       const options = types.map(t => `<option value="${esc(t)}">${esc(t)}</option>`).join('');
-      const rows = timeline.map(ev => `
-        <div class="timeline-row ${ev.detector_hit ? 'detector' : ''}" data-timeline-type="${esc(ev.type || '')}">
-          <div><code>${esc(ev.occurred_at_ms || 0)}ms</code></div>
-          <div class="timeline-kind">${esc(ev.kind || ev.type || 'evidence')}</div>
-          <div>
-            <strong>${esc(ev.title || ev.type || 'Evidence')}</strong>
-            <div class="timeline-summary">${esc(ev.summary || '')}</div>
-            ${ev.detector ? `<div class="empty">Detector: <code>${esc(ev.detector)}</code></div>` : ''}
-          </div>
-        </div>`).join('');
+      const rows = timeline.map(ev => {
+        const reasons = ev.reason_codes || [];
+        const reasonText = reasons.length ? ` Reasons: ${reasons.map(code => `<code>${esc(code)}</code>`).join(', ')}` : '';
+        const confidenceText = ev.confidence ? ` Confidence: <code>${esc(ev.confidence)}</code>` : '';
+        return `
+          <div class="timeline-row ${ev.detector_hit ? 'detector' : ''}" data-timeline-type="${esc(ev.type || '')}">
+            <div><code>${esc(ev.occurred_at_ms || 0)}ms</code></div>
+            <div class="timeline-kind">${esc(ev.kind || ev.type || 'evidence')}</div>
+            <div>
+              <strong>${esc(ev.title || ev.type || 'Evidence')}</strong>
+              <div class="timeline-summary">${esc(ev.summary || '')}</div>
+              ${ev.detector ? `<div class="empty">Detector: <code>${esc(ev.detector)}</code>${confidenceText}${reasonText}</div>` : ''}
+            </div>
+          </div>`;
+      }).join('');
       return `
         <div class="lbl">Timeline</div>
         <div style="display:flex; gap:8px; align-items:center; margin:6px 0 8px 0">
