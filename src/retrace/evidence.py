@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 
 EvidenceRedactionState = Literal["raw", "redacted", "sensitive"]
+PROMPT_SAFE_REDACTION_STATES = ("raw", "redacted")
 
 
 @dataclass(frozen=True)
@@ -65,7 +66,7 @@ def evidence_items_from_replay_issue(
     source = f"replay_issue:{issue_public_id}"
     for signal in _dict_items(evidence.get("signals")):
         occurred_at_ms = _safe_int(signal.get("timestamp_ms"))
-        payload = {"issue_public_id": issue_public_id, **signal}
+        payload = {**_without_issue_public_id(signal), "issue_public_id": issue_public_id}
         items.append(
             EvidenceItem(
                 failure_id=failure_id,
@@ -85,7 +86,7 @@ def evidence_items_from_replay_issue(
         )
     for event in _dict_items(evidence.get("events")):
         occurred_at_ms = _safe_int(event.get("timestamp_ms"))
-        payload = {"issue_public_id": issue_public_id, **event}
+        payload = {**_without_issue_public_id(event), "issue_public_id": issue_public_id}
         items.append(
             EvidenceItem(
                 failure_id=failure_id,
@@ -142,6 +143,10 @@ def _dict_items(value: object) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _without_issue_public_id(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if key != "issue_public_id"}
 
 
 def _safe_int(value: object) -> int:

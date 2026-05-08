@@ -80,6 +80,44 @@ def test_sensitive_evidence_can_be_excluded_for_prompts(tmp_path: Path) -> None:
     assert prompt_rows[0].safe_for_prompts is True
 
 
+def test_prompt_safe_filter_excludes_unknown_redaction_states(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    failure_id = store.upsert_failure(
+        _failure(
+            project_id="proj_1",
+            environment_id="env_1",
+            source_external_id="manual-unknown-redaction",
+        )
+    )
+    store.append_failure_evidence(
+        EvidenceItem(
+            failure_id=failure_id,
+            evidence_type="console_log",
+            occurred_at_ms=100,
+            source="manual",
+            redaction_state="raw",
+            payload={"message": "safe"},
+        )
+    )
+    with store._conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO failure_evidence
+            (id, failure_id, evidence_type, occurred_at_ms, source,
+             redaction_state, payload_json)
+            VALUES ('ev_unknown', ?, 'console_log', 200, 'legacy', 'unknown', '{}')
+            """,
+            (failure_id,),
+        )
+
+    rows = store.list_failure_evidence(
+        failure_id=failure_id,
+        include_sensitive=False,
+    )
+    assert [row.redaction_state for row in rows] == ["raw"]
+
+
 def test_evidence_payload_must_be_json_serializable(tmp_path: Path) -> None:
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
@@ -190,6 +228,34 @@ def test_replay_evidence_builder_falls_back_to_bundle() -> None:
     assert len(items) == 1
     assert items[0].evidence_type == "replay_evidence_bundle"
     assert items[0].safe_for_prompts is True
+
+
+def test_replay_evidence_builder_preserves_canonical_issue_public_id() -> None:
+    items = evidence_items_from_replay_issue(
+        failure_id="flr_1",
+        issue_public_id="bug_canonical",
+        evidence={
+            "signals": [
+                {
+                    "detector": "network_5xx",
+                    "timestamp_ms": 1,
+                    "issue_public_id": "bug_spoofed",
+                }
+            ],
+            "events": [
+                {
+                    "type": 3,
+                    "timestamp_ms": 2,
+                    "issue_public_id": "bug_spoofed",
+                }
+            ],
+        },
+    )
+
+    assert [item.payload["issue_public_id"] for item in items] == [
+        "bug_canonical",
+        "bug_canonical",
+    ]
 
 
 def _failure(*, project_id: str, environment_id: str, source_external_id: str):
