@@ -56,6 +56,13 @@ def generate_spec_from_replay_issue(
     base_url = app_url.strip() or _infer_base_url(playback.events) or "http://127.0.0.1:3000"
     exact_steps, gaps = _steps_from_events(playback.events, base_url=base_url)
     assertions = _assertions_from_issue(issue)
+    generation_notes = _generation_notes(
+        issue=issue,
+        base_url=base_url,
+        representative_session_id=representative_session_id,
+        exact_steps=exact_steps,
+        gaps=gaps,
+    )
     prompt = (
         f"Replay-derived regression for {issue['public_id']}: "
         f"{str(issue['title'] or 'Replay issue')}"
@@ -78,6 +85,7 @@ def generate_spec_from_replay_issue(
             "replay_id": str(playback.session["id"]),
             "replay_public_id": str(playback.session["public_id"]),
             "session_id": representative_session_id,
+            "generation": generation_notes,
         },
         data_extraction=[],
     )
@@ -466,6 +474,58 @@ def _assertions_from_issue(issue: Any) -> list[dict[str, Any]]:
         }
     ]
     signal_summary = _json_obj(issue["signal_summary_json"])
+    evidence = _json_obj(issue["evidence_json"])
+    signals = _evidence_signals(evidence)
+    network_signal = _first_signal(signals, {"network_4xx", "network_5xx"})
+    if network_signal is not None:
+        details = _json_obj(network_signal.get("details"))
+        status = details.get("status") or details.get("status_code") or "4xx/5xx"
+        method = str(details.get("method") or details.get("request_method") or "REQUEST")
+        request_url = str(
+            details.get("request_url") or details.get("url") or "failed request"
+        )
+        assertions.append(
+            {
+                "id": "network-failure-cleared",
+                "type": "model_consensus",
+                "prompt": (
+                    "After replaying the steps, verify the failed network request "
+                    f"does not recur: {method.upper()} {request_url} returned {status}."
+                ),
+                "expected": "No matching failed request or visible network error remains.",
+                "consensus_group": str(issue["public_id"]),
+                "source": "replay_generator",
+                "evidence": {
+                    "detector": network_signal.get("detector"),
+                    "method": method.upper(),
+                    "url": request_url,
+                    "status": status,
+                },
+            }
+        )
+        assertions.append(_error_ui_absent_assertion("network-error-ui-absent"))
+    if "blank_render" in signal_summary:
+        assertions.append(
+            {
+                "id": "page-not-blank",
+                "type": "selector_visible",
+                "selector": "body",
+                "expected": "body visible",
+                "timeout_ms": 3000,
+                "source": "replay_generator",
+            }
+        )
+        assertions.append(
+            {
+                "id": "visible-content-present",
+                "type": "text_matches",
+                "selector": "body",
+                "expected": r"\S",
+                "source": "replay_generator",
+            }
+        )
+    if "error_toast" in signal_summary:
+        assertions.append(_error_ui_absent_assertion("error-toast-absent"))
     if signal_summary:
         assertions.append(
             {
@@ -483,7 +543,89 @@ def _assertions_from_issue(issue: Any) -> list[dict[str, Any]]:
     return assertions
 
 
+def _error_ui_absent_assertion(assertion_id: str) -> dict[str, Any]:
+    return {
+        "id": assertion_id,
+        "type": "selector_count",
+        "selector": (
+            '[role="alert"], [data-testid*="toast"], [data-test*="toast"], '
+            '[data-qa*="toast"], .toast, .Toastify__toast'
+        ),
+        "expected": 0,
+        "source": "replay_generator",
+    }
+
+
+def _evidence_signals(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = evidence.get("signals")
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _first_signal(
+    signals: list[dict[str, Any]],
+    detectors: set[str],
+) -> dict[str, Any] | None:
+    for signal in signals:
+        if str(signal.get("detector") or "") in detectors:
+            return signal
+    return None
+
+
+def _generation_notes(
+    *,
+    issue: Any,
+    base_url: str,
+    representative_session_id: str,
+    exact_steps: list[dict[str, Any]],
+    gaps: list[str],
+) -> dict[str, Any]:
+    return {
+        "human_readable_steps": _human_readable_steps(exact_steps),
+        "preconditions": [
+            f"Run the app at {base_url}.",
+            f"Replay source session: {representative_session_id}.",
+            f"Source issue: {issue['public_id']}.",
+        ],
+        "fixture_notes": [
+            "Replay input values are redacted; replace placeholders with safe test data.",
+            "Selectors are generated from SDK metadata when available.",
+        ],
+        "unsupported_step_warnings": list(gaps),
+    }
+
+
+def _human_readable_steps(exact_steps: list[dict[str, Any]]) -> list[str]:
+    readable: list[str] = []
+    for step in exact_steps:
+        action = str(step.get("action") or "")
+        if action == "get":
+            readable.append(f"Open {step.get('url')}")
+        elif action == "click":
+            readable.append(f"Click {_target_label(step)}")
+        elif action == "type":
+            readable.append(f"Type redacted input into {_target_label(step)}")
+        elif action == "unknown":
+            readable.append(f"Review unsupported replay step {step.get('id')}")
+    return readable
+
+
+def _target_label(step: dict[str, Any]) -> str:
+    target = step.get("target")
+    if not isinstance(target, dict):
+        return "unknown target"
+    return str(
+        target.get("selector")
+        or target.get("selector_rationale")
+        or target.get("rrweb_id")
+        or "unknown target"
+    )
+
+
 def _json_obj(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
     try:
         value = json.loads(str(raw or "{}"))
     except json.JSONDecodeError:
