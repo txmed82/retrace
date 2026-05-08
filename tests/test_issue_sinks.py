@@ -408,6 +408,8 @@ def test_build_issue_sink_payload_skips_correlation_when_row_partial() -> None:
         "status": "new",
         "summary": "s",
         "likely_cause": "",
+        "confidence": None,
+        "fingerprint": None,
         "affected_count": 1,
         "affected_users": 1,
         "reproduction_steps_json": "[]",
@@ -420,6 +422,9 @@ def test_build_issue_sink_payload_skips_correlation_when_row_partial() -> None:
         issue=partial, sessions=[], provider="linear"
     )
     assert "correlation" not in payload
+    assert payload["confidence"] == "medium"
+    assert payload["fingerprint"] == "bug_1"
+    assert "fingerprint:bug_1" in payload["dedupe_marker"]
 
 
 def test_render_issue_markdown_includes_correlation_block() -> None:

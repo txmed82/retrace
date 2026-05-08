@@ -4,7 +4,7 @@ import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypedDict
 
 from retrace.clusterer import cluster_sessions
 from retrace.detectors import Signal, all_detectors
@@ -39,6 +39,13 @@ class ReplayProcessingResult:
     issues: list[ReplayIssueUpsertResult]
 
 
+class ReplayIssueDetail(TypedDict, total=False):
+    public_id: str
+    project_id: str
+    environment_id: str
+    previous_resolved_at: str
+
+
 @dataclass(frozen=True)
 class ReplayJobProcessingResult:
     jobs_seen: int
@@ -50,8 +57,8 @@ class ReplayJobProcessingResult:
     issues_regressed: int = 0
     regressed_public_ids: tuple[str, ...] = ()
     inserted_public_ids: tuple[str, ...] = ()
-    inserted_details: tuple[dict[str, str], ...] = ()
-    regressed_details: tuple[dict[str, str], ...] = ()
+    inserted_details: tuple[ReplayIssueDetail, ...] = ()
+    regressed_details: tuple[ReplayIssueDetail, ...] = ()
 
 
 @dataclass(frozen=True)

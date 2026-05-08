@@ -48,6 +48,8 @@ def build_issue_sink_payload(
             }
         )
     correlation = _correlation_block(issue)
+    confidence = _row_str(issue, "confidence", "medium")
+    fingerprint = _row_str(issue, "fingerprint", public_id)
     payload: dict[str, Any] = {
         "provider": provider,
         "source": "retrace",
@@ -55,9 +57,9 @@ def build_issue_sink_payload(
         "source_public_id": public_id,
         "title": f"[{public_id}] {str(issue['title'] or 'Replay issue')}",
         "severity": str(issue["severity"]),
-        "confidence": str(_row_get(issue, "confidence", "medium")),
+        "confidence": confidence,
         "status": str(issue["status"]),
-        "fingerprint": str(_row_get(issue, "fingerprint", public_id)),
+        "fingerprint": fingerprint,
         "summary": str(issue["summary"]),
         "likely_cause": str(issue["likely_cause"]),
         "affected_count": int(issue["affected_count"]),
@@ -66,9 +68,7 @@ def build_issue_sink_payload(
         "reproduction_steps": _safe_json_list(issue["reproduction_steps_json"]),
         "evidence": _safe_json_obj(issue["evidence_json"]),
         "issue_url": f"{base_url.rstrip('/')}/#issue={public_id}" if base_url else "",
-        "dedupe_marker": _dedupe_marker(
-            public_id, str(_row_get(issue, "fingerprint", public_id))
-        ),
+        "dedupe_marker": _dedupe_marker(public_id, fingerprint),
     }
     if correlation:
         payload["correlation"] = correlation
@@ -83,7 +83,7 @@ def _enrich_issue_sink_payload(
     base_url: str,
 ) -> None:
     public_id = str(payload.get("source_public_id") or "")
-    failure_id = str(issue["canonical_failure_id"] or "")
+    failure_id = _row_str(issue, "canonical_failure_id", "")
     timeline: list[dict[str, Any]] = []
     test_links = []
     if failure_id:
@@ -280,6 +280,13 @@ def _row_get(issue: Any, key: str, default: Any = "") -> Any:
         return issue[key]
     except Exception:
         return default
+
+
+def _row_str(issue: Any, key: str, default: str = "") -> str:
+    value = _row_get(issue, key, default)
+    if value is None:
+        value = default
+    return str(value)
 
 
 def render_issue_markdown(payload: dict[str, Any]) -> str:
