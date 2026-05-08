@@ -290,37 +290,96 @@ def _step_target_from_capture(raw_target: Any) -> dict[str, Any]:
     if not isinstance(raw_target, dict):
         return {}
     target = {k: v for k, v in raw_target.items() if v not in (None, "")}
-    selector = _selector_from_captured_target(target)
-    if selector:
-        target["selector"] = selector
+    candidates = _selector_candidates_from_captured_target(target)
+    if candidates:
+        target["selector"] = candidates[0]["selector"]
+        target["selector_candidates"] = candidates
+        target["selector_rationale"] = candidates[0]["rationale"]
     return target
 
 
 def _selector_from_captured_target(target: dict[str, Any]) -> str:
+    candidates = _selector_candidates_from_captured_target(target)
+    return str(candidates[0]["selector"]) if candidates else ""
+
+
+def _selector_candidates_from_captured_target(
+    target: dict[str, Any],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+
+    def add(strategy: str, selector: str, rationale: str, score: int) -> None:
+        if selector and all(item["selector"] != selector for item in candidates):
+            candidates.append(
+                {
+                    "selector": selector,
+                    "strategy": strategy,
+                    "score": score,
+                    "rationale": rationale,
+                }
+            )
+
     tag = _clean_css_identifier(str(target.get("tagName") or ""))
     test_id = _first_text(target, "testIdValue", "testId", "test_id", "dataTestId")
     if test_id:
         attr = _safe_test_id_attr(_first_text(target, "testIdAttrName"))
-        return f'[{attr}="{_css_attr_escape(test_id)}"]'
-    element_id = _first_text(target, "id")
-    if element_id:
-        if _CSS_IDENT_RE.fullmatch(element_id):
-            return f"#{element_id}"
-        return f'[id="{_css_attr_escape(element_id)}"]'
-    name = _first_text(target, "name")
-    if name:
-        prefix = f"{tag}" if tag else ""
-        return f'{prefix}[name="{_css_attr_escape(name)}"]'
+        add(
+            "test_id",
+            f'[{attr}="{_css_attr_escape(test_id)}"]',
+            f"{attr} is the most stable captured test selector.",
+            100,
+        )
+    role = _first_text(target, "role") or _implicit_role(tag)
+    accessible_name = _accessible_name(target)
+    if role and accessible_name:
+        add(
+            "role_name",
+            f'role={_playwright_text_escape(role)}[name="{_playwright_text_escape(accessible_name)}"]',
+            "Accessible role and name usually survive markup refactors.",
+            90,
+        )
+    label = _first_text(target, "labelText", "label")
+    if label:
+        add(
+            "label",
+            f'label="{_playwright_text_escape(label)}"',
+            "Associated form label is a durable user-facing locator.",
+            88,
+        )
     aria_label = _first_text(target, "ariaLabel", "aria_label")
     if aria_label:
         prefix = f"{tag}" if tag else ""
-        return f'{prefix}[aria-label="{_css_attr_escape(aria_label)}"]'
-    role = _first_text(target, "role")
-    if role:
-        return f'[role="{_css_attr_escape(role)}"]'
+        add(
+            "aria_label",
+            f'{prefix}[aria-label="{_css_attr_escape(aria_label)}"]',
+            "ARIA label is explicit accessibility metadata.",
+            86,
+        )
+    name = _first_text(target, "name")
+    if name:
+        prefix = f"{tag}" if tag else ""
+        add(
+            "name",
+            f'{prefix}[name="{_css_attr_escape(name)}"]',
+            "Name attribute is stable for form controls.",
+            82,
+        )
+    element_id = _first_text(target, "id")
+    if element_id:
+        selector = (
+            f"#{element_id}"
+            if _CSS_IDENT_RE.fullmatch(element_id)
+            else f'[id="{_css_attr_escape(element_id)}"]'
+        )
+        add("id", selector, "Element ID is useful when no semantic locator wins.", 70)
     text = _first_text(target, "text")
-    if text and (tag in {"a", "button"} or not tag):
-        return f'text="{_playwright_text_escape(text)}"'
+    if _is_constrained_text(text, tag):
+        add(
+            "text",
+            f'text="{_playwright_text_escape(text)}"',
+            "Short visible text can work, but may change with copy updates.",
+            60,
+        )
     class_name = _first_text(target, "className", "class")
     classes = [
         token
@@ -328,8 +387,33 @@ def _selector_from_captured_target(target: dict[str, Any]) -> str:
         if token and _CSS_IDENT_RE.fullmatch(token)
     ]
     if tag and classes:
-        return f"{tag}{''.join(f'.{token}' for token in classes[:2])}"
-    return ""
+        add(
+            "class",
+            f"{tag}{''.join(f'.{token}' for token in classes[:2])}",
+            "Class names are brittle and are only used as a last resort.",
+            20,
+        )
+    return sorted(candidates, key=lambda item: -int(item["score"]))
+
+
+def _implicit_role(tag: str) -> str:
+    return {
+        "a": "link",
+        "button": "button",
+        "input": "textbox",
+        "select": "combobox",
+        "textarea": "textbox",
+    }.get(tag, "")
+
+
+def _accessible_name(target: dict[str, Any]) -> str:
+    return _first_text(target, "accessibleName", "ariaLabel", "labelText", "text")
+
+
+def _is_constrained_text(text: str, tag: str) -> bool:
+    if not text or len(text) > 80:
+        return False
+    return tag in {"a", "button"} or not tag
 
 
 def _first_text(target: dict[str, Any], *keys: str) -> str:

@@ -112,6 +112,16 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     return true;
   }
 
+  function labelTextFor(target: Element): string | undefined {
+    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) {
+      const labels = Array.from(target.labels || []);
+      const label = labels.find((item) => item.textContent?.trim());
+      if (label) return label.textContent?.trim().slice(0, 120) || undefined;
+    }
+    const wrapped = target.closest("label");
+    return wrapped?.textContent?.trim().slice(0, 120) || undefined;
+  }
+
   function describeTarget(target: EventTarget | null): Record<string, unknown> {
     if (!(target instanceof Element)) {
       return {};
@@ -131,6 +141,13 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
       name: target.getAttribute("name") || undefined,
       role: target.getAttribute("role") || undefined,
       ariaLabel: target.getAttribute("aria-label") || undefined,
+      accessibleName:
+        target.getAttribute("aria-label") ||
+        labelTextFor(target) ||
+        (shouldCaptureTargetText(target) ? target.textContent?.trim().slice(0, 120) : undefined),
+      labelText: labelTextFor(target),
+      placeholder: target.getAttribute("placeholder") || undefined,
+      title: target.getAttribute("title") || undefined,
     };
     if (shouldCaptureTargetText(target)) {
       description.text = target.textContent?.trim().slice(0, 120) || undefined;
