@@ -703,6 +703,7 @@ def _json_field(row: Any, key: str, fallback: Any) -> Any:
 def _replay_issue_payload(
     row: Any, *, sessions: list[dict[str, Any]]
 ) -> dict[str, Any]:
+    canonical_failure_id = row["canonical_failure_id"]
     return {
         "id": str(row["id"]),
         "public_id": str(row["public_id"]),
@@ -723,7 +724,9 @@ def _replay_issue_payload(
         "external_ticket_state": str(row["external_ticket_state"]),
         "external_ticket_url": str(row["external_ticket_url"]),
         "external_ticket_id": str(row["external_ticket_id"]),
-        "canonical_failure_id": str(row["canonical_failure_id"]),
+        "canonical_failure_id": (
+            None if canonical_failure_id is None else str(canonical_failure_id)
+        ),
         "first_seen_ms": int(row["first_seen_ms"]),
         "last_seen_ms": int(row["last_seen_ms"]),
         "updated_at": str(row["updated_at"]),

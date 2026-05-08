@@ -131,7 +131,7 @@ def build_evidence_timeline(rows: list[Any]) -> list[dict[str, Any]]:
     return sorted(
         timeline,
         key=lambda item: (
-            int(item.get("occurred_at_ms") or 0),
+            _safe_int(item.get("occurred_at_ms")),
             str(item.get("type") or ""),
             str(item.get("id") or ""),
         ),
@@ -149,7 +149,7 @@ def _timeline_event_from_row(row: Any) -> dict[str, Any]:
         "id": str(getattr(row, "id", "") or ""),
         "type": evidence_type,
         "kind": kind,
-        "occurred_at_ms": int(getattr(row, "occurred_at_ms", 0) or 0),
+        "occurred_at_ms": _safe_int(getattr(row, "occurred_at_ms", 0)),
         "source": str(getattr(row, "source", "") or ""),
         "title": title,
         "summary": summary,
