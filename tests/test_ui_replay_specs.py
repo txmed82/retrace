@@ -11,6 +11,7 @@ from retrace.commands.ui import (
     _INDEX_HTML,
     _replay_api_check,
     _generate_replay_issue_spec_payload,
+    _to_replay_dashboard_payload,
     _transition_replay_issue_payload,
     _verify_resolved_issues_payload,
 )
@@ -85,6 +86,8 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "onclick=" not in _INDEX_HTML
     assert "sendSdkSmokeReplay" in _INDEX_HTML
     assert "X-Retrace-Key" in _INDEX_HTML
+    assert "copyEvidenceBundle" in _INDEX_HTML
+    assert "timelineTypeFilter" in _INDEX_HTML
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(
@@ -115,6 +118,61 @@ def test_create_sdk_key_payload_creates_browser_ingest_key(
     assert row.id == payload["id"]
     assert row.project_id == payload["project_id"]
     assert row.environment_id == payload["environment_id"]
+
+
+def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="checkout-network-500",
+        session_ids=["sess-timeline"],
+        signal_summary={"network_5xx": 1, "console_error": 1},
+        first_seen_ms=100,
+        last_seen_ms=500,
+        title="Checkout failed",
+        evidence={
+            "signals": [
+                {
+                    "detector": "network_5xx",
+                    "timestamp_ms": 300,
+                    "details": {
+                        "method": "POST",
+                        "request_url": "/api/checkout",
+                        "status": 500,
+                        "duration_ms": 42,
+                    },
+                },
+                {
+                    "detector": "console_error",
+                    "timestamp_ms": 400,
+                    "details": {
+                        "level": "error",
+                        "message": "Checkout total is undefined",
+                    },
+                },
+            ],
+            "events": [
+                {"type": 4, "timestamp_ms": 100, "href": "https://app.test/checkout"},
+                {"type": 3, "timestamp_ms": 200, "source": 2, "data_type": 2, "id": 9},
+            ],
+        },
+    )
+
+    payload = _to_replay_dashboard_payload(store)
+    issue = payload["issues"][0]
+    timeline = issue["timeline"]
+
+    assert [event["title"] for event in timeline] == [
+        "Navigation",
+        "Click",
+        "Network 500",
+        "Console error",
+    ]
+    assert timeline[2]["kind"] == "network"
+    assert timeline[2]["summary"] == "POST /api/checkout returned 500 in 42ms"
+    assert timeline[2]["detector_hit"] is True
+    assert timeline[3]["summary"] == "Checkout total is undefined"
 
 
 def test_create_sdk_key_payload_reports_creation_error(
