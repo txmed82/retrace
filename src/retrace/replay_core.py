@@ -50,6 +50,7 @@ class ReplayJobProcessingResult:
     issues_regressed: int = 0
     regressed_public_ids: tuple[str, ...] = ()
     inserted_public_ids: tuple[str, ...] = ()
+    inserted_details: tuple[dict[str, str], ...] = ()
     regressed_details: tuple[dict[str, str], ...] = ()
 
 
@@ -650,6 +651,7 @@ def make_replay_finalize_handler(
     accumulator.setdefault("issues_regressed", 0)
     accumulator.setdefault("inserted_ids", [])
     accumulator.setdefault("regressed_ids", [])
+    accumulator.setdefault("inserted_details", [])
     accumulator.setdefault("regressed_details", [])
 
     def handler(job: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -671,12 +673,21 @@ def make_replay_finalize_handler(
             if upsert.inserted:
                 accumulator["issues_inserted"] += 1
                 accumulator["inserted_ids"].append(upsert.public_id)
+                accumulator["inserted_details"].append(
+                    {
+                        "public_id": upsert.public_id,
+                        "project_id": str(job["project_id"]),
+                        "environment_id": str(job["environment_id"]),
+                    }
+                )
             elif upsert.regressed:
                 accumulator["issues_regressed"] += 1
                 accumulator["regressed_ids"].append(upsert.public_id)
                 accumulator["regressed_details"].append(
                     {
                         "public_id": upsert.public_id,
+                        "project_id": str(job["project_id"]),
+                        "environment_id": str(job["environment_id"]),
                         "previous_resolved_at": upsert.previous_resolved_at,
                     }
                 )
@@ -722,5 +733,6 @@ def process_queued_replay_jobs(
         issues_regressed=int(accumulator.get("issues_regressed", 0)),
         regressed_public_ids=tuple(accumulator.get("regressed_ids", []) or []),
         inserted_public_ids=tuple(accumulator.get("inserted_ids", []) or []),
+        inserted_details=tuple(accumulator.get("inserted_details", []) or []),
         regressed_details=tuple(accumulator.get("regressed_details", []) or []),
     )

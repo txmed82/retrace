@@ -141,15 +141,17 @@ def _build_enricher(cfg: Any, store: Storage) -> CorrelationEnricher | None:
         return None
 
 
-def _issue_cards_for_public_ids(
+def _issue_cards_for_items(
     store: Storage,
-    *,
-    project_id: str,
-    environment_id: str,
-    public_ids: list[str],
+    items: list[dict[str, str]],
 ) -> list[dict[str, Any]]:
     cards: list[dict[str, Any]] = []
-    for public_id in public_ids[:10]:
+    for item in items[:10]:
+        public_id = str(item.get("public_id") or "")
+        project_id = str(item.get("project_id") or "")
+        environment_id = str(item.get("environment_id") or "")
+        if not public_id or not project_id or not environment_id:
+            continue
         issue = store.get_replay_issue(
             project_id=project_id,
             environment_id=environment_id,
@@ -587,7 +589,6 @@ def api_process_replays(config_path: Path, limit: int) -> None:
     cfg = load_config(config_path)
     store = Storage(cfg.run.data_dir / "retrace.db")
     store.init_schema()
-    workspace = store.ensure_workspace(project_name="Default")
     result = process_queued_replay_jobs(
         store=store,
         limit=limit,
@@ -597,18 +598,8 @@ def api_process_replays(config_path: Path, limit: int) -> None:
         result.issues_inserted or result.issues_regressed
     ) and cfg.notifications.enabled:
         sinks = build_sinks_from_config(cfg.notifications)
-        inserted_cards = _issue_cards_for_public_ids(
-            store,
-            project_id=workspace.project_id,
-            environment_id=workspace.environment_id,
-            public_ids=list(result.inserted_public_ids),
-        )
-        regressed_cards = _issue_cards_for_public_ids(
-            store,
-            project_id=workspace.project_id,
-            environment_id=workspace.environment_id,
-            public_ids=list(result.regressed_public_ids),
-        )
+        inserted_cards = _issue_cards_for_items(store, list(result.inserted_details))
+        regressed_cards = _issue_cards_for_items(store, list(result.regressed_details))
         try:
             if result.issues_inserted:
                 dispatch_notification(

@@ -108,9 +108,14 @@ def _enrich_issue_sink_payload(
 
 
 def compact_issue_card(payload: dict[str, Any]) -> dict[str, Any]:
+    public_id = str(payload.get("source_public_id") or "")
+    title = str(payload.get("title") or "")
+    prefix = f"[{public_id}] "
+    if public_id and title.startswith(prefix):
+        title = title[len(prefix) :]
     return {
-        "public_id": str(payload.get("source_public_id") or ""),
-        "title": str(payload.get("title") or ""),
+        "public_id": public_id,
+        "title": title,
         "severity": str(payload.get("severity") or ""),
         "confidence": str(payload.get("confidence") or ""),
         "affected_count": int(payload.get("affected_count") or 0),

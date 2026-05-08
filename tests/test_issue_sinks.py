@@ -11,7 +11,7 @@ from pytest_httpx import HTTPXMock
 
 from retrace.cli import main
 from retrace.issue_sink_clients import GitHubClient, IssueSinkError, LinearClient
-from retrace.issue_sinks import promote_replay_issue, render_issue_markdown
+from retrace.issue_sinks import compact_issue_card, promote_replay_issue, render_issue_markdown
 from retrace.replay_core import ReplaySignalConfig, process_replay_sessions
 from retrace.storage import Storage
 
@@ -378,6 +378,20 @@ def test_render_issue_markdown_contains_key_fields() -> None:
     assert "`checkout-regression`" in body
     assert "Repair" in body
     assert "bug_xyz" in body
+
+
+def test_compact_issue_card_strips_prefixed_public_id() -> None:
+    card = compact_issue_card(
+        {
+            "source_public_id": "bug_xyz",
+            "title": "[bug_xyz] Checkout button fails",
+            "severity": "high",
+            "confidence": "high",
+            "affected_count": 2,
+        }
+    )
+
+    assert card["title"] == "Checkout button fails"
 
 
 def test_build_issue_sink_payload_skips_correlation_when_row_partial() -> None:
