@@ -9,7 +9,11 @@ import json
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
-from retrace.evidence import EvidenceItem, evidence_items_from_replay_issue
+from retrace.evidence import (
+    PROMPT_SAFE_REDACTION_STATES,
+    EvidenceItem,
+    evidence_items_from_replay_issue,
+)
 from retrace.failures import CanonicalFailure, canonical_failure_from_replay_issue
 
 
@@ -1421,7 +1425,9 @@ class Storage:
         where = "failure_id = ?"
         params: list[object] = [failure_id]
         if not include_sensitive:
-            where += " AND redaction_state != 'sensitive'"
+            placeholders = ",".join("?" for _ in PROMPT_SAFE_REDACTION_STATES)
+            where += f" AND redaction_state IN ({placeholders})"
+            params.extend(PROMPT_SAFE_REDACTION_STATES)
         with self._conn() as conn:
             rows = conn.execute(
                 f"""
