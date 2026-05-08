@@ -2613,6 +2613,7 @@ class Storage:
                         WHEN replay_issues.status = 'ongoing' THEN 'ongoing'
                         WHEN replay_issues.status = 'regressed' THEN 'ongoing'
                         WHEN replay_issues.status = 'ticket_created' THEN 'ticket_created'
+                        WHEN replay_issues.status = 'ignored' THEN 'ignored'
                         ELSE replay_issues.status
                     END,
                     fingerprint_version = excluded.fingerprint_version,
@@ -2928,6 +2929,7 @@ class Storage:
                   AND external_ticket_id IS NOT NULL
                   AND external_ticket_id != ''
                   AND status != 'resolved'
+                  AND status != 'ignored'
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
@@ -2949,6 +2951,7 @@ class Storage:
             "resolved",
             "ongoing",
             "regressed",
+            "ignored",
         }
         if status not in allowed:
             raise ValueError(f"invalid replay issue status: {status}")
@@ -2985,6 +2988,9 @@ class Storage:
 
     def mark_replay_issue_unresolved(self, issue_id: str) -> bool:
         return self.transition_replay_issue(issue_id, status="unresolved")
+
+    def ignore_replay_issue(self, issue_id: str) -> bool:
+        return self.transition_replay_issue(issue_id, status="ignored")
 
     def mark_replay_issue_ticket_created(
         self,

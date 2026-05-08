@@ -287,6 +287,27 @@ def test_promote_replay_issue_falls_back_to_stub_without_client(tmp_path: Path) 
     assert result.external_url.startswith("github://issue/")
 
 
+def test_promote_replay_issue_skips_ignored_issue(tmp_path: Path) -> None:
+    store, workspace, issue_public_id = _seed_issue(tmp_path)
+    issue = store.get_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=issue_public_id,
+    )
+    assert issue is not None
+    assert store.ignore_replay_issue(str(issue["id"])) is True
+
+    with pytest.raises(IssueSinkError, match="ignored"):
+        promote_replay_issue(
+            store=store,
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            issue_id=issue_public_id,
+            provider="github",
+            base_url="https://retrace.example",
+        )
+
+
 def test_promote_replay_issue_requires_team_for_real_linear(tmp_path: Path) -> None:
     store, workspace, issue_public_id = _seed_issue(tmp_path)
     with httpx.Client() as raw:

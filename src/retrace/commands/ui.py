@@ -859,6 +859,8 @@ def _generate_replay_issue_fix_prompts_payload(
         )
         if issue is None:
             return {"ok": False, "error": f"Replay issue not found: {issue_id}"}, 404
+        if str(issue["status"] or "") == "ignored":
+            return {"ok": False, "error": f"Replay issue is ignored: {issue_id}"}, 409
         finding = parsed_finding_from_replay_issue(issue)
         repo_path = Path(repo.local_path) if repo.local_path else None
         result = generate_fix_suggestions(
@@ -911,8 +913,8 @@ def _transition_replay_issue_payload(
     environment_id: str,
     status: str,
 ) -> tuple[dict[str, Any], int]:
-    if status not in {"resolved", "unresolved"}:
-        return {"ok": False, "error": "status must be resolved or unresolved"}, 400
+    if status not in {"resolved", "unresolved", "ignored"}:
+        return {"ok": False, "error": "status must be resolved, unresolved, or ignored"}, 400
     issue = store.get_replay_issue(
         project_id=project_id,
         environment_id=environment_id,
@@ -1952,6 +1954,7 @@ const retrace = init({
         <div style="margin-top:10px">
           <button class="btn" id="resolveReplayIssueBtn" type="button">Mark Resolved</button>
           <button class="btn" id="unresolveReplayIssueBtn" type="button">Mark Unresolved</button>
+          <button class="btn" id="ignoreReplayIssueBtn" type="button">Ignore Fingerprint</button>
           <span class="empty" id="replayLifecycleStatus"></span>
         </div>
         <div style="margin-top:10px">
@@ -1974,6 +1977,7 @@ const retrace = init({
       });
       byId('resolveReplayIssueBtn')?.addEventListener('click', () => transitionReplayIssue(issue, 'resolved'));
       byId('unresolveReplayIssueBtn')?.addEventListener('click', () => transitionReplayIssue(issue, 'unresolved'));
+      byId('ignoreReplayIssueBtn')?.addEventListener('click', () => transitionReplayIssue(issue, 'ignored'));
       byId('generateReplaySpecBtn')?.addEventListener('click', () => generateReplayIssueSpec(issue));
       byId('generateReplayFixPromptsBtn')?.addEventListener('click', () => generateReplayIssueFixPrompts(issue));
       byId('timelineTypeFilter')?.addEventListener('change', ev => filterIssueTimeline(ev.target.value));

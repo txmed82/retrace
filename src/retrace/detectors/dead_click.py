@@ -15,6 +15,34 @@ from retrace.detectors.base import (
 FOLLOWUP_WINDOW_MS = 2000
 
 
+def _target_attrs(e: dict[str, Any]) -> dict[str, Any]:
+    target = event_data(e).get("target")
+    if not isinstance(target, dict):
+        return {}
+    attrs = target.get("attributes")
+    return attrs if isinstance(attrs, dict) else {}
+
+
+def _truthy_attr(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"", "1", "true", "disabled", "yes"}
+
+
+def _is_benign_click(e: dict[str, Any]) -> bool:
+    attrs = _target_attrs(e)
+    if "disabled" in attrs and _truthy_attr(attrs.get("disabled")):
+        return True
+    if str(attrs.get("aria-disabled") or "").strip().lower() == "true":
+        return True
+    if str(attrs.get("data-retrace-ignore") or "").strip().lower() == "true":
+        return True
+    href = str(attrs.get("href") or "").strip()
+    if href in {"#", "javascript:void(0)", "javascript:;"}:
+        return True
+    return False
+
+
 def _is_click(e: dict[str, Any]) -> bool:
     if e.get("type") != 3:
         return False
@@ -45,6 +73,8 @@ class DeadClickDetector:
         enum = list(iter_with_url(events))
         for i, (url, e) in enumerate(enum):
             if not _is_click(e):
+                continue
+            if _is_benign_click(e):
                 continue
             click_ts = event_timestamp_ms(e)
             tid = event_data(e).get("id")

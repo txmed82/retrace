@@ -41,3 +41,12 @@ def test_dead_click_suppressed_by_network_request():
         network_event(ts=1500, url="https://api/x", status=200),
     ]
     assert detector.detect("s", events) == []
+
+
+def test_dead_click_suppresses_disabled_control_clicks():
+    from retrace.detectors.dead_click import detector
+
+    click = click_event(ts=1000, x=0, y=0, target_id=7)
+    click["data"]["target"] = {"attributes": {"disabled": ""}}
+
+    assert detector.detect("s", [meta(ts=0), click]) == []

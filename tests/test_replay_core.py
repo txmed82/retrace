@@ -521,6 +521,51 @@ def test_replay_issue_lifecycle_tracks_ongoing_unresolved_and_ticket_created(
     assert issue["external_ticket_url"].endswith("/RET-999")
 
 
+def test_replay_issue_ignored_fingerprint_stays_ignored_on_reprocess(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    events = [
+        _navigation("https://app.example/checkout"),
+        _console_error("Error: checkout failed"),
+    ]
+    for session_id in ["sess-ignore-a", "sess-ignore-b"]:
+        store.insert_replay_batch(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            session_id=session_id,
+            sequence=0,
+            events=events,
+            flush_type="final",
+        )
+
+    first = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-ignore-a"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    assert store.ignore_replay_issue(first.issues[0].issue_id) is True
+
+    second = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-ignore-a", "sess-ignore-b"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    issue = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )[0]
+
+    assert second.issues[0].current_status == "ignored"
+    assert second.issues[0].inserted is False
+    assert issue["status"] == "ignored"
+    assert issue["affected_count"] == 2
+
+
 def test_replay_core_persists_ai_analysis_metadata_and_evidence(tmp_path: Path) -> None:
     store, workspace = _workspace(tmp_path)
     store.insert_replay_batch(

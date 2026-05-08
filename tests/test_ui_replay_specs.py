@@ -349,6 +349,41 @@ def test_generate_replay_issue_fix_prompts_payload_creates_agent_prompts(
     assert (out_dir / payload["prompt_files"]["codex"]).exists()
 
 
+def test_generate_replay_issue_fix_prompts_payload_skips_ignored_issue(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.upsert_github_repo(
+        repo_full_name="acme/widgets",
+        default_branch="main",
+        local_path=str(tmp_path),
+    )
+    upsert = store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="ignored-fix-prompts",
+        session_ids=["sess-ignored"],
+        signal_summary={"console_error": 1},
+        first_seen_ms=100,
+        last_seen_ms=100,
+        title="Ignored issue",
+    )
+    assert store.ignore_replay_issue(upsert.issue_id) is True
+
+    payload, status = _generate_replay_issue_fix_prompts_payload(
+        store=store,
+        output_dir=tmp_path / "reports",
+        issue_id=upsert.public_id,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        repo_full_name="acme/widgets",
+    )
+
+    assert status == 409
+    assert payload["ok"] is False
+    assert "ignored" in payload["error"]
+
+
 def test_transition_replay_issue_payload_marks_resolved_and_unresolved(
     tmp_path: Path,
 ) -> None:
@@ -403,6 +438,17 @@ def test_transition_replay_issue_payload_marks_resolved_and_unresolved(
     assert status == 200
     assert payload["issue"]["status"] == "unresolved"
 
+    payload, status = _transition_replay_issue_payload(
+        store=store,
+        issue_id=issue_public_id,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        status="ignored",
+    )
+
+    assert status == 200
+    assert payload["issue"]["status"] == "ignored"
+
 
 def test_transition_replay_issue_payload_reports_missing_issue(
     tmp_path: Path,
@@ -435,7 +481,10 @@ def test_transition_replay_issue_payload_rejects_unknown_status(
     )
 
     assert status == 400
-    assert payload == {"ok": False, "error": "status must be resolved or unresolved"}
+    assert payload == {
+        "ok": False,
+        "error": "status must be resolved, unresolved, or ignored",
+    }
 
 
 def test_verify_resolved_issues_payload_dry_run_lists_linked_specs(
