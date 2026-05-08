@@ -116,6 +116,9 @@ def test_prompt_safe_filter_excludes_unknown_redaction_states(tmp_path: Path) ->
         include_sensitive=False,
     )
     assert [row.redaction_state for row in rows] == ["raw"]
+    all_rows = store.list_failure_evidence(failure_id=failure_id)
+    assert [row.redaction_state for row in all_rows] == ["raw", "unknown"]
+    assert [row.safe_for_prompts for row in all_rows] == [True, False]
 
 
 def test_evidence_payload_must_be_json_serializable(tmp_path: Path) -> None:

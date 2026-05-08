@@ -517,7 +517,7 @@ class EvidenceRow:
 
     @property
     def safe_for_prompts(self) -> bool:
-        return self.redaction_state != "sensitive"
+        return self.redaction_state in PROMPT_SAFE_REDACTION_STATES
 
 
 @dataclass
