@@ -241,8 +241,8 @@ def _console_message(value: object) -> str:
 def _string_list(value: object) -> list[str]:
     if isinstance(value, str):
         raw = [value]
-    elif isinstance(value, list):
-        raw = value
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
     else:
         raw = []
     out: list[str] = []

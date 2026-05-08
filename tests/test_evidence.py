@@ -64,6 +64,29 @@ def test_evidence_timeline_tolerates_malformed_timestamps() -> None:
     assert timeline[0]["summary"] == "bad timestamp"
 
 
+def test_evidence_timeline_preserves_tuple_reason_codes() -> None:
+    timeline = build_evidence_timeline(
+        [
+            SimpleNamespace(
+                id="ev_reasons",
+                evidence_type="console_log",
+                occurred_at_ms=100,
+                source="manual",
+                payload={
+                    "detector": "console_error",
+                    "confidence": "medium",
+                    "reason_codes": ("console_error.error_level",),
+                    "message": "boom",
+                },
+                artifact_path="",
+            )
+        ]
+    )
+
+    assert timeline[0]["confidence"] == "medium"
+    assert timeline[0]["reason_codes"] == ["console_error.error_level"]
+
+
 def test_failure_evidence_preserves_append_order_for_same_timestamp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
