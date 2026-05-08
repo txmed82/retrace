@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from retrace.tester import (
+    _classify_failure,
     create_spec,
     load_spec,
     run_spec,
@@ -70,6 +71,55 @@ class _LLMHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+
+def test_failure_classifier_separates_selector_drift_and_app_bug(tmp_path: Path) -> None:
+    log_path = tmp_path / "harness.log"
+    log_path.write_text("")
+
+    selector_classification = _classify_failure(
+        harness_log_path=log_path,
+        error="",
+        exit_code=1,
+        assertion_results=[
+            {
+                "assertion_type": "selector_visible",
+                "ok": False,
+                "actual": {"visible": False},
+            }
+        ],
+    )
+    app_classification = _classify_failure(
+        harness_log_path=log_path,
+        error="",
+        exit_code=1,
+        assertion_results=[
+            {
+                "assertion_type": "text_contains",
+                "ok": False,
+                "actual": {"text": "Unexpected checkout error"},
+            }
+        ],
+    )
+
+    assert selector_classification == "selector_drift"
+    assert app_classification == "app_bug"
+
+
+def test_failure_classifier_marks_unreachable_app_as_environment(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "harness.log"
+    log_path.write_text("")
+
+    classification = _classify_failure(
+        harness_log_path=log_path,
+        error="App did not become reachable at http://127.0.0.1:9 after startup.",
+        exit_code=1,
+        assertion_results=[],
+    )
+
+    assert classification == "environment_failure"
 
 
 def _server_url() -> tuple[ThreadingHTTPServer, str]:

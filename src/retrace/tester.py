@@ -32,6 +32,15 @@ SPEC_SCHEMA_VERSION = 2
 ALLOWED_MODES = {"describe", "explore_suite"}
 ALLOWED_AUTH_MODES = {"none", "form", "jwt", "headers"}
 ALLOWED_EXECUTION_ENGINES = {"harness", "native", "explore", "visual", "auto"}
+FAILURE_CLASSIFICATIONS = {
+    "app_bug",
+    "test_bug",
+    "environment_failure",
+    "auth_failure",
+    "timeout",
+    "selector_drift",
+    "unknown",
+}
 
 
 @dataclass
@@ -114,6 +123,7 @@ class TesterRunResult:
     flaky: bool
     flake_reason: str
     status: str
+    failure_classification: str = "unknown"
     error: str = ""
     execution_engine: str = "harness"
     artifacts: list[dict[str, Any]] = field(default_factory=list)
@@ -2330,7 +2340,13 @@ def run_spec(
                     )
                 )
 
-        flake_reason = _classify_flake_reason(harness_log_path, last_error)
+        failure_classification = _classify_failure(
+            harness_log_path=harness_log_path,
+            error=last_error,
+            assertion_results=assertion_results,
+            exit_code=last_exit,
+        )
+        flake_reason = _flake_reason_from_classification(failure_classification)
         flaky = attempts > 1 and last_exit == 0
         ok = last_exit == 0
         status = (
@@ -2352,13 +2368,20 @@ def run_spec(
             flaky=flaky,
             flake_reason=flake_reason,
             status=status,
+            failure_classification=failure_classification,
             error=last_error,
             execution_engine=execution_engine,
             artifacts=artifacts,
             assertion_results=assertion_results,
         )
     except Exception as exc:
-        flake_reason = _classify_flake_reason(harness_log_path, str(exc))
+        failure_classification = _classify_failure(
+            harness_log_path=harness_log_path,
+            error=str(exc),
+            assertion_results=assertion_results,
+            exit_code=1,
+        )
+        flake_reason = _flake_reason_from_classification(failure_classification)
         result = TesterRunResult(
             run_id=run_id,
             spec_id=spec.spec_id,
@@ -2373,6 +2396,7 @@ def run_spec(
             flaky=False,
             flake_reason=flake_reason,
             status="flaky_failed" if flake_reason else "failed",
+            failure_classification=failure_classification,
             error=str(exc),
             execution_engine=execution_engine,
             artifacts=artifacts,
@@ -2388,7 +2412,13 @@ def run_spec(
     return result
 
 
-def _classify_flake_reason(harness_log_path: Path, error: str) -> str:
+def _classify_failure(
+    *,
+    harness_log_path: Path,
+    error: str,
+    assertion_results: list[dict[str, Any]],
+    exit_code: int,
+) -> str:
     text = ""
     try:
         if harness_log_path.exists():
@@ -2396,12 +2426,82 @@ def _classify_flake_reason(harness_log_path: Path, error: str) -> str:
     except Exception:
         text = ""
     merged = f"{text}\n{(error or '').lower()}"
-    if any(k in merged for k in ["timeout", "timed out", "net::err", "connection reset"]):
-        return "network_timeout"
-    if any(k in merged for k in ["selector", "element not found", "stale element"]):
-        return "selector_drift"
-    if any(k in merged for k in ["401", "403", "unauthorized", "forbidden", "auth"]):
+    failed_assertions = [
+        item for item in assertion_results if not bool(item.get("ok", False))
+    ]
+    if any(
+        k in merged
+        for k in [
+            "app did not become reachable",
+            "connection refused",
+            "econnrefused",
+            "net::err_connection_refused",
+            "failed to connect",
+            "could not connect",
+            "server unavailable",
+        ]
+    ):
+        return "environment_failure"
+    if any(k in merged for k in ["timeout", "timed out", "deadline exceeded"]):
+        return "timeout"
+    if any(
+        k in merged
+        for k in [
+            "needs selector",
+            "unsupported_in_playwright",
+            "invalid_regex",
+            "unknown action",
+            "forbidden",
+            "malformed",
+        ]
+    ):
+        return "test_bug"
+    if any(k in merged for k in ["401", "403", "unauthorized", "forbidden"]):
         return "auth_failure"
+    if any(k in merged for k in ["authentication failed", "auth failure", "login failed"]):
+        return "auth_failure"
+    if _failed_selector_assertion(failed_assertions) or any(
+        k in merged
+        for k in [
+            "element not found",
+            "stale element",
+            "waiting for selector",
+            "waiting for locator",
+            "strict mode violation",
+        ]
+    ):
+        return "selector_drift"
+    if failed_assertions:
+        return "app_bug"
+    if int(exit_code) != 0 or error:
+        return "unknown"
+    return "unknown"
+
+
+def _failed_selector_assertion(items: list[dict[str, Any]]) -> bool:
+    for item in items:
+        assertion_type = str(item.get("assertion_type") or "").lower()
+        if assertion_type in {
+            "selector_visible",
+            "element_visible",
+            "visible",
+            "selector_text",
+            "element_text",
+            "selector_count",
+            "element_count",
+        }:
+            return True
+    return False
+
+
+def _flake_reason_from_classification(failure_classification: str) -> str:
+    if failure_classification in {
+        "auth_failure",
+        "environment_failure",
+        "selector_drift",
+        "timeout",
+    }:
+        return failure_classification
     return ""
 
 

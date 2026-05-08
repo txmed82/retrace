@@ -442,6 +442,7 @@ def tester_run(
                 "status": result.status,
                 "flaky": result.flaky,
                 "flake_reason": result.flake_reason,
+                "failure_classification": result.failure_classification,
                 "error": result.error,
                 "execution_engine": result.execution_engine,
                 "artifacts": result.artifacts,
@@ -473,6 +474,7 @@ def tester_run(
                         "execution_engine": result.execution_engine,
                         "attempts": result.attempts,
                         "flake_reason": result.flake_reason,
+                        "failure_classification": result.failure_classification,
                     },
                 ),
             )
@@ -586,6 +588,9 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
                                 "spec_id": job.get("spec_id"),
                                 "execution_engine": job.get("execution_engine"),
                                 "attempts": job.get("attempts"),
+                                "failure_classification": job.get(
+                                    "failure_classification"
+                                ),
                             },
                         ),
                     )
