@@ -1539,8 +1539,14 @@ class Storage:
         if not spec_id.strip():
             raise ValueError("spec_id is required")
         now = datetime.now(timezone.utc).isoformat()
-        link_id = self._id("ftl")
         with self._conn() as conn:
+            failure_row = conn.execute(
+                "SELECT 1 FROM failures WHERE id = ?",
+                (failure_id.strip(),),
+            ).fetchone()
+            if failure_row is None:
+                raise ValueError(f"unknown failure_id: {failure_id}")
+            link_id = self._id("ftl")
             conn.execute(
                 """
                 INSERT INTO failure_test_links
@@ -1627,10 +1633,18 @@ class Storage:
         return [self._failure_test_link_from_row(row) for row in rows]
 
     def coverage_state_for_failure(self, failure_id: str) -> str:
-        links = self.list_failure_test_links(failure_id=failure_id, limit=500)
-        if not links:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT coverage_state
+                FROM failure_test_links
+                WHERE failure_id = ?
+                """,
+                (failure_id,),
+            ).fetchall()
+        if not rows:
             return "not_covered"
-        states = {link.coverage_state for link in links}
+        states = {str(row["coverage_state"]) for row in rows}
         for state in (
             "covered_failing",
             "covered_flaky",

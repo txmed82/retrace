@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from retrace.failures import (
     canonical_failure_from_monitor_incident,
     canonical_failure_from_replay_issue,
@@ -265,6 +267,58 @@ def test_failure_test_run_update_can_target_exact_link(tmp_path: Path) -> None:
     assert first_link.latest_run_id == "run_exact"
     assert second_link.id == second_link_id
     assert second_link.coverage_state == "covered_unverified"
+
+
+def test_failure_test_links_reject_unknown_failure(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+
+    with pytest.raises(ValueError, match="unknown failure_id"):
+        store.upsert_failure_test_link(
+            failure_id="flr_missing",
+            spec_id="missing-failure-regression",
+        )
+
+
+def test_failure_coverage_state_aggregates_all_links(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    created = store.upsert_replay_issue(
+        project_id="proj_1",
+        environment_id="env_1",
+        fingerprint="large-coverage-set",
+        session_ids=["sess_1"],
+        signal_summary={"dead_click": 1},
+        first_seen_ms=100,
+        last_seen_ms=100,
+    )
+    issue = store.get_replay_issue(
+        project_id="proj_1",
+        environment_id="env_1",
+        issue_id=created.public_id,
+    )
+    assert issue is not None
+    failure_id = str(issue["canonical_failure_id"])
+    with store._conn() as conn:
+        for index in range(501):
+            state = "covered_failing" if index == 0 else "covered_unverified"
+            conn.execute(
+                """
+                INSERT INTO failure_test_links
+                (id, failure_id, spec_id, coverage_state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"ftl_{index}",
+                    failure_id,
+                    f"spec_{index}",
+                    state,
+                    f"2026-05-08T00:{index // 60:02d}:{index % 60:02d}+00:00",
+                    f"2026-05-08T00:{index // 60:02d}:{index % 60:02d}+00:00",
+                ),
+            )
+
+    assert store.coverage_state_for_failure(failure_id) == "covered_failing"
 
 
 def test_test_run_failure_can_be_represented_as_canonical_failure() -> None:
