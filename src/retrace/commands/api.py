@@ -13,7 +13,7 @@ import click
 
 from retrace.config import load_config
 from retrace.issue_sink_clients import GitHubClient, IssueSinkError, LinearClient
-from retrace.issue_sinks import promote_replay_issue
+from retrace.issue_sinks import build_issue_card, compact_issue_card, promote_replay_issue
 from retrace.notification_sinks import (
     NotificationEvent,
     NotificationPayload,
@@ -139,6 +139,29 @@ def _build_enricher(cfg: Any, store: Storage) -> CorrelationEnricher | None:
             exc_info=True,
         )
         return None
+
+
+def _issue_cards_for_items(
+    store: Storage,
+    items: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    for item in items[:10]:
+        public_id = str(item.get("public_id") or "")
+        project_id = str(item.get("project_id") or "")
+        environment_id = str(item.get("environment_id") or "")
+        if not public_id or not project_id or not environment_id:
+            continue
+        issue = store.get_replay_issue(
+            project_id=project_id,
+            environment_id=environment_id,
+            issue_id=public_id,
+        )
+        if issue is None:
+            continue
+        sessions = store.list_replay_issue_sessions(str(issue["id"]))
+        cards.append(build_issue_card(store=store, issue=issue, sessions=sessions))
+    return cards
 
 
 def _handler(
@@ -575,6 +598,8 @@ def api_process_replays(config_path: Path, limit: int) -> None:
         result.issues_inserted or result.issues_regressed
     ) and cfg.notifications.enabled:
         sinks = build_sinks_from_config(cfg.notifications)
+        inserted_cards = _issue_cards_for_items(store, list(result.inserted_details))
+        regressed_cards = _issue_cards_for_items(store, list(result.regressed_details))
         try:
             if result.issues_inserted:
                 dispatch_notification(
@@ -585,7 +610,10 @@ def api_process_replays(config_path: Path, limit: int) -> None:
                         summary=(
                             f"New: {', '.join(result.inserted_public_ids[:5]) or '—'}"
                         ),
-                        extra={"public_ids": list(result.inserted_public_ids)},
+                        extra={
+                            "public_ids": list(result.inserted_public_ids),
+                            "issue_cards": inserted_cards,
+                        },
                     ),
                 )
             if result.issues_regressed:
@@ -597,7 +625,11 @@ def api_process_replays(config_path: Path, limit: int) -> None:
                         summary=(
                             f"Regressed: {', '.join(result.regressed_public_ids[:5]) or '—'}"
                         ),
-                        extra={"public_ids": list(result.regressed_public_ids)},
+                        extra={
+                            "public_ids": list(result.regressed_public_ids),
+                            "regressions": list(result.regressed_details),
+                            "issue_cards": regressed_cards,
+                        },
                     ),
                 )
         finally:
@@ -742,7 +774,10 @@ def api_promote_issue(
                     severity=str(result.payload.get("severity") or ""),
                     public_id=result.issue_public_id,
                     url=result.external_url,
-                    extra={"provider": result.provider},
+                    extra={
+                        "provider": result.provider,
+                        "issue_card": compact_issue_card(result.payload),
+                    },
                 ),
             )
         finally:

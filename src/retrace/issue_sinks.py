@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from retrace.evidence import build_evidence_timeline
 from retrace.issue_sink_clients import (
     CreatedIssue,
     GitHubClient,
@@ -47,6 +48,8 @@ def build_issue_sink_payload(
             }
         )
     correlation = _correlation_block(issue)
+    confidence = _row_str(issue, "confidence", "medium")
+    fingerprint = _row_str(issue, "fingerprint", public_id)
     payload: dict[str, Any] = {
         "provider": provider,
         "source": "retrace",
@@ -54,7 +57,9 @@ def build_issue_sink_payload(
         "source_public_id": public_id,
         "title": f"[{public_id}] {str(issue['title'] or 'Replay issue')}",
         "severity": str(issue["severity"]),
+        "confidence": confidence,
         "status": str(issue["status"]),
+        "fingerprint": fingerprint,
         "summary": str(issue["summary"]),
         "likely_cause": str(issue["likely_cause"]),
         "affected_count": int(issue["affected_count"]),
@@ -62,10 +67,158 @@ def build_issue_sink_payload(
         "replay_links": replay_links,
         "reproduction_steps": _safe_json_list(issue["reproduction_steps_json"]),
         "evidence": _safe_json_obj(issue["evidence_json"]),
+        "issue_url": f"{base_url.rstrip('/')}/#issue={public_id}" if base_url else "",
+        "dedupe_marker": _dedupe_marker(public_id, fingerprint),
     }
     if correlation:
         payload["correlation"] = correlation
     return payload
+
+
+def _enrich_issue_sink_payload(
+    *,
+    store: Storage,
+    issue: Any,
+    payload: dict[str, Any],
+    base_url: str,
+) -> None:
+    public_id = str(payload.get("source_public_id") or "")
+    failure_id = _row_str(issue, "canonical_failure_id", "")
+    timeline: list[dict[str, Any]] = []
+    test_links = []
+    if failure_id:
+        timeline = build_evidence_timeline(
+            store.list_failure_evidence(failure_id=failure_id, include_sensitive=False)
+        )
+        for link in store.list_failure_test_links(failure_id=failure_id, limit=10):
+            test_links.append(
+                {
+                    "spec_id": link.spec_id,
+                    "spec_name": link.spec_name,
+                    "coverage_state": link.coverage_state,
+                    "latest_run_status": link.latest_run_status,
+                    "latest_run_classification": link.latest_run_classification,
+                }
+            )
+    payload["timeline_summary"] = _timeline_summary(timeline)
+    payload["generated_test_status"] = _generated_test_status(test_links)
+    payload["test_links"] = test_links
+    payload["likely_files"] = _likely_files(payload)
+    payload["actions"] = _issue_actions(payload, base_url=base_url, public_id=public_id)
+
+
+def compact_issue_card(payload: dict[str, Any]) -> dict[str, Any]:
+    public_id = str(payload.get("source_public_id") or "")
+    title = str(payload.get("title") or "")
+    prefix = f"[{public_id}] "
+    if public_id and title.startswith(prefix):
+        title = title[len(prefix) :]
+    return {
+        "public_id": public_id,
+        "title": title,
+        "severity": str(payload.get("severity") or ""),
+        "confidence": str(payload.get("confidence") or ""),
+        "affected_count": int(payload.get("affected_count") or 0),
+        "affected_users": int(payload.get("affected_users") or 0),
+        "summary": str(payload.get("summary") or ""),
+        "replay_url": _first_replay_url(payload),
+        "timeline_summary": str(payload.get("timeline_summary") or ""),
+        "generated_test_status": str(payload.get("generated_test_status") or ""),
+        "likely_files": list(payload.get("likely_files") or []),
+        "actions": dict(payload.get("actions") or {}),
+    }
+
+
+def build_issue_card(
+    *,
+    store: Storage,
+    issue: Any,
+    sessions: list[Any],
+    base_url: str = "",
+    provider: str = "notification",
+) -> dict[str, Any]:
+    payload = build_issue_sink_payload(
+        issue=issue,
+        sessions=sessions,
+        provider=provider,
+        base_url=base_url,
+    )
+    _enrich_issue_sink_payload(
+        store=store,
+        issue=issue,
+        payload=payload,
+        base_url=base_url,
+    )
+    return compact_issue_card(payload)
+
+
+def _timeline_summary(timeline: list[dict[str, Any]]) -> str:
+    if not timeline:
+        return "No timeline evidence captured yet."
+    parts: list[str] = []
+    for event in timeline[:4]:
+        title = str(event.get("title") or event.get("kind") or "Evidence")
+        summary = str(event.get("summary") or "").strip()
+        parts.append(f"{title}: {summary}" if summary else title)
+    if len(timeline) > 4:
+        parts.append(f"+{len(timeline) - 4} more")
+    return " | ".join(parts)
+
+
+def _generated_test_status(test_links: list[dict[str, Any]]) -> str:
+    if not test_links:
+        return "not generated"
+    states = [str(link.get("coverage_state") or "covered_unverified") for link in test_links]
+    latest = str(test_links[0].get("latest_run_status") or "").strip()
+    label = ", ".join(sorted(set(states)))
+    return f"{label}; latest run {latest}" if latest else label
+
+
+def _likely_files(payload: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    correlation = payload.get("correlation") if isinstance(payload.get("correlation"), dict) else {}
+    top_frame = str(correlation.get("top_stack_frame") or "").strip()
+    if top_frame:
+        out.append(top_frame)
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    for signal in evidence.get("signals") or []:
+        if not isinstance(signal, dict):
+            continue
+        for key in ("file", "filename", "source_file", "component"):
+            value = str(signal.get(key) or "").strip()
+            if value and value not in out:
+                out.append(value)
+    return out[:5]
+
+
+def _issue_actions(
+    payload: dict[str, Any], *, base_url: str, public_id: str
+) -> dict[str, str]:
+    actions: dict[str, str] = {}
+    issue_url = str(payload.get("issue_url") or "")
+    if issue_url:
+        actions["open_retrace"] = issue_url
+        actions["repair"] = f"{issue_url}&action=repair"
+        actions["tests"] = f"{issue_url}&panel=tests"
+    replay_url = _first_replay_url(payload)
+    if replay_url:
+        actions["replay"] = replay_url
+    if base_url and public_id:
+        actions.setdefault("api", f"{base_url.rstrip('/')}/api/replay-dashboard")
+    return actions
+
+
+def _first_replay_url(payload: dict[str, Any]) -> str:
+    links = payload.get("replay_links") or []
+    if isinstance(links, list) and links:
+        first = links[0]
+        if isinstance(first, dict):
+            return str(first.get("url") or "")
+    return ""
+
+
+def _dedupe_marker(public_id: str, fingerprint: str) -> str:
+    return f"<!-- retrace:issue:{public_id} fingerprint:{fingerprint} -->"
 
 
 _CORRELATION_COLUMNS = {
@@ -120,21 +273,59 @@ def _row_keys(issue: Any) -> set[str]:
     return set()
 
 
+def _row_get(issue: Any, key: str, default: Any = "") -> Any:
+    if key not in _row_keys(issue):
+        return default
+    try:
+        return issue[key]
+    except Exception:
+        return default
+
+
+def _row_str(issue: Any, key: str, default: str = "") -> str:
+    value = _row_get(issue, key, default)
+    if value is None:
+        value = default
+    return str(value)
+
+
 def render_issue_markdown(payload: dict[str, Any]) -> str:
     """Render the sink payload as a Markdown body for Linear/GitHub."""
     lines: list[str] = []
+    marker = str(payload.get("dedupe_marker") or "")
+    if marker:
+        lines.append(marker)
+        lines.append("")
     lines.append(str(payload.get("summary") or ""))
     lines.append("")
     lines.append(
         f"**Severity:** {payload.get('severity', 'unknown')}  "
+        f"**Confidence:** {payload.get('confidence', 'unknown')}  "
         f"**Affected sessions:** {payload.get('affected_count', 0)}  "
         f"**Affected users:** {payload.get('affected_users', 0)}"
     )
+    status = str(payload.get("generated_test_status") or "")
+    if status:
+        lines.append(f"**Generated test:** {status}")
+    issue_url = str(payload.get("issue_url") or "")
+    if issue_url:
+        lines.append(f"**Retrace:** {issue_url}")
     cause = str(payload.get("likely_cause") or "")
     if cause:
         lines.append("")
         lines.append("### Likely cause")
         lines.append(cause)
+    timeline_summary = str(payload.get("timeline_summary") or "")
+    if timeline_summary:
+        lines.append("")
+        lines.append("### Timeline")
+        lines.append(timeline_summary)
+    likely_files = payload.get("likely_files") or []
+    if likely_files:
+        lines.append("")
+        lines.append("### Likely files")
+        for file in likely_files:
+            lines.append(f"- `{file}`")
     steps = payload.get("reproduction_steps") or []
     if steps:
         lines.append("")
@@ -150,6 +341,21 @@ def render_issue_markdown(payload: dict[str, Any]) -> str:
             url = link.get("url") or ""
             sid = link.get("session_id") or ""
             lines.append(f"- [{role}] [{sid}]({url})")
+    test_links = payload.get("test_links") or []
+    if test_links:
+        lines.append("")
+        lines.append("### Generated tests")
+        for link in test_links:
+            spec = link.get("spec_id") or "unknown-spec"
+            state = link.get("coverage_state") or "unknown"
+            latest = link.get("latest_run_status") or "not run"
+            lines.append(f"- `{spec}` — {state}; latest run: {latest}")
+    actions = payload.get("actions") or {}
+    if actions:
+        lines.append("")
+        lines.append("### Actions")
+        for label, url in actions.items():
+            lines.append(f"- [{str(label).replace('_', ' ').title()}]({url})")
     correlation = payload.get("correlation") or {}
     if correlation:
         lines.append("")
@@ -215,6 +421,12 @@ def promote_replay_issue(
         issue=issue,
         sessions=sessions,
         provider=provider,
+        base_url=base_url,
+    )
+    _enrich_issue_sink_payload(
+        store=store,
+        issue=issue,
+        payload=payload,
         base_url=base_url,
     )
 

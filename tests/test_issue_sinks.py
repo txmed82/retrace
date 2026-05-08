@@ -11,7 +11,7 @@ from pytest_httpx import HTTPXMock
 
 from retrace.cli import main
 from retrace.issue_sink_clients import GitHubClient, IssueSinkError, LinearClient
-from retrace.issue_sinks import promote_replay_issue, render_issue_markdown
+from retrace.issue_sinks import compact_issue_card, promote_replay_issue, render_issue_markdown
 from retrace.replay_core import ReplaySignalConfig, process_replay_sessions
 from retrace.storage import Storage
 
@@ -244,8 +244,10 @@ def test_promote_replay_issue_via_real_linear_client(tmp_path: Path) -> None:
 
 def test_promote_replay_issue_via_real_github_client(tmp_path: Path) -> None:
     store, workspace, issue_public_id = _seed_issue(tmp_path)
+    captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = json.loads(request.content.decode("utf-8"))
         return httpx.Response(
             201,
             json={
@@ -270,6 +272,13 @@ def test_promote_replay_issue_via_real_github_client(tmp_path: Path) -> None:
     assert result.created is True
     assert result.external_id == "acme/web#12"
     assert result.external_url == "https://github.com/acme/web/issues/12"
+    body = captured["json"]["body"]
+    assert f"<!-- retrace:issue:{issue_public_id}" in body
+    assert "### Timeline" in body
+    assert "### Replays" in body
+    assert "### Actions" in body
+    assert "Generated test" in body
+    assert "Repair" in body
 
 
 def test_promote_replay_issue_falls_back_to_stub_without_client(tmp_path: Path) -> None:
@@ -332,21 +341,57 @@ def test_render_issue_markdown_contains_key_fields() -> None:
         {
             "summary": "Page crashes",
             "severity": "high",
+            "confidence": "high",
             "affected_count": 3,
             "affected_users": 2,
             "likely_cause": "missing total",
+            "timeline_summary": "Click: Pay | Console error: total undefined",
+            "generated_test_status": "covered_failing; latest run failed",
+            "likely_files": ["src/checkout.tsx"],
             "reproduction_steps": ["Open page", "Click pay"],
             "replay_links": [
                 {"role": "representative", "session_id": "abc", "url": "https://r/abc"}
             ],
+            "test_links": [
+                {
+                    "spec_id": "checkout-regression",
+                    "coverage_state": "covered_failing",
+                    "latest_run_status": "failed",
+                }
+            ],
+            "actions": {
+                "repair": "https://retrace.example/#issue=bug_xyz&action=repair"
+            },
+            "dedupe_marker": "<!-- retrace:issue:bug_xyz fingerprint:f1 -->",
             "source_public_id": "bug_xyz",
         }
     )
+    assert body.startswith("<!-- retrace:issue:bug_xyz fingerprint:f1 -->")
     assert "Page crashes" in body
     assert "**Severity:** high" in body
+    assert "**Confidence:** high" in body
+    assert "covered_failing; latest run failed" in body
+    assert "Click: Pay" in body
+    assert "`src/checkout.tsx`" in body
     assert "1. Open page" in body
     assert "https://r/abc" in body
+    assert "`checkout-regression`" in body
+    assert "Repair" in body
     assert "bug_xyz" in body
+
+
+def test_compact_issue_card_strips_prefixed_public_id() -> None:
+    card = compact_issue_card(
+        {
+            "source_public_id": "bug_xyz",
+            "title": "[bug_xyz] Checkout button fails",
+            "severity": "high",
+            "confidence": "high",
+            "affected_count": 2,
+        }
+    )
+
+    assert card["title"] == "Checkout button fails"
 
 
 def test_build_issue_sink_payload_skips_correlation_when_row_partial() -> None:
@@ -363,6 +408,8 @@ def test_build_issue_sink_payload_skips_correlation_when_row_partial() -> None:
         "status": "new",
         "summary": "s",
         "likely_cause": "",
+        "confidence": None,
+        "fingerprint": None,
         "affected_count": 1,
         "affected_users": 1,
         "reproduction_steps_json": "[]",
@@ -375,6 +422,9 @@ def test_build_issue_sink_payload_skips_correlation_when_row_partial() -> None:
         issue=partial, sessions=[], provider="linear"
     )
     assert "correlation" not in payload
+    assert payload["confidence"] == "medium"
+    assert payload["fingerprint"] == "bug_1"
+    assert "fingerprint:bug_1" in payload["dedupe_marker"]
 
 
 def test_render_issue_markdown_includes_correlation_block() -> None:

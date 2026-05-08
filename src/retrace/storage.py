@@ -599,6 +599,7 @@ class ReplayIssueUpsertResult:
     inserted: bool
     previous_status: str = ""
     current_status: str = ""
+    previous_resolved_at: str = ""
 
     @property
     def regressed(self) -> bool:
@@ -2621,12 +2622,13 @@ class Storage:
         with self._conn() as conn:
             prior_row = conn.execute(
                 """
-                SELECT status FROM replay_issues
+                SELECT status, resolved_at FROM replay_issues
                 WHERE project_id = ? AND environment_id = ? AND fingerprint = ?
                 """,
                 (project_id, environment_id, fingerprint),
             ).fetchone()
             previous_status = str(prior_row["status"]) if prior_row else ""
+            previous_resolved_at = str(prior_row["resolved_at"] or "") if prior_row else ""
             conn.execute(
                 """
                 INSERT INTO replay_issues
@@ -2850,6 +2852,7 @@ class Storage:
             inserted=inserted,
             previous_status=previous_status,
             current_status=current_status,
+            previous_resolved_at=previous_resolved_at,
         )
 
     def list_replay_issues(

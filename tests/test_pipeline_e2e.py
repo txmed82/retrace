@@ -276,5 +276,6 @@ def test_replay_upsert_surfaces_previous_and_regressed_status(tmp_path: Path) ->
     )
     assert res2.issues[0].inserted is False
     assert res2.issues[0].previous_status == "resolved"
+    assert res2.issues[0].previous_resolved_at
     assert res2.issues[0].current_status == "regressed"
     assert res2.issues[0].regressed is True

@@ -128,6 +128,47 @@ def test_slack_sink_formats_blocks() -> None:
     assert "<https://retrace.example/issues/bug_xyz|Open in Retrace>" in body["text"]
 
 
+def test_slack_sink_formats_grouped_issue_cards() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, text="ok")
+
+    card = {
+        "public_id": "bug_checkout",
+        "title": "Checkout button fails",
+        "severity": "high",
+        "confidence": "high",
+        "affected_count": 4,
+        "replay_url": "https://retrace.example/replays/sess-1",
+        "timeline_summary": "Click: checkout | Console error: total undefined",
+        "generated_test_status": "covered_failing",
+        "likely_files": ["src/checkout.tsx"],
+        "actions": {
+            "repair": "https://retrace.example/#issue=bug_checkout&action=repair",
+            "tests": "https://retrace.example/#issue=bug_checkout&panel=tests",
+        },
+    }
+    with httpx.Client(transport=httpx.MockTransport(handler)) as raw:
+        sink = SlackSink(webhook_url="https://hooks.slack/x", client=raw)
+        sink.send(
+            _payload(
+                title="1 new replay issue",
+                extra={"issue_cards": [card]},
+            )
+        )
+
+    text = captured["body"]["text"]
+    assert "bug_checkout" in text
+    assert "Severity `high`" in text
+    assert "Click: checkout" in text
+    assert "Generated test: `covered_failing`" in text
+    assert "`src/checkout.tsx`" in text
+    assert "<https://retrace.example/replays/sess-1|Replay>" in text
+    assert "Repair" in text
+
+
 def test_slack_sink_uses_default_emoji_for_unknown_event() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
