@@ -1,5 +1,4 @@
 from pathlib import Path
-import time
 
 import pytest
 
@@ -56,7 +55,14 @@ def test_failure_evidence_preserves_append_order_for_same_timestamp(
         )
     )
     ids = iter(["ev_z", "ev_a"])
+    timestamps = iter(
+        [
+            "2026-05-08T20:41:00.000001+00:00",
+            "2026-05-08T20:41:00.000002+00:00",
+        ]
+    )
     monkeypatch.setattr(store, "_id", lambda prefix: next(ids))
+    monkeypatch.setattr(store, "_now_iso_microseconds", lambda: next(timestamps))
 
     store.append_failure_evidence(
         EvidenceItem(
@@ -68,7 +74,6 @@ def test_failure_evidence_preserves_append_order_for_same_timestamp(
             payload={"message": "first"},
         )
     )
-    time.sleep(0.001)
     store.append_failure_evidence(
         EvidenceItem(
             failure_id=failure_id,
@@ -83,6 +88,60 @@ def test_failure_evidence_preserves_append_order_for_same_timestamp(
     rows = store.list_failure_evidence(failure_id=failure_id)
     assert [row.id for row in rows] == ["ev_z", "ev_a"]
     assert [row.payload["message"] for row in rows] == ["first", "second"]
+
+
+def test_failure_evidence_orders_mixed_created_at_formats_chronologically(
+    tmp_path: Path,
+) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    failure_id = store.upsert_failure(
+        _failure(
+            project_id="proj_1",
+            environment_id="env_1",
+            source_external_id="manual-mixed-time",
+        )
+    )
+    with store._conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO failure_evidence
+            (id, failure_id, evidence_type, occurred_at_ms, source, redaction_state,
+             payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_late_legacy",
+                failure_id,
+                "console_log",
+                100,
+                "manual",
+                "raw",
+                '{"message": "late"}',
+                "2026-05-08 20:41:01",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO failure_evidence
+            (id, failure_id, evidence_type, occurred_at_ms, source, redaction_state,
+             payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_early_iso",
+                failure_id,
+                "console_log",
+                100,
+                "manual",
+                "raw",
+                '{"message": "early"}',
+                "2026-05-08T20:41:00.999000+00:00",
+            ),
+        )
+
+    rows = store.list_failure_evidence(failure_id=failure_id)
+    assert [row.id for row in rows] == ["ev_early_iso", "ev_late_legacy"]
 
 
 def test_sensitive_evidence_can_be_excluded_for_prompts(tmp_path: Path) -> None:
