@@ -122,6 +122,42 @@ def test_failure_classifier_marks_unreachable_app_as_environment(
     assert classification == "environment_failure"
 
 
+def test_failure_classifier_reads_failed_assertion_payload(tmp_path: Path) -> None:
+    log_path = tmp_path / "harness.log"
+    log_path.write_text("")
+
+    classification = _classify_failure(
+        harness_log_path=log_path,
+        error="",
+        exit_code=1,
+        assertion_results=[
+            {
+                "assertion_type": "text_matches",
+                "ok": False,
+                "actual": {"error": "invalid_regex: unterminated character set"},
+            }
+        ],
+    )
+
+    assert classification == "test_bug"
+
+
+def test_failure_classifier_prefers_auth_for_forbidden_response(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "harness.log"
+    log_path.write_text("403 forbidden\n")
+
+    classification = _classify_failure(
+        harness_log_path=log_path,
+        error="",
+        exit_code=1,
+        assertion_results=[],
+    )
+
+    assert classification == "auth_failure"
+
+
 def _server_url() -> tuple[ThreadingHTTPServer, str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

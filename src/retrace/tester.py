@@ -2425,10 +2425,16 @@ def _classify_failure(
             text = harness_log_path.read_text(encoding="utf-8", errors="ignore").lower()
     except Exception:
         text = ""
-    merged = f"{text}\n{(error or '').lower()}"
     failed_assertions = [
         item for item in assertion_results if not bool(item.get("ok", False))
     ]
+    merged = "\n".join(
+        [
+            text,
+            str(error or ""),
+            _assertion_text_for_classification(failed_assertions),
+        ]
+    ).lower()
     if any(
         k in merged
         for k in [
@@ -2451,7 +2457,6 @@ def _classify_failure(
             "unsupported_in_playwright",
             "invalid_regex",
             "unknown action",
-            "forbidden",
             "malformed",
         ]
     ):
@@ -2476,6 +2481,27 @@ def _classify_failure(
     if int(exit_code) != 0 or error:
         return "unknown"
     return "unknown"
+
+
+def _assertion_text_for_classification(items: list[dict[str, Any]]) -> str:
+    chunks: list[str] = []
+    for item in items:
+        for key in (
+            "assertion_type",
+            "message",
+            "actual",
+            "expected",
+            "step",
+            "assertion",
+        ):
+            value = item.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (dict, list)):
+                chunks.append(json.dumps(value, sort_keys=True, default=str))
+            else:
+                chunks.append(str(value))
+    return "\n".join(chunks)
 
 
 def _failed_selector_assertion(items: list[dict[str, Any]]) -> bool:

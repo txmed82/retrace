@@ -1686,7 +1686,7 @@ class Storage:
         run_ok = 1 if bool(getattr(run_result, "ok", False)) else 0
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE failure_test_links
                 SET coverage_state = ?,
@@ -1696,7 +1696,7 @@ class Storage:
                     latest_run_ok = ?,
                     latest_run_at = ?,
                     updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND spec_id = ?
                 """,
                 (
                     coverage_state,
@@ -1707,8 +1707,13 @@ class Storage:
                     now,
                     now,
                     link_id,
+                    spec_id,
                 ),
             )
+            if int(cursor.rowcount) == 0:
+                raise ValueError(
+                    f"unknown failure_test_link id={link_id} spec_id={spec_id}"
+                )
             rows = conn.execute(
                 """
                 SELECT *

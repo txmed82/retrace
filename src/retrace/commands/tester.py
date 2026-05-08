@@ -549,15 +549,16 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
             cwd=config_path.parent,
         )
         if job is not None:
+            result_payload = job.get("result") if isinstance(job.get("result"), dict) else {}
             try:
                 store = Storage(cfg.run.data_dir / "retrace.db")
                 store.init_schema()
                 spec_id = str(job.get("spec_id") or "")
                 link_id = _single_failure_test_link_id(store, spec_id)
-                if link_id:
+                if link_id and result_payload:
                     store.update_failure_test_link_run(
                         spec_id=spec_id,
-                        run_result=SimpleNamespace(**job),
+                        run_result=SimpleNamespace(**result_payload),
                         link_id=link_id,
                     )
             except Exception as exc:
@@ -582,13 +583,17 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
                         NotificationPayload(
                             event=NotificationEvent.RUN_FAILED.value,
                             title=f"Queued tester run failed: {job.get('spec_id', '')}",
-                            summary=str(job.get("error") or ""),
-                            public_id=str(job.get("run_id") or ""),
+                            summary=str(
+                                result_payload.get("error") or job.get("error") or ""
+                            ),
+                            public_id=str(result_payload.get("run_id") or ""),
                             extra={
                                 "spec_id": job.get("spec_id"),
-                                "execution_engine": job.get("execution_engine"),
-                                "attempts": job.get("attempts"),
-                                "failure_classification": job.get(
+                                "execution_engine": result_payload.get(
+                                    "execution_engine"
+                                ),
+                                "attempts": result_payload.get("attempts"),
+                                "failure_classification": result_payload.get(
                                     "failure_classification"
                                 ),
                             },
