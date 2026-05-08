@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
+from retrace.failures import CanonicalFailure, canonical_failure_from_replay_issue
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -222,6 +224,40 @@ CREATE TABLE IF NOT EXISTS signal_definitions (
     UNIQUE(project_id, environment_id, detector)
 );
 
+CREATE TABLE IF NOT EXISTS failures (
+    id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_external_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'new',
+    affected_users INTEGER NOT NULL DEFAULT 0,
+    affected_sessions INTEGER NOT NULL DEFAULT 0,
+    first_seen_ms INTEGER NOT NULL DEFAULT 0,
+    last_seen_ms INTEGER NOT NULL DEFAULT 0,
+    related_deploy_sha TEXT NOT NULL DEFAULT '',
+    related_pr_number INTEGER,
+    linked_tests_json TEXT NOT NULL DEFAULT '[]',
+    linked_repair_task_id TEXT NOT NULL DEFAULT '',
+    linked_external_thread_id TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, source_type, source_external_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_failures_scope_status
+ON failures(project_id, environment_id, status, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_failures_fingerprint
+ON failures(project_id, environment_id, fingerprint);
+
 CREATE TABLE IF NOT EXISTS replay_issues (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -250,6 +286,7 @@ CREATE TABLE IF NOT EXISTS replay_issues (
     external_ticket_state TEXT NOT NULL DEFAULT '',
     external_ticket_url TEXT NOT NULL DEFAULT '',
     external_ticket_id TEXT NOT NULL DEFAULT '',
+    canonical_failure_id TEXT NOT NULL DEFAULT '',
     distinct_id TEXT NOT NULL DEFAULT '',
     error_issue_ids_json TEXT NOT NULL DEFAULT '[]',
     trace_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -408,6 +445,34 @@ class SignalDefinitionRow:
     custom_definition: str
     match_count: int
     last_match_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
+class FailureRow:
+    id: str
+    public_id: str
+    project_id: str
+    environment_id: str
+    source_type: str
+    source_external_id: str
+    fingerprint: str
+    title: str
+    summary: str
+    severity: str
+    confidence: str
+    status: str
+    affected_users: int
+    affected_sessions: int
+    first_seen_ms: int
+    last_seen_ms: int
+    related_deploy_sha: str
+    related_pr_number: Optional[int]
+    linked_tests: list[str]
+    linked_repair_task_id: str
+    linked_external_thread_id: str
+    metadata: dict[str, Any]
     created_at: datetime
     updated_at: datetime
 
@@ -636,6 +701,7 @@ class Storage:
                 "external_ticket_state": "TEXT NOT NULL DEFAULT ''",
                 "external_ticket_url": "TEXT NOT NULL DEFAULT ''",
                 "external_ticket_id": "TEXT NOT NULL DEFAULT ''",
+                "canonical_failure_id": "TEXT NOT NULL DEFAULT ''",
                 "analysis_status": "TEXT NOT NULL DEFAULT ''",
                 "analysis_model": "TEXT NOT NULL DEFAULT ''",
                 "analysis_prompt_version": "TEXT NOT NULL DEFAULT ''",
@@ -1076,6 +1142,184 @@ class Storage:
             custom_definition=str(row["custom_definition"] or ""),
             match_count=int(row["match_count"] or 0),
             last_match_at=self._dt(row["last_match_at"]),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    def upsert_failure(self, failure: CanonicalFailure) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        failure_id = self._id("flr")
+        with self._conn() as conn:
+            return self._upsert_failure(
+                conn,
+                failure=failure,
+                now=now,
+                failure_id=failure_id,
+            )
+
+    def _upsert_failure(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        failure: CanonicalFailure,
+        now: str,
+        failure_id: str,
+    ) -> str:
+        conn.execute(
+            """
+            INSERT INTO failures
+            (id, public_id, project_id, environment_id, source_type, source_external_id,
+             fingerprint, title, summary, severity, confidence, status, affected_users,
+             affected_sessions, first_seen_ms, last_seen_ms, related_deploy_sha,
+             related_pr_number, linked_tests_json, linked_repair_task_id,
+             linked_external_thread_id, metadata_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, environment_id, source_type, source_external_id)
+            DO UPDATE SET
+                public_id = excluded.public_id,
+                fingerprint = excluded.fingerprint,
+                title = excluded.title,
+                summary = excluded.summary,
+                severity = excluded.severity,
+                confidence = excluded.confidence,
+                status = excluded.status,
+                affected_users = excluded.affected_users,
+                affected_sessions = excluded.affected_sessions,
+                first_seen_ms = CASE
+                    WHEN failures.first_seen_ms = 0 THEN excluded.first_seen_ms
+                    WHEN excluded.first_seen_ms = 0 THEN failures.first_seen_ms
+                    ELSE MIN(failures.first_seen_ms, excluded.first_seen_ms)
+                END,
+                last_seen_ms = MAX(failures.last_seen_ms, excluded.last_seen_ms),
+                related_deploy_sha = excluded.related_deploy_sha,
+                related_pr_number = excluded.related_pr_number,
+                linked_tests_json = excluded.linked_tests_json,
+                linked_repair_task_id = excluded.linked_repair_task_id,
+                linked_external_thread_id = excluded.linked_external_thread_id,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                failure_id,
+                failure.public_id,
+                failure.project_id,
+                failure.environment_id,
+                failure.source_type,
+                failure.source_external_id,
+                failure.fingerprint,
+                failure.title,
+                failure.summary,
+                failure.severity,
+                failure.confidence,
+                failure.status,
+                int(failure.affected_users),
+                int(failure.affected_sessions),
+                int(failure.first_seen_ms),
+                int(failure.last_seen_ms),
+                failure.related_deploy_sha,
+                failure.related_pr_number,
+                json.dumps(failure.linked_tests, sort_keys=True),
+                failure.linked_repair_task_id,
+                failure.linked_external_thread_id,
+                json.dumps(failure.metadata, sort_keys=True),
+                now,
+            ),
+        )
+        row = conn.execute(
+            """
+            SELECT id
+            FROM failures
+            WHERE project_id = ? AND environment_id = ?
+              AND source_type = ? AND source_external_id = ?
+            """,
+            (
+                failure.project_id,
+                failure.environment_id,
+                failure.source_type,
+                failure.source_external_id,
+            ),
+        ).fetchone()
+        assert row is not None
+        return str(row["id"])
+
+    def get_failure(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        failure_id: str,
+    ) -> Optional[FailureRow]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM failures
+                WHERE project_id = ? AND environment_id = ?
+                  AND (id = ? OR public_id = ?)
+                """,
+                (project_id, environment_id, failure_id, failure_id),
+            ).fetchone()
+        return self._failure_from_row(row) if row is not None else None
+
+    def list_failures(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        source_type: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[FailureRow]:
+        params: list[object] = [project_id, environment_id]
+        where = "project_id = ? AND environment_id = ?"
+        if source_type is not None:
+            where += " AND source_type = ?"
+            params.append(source_type)
+        if status is not None:
+            where += " AND status = ?"
+            params.append(status)
+        params.append(max(1, min(int(limit), 500)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM failures
+                WHERE {where}
+                ORDER BY updated_at DESC, public_id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._failure_from_row(row) for row in rows]
+
+    def _failure_from_row(self, row: sqlite3.Row) -> FailureRow:
+        return FailureRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            source_type=str(row["source_type"]),
+            source_external_id=str(row["source_external_id"]),
+            fingerprint=str(row["fingerprint"]),
+            title=str(row["title"]),
+            summary=str(row["summary"]),
+            severity=str(row["severity"]),
+            confidence=str(row["confidence"]),
+            status=str(row["status"]),
+            affected_users=int(row["affected_users"] or 0),
+            affected_sessions=int(row["affected_sessions"] or 0),
+            first_seen_ms=int(row["first_seen_ms"] or 0),
+            last_seen_ms=int(row["last_seen_ms"] or 0),
+            related_deploy_sha=str(row["related_deploy_sha"] or ""),
+            related_pr_number=(
+                int(row["related_pr_number"])
+                if row["related_pr_number"] is not None
+                else None
+            ),
+            linked_tests=self._parse_string_list_json(row["linked_tests_json"]),
+            linked_repair_task_id=str(row["linked_repair_task_id"] or ""),
+            linked_external_thread_id=str(row["linked_external_thread_id"] or ""),
+            metadata=dict(self._safe_json_obj(row["metadata_json"])),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
         )
@@ -1952,6 +2196,29 @@ class Storage:
                     now,
                     issue_id,
                 ),
+            )
+            issue_row = conn.execute(
+                """
+                SELECT *
+                FROM replay_issues
+                WHERE id = ?
+                """,
+                (issue_id,),
+            ).fetchone()
+            assert issue_row is not None
+            canonical_failure_id = self._upsert_failure(
+                conn,
+                failure=canonical_failure_from_replay_issue(dict(issue_row)),
+                now=now,
+                failure_id=self._id("flr"),
+            )
+            conn.execute(
+                """
+                UPDATE replay_issues
+                SET canonical_failure_id = ?
+                WHERE id = ?
+                """,
+                (canonical_failure_id, issue_id),
             )
         return ReplayIssueUpsertResult(
             issue_id=issue_id,
