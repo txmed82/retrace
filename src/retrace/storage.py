@@ -9,6 +9,11 @@ import json
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
+from retrace.evidence import (
+    PROMPT_SAFE_REDACTION_STATES,
+    EvidenceItem,
+    evidence_items_from_replay_issue,
+)
 from retrace.failures import CanonicalFailure, canonical_failure_from_replay_issue
 
 
@@ -258,6 +263,26 @@ ON failures(project_id, environment_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_failures_fingerprint
 ON failures(project_id, environment_id, fingerprint);
 
+CREATE TABLE IF NOT EXISTS failure_evidence (
+    id TEXT PRIMARY KEY,
+    failure_id TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    occurred_at_ms INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT '',
+    redaction_state TEXT NOT NULL DEFAULT 'raw',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    artifact_path TEXT NOT NULL DEFAULT '',
+    dedupe_key TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_failure_evidence_failure_time
+ON failure_evidence(failure_id, occurred_at_ms, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_failure_evidence_dedupe
+ON failure_evidence(failure_id, dedupe_key)
+WHERE dedupe_key != '';
+
 CREATE TABLE IF NOT EXISTS replay_issues (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -475,6 +500,24 @@ class FailureRow:
     metadata: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass
+class EvidenceRow:
+    id: str
+    failure_id: str
+    evidence_type: str
+    occurred_at_ms: int
+    source: str
+    redaction_state: str
+    payload: dict[str, Any]
+    artifact_path: str
+    dedupe_key: str
+    created_at: datetime
+
+    @property
+    def safe_for_prompts(self) -> bool:
+        return self.redaction_state in PROMPT_SAFE_REDACTION_STATES
 
 
 @dataclass
@@ -852,6 +895,10 @@ class Storage:
         if not value:
             return None
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+    @staticmethod
+    def _now_iso_microseconds() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
     def ensure_workspace(
         self,
@@ -1322,6 +1369,113 @@ class Storage:
             metadata=dict(self._safe_json_obj(row["metadata_json"])),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    def append_failure_evidence(self, evidence: EvidenceItem) -> str:
+        with self._conn() as conn:
+            return self._append_failure_evidence(conn, evidence=evidence)
+
+    def _append_failure_evidence(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        evidence: EvidenceItem,
+    ) -> str:
+        if evidence.redaction_state not in {"raw", "redacted", "sensitive"}:
+            raise ValueError("invalid evidence redaction_state")
+        try:
+            payload_json = json.dumps(evidence.payload, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("evidence payload must be JSON-serializable") from exc
+        evidence_id = self._id("ev")
+        created_at = self._now_iso_microseconds()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO failure_evidence
+            (id, failure_id, evidence_type, occurred_at_ms, source, redaction_state,
+             payload_json, artifact_path, dedupe_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                evidence_id,
+                evidence.failure_id,
+                evidence.evidence_type,
+                int(evidence.occurred_at_ms),
+                evidence.source,
+                evidence.redaction_state,
+                payload_json,
+                evidence.artifact_path,
+                evidence.dedupe_key,
+                created_at,
+            ),
+        )
+        if evidence.dedupe_key:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM failure_evidence
+                WHERE failure_id = ? AND dedupe_key = ?
+                """,
+                (evidence.failure_id, evidence.dedupe_key),
+            ).fetchone()
+            assert row is not None
+            return str(row["id"])
+        return evidence_id
+
+    def list_failure_evidence(
+        self,
+        *,
+        failure_id: str,
+        include_sensitive: bool = True,
+    ) -> list[EvidenceRow]:
+        where = "failure_id = ?"
+        params: list[object] = [failure_id]
+        if not include_sensitive:
+            placeholders = ",".join("?" for _ in PROMPT_SAFE_REDACTION_STATES)
+            where += f" AND redaction_state IN ({placeholders})"
+            params.extend(PROMPT_SAFE_REDACTION_STATES)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM failure_evidence
+                WHERE {where}
+                ORDER BY
+                    occurred_at_ms,
+                    replace(replace(created_at, ' ', 'T'), '+00:00', 'Z'),
+                    id
+                """,
+                params,
+            ).fetchall()
+        return [self._evidence_from_row(row) for row in rows]
+
+    def _backfill_replay_issue_evidence(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        failure_id: str,
+        issue_public_id: str,
+        evidence: dict[str, Any],
+    ) -> None:
+        for item in evidence_items_from_replay_issue(
+            failure_id=failure_id,
+            issue_public_id=issue_public_id,
+            evidence=evidence,
+        ):
+            self._append_failure_evidence(conn, evidence=item)
+
+    def _evidence_from_row(self, row: sqlite3.Row) -> EvidenceRow:
+        return EvidenceRow(
+            id=str(row["id"]),
+            failure_id=str(row["failure_id"]),
+            evidence_type=str(row["evidence_type"]),
+            occurred_at_ms=int(row["occurred_at_ms"] or 0),
+            source=str(row["source"] or ""),
+            redaction_state=str(row["redaction_state"] or "raw"),
+            payload=dict(self._safe_json_obj(row["payload_json"])),
+            artifact_path=str(row["artifact_path"] or ""),
+            dedupe_key=str(row["dedupe_key"] or ""),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
         )
 
     def get_sdk_key_by_hash(self, key_hash: str) -> Optional[SDKKeyRow]:
@@ -2219,6 +2373,12 @@ class Storage:
                 WHERE id = ?
                 """,
                 (canonical_failure_id, issue_id),
+            )
+            self._backfill_replay_issue_evidence(
+                conn,
+                failure_id=canonical_failure_id,
+                issue_public_id=public_id,
+                evidence=dict(self._safe_json_obj(issue_row["evidence_json"])),
             )
         return ReplayIssueUpsertResult(
             issue_id=issue_id,
