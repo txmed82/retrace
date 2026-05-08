@@ -867,6 +867,7 @@ class Storage:
                 ON signal_definitions(project_id, environment_id, enabled)
                 """
             )
+            self._backfill_failure_test_links(conn)
 
     @staticmethod
     def _id(prefix: str) -> str:
@@ -1664,18 +1665,16 @@ class Storage:
     ) -> list[FailureTestLinkRow]:
         spec_id = spec_id.strip()
         link_id = link_id.strip()
-        if not spec_id and not link_id:
-            raise ValueError("spec_id or link_id is required")
+        if not link_id:
+            raise ValueError("link_id is required for updates")
         coverage_state = self._coverage_state_from_run_result(run_result)
         run_id = str(getattr(run_result, "run_id", "") or "")
         run_status = str(getattr(run_result, "status", "") or "")
         run_ok = 1 if bool(getattr(run_result, "ok", False)) else 0
         now = datetime.now(timezone.utc).isoformat()
-        where = "id = ?" if link_id else "spec_id = ?"
-        where_value = link_id or spec_id
         with self._conn() as conn:
             conn.execute(
-                f"""
+                """
                 UPDATE failure_test_links
                 SET coverage_state = ?,
                     latest_run_id = ?,
@@ -1683,20 +1682,119 @@ class Storage:
                     latest_run_ok = ?,
                     latest_run_at = ?,
                     updated_at = ?
-                WHERE {where}
+                WHERE id = ?
                 """,
-                (coverage_state, run_id, run_status, run_ok, now, now, where_value),
+                (coverage_state, run_id, run_status, run_ok, now, now, link_id),
             )
             rows = conn.execute(
-                f"""
+                """
                 SELECT *
                 FROM failure_test_links
-                WHERE {where}
+                WHERE id = ?
                 ORDER BY updated_at DESC, id
                 """,
-                (where_value,),
+                (link_id,),
             ).fetchall()
         return [self._failure_test_link_from_row(row) for row in rows]
+
+    def _backfill_failure_test_links(self, conn: sqlite3.Connection) -> None:
+        migrated = conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            ("failure_test_links_backfill_v1",),
+        ).fetchone()
+        if migrated is not None:
+            return
+        rows = conn.execute(
+            """
+            SELECT id, linked_tests_json
+            FROM failures
+            WHERE linked_tests_json IS NOT NULL
+              AND linked_tests_json != ''
+              AND linked_tests_json != '[]'
+            """
+        ).fetchall()
+        now = datetime.now(timezone.utc).isoformat()
+        for row in rows:
+            for link in self._legacy_failure_test_links(row["linked_tests_json"]):
+                spec_id = link["spec_id"]
+                conn.execute(
+                    """
+                    INSERT INTO failure_test_links
+                    (id, failure_id, spec_id, spec_name, spec_path, source,
+                     coverage_state, latest_run_id, latest_run_status,
+                     latest_run_ok, latest_run_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 'legacy', ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(failure_id, spec_id) DO NOTHING
+                    """,
+                    (
+                        self._id("ftl"),
+                        str(row["id"]),
+                        spec_id,
+                        link["spec_name"],
+                        link["spec_path"],
+                        link["coverage_state"],
+                        link["latest_run_id"],
+                        link["latest_run_status"],
+                        link["latest_run_ok"],
+                        link["latest_run_at"],
+                        now,
+                        now,
+                    ),
+                )
+        conn.execute(
+            """
+            INSERT INTO meta (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            ("failure_test_links_backfill_v1", now),
+        )
+
+    @classmethod
+    def _legacy_failure_test_links(cls, raw: object) -> list[dict[str, object]]:
+        try:
+            parsed = json.loads(str(raw or "[]"))
+        except Exception:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        links: list[dict[str, object]] = []
+        for item in parsed:
+            if isinstance(item, dict):
+                spec_id = str(item.get("spec_id") or item.get("id") or "").strip()
+                state = str(
+                    item.get("coverage_state") or "covered_unverified"
+                ).strip()
+                if state not in FAILURE_TEST_COVERAGE_STATES:
+                    state = "covered_unverified"
+                latest_run_ok = item.get("latest_run_ok")
+                if latest_run_ok is not None:
+                    latest_run_ok = 1 if bool(latest_run_ok) else 0
+                link = {
+                    "spec_id": spec_id,
+                    "spec_name": str(item.get("spec_name") or item.get("name") or ""),
+                    "spec_path": str(item.get("spec_path") or item.get("path") or ""),
+                    "coverage_state": state,
+                    "latest_run_id": str(item.get("latest_run_id") or ""),
+                    "latest_run_status": str(item.get("latest_run_status") or ""),
+                    "latest_run_ok": latest_run_ok,
+                    "latest_run_at": item.get("latest_run_at"),
+                }
+            else:
+                spec_id = str(item or "").strip()
+                link = {
+                    "spec_id": spec_id,
+                    "spec_name": "",
+                    "spec_path": "",
+                    "coverage_state": "covered_unverified",
+                    "latest_run_id": "",
+                    "latest_run_status": "",
+                    "latest_run_ok": None,
+                    "latest_run_at": None,
+                }
+            if spec_id:
+                links.append(link)
+        return links
 
     @staticmethod
     def _coverage_state_from_run_result(run_result: object) -> str:

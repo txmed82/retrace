@@ -1014,18 +1014,20 @@ def _verify_resolved_issues_payload(
                 }
             )
             continue
-        try:
-            store.update_failure_test_link_run(
-                spec_id=result.spec_id,
-                run_result=result,
-                link_id=str(entry.get("coverage_link_id") or ""),
-            )
-        except Exception:
-            logger.warning(
-                "failed to persist failure_test_link run metadata",
-                extra={"spec_id": result.spec_id, "run_id": result.run_id},
-                exc_info=True,
-            )
+        coverage_link_id = str(entry.get("coverage_link_id") or "")
+        if coverage_link_id:
+            try:
+                store.update_failure_test_link_run(
+                    spec_id=result.spec_id,
+                    run_result=result,
+                    link_id=coverage_link_id,
+                )
+            except Exception:
+                logger.warning(
+                    "failed to persist failure_test_link run metadata",
+                    extra={"spec_id": result.spec_id, "run_id": result.run_id},
+                    exc_info=True,
+                )
         if result.ok:
             verified.append(entry["public_id"])
             continue
@@ -2497,10 +2499,13 @@ def ui_command(
                     cwd=config_path.parent,
                 )
                 try:
-                    store.update_failure_test_link_run(
-                        spec_id=result.spec_id,
-                        run_result=result,
-                    )
+                    links = store.list_failure_test_links(spec_id=result.spec_id, limit=2)
+                    if len(links) == 1:
+                        store.update_failure_test_link_run(
+                            spec_id=result.spec_id,
+                            run_result=result,
+                            link_id=links[0].id,
+                        )
                 except Exception:
                     logger.warning(
                         "failed to persist failure_test_link run metadata",

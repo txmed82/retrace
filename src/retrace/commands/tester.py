@@ -42,6 +42,11 @@ def _tester_defaults(config_path: Path) -> dict[str, Any]:
     return (raw.get("tester") or {}) if isinstance(raw, dict) else {}
 
 
+def _single_failure_test_link_id(store: Storage, spec_id: str) -> str:
+    links = store.list_failure_test_links(spec_id=spec_id, limit=2)
+    return links[0].id if len(links) == 1 else ""
+
+
 @tester_group.command("create")
 @click.option(
     "--config",
@@ -411,7 +416,13 @@ def tester_run(
     try:
         store = Storage(cfg.run.data_dir / "retrace.db")
         store.init_schema()
-        store.update_failure_test_link_run(spec_id=result.spec_id, run_result=result)
+        link_id = _single_failure_test_link_id(store, result.spec_id)
+        if link_id:
+            store.update_failure_test_link_run(
+                spec_id=result.spec_id,
+                run_result=result,
+                link_id=link_id,
+            )
     except Exception as exc:
         click.echo(
             f"warning: failed to persist failure_test_link metadata: {exc}",
@@ -539,10 +550,14 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
             try:
                 store = Storage(cfg.run.data_dir / "retrace.db")
                 store.init_schema()
-                store.update_failure_test_link_run(
-                    spec_id=str(job.get("spec_id") or ""),
-                    run_result=SimpleNamespace(**job),
-                )
+                spec_id = str(job.get("spec_id") or "")
+                link_id = _single_failure_test_link_id(store, spec_id)
+                if link_id:
+                    store.update_failure_test_link_run(
+                        spec_id=spec_id,
+                        run_result=SimpleNamespace(**job),
+                        link_id=link_id,
+                    )
             except Exception as exc:
                 click.echo(
                     f"warning: failed to persist failure_test_link metadata: {exc}",

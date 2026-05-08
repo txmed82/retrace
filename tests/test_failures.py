@@ -103,7 +103,7 @@ def test_failure_test_links_track_latest_run_state(tmp_path: Path) -> None:
     failure_id = str(issue["canonical_failure_id"])
 
     assert store.coverage_state_for_failure(failure_id) == "not_covered"
-    store.upsert_failure_test_link(
+    link_id = store.upsert_failure_test_link(
         failure_id=failure_id,
         issue_id=str(issue["id"]),
         issue_public_id=str(issue["public_id"]),
@@ -138,6 +138,7 @@ def test_failure_test_links_track_latest_run_state(tmp_path: Path) -> None:
     )
     links = store.update_failure_test_link_run(
         spec_id="checkout-regression",
+        link_id=link_id,
         run_result=failing,
     )
     assert links[0].coverage_state == "covered_failing"
@@ -163,6 +164,7 @@ def test_failure_test_links_track_latest_run_state(tmp_path: Path) -> None:
     )
     links = store.update_failure_test_link_run(
         spec_id="checkout-regression",
+        link_id=link_id,
         run_result=passing,
     )
     assert links[0].coverage_state == "covered_passing"
@@ -268,6 +270,12 @@ def test_failure_test_run_update_can_target_exact_link(tmp_path: Path) -> None:
     assert second_link.id == second_link_id
     assert second_link.coverage_state == "covered_unverified"
 
+    with pytest.raises(ValueError, match="link_id is required"):
+        store.update_failure_test_link_run(
+            spec_id="shared-regression",
+            run_result=result,
+        )
+
 
 def test_failure_test_links_reject_unknown_failure(tmp_path: Path) -> None:
     store = Storage(tmp_path / "retrace.db")
@@ -319,6 +327,58 @@ def test_failure_coverage_state_aggregates_all_links(tmp_path: Path) -> None:
             )
 
     assert store.coverage_state_for_failure(failure_id) == "covered_failing"
+
+
+def test_failure_test_links_backfill_legacy_linked_tests(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    created = store.upsert_replay_issue(
+        project_id="proj_1",
+        environment_id="env_1",
+        fingerprint="legacy-coverage",
+        session_ids=["sess_1"],
+        signal_summary={"dead_click": 1},
+        first_seen_ms=100,
+        last_seen_ms=100,
+    )
+    issue = store.get_replay_issue(
+        project_id="proj_1",
+        environment_id="env_1",
+        issue_id=created.public_id,
+    )
+    assert issue is not None
+    failure_id = str(issue["canonical_failure_id"])
+    with store._conn() as conn:
+        conn.execute("DELETE FROM meta WHERE key = ?", ("failure_test_links_backfill_v1",))
+        conn.execute("DELETE FROM failure_test_links WHERE failure_id = ?", (failure_id,))
+        conn.execute(
+            """
+            UPDATE failures
+            SET linked_tests_json = ?
+            WHERE id = ?
+            """,
+            (
+                '[{"spec_id":"legacy-checkout","spec_name":"Legacy checkout",'
+                '"spec_path":"specs/legacy.json","coverage_state":"covered_passing",'
+                '"latest_run_id":"run_legacy","latest_run_status":"passed",'
+                '"latest_run_ok":true,"latest_run_at":"2026-05-08T00:00:00Z"}]',
+                failure_id,
+            ),
+        )
+
+    store.init_schema()
+
+    links = store.list_failure_test_links(failure_id=failure_id)
+    assert len(links) == 1
+    assert links[0].spec_id == "legacy-checkout"
+    assert links[0].spec_name == "Legacy checkout"
+    assert links[0].spec_path == "specs/legacy.json"
+    assert links[0].source == "legacy"
+    assert links[0].coverage_state == "covered_passing"
+    assert links[0].latest_run_id == "run_legacy"
+    assert links[0].latest_run_status == "passed"
+    assert links[0].latest_run_ok is True
+    assert store.coverage_state_for_failure(failure_id) == "covered_passing"
 
 
 def test_test_run_failure_can_be_represented_as_canonical_failure() -> None:
