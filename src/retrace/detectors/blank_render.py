@@ -54,16 +54,21 @@ class BlankRenderDetector:
         nav_ts: int | None = None
         last_node_count: int | None = None
         last_loading_state = False
+        low_state_start_ts: int | None = None
 
         def _maybe_emit(end_ts: int) -> None:
             dwell_ms = end_ts - nav_ts if nav_ts is not None else 0
+            low_state_dwell_ms = (
+                end_ts - low_state_start_ts if low_state_start_ts is not None else 0
+            )
             if (
                 current_url
                 and nav_ts is not None
                 and last_node_count is not None
                 and dwell_ms >= MIN_DWELL_MS
+                and low_state_dwell_ms >= MIN_DWELL_MS
                 and last_node_count < MAX_NODES
-                and (not last_loading_state or dwell_ms >= LOADING_DWELL_MS)
+                and (not last_loading_state or low_state_dwell_ms >= LOADING_DWELL_MS)
             ):
                 reason_codes = ["blank_render.low_node_count_after_dwell"]
                 if last_loading_state:
@@ -77,6 +82,7 @@ class BlankRenderDetector:
                         details={
                             "node_count": last_node_count,
                             "dwell_ms": dwell_ms,
+                            "state_dwell_ms": low_state_dwell_ms,
                             "loading_state": last_loading_state,
                         },
                         confidence="high",
@@ -98,10 +104,19 @@ class BlankRenderDetector:
                 nav_ts = ts
                 last_node_count = None
                 last_loading_state = False
+                low_state_start_ts = None
             elif t == 2:
                 root = event_data(e).get("node") or {}
-                last_node_count = _count_element_nodes(root)
-                last_loading_state = _looks_like_loading(root)
+                node_count = _count_element_nodes(root)
+                loading_state = _looks_like_loading(root)
+                was_low = last_node_count is not None and last_node_count < MAX_NODES
+                is_low = node_count < MAX_NODES
+                if not is_low:
+                    low_state_start_ts = None
+                elif not was_low or loading_state != last_loading_state:
+                    low_state_start_ts = ts
+                last_node_count = node_count
+                last_loading_state = loading_state
         if events:
             _maybe_emit(last_ts)
         return out

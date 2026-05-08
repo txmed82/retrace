@@ -95,3 +95,16 @@ def test_blank_render_fires_when_loading_state_exceeds_threshold():
     assert len(signals) == 1
     assert signals[0].details["loading_state"] is True
     assert "blank_render.loading_state_exceeded_threshold" in signals[0].reason_codes
+
+
+def test_blank_render_waits_after_loading_to_blank_transition():
+    from retrace.detectors.blank_render import detector
+
+    events = [
+        meta(ts=0, href="https://x/loading"),
+        _loading_snapshot(ts=0),
+        _full_snapshot(ts=8100, node_count=1),
+        {"type": 3, "timestamp": 8500, "data": {"source": 2, "type": 2, "id": 1}},
+    ]
+
+    assert detector.detect("s", events) == []

@@ -37,8 +37,8 @@ def _is_benign_click(e: dict[str, Any]) -> bool:
         return True
     if str(attrs.get("data-retrace-ignore") or "").strip().lower() == "true":
         return True
-    href = str(attrs.get("href") or "").strip()
-    if href in {"#", "javascript:void(0)", "javascript:;"}:
+    href = str(attrs.get("href") or "").strip().lower().rstrip(";")
+    if href in {"#", "javascript:void(0)", "javascript:"}:
         return True
     return False
 

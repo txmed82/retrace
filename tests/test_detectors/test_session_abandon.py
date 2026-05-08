@@ -41,3 +41,15 @@ def test_session_abandon_ignores_auth_noise_near_end():
     ]
 
     assert detector.detect("s", events) == []
+
+
+def test_session_abandon_ignores_client_cancel_noise_near_end():
+    from retrace.detectors.session_abandon import detector
+
+    events = [
+        meta(ts=0),
+        network_event(ts=1000, url="https://api.example.com/me", status=499),
+        {"type": 3, "timestamp": 1200, "data": {"source": 2, "type": 2, "id": 1}},
+    ]
+
+    assert detector.detect("s", events) == []
