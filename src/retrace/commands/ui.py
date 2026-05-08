@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import platform
 import re
@@ -39,6 +40,8 @@ from retrace.tester import (
     runs_dir_for_data_dir,
     specs_dir_for_data_dir,
 )
+
+logger = logging.getLogger(__name__)
 
 _CLOUD_LLM_PROVIDERS = {"openai", "anthropic", "openrouter"}
 
@@ -943,8 +946,10 @@ def _verify_resolved_issues_payload(
         limit_v = max(1, min(int(limit), 100))
     except (TypeError, ValueError):
         limit_v = 10
+    specs_by_id: dict[str, Any] = {}
     specs_by_issue: dict[str, Any] = {}
     for spec in list_specs(specs_dir_for_data_dir(data_dir)):
+        specs_by_id[spec.spec_id] = spec
         public_id = str(spec.fixtures.get("issue_public_id") or "").strip()
         if not public_id:
             continue
@@ -960,11 +965,24 @@ def _verify_resolved_issues_payload(
     plan: list[dict[str, Any]] = []
     for row in resolved[:limit_v]:
         public_id = str(row["public_id"])
-        spec = specs_by_issue.get(public_id)
+        spec = None
+        link_id = ""
+        failure_id = str(row["canonical_failure_id"] or "")
+        if failure_id:
+            for link in store.list_failure_test_links(failure_id=failure_id):
+                linked_spec = specs_by_id.get(link.spec_id)
+                if linked_spec is not None:
+                    spec = linked_spec
+                    link_id = link.id
+                    break
+        if spec is None:
+            spec = specs_by_issue.get(public_id)
         plan.append(
             {
                 "public_id": public_id,
                 "issue_id": str(row["id"]),
+                "failure_id": failure_id,
+                "coverage_link_id": link_id,
                 "title": str(row["title"] or "Replay issue"),
                 "spec_id": spec.spec_id if spec else "",
                 "has_spec": spec is not None,
@@ -980,7 +998,7 @@ def _verify_resolved_issues_payload(
         spec_id = entry["spec_id"]
         if not spec_id:
             continue
-        spec = specs_by_issue[entry["public_id"]]
+        spec = specs_by_id.get(spec_id) or specs_by_issue[entry["public_id"]]
         try:
             result = run_spec(
                 spec=spec,
@@ -996,6 +1014,20 @@ def _verify_resolved_issues_payload(
                 }
             )
             continue
+        coverage_link_id = str(entry.get("coverage_link_id") or "")
+        if coverage_link_id:
+            try:
+                store.update_failure_test_link_run(
+                    spec_id=result.spec_id,
+                    run_result=result,
+                    link_id=coverage_link_id,
+                )
+            except Exception:
+                logger.warning(
+                    "failed to persist failure_test_link run metadata",
+                    extra={"spec_id": result.spec_id, "run_id": result.run_id},
+                    exc_info=True,
+                )
         if result.ok:
             verified.append(entry["public_id"])
             continue
@@ -2466,6 +2498,20 @@ def ui_command(
                     },
                     cwd=config_path.parent,
                 )
+                try:
+                    links = store.list_failure_test_links(spec_id=result.spec_id, limit=2)
+                    if len(links) == 1:
+                        store.update_failure_test_link_run(
+                            spec_id=result.spec_id,
+                            run_result=result,
+                            link_id=links[0].id,
+                        )
+                except Exception:
+                    logger.warning(
+                        "failed to persist failure_test_link run metadata",
+                        extra={"spec_id": result.spec_id, "run_id": result.run_id},
+                        exc_info=True,
+                    )
                 status = 200 if result.ok else 400
                 self._json({"ok": result.ok, "result": result.__dict__}, status=status)
                 return

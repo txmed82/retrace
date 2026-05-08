@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import click
@@ -39,6 +40,11 @@ def _tester_defaults(config_path: Path) -> dict[str, Any]:
         return {}
     raw = yaml.safe_load(config_path.read_text()) or {}
     return (raw.get("tester") or {}) if isinstance(raw, dict) else {}
+
+
+def _single_failure_test_link_id(store: Storage, spec_id: str) -> str:
+    links = store.list_failure_test_links(spec_id=spec_id, limit=2)
+    return links[0].id if len(links) == 1 else ""
 
 
 @tester_group.command("create")
@@ -407,6 +413,21 @@ def tester_run(
         max_retries=retries_v,
         cwd=config_path.parent,
     )
+    try:
+        store = Storage(cfg.run.data_dir / "retrace.db")
+        store.init_schema()
+        link_id = _single_failure_test_link_id(store, result.spec_id)
+        if link_id:
+            store.update_failure_test_link_run(
+                spec_id=result.spec_id,
+                run_result=result,
+                link_id=link_id,
+            )
+    except Exception as exc:
+        click.echo(
+            f"warning: failed to persist failure_test_link metadata: {exc}",
+            err=True,
+        )
     click.echo(
         json.dumps(
             {
@@ -526,6 +547,22 @@ def tester_worker(config_path: Path, once: bool, interval: int) -> None:
             cwd=config_path.parent,
         )
         if job is not None:
+            try:
+                store = Storage(cfg.run.data_dir / "retrace.db")
+                store.init_schema()
+                spec_id = str(job.get("spec_id") or "")
+                link_id = _single_failure_test_link_id(store, spec_id)
+                if link_id:
+                    store.update_failure_test_link_run(
+                        spec_id=spec_id,
+                        run_result=SimpleNamespace(**job),
+                        link_id=link_id,
+                    )
+            except Exception as exc:
+                click.echo(
+                    f"warning: failed to persist failure_test_link metadata: {exc}",
+                    err=True,
+                )
             click.echo(json.dumps(job, indent=2))
             if not job.get("ok", False) and cfg.notifications.enabled:
                 from retrace.notification_sinks import (

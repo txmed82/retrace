@@ -608,7 +608,15 @@ def test_generate_spec_from_replay_issue_preserves_public_ids(
     assert generated.spec.exact_steps[0]["url"] == "https://app.example/checkout"
     assert generated.spec.exact_steps[1]["action"] == "click"
     assert generated.spec.fixtures["issue_public_id"] == issue_public_id
+    assert generated.spec.fixtures["canonical_failure_id"]
     assert (tmp_path / "specs" / f"{generated.spec.spec_id}.json").exists()
+    links = store.list_failure_test_links(
+        failure_id=str(generated.spec.fixtures["canonical_failure_id"])
+    )
+    assert len(links) == 1
+    assert links[0].spec_id == generated.spec.spec_id
+    assert links[0].issue_public_id == issue_public_id
+    assert links[0].coverage_state == "covered_unverified"
 
 
 def test_generate_spec_prefers_sdk_target_selectors_over_rrweb_ids(
