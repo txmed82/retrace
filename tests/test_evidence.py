@@ -1,8 +1,13 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from retrace.evidence import EvidenceItem, evidence_items_from_replay_issue
+from retrace.evidence import (
+    EvidenceItem,
+    build_evidence_timeline,
+    evidence_items_from_replay_issue,
+)
 from retrace.storage import Storage
 
 
@@ -39,6 +44,24 @@ def test_append_and_list_failure_evidence_chronologically(tmp_path: Path) -> Non
     rows = store.list_failure_evidence(failure_id=failure_id)
     assert [row.evidence_type for row in rows] == ["network_request", "console_log"]
     assert rows[0].payload == {"status": 500}
+
+
+def test_evidence_timeline_tolerates_malformed_timestamps() -> None:
+    timeline = build_evidence_timeline(
+        [
+            SimpleNamespace(
+                id="ev_bad",
+                evidence_type="console_log",
+                occurred_at_ms="not-a-number",
+                source="manual",
+                payload={"level": "error", "message": "bad timestamp"},
+                artifact_path="",
+            )
+        ]
+    )
+
+    assert timeline[0]["occurred_at_ms"] == 0
+    assert timeline[0]["summary"] == "bad timestamp"
 
 
 def test_failure_evidence_preserves_append_order_for_same_timestamp(

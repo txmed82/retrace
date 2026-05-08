@@ -24,6 +24,7 @@ from retrace.fix_suggestions import (
     replay_issue_report_key,
     slugify,
 )
+from retrace.evidence import build_evidence_timeline
 from retrace.llm.client import build_llm_http_request
 from retrace.reports.parser import parse_report_findings
 from retrace.replay_specs import generate_spec_from_replay_issue
@@ -702,6 +703,7 @@ def _json_field(row: Any, key: str, fallback: Any) -> Any:
 def _replay_issue_payload(
     row: Any, *, sessions: list[dict[str, Any]]
 ) -> dict[str, Any]:
+    canonical_failure_id = row["canonical_failure_id"]
     return {
         "id": str(row["id"]),
         "public_id": str(row["public_id"]),
@@ -722,10 +724,14 @@ def _replay_issue_payload(
         "external_ticket_state": str(row["external_ticket_state"]),
         "external_ticket_url": str(row["external_ticket_url"]),
         "external_ticket_id": str(row["external_ticket_id"]),
+        "canonical_failure_id": (
+            None if canonical_failure_id is None else str(canonical_failure_id)
+        ),
         "first_seen_ms": int(row["first_seen_ms"]),
         "last_seen_ms": int(row["last_seen_ms"]),
         "updated_at": str(row["updated_at"]),
         "sessions": sessions,
+        "timeline": [],
         "share_url": f"#issue={str(row['public_id'])}",
     }
 
@@ -746,12 +752,16 @@ def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
             }
         )
     for row in issue_rows:
-        issues.append(
-            _replay_issue_payload(
-                row,
-                sessions=issue_sessions_by_id.get(str(row["id"]), []),
-            )
+        payload = _replay_issue_payload(
+            row,
+            sessions=issue_sessions_by_id.get(str(row["id"]), []),
         )
+        failure_id = str(row["canonical_failure_id"] or "")
+        if failure_id:
+            payload["timeline"] = build_evidence_timeline(
+                store.list_failure_evidence(failure_id=failure_id)
+            )
+        issues.append(payload)
     sessions = []
     for row in store.list_recent_replay_sessions(limit=50):
         sessions.append(
@@ -1177,6 +1187,12 @@ _INDEX_HTML = """<!doctype html>
     .rr { background:#0b1220; border:1px solid #1f2937; border-radius:10px; padding:8px; }
     .empty { color:var(--muted); font-size:13px; }
     .btn { background:#0b1220; color:#e5e7eb; border:1px solid #374151; border-radius:8px; padding:6px 8px; cursor:pointer; font-size:12px; }
+    .timeline { border:1px solid #1f2937; border-radius:8px; overflow:hidden; }
+    .timeline-row { display:grid; grid-template-columns:88px 130px 1fr; gap:10px; padding:9px 10px; border-top:1px solid #1f2937; font-size:13px; }
+    .timeline-row:first-child { border-top:0; }
+    .timeline-row.detector { background:#172033; border-left:3px solid #f59e0b; }
+    .timeline-kind { color:#93c5fd; text-transform:uppercase; font-size:11px; letter-spacing:.08em; }
+    .timeline-summary { color:var(--muted); margin-top:2px; overflow-wrap:anywhere; }
     .ok { color:#86efac; } .bad { color:#fca5a5; }
   </style>
 </head>
@@ -1865,6 +1881,55 @@ const retrace = init({
       });
     }
 
+    function renderIssueTimeline(issue){
+      const timeline = issue.timeline || [];
+      const types = [...new Set(timeline.map(ev => ev.type || 'evidence'))].sort();
+      const options = types.map(t => `<option value="${esc(t)}">${esc(t)}</option>`).join('');
+      const rows = timeline.map(ev => `
+        <div class="timeline-row ${ev.detector_hit ? 'detector' : ''}" data-timeline-type="${esc(ev.type || '')}">
+          <div><code>${esc(ev.occurred_at_ms || 0)}ms</code></div>
+          <div class="timeline-kind">${esc(ev.kind || ev.type || 'evidence')}</div>
+          <div>
+            <strong>${esc(ev.title || ev.type || 'Evidence')}</strong>
+            <div class="timeline-summary">${esc(ev.summary || '')}</div>
+            ${ev.detector ? `<div class="empty">Detector: <code>${esc(ev.detector)}</code></div>` : ''}
+          </div>
+        </div>`).join('');
+      return `
+        <div class="lbl">Timeline</div>
+        <div style="display:flex; gap:8px; align-items:center; margin:6px 0 8px 0">
+          <select id="timelineTypeFilter" style="background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:7px;">
+            <option value="">All event types</option>${options}
+          </select>
+          <button class="btn" id="copyEvidenceBundleBtn" type="button">Copy Evidence Bundle</button>
+          <span class="empty" id="copyEvidenceBundleStatus"></span>
+        </div>
+        ${rows ? `<div class="timeline" id="issueTimeline">${rows}</div>` : '<div class="empty">No timeline evidence captured yet.</div>'}
+      `;
+    }
+
+    function filterIssueTimeline(value){
+      byId('issueTimeline')?.querySelectorAll('.timeline-row').forEach(row => {
+        row.style.display = !value || row.dataset.timelineType === value ? '' : 'none';
+      });
+    }
+
+    function copyEvidenceBundle(issue){
+      copyText(JSON.stringify({
+        public_id: issue.public_id,
+        title: issue.title,
+        status: issue.status,
+        severity: issue.severity,
+        summary: issue.summary,
+        likely_cause: issue.likely_cause,
+        reproduction_steps: issue.reproduction_steps || [],
+        timeline: issue.timeline || [],
+        evidence: issue.evidence || {},
+      }, null, 2));
+      const status = byId('copyEvidenceBundleStatus');
+      if(status) status.textContent = 'Copied';
+    }
+
     function renderReplayIssueDetail(issue){
       const root = byId('replayIssueDetail');
       if(!root || !issue){ return; }
@@ -1878,6 +1943,7 @@ const retrace = init({
         <div class="lbl">Summary</div><div>${esc(issue.summary || '')}</div>
         <div class="lbl">Likely Cause</div><div>${esc(issue.likely_cause || '')}</div>
         <div class="lbl">Reproduction Steps</div>${steps ? `<ul>${steps}</ul>` : '<div class="empty">No steps generated yet.</div>'}
+        ${renderIssueTimeline(issue)}
         <div style="margin-top:10px">
           <button class="btn" id="resolveReplayIssueBtn" type="button">Mark Resolved</button>
           <button class="btn" id="unresolveReplayIssueBtn" type="button">Mark Unresolved</button>
@@ -1905,6 +1971,8 @@ const retrace = init({
       byId('unresolveReplayIssueBtn')?.addEventListener('click', () => transitionReplayIssue(issue, 'unresolved'));
       byId('generateReplaySpecBtn')?.addEventListener('click', () => generateReplayIssueSpec(issue));
       byId('generateReplayFixPromptsBtn')?.addEventListener('click', () => generateReplayIssueFixPrompts(issue));
+      byId('timelineTypeFilter')?.addEventListener('change', ev => filterIssueTimeline(ev.target.value));
+      byId('copyEvidenceBundleBtn')?.addEventListener('click', () => copyEvidenceBundle(issue));
     }
 
     function applyReplayHash(issues, sessions){

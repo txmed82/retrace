@@ -126,6 +126,112 @@ def evidence_items_from_replay_issue(
     return sorted(items, key=lambda item: (item.occurred_at_ms, item.evidence_type))
 
 
+def build_evidence_timeline(rows: list[Any]) -> list[dict[str, Any]]:
+    timeline = [_timeline_event_from_row(row) for row in rows]
+    return sorted(
+        timeline,
+        key=lambda item: (
+            _safe_int(item.get("occurred_at_ms")),
+            str(item.get("type") or ""),
+            str(item.get("id") or ""),
+        ),
+    )
+
+
+def _timeline_event_from_row(row: Any) -> dict[str, Any]:
+    evidence_type = str(getattr(row, "evidence_type", "") or "")
+    payload = dict(getattr(row, "payload", {}) or {})
+    details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+    detail_map = {**payload, **details}
+    title, summary, kind = _timeline_copy(evidence_type, detail_map)
+    detector = str(payload.get("detector") or detail_map.get("detector") or "")
+    return {
+        "id": str(getattr(row, "id", "") or ""),
+        "type": evidence_type,
+        "kind": kind,
+        "occurred_at_ms": _safe_int(getattr(row, "occurred_at_ms", 0)),
+        "source": str(getattr(row, "source", "") or ""),
+        "title": title,
+        "summary": summary,
+        "detector": detector,
+        "detector_hit": bool(detector) or evidence_type != "replay_event",
+        "artifact_path": str(getattr(row, "artifact_path", "") or ""),
+        "payload": payload,
+    }
+
+
+def _timeline_copy(
+    evidence_type: str,
+    values: dict[str, Any],
+) -> tuple[str, str, str]:
+    if evidence_type == "network_request":
+        method = _first_str(values, "method", "request_method", default="REQUEST")
+        url = _first_str(values, "request_url", "url", "href", default="unknown URL")
+        status = _first_str(values, "status", "status_code", default="unknown")
+        timing = _first_str(
+            values,
+            "duration_ms",
+            "elapsed_ms",
+            "timing_ms",
+            default="",
+        )
+        suffix = f" in {timing}ms" if timing else ""
+        return (
+            f"Network {status}",
+            f"{method.upper()} {url} returned {status}{suffix}",
+            "network",
+        )
+    if evidence_type == "console_log":
+        level = _first_str(values, "level", default="error")
+        message = _console_message(values.get("message", values.get("payload", "")))
+        return (f"Console {level}", message or "Console event captured", "console")
+    if evidence_type == "replay_event":
+        return _replay_event_copy(values)
+    if evidence_type == "frontend_exception":
+        message = _first_str(values, "message", "error", default="Exception captured")
+        return ("Frontend exception", message, "exception")
+    if evidence_type == "dom_snapshot":
+        return ("DOM signal", "Blank or unexpected render state detected", "dom")
+    label = evidence_type.replace("_", " ").strip().title() or "Evidence"
+    detector = _first_str(values, "detector", default="")
+    return (label, detector.replace("_", " ") if detector else label, "detector")
+
+
+def _replay_event_copy(values: dict[str, Any]) -> tuple[str, str, str]:
+    event_type = _safe_int(values.get("type"))
+    source = _safe_int(values.get("source"))
+    data_type = _safe_int(values.get("data_type"))
+    target = _first_str(values, "id", default="unknown")
+    if event_type == 4:
+        return (
+            "Navigation",
+            f"Opened {_first_str(values, 'href', default='unknown URL')}",
+            "replay",
+        )
+    if event_type == 3 and source == 2 and data_type == 2:
+        return ("Click", f"Clicked element id {target}", "replay")
+    if event_type == 3 and source == 5:
+        return ("Input", f"Entered text into element id {target}", "replay")
+    plugin = _first_str(values, "plugin", default="")
+    if plugin:
+        return ("Replay plugin event", plugin, "replay")
+    return ("Replay event", f"rrweb event type {event_type}", "replay")
+
+
+def _first_str(source: dict[str, Any], *keys: str, default: str = "") -> str:
+    for key in keys:
+        candidate = source.get(key)
+        if candidate is not None and str(candidate).strip():
+            return str(candidate).strip()
+    return default
+
+
+def _console_message(value: object) -> str:
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
 def _signal_evidence_type(signal: dict[str, Any]) -> str:
     detector = str(signal.get("detector") or "").strip()
     if detector == "network_5xx" or detector == "network_4xx":
