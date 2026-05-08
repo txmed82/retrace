@@ -699,6 +699,9 @@ def test_generate_spec_prefers_sdk_target_selectors_over_rrweb_ids(
     assert generated.spec.exact_steps[3]["target"]["selector"] == '[data-qa="coupon-toggle"]'
     assert all("rrweb node" not in gap for gap in generated.known_gaps)
     assert generated.known_gaps == ["input-1 needs safe test data"]
+    assert (
+        generated.spec.fixtures["generation"]["unsupported_step_warnings"] == []
+    )
     assert generated.confidence == "medium"
 
 
@@ -802,6 +805,87 @@ def test_generate_spec_keeps_rrweb_fallbacks_not_near_sdk_events(
     assert generated.known_gaps == [
         "click-2 needs a durable locator for rrweb node 77"
     ]
+
+
+def test_generate_spec_adds_signal_assertions_and_generation_notes(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-signal-assertions",
+        sequence=0,
+        events=[
+            _navigation("https://app.example/checkout"),
+            _sdk_click(
+                {
+                    "tagName": "button",
+                    "testIdAttrName": "data-testid",
+                    "testIdValue": "checkout-pay",
+                    "text": "Pay now",
+                },
+                ts=100,
+            ),
+        ],
+        flush_type="final",
+    )
+    created = store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="checkout-network-toast-blank",
+        session_ids=["sess-signal-assertions"],
+        signal_summary={"network_5xx": 1, "blank_render": 1, "error_toast": 1},
+        first_seen_ms=100,
+        last_seen_ms=500,
+        title="Checkout fails after payment",
+        evidence={
+            "signals": [
+                {
+                    "detector": "network_5xx",
+                    "timestamp_ms": 300,
+                    "details": {
+                        "method": "post",
+                        "request_url": "/api/checkout",
+                        "status": 500,
+                    },
+                }
+            ]
+        },
+    )
+
+    generated = generate_spec_from_replay_issue(
+        store=store,
+        specs_dir=tmp_path / "specs",
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=created.public_id,
+    )
+
+    assertions_by_id = {
+        assertion["id"]: assertion for assertion in generated.spec.assertions
+    }
+    assert assertions_by_id["network-failure-cleared"]["evidence"] == {
+        "detector": "network_5xx",
+        "method": "POST",
+        "url": "/api/checkout",
+        "status": 500,
+    }
+    assert assertions_by_id["network-error-ui-absent"]["type"] == "selector_count"
+    assert assertions_by_id["network-error-ui-absent"]["expected"] == 0
+    assert '[role="alert"],' not in assertions_by_id["network-error-ui-absent"]["selector"]
+    assert "error" in assertions_by_id["network-error-ui-absent"]["selector"]
+    assert assertions_by_id["page-not-blank"]["type"] == "selector_visible"
+    assert assertions_by_id["visible-content-present"]["type"] == "text_matches"
+    assert assertions_by_id["error-toast-absent"]["type"] == "selector_count"
+    generation = generated.spec.fixtures["generation"]
+    assert generation["human_readable_steps"] == [
+        "Open https://app.example/checkout",
+        'Click [data-testid="checkout-pay"]',
+    ]
+    assert "Run the app at https://app.example." in generation["preconditions"]
+    assert any("redacted" in note for note in generation["fixture_notes"])
+    assert generation["unsupported_step_warnings"] == []
 
 
 def test_promote_replay_issue_dedupes_external_ticket(
