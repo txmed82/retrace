@@ -125,7 +125,7 @@ def normalize_monitoring_alert(*, provider: str, payload: dict[str, Any]) -> Mon
 
 def _sentry_alert(payload: dict[str, Any]) -> MonitoringAlert:
     data = _dict(payload.get("data"))
-    event = _dict(data.get("event")) or _dict(payload.get("event"))
+    event = _dict(data.get("event")) or _dict(payload.get("event")) or payload
     issue = _dict(data.get("issue")) or _dict(payload.get("issue"))
     external_id = _first_str(
         event,
@@ -152,6 +152,23 @@ def _sentry_alert(payload: dict[str, Any]) -> MonitoringAlert:
         if part
     ]
     level = _first_str(event, "level", default=_first_str(issue, "level", default="error"))
+    top_stack_frame = _top_stack_frame(event)
+    transaction = _first_str(event, "transaction", default="")
+    grouping_fingerprint = _fingerprint(
+        "sentry-group",
+        "",
+        "|".join(
+            part
+            for part in (
+                exception_type,
+                exception_value,
+                top_stack_frame,
+                transaction,
+            )
+            if part
+        )
+        or title,
+    )
     fingerprint = _fingerprint(
         "sentry",
         external_id,
@@ -164,7 +181,11 @@ def _sentry_alert(payload: dict[str, Any]) -> MonitoringAlert:
         "event_url": _first_str(event, "url", "web_url", default=""),
         "level": level,
         "trace_ids": _trace_ids_from_sentry(event),
-        "top_stack_frame": _top_stack_frame(event),
+        "top_stack_frame": top_stack_frame,
+        "transaction": transaction,
+        "release": _first_str(event, "release", default=""),
+        "environment": _first_str(event, "environment", default=""),
+        "grouping_fingerprint": grouping_fingerprint,
     }
     return MonitoringAlert(
         provider="sentry",
@@ -184,7 +205,9 @@ def _sentry_alert(payload: dict[str, Any]) -> MonitoringAlert:
                 "level": level,
                 "issue": _trim_dict(issue, {"id", "short_id", "title", "url", "web_url"}),
                 "trace_ids": _trace_ids_from_sentry(event),
-                "top_stack_frame": _top_stack_frame(event),
+                "top_stack_frame": top_stack_frame,
+                "transaction": transaction,
+                "release": _first_str(event, "release", default=""),
             }
         ),
     )

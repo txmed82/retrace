@@ -41,6 +41,7 @@ from retrace.sdk_keys import (
     create_sdk_key,
     create_service_token,
 )
+from retrace.sentry_compat import SentryCompatIngestError, ingest_sentry_compat_request
 from retrace.storage import Storage
 
 
@@ -74,7 +75,7 @@ def _cors_headers(handler: BaseHTTPRequestHandler) -> None:
         "Access-Control-Allow-Headers",
         (
             "authorization, content-encoding, content-type, x-github-delivery, "
-            "x-github-event, x-hub-signature-256, x-retrace-key"
+            "x-github-event, x-hub-signature-256, x-retrace-key, x-sentry-auth"
         ),
     )
     handler.send_header("Access-Control-Max-Age", "86400")
@@ -248,6 +249,7 @@ def _handler(
                 parsed.path != "/api/sdk/replay"
                 and parsed.path != "/api/deploys"
                 and not parsed.path.startswith("/api/otel/")
+                and not parsed.path.startswith("/api/sentry/")
                 and not parsed.path.startswith("/api/monitoring/webhook")
                 and parsed.path != "/api/github/webhook"
             ):
@@ -277,6 +279,9 @@ def _handler(
                 "/api/monitoring/webhook/"
             ):
                 self._handle_monitoring_webhook(parsed.path, parsed.query)
+                return
+            if parsed.path.startswith("/api/sentry/"):
+                self._handle_sentry_compat_ingest(parsed.path, parsed.query)
                 return
             if parsed.path == "/api/github/webhook":
                 self._handle_github_webhook()
@@ -327,6 +332,62 @@ def _handler(
                         "message": "An internal server error occurred.",
                     },
                 )
+
+        def _handle_sentry_compat_ingest(self, path: str, query: str) -> None:
+            suffix = path.removeprefix("/api/sentry/").strip("/")
+            parts = [part for part in suffix.split("/") if part]
+            if len(parts) < 2:
+                _json_response(self, 404, {"error": "not_found"})
+                return
+            project_id = parts[0].strip()
+            endpoint = parts[1].strip()
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length < 0:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length > MAX_REPLAY_BODY_BYTES:
+                _json_response(
+                    self,
+                    413,
+                    {
+                        "error": "body_too_large",
+                        "message": "Sentry payload is too large.",
+                    },
+                )
+                return
+            body = self.rfile.read(length)
+            try:
+                result = ingest_sentry_compat_request(
+                    store=store,
+                    project_id=project_id,
+                    endpoint=endpoint,
+                    headers={k: v for k, v in self.headers.items()},
+                    body=body,
+                    query=_query_dict(query),
+                )
+            except SentryCompatIngestError as exc:
+                _json_response(
+                    self,
+                    exc.status,
+                    {"error": exc.code, "message": exc.message},
+                )
+                return
+            except Exception:
+                logger.exception("Unhandled Sentry compatibility ingest error")
+                _json_response(
+                    self,
+                    500,
+                    {
+                        "error": "internal_error",
+                        "message": "An internal server error occurred.",
+                    },
+                )
+                return
+            _json_response(self, 202, result.to_dict())
 
         def _handle_monitoring_webhook(self, path: str, query: str) -> None:
             token = _require_service_token(

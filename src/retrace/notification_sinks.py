@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class NotificationEvent(str, Enum):
+    APP_ERROR_CREATED = "app_error.created"
     ISSUE_CREATED = "issue.created"
     ISSUE_REGRESSED = "issue.regressed"
     ISSUE_RESOLVED = "issue.resolved"
@@ -222,6 +223,7 @@ class SlackSink:
     def _format(payload: NotificationPayload) -> dict[str, Any]:
         emoji = {
             NotificationEvent.ISSUE_CREATED.value: ":rotating_light:",
+            NotificationEvent.APP_ERROR_CREATED.value: ":rotating_light:",
             NotificationEvent.ISSUE_REGRESSED.value: ":warning:",
             NotificationEvent.ISSUE_RESOLVED.value: ":white_check_mark:",
             NotificationEvent.RUN_FAILED.value: ":x:",
