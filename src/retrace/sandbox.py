@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -45,6 +46,7 @@ class PRSandboxConfig:
     artifacts_dir: Path | None = None
     workspace_parent: Path | None = None
     keep_workspace: bool = False
+    allow_shell_commands: bool = False
     timeout_seconds: int = 600
     clone_depth: int = 1
     run_id: str = ""
@@ -91,6 +93,7 @@ def run_pr_review_sandbox(config: PRSandboxConfig) -> PRSandboxRunResult:
         raise ValueError("ref is required")
     run_id = config.run_id.strip() or f"sandbox_{uuid4().hex[:12]}"
     artifacts_dir = _resolve_artifacts_dir(config.artifacts_dir, run_id)
+    workspace_parent_auto_created = config.workspace_parent is None
     workspace_parent = config.workspace_parent or Path(
         tempfile.mkdtemp(prefix="retrace-sandbox-workspaces-")
     )
@@ -120,6 +123,7 @@ def run_pr_review_sandbox(config: PRSandboxConfig) -> PRSandboxRunResult:
                     artifacts_dir=artifacts_dir,
                     label=f"setup-{index}",
                     timeout_seconds=config.timeout_seconds,
+                    allow_shell=config.allow_shell_commands,
                 )
                 setup_results.append(result)
                 if not result.ok:
@@ -132,6 +136,7 @@ def run_pr_review_sandbox(config: PRSandboxConfig) -> PRSandboxRunResult:
                         artifacts_dir=artifacts_dir,
                         label=f"test-{index}",
                         timeout_seconds=config.timeout_seconds,
+                        allow_shell=config.allow_shell_commands,
                     )
                     test_results.append(result)
         status = _sandbox_status(clone_result, setup_results, test_results)
@@ -149,6 +154,11 @@ def run_pr_review_sandbox(config: PRSandboxConfig) -> PRSandboxRunResult:
             shutil.rmtree(workspace_path.parent, ignore_errors=True)
             workspace_cleaned = True
             _update_manifest_cleanup(artifacts_dir=artifacts_dir, cleaned=True)
+            if workspace_parent_auto_created:
+                try:
+                    workspace_parent.rmdir()
+                except OSError:
+                    pass
     return PRSandboxRunResult(
         run_id=run_id,
         repo_url=config.repo_url,
@@ -240,13 +250,17 @@ def _run_command(
     artifacts_dir: Path,
     label: str,
     timeout_seconds: int,
+    allow_shell: bool = False,
 ) -> SandboxCommandResult:
     start = time.monotonic()
-    shell = isinstance(command, str)
-    display = command if isinstance(command, str) else " ".join(command)
+    shell = isinstance(command, str) and allow_shell
+    args: SandboxCommand = command
+    if isinstance(command, str) and not allow_shell:
+        args = shlex.split(command)
+    display = command if isinstance(command, str) else shlex.join(map(str, command))
     try:
         completed = subprocess.run(
-            command,
+            args,
             cwd=cwd,
             shell=shell,
             text=True,

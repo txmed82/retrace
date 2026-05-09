@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -62,6 +63,33 @@ def test_pr_review_sandbox_runs_command_captures_artifacts_and_cleans_workspace(
     )
     assert manifest["workspace_cleaned"] is True
     assert any(item["artifact_type"] == "sandbox_command_log" for item in result.artifacts)
+
+
+def test_pr_review_sandbox_cleans_auto_workspace_parent_and_splits_string_commands(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+
+    result = run_pr_review_sandbox(
+        PRSandboxConfig(
+            repo_url=str(repo),
+            ref="feature",
+            test_commands=[
+                f"{shlex.quote(sys.executable)} -c \"print('string command passed')\""
+            ],
+            artifacts_dir=tmp_path / "artifacts",
+            run_id="run_auto_workspace",
+        )
+    )
+
+    auto_parent = Path(result.workspace_path).parent.parent
+    assert result.status == "succeeded"
+    assert result.workspace_cleaned is True
+    assert not auto_parent.exists()
+    assert "string command passed" in Path(
+        result.test_results[0].combined_log_path
+    ).read_text(encoding="utf-8")
 
 
 def test_failed_sandbox_result_can_feed_canonical_failures(tmp_path: Path) -> None:
