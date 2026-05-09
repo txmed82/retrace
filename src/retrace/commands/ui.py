@@ -771,6 +771,8 @@ def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
         issue_sessions_by_id.setdefault(str(session["issue_id"]), []).append(
             {
                 "session_id": str(session["session_id"]),
+                "stable_id": str(session["replay_stable_id"] or session["session_id"]),
+                "public_id": str(session["replay_public_id"] or ""),
                 "role": str(session["role"]),
                 "first_seen_ms": int(session["first_seen_ms"]),
                 "last_seen_ms": int(session["last_seen_ms"]),
@@ -1952,7 +1954,9 @@ const retrace = init({
       const verified = (data.verified || []).length;
       const regressed = (data.regressed || []).length;
       const planned = (data.plan || []).length;
-      await loadReplayDashboard(`Verified ${verified}/${planned} resolved issue(s); regressed=${regressed}.`);
+      const message = `Verified ${verified}/${planned} resolved issue(s); regressed=${regressed}.`;
+      await refreshTesterAndReplay('', message);
+      if(byId('verifyResolvedStatus')) byId('verifyResolvedStatus').textContent = message;
     }
 
     async function loadReplayDashboard(processStatus = ''){

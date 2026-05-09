@@ -130,6 +130,14 @@ def test_create_sdk_key_payload_creates_browser_ingest_key(
 
 def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> None:
     store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-timeline",
+        sequence=0,
+        events=[{"type": 4, "timestamp": 100, "data": {"href": "https://app.test/checkout"}}],
+        flush_type="final",
+    )
     created = store.upsert_replay_issue(
         project_id=workspace.project_id,
         environment_id=workspace.environment_id,
@@ -222,6 +230,8 @@ def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> N
     assert timeline[2]["reason_codes"] == ["network_5xx.status_5xx"]
     assert timeline[3]["summary"] == "Checkout total is undefined"
     assert issue["confidence"] == "medium"
+    assert issue["sessions"][0]["stable_id"] == "sess-timeline"
+    assert issue["sessions"][0]["public_id"].startswith("rpl_")
     assert issue["test_links"][0]["spec_id"] == "checkout-replay-regression"
     assert issue["test_links"][0]["coverage_state"] == "covered_failing"
     assert issue["test_links"][0]["latest_run_status"] == "failed"
