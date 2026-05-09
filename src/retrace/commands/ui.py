@@ -2274,17 +2274,21 @@ const retrace = init({
           environment_id: replayState.issues[0]?.environment_id || '',
           app_url: byId('testerSpecAppUrl')?.value || '',
           missing_only: true,
-          limit: 25,
+          limit: Math.min(issueIds.length || 25, 100),
         }),
       });
       const data = await res.json();
-      if(!res.ok || !data.ok){
-        const failures = (data.failed || []).map(item => `${item.issue_public_id}: ${item.error}`).join('; ');
+      const failures = (data.failed || []).map(item => `${item.issue_public_id}: ${item.error}`).join('; ');
+      if(!res.ok){
         if(status) status.textContent = failures || data.error || 'Grouped spec generation failed';
         await refreshTesterAndReplay(replayState.activeIssueId);
         return;
       }
-      if(status) status.textContent = `Generated ${data.generated || 0}; skipped ${(data.skipped || []).length}.`;
+      if(status) {
+        status.textContent = failures
+          ? `Generated ${data.generated || 0}; skipped ${(data.skipped || []).length}; failed ${(data.failed || []).length}: ${failures}`
+          : `Generated ${data.generated || 0}; skipped ${(data.skipped || []).length}.`;
+      }
       await refreshTesterAndReplay(replayState.activeIssueId);
     }
 

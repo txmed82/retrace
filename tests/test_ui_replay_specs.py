@@ -128,6 +128,8 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "generateGroupedReplayIssueSpecs" in _INDEX_HTML
     assert "/api/replay-issues/specs" in _INDEX_HTML
     assert "data-issue-select" in _INDEX_HTML
+    assert "limit: Math.min(issueIds.length || 25, 100)" in _INDEX_HTML
+    assert "failed ${(data.failed || []).length}" in _INDEX_HTML
     assert 'role="button" tabindex="0"' in _INDEX_HTML
     assert 'rel="noopener noreferrer"' in _INDEX_HTML
     assert "hashchange" in _INDEX_HTML
@@ -510,6 +512,65 @@ def test_generate_replay_issue_specs_payload_creates_missing_group_specs(
     assert {item["reason"] for item in second_payload["skipped"]} == {
         "already_covered"
     }
+
+
+def test_generate_replay_issue_specs_payload_reports_partial_success(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-group-ok",
+        sequence=0,
+        events=[
+            {
+                "type": 4,
+                "timestamp": 0,
+                "data": {"href": "https://app.example/ok"},
+            }
+        ],
+        flush_type="final",
+    )
+    valid = store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="grouped-ok",
+        session_ids=["sess-group-ok"],
+        signal_summary={"console_error": 1},
+        first_seen_ms=100,
+        last_seen_ms=100,
+        title="Grouped ok",
+    )
+    invalid = store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="grouped-missing-playback",
+        session_ids=["sess-missing-playback"],
+        signal_summary={"console_error": 1},
+        first_seen_ms=100,
+        last_seen_ms=100,
+        title="Grouped missing playback",
+    )
+
+    payload, status = _generate_replay_issue_specs_payload(
+        store=store,
+        data_dir=tmp_path,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_ids=[valid.public_id, invalid.public_id],
+    )
+
+    assert status == 207
+    assert payload["ok"] is False
+    assert payload["generated"] == 1
+    assert payload["results"][0]["issue_public_id"] == valid.public_id
+    assert payload["failed"] == [
+        {
+            "issue_public_id": invalid.public_id,
+            "error": "Replay session not found: sess-missing-playback",
+        }
+    ]
 
 
 def test_generate_and_run_replay_issue_api_spec_payload_updates_coverage(
