@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -121,13 +122,67 @@ def _filter_signals_by_definition(
     if definition is None:
         return signals
     thresholds = definition.thresholds or {}
+    filtered = [
+        signal
+        for signal in signals
+        if not _signal_matches_suppression(signal, thresholds.get("suppression_rules"))
+    ]
+    min_confidence = str(thresholds.get("min_confidence") or "").strip().lower()
+    if min_confidence:
+        min_rank = _confidence_rank(min_confidence)
+        filtered = [
+            signal
+            for signal in filtered
+            if _confidence_rank(signal.confidence) >= min_rank
+        ]
     try:
         min_matches = int(thresholds.get("min_matches") or 1)
     except (TypeError, ValueError):
         min_matches = 1
-    if min_matches > 1 and len(signals) < min_matches:
+    if min_matches > 1 and len(filtered) < min_matches:
         return []
-    return signals
+    return filtered
+
+
+def _signal_matches_suppression(signal: Signal, raw_rules: object) -> bool:
+    if not isinstance(raw_rules, list):
+        return False
+    for raw_rule in raw_rules:
+        if not isinstance(raw_rule, dict):
+            continue
+        if _suppression_rule_matches(signal, raw_rule):
+            return True
+    return False
+
+
+def _suppression_rule_matches(signal: Signal, rule: dict[str, Any]) -> bool:
+    detector = str(rule.get("detector") or "").strip()
+    if detector and detector != signal.detector:
+        return False
+    reason_codes = rule.get("reason_codes")
+    if isinstance(reason_codes, str):
+        reason_codes = [reason_codes]
+    if isinstance(reason_codes, list):
+        expected = {str(code).strip() for code in reason_codes if str(code).strip()}
+        if expected and not expected.intersection(signal.reason_codes):
+            return False
+    url_contains = str(rule.get("url_contains") or "").strip()
+    if url_contains and url_contains not in signal.url:
+        return False
+    message_contains = str(rule.get("message_contains") or "").strip()
+    if message_contains and message_contains not in _signal_detail_text(signal):
+        return False
+    detail_contains = str(rule.get("detail_contains") or "").strip()
+    if detail_contains and detail_contains not in _signal_detail_text(signal):
+        return False
+    return True
+
+
+def _signal_detail_text(signal: Signal) -> str:
+    try:
+        return json.dumps(signal.details or {}, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(signal.details or "")
 
 
 def _signal_sentence(signal: Signal) -> str:

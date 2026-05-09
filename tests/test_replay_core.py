@@ -300,6 +300,110 @@ def test_replay_signal_definition_min_matches_filters_low_volume_matches(
     ] == 0
 
 
+def test_replay_signal_definition_min_confidence_filters_low_trust_matches(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.upsert_signal_definition(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        detector="rage_click",
+        enabled=True,
+        thresholds={"min_confidence": "medium"},
+    )
+    for detector in [
+        "console_error",
+        "dead_click",
+        "blank_render",
+        "network_4xx",
+        "network_5xx",
+        "error_toast",
+        "session_abandon_on_error",
+    ]:
+        store.upsert_signal_definition(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            detector=detector,
+            enabled=False,
+        )
+    events: list[dict[str, Any]] = [_navigation("https://app.example/cart")]
+    for ts in [100, 200, 300]:
+        click = _click(7, ts=ts)
+        click["data"]["target"] = {
+            "attributes": {
+                "disabled": "",
+                "title": "Complete required fields first",
+            }
+        }
+        events.append(click)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-low-confidence",
+        sequence=0,
+        events=events,
+        flush_type="normal",
+    )
+
+    result = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-low-confidence"],
+    )
+
+    assert result.signals_detected == 0
+    assert result.issues == []
+    assert store.list_replay_signals(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-low-confidence",
+    ) == []
+
+
+def test_replay_signal_definition_suppression_rules_filter_known_noise(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.upsert_signal_definition(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        detector="console_error",
+        enabled=True,
+        thresholds={
+            "suppression_rules": [
+                {
+                    "reason_codes": ["console_error.error_level"],
+                    "message_contains": "ResizeObserver loop limit exceeded",
+                    "url_contains": "/settings",
+                }
+            ]
+        },
+    )
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-suppressed-noise",
+        sequence=0,
+        events=[
+            _navigation("https://app.example/settings"),
+            _console_error("ResizeObserver loop limit exceeded"),
+        ],
+        flush_type="normal",
+    )
+
+    result = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-suppressed-noise"],
+    )
+
+    assert result.signals_detected == 0
+    assert result.signals_inserted == 0
+    assert result.issues == []
+
+
 def test_replay_core_clusters_sessions_and_regresses_resolved_issue(tmp_path: Path) -> None:
     store, workspace = _workspace(tmp_path)
     for session_id, distinct_id in [("sess-a", "user-a"), ("sess-b", "user-b")]:
