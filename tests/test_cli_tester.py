@@ -135,6 +135,56 @@ def test_tester_create_suite_defaults_to_explore_mode(
     assert "\texplore_suite\t" in listed.output
 
 
+def test_tester_create_uses_auth_profile_without_persisting_secret(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "config.yaml").write_text(
+        _CONFIG_YAML
+        + """
+tester:
+  auth_profiles:
+    local-jwt:
+      mode: jwt
+      jwt_env: RETRACE_LOCAL_JWT
+      browser_settings:
+        viewport_width: 1200
+      auth_setup_steps:
+        - id: auth-marker
+          action: script
+          set:
+            auth_profile: "'local-jwt'"
+"""
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("RETRACE_LOCAL_JWT", "secret-token")
+    runner = CliRunner()
+
+    create = runner.invoke(
+        main,
+        [
+            "tester",
+            "create",
+            "--name",
+            "Private flow",
+            "--auth-profile",
+            "local-jwt",
+            "--engine",
+            "native",
+        ],
+    )
+    assert create.exit_code == 0, create.output
+
+    spec_path = next((tmp_path / "data" / "ui-tests" / "specs").glob("*.json"))
+    payload = json.loads(spec_path.read_text())
+    assert payload["auth_required"] is True
+    assert payload["auth_mode"] == "jwt"
+    assert payload["auth_profile"] == "local-jwt"
+    assert payload["auth_jwt_env"] == "RETRACE_LOCAL_JWT"
+    assert payload["auth_setup_steps"][0]["id"] == "auth-marker"
+    assert payload["browser_settings"]["viewport_width"] == 1200
+    assert "secret-token" not in spec_path.read_text()
+
+
 def test_create_suite_run_generates_accepts_and_runs_draft_specs(
     tmp_path: Path, monkeypatch
 ) -> None:

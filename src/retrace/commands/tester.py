@@ -45,6 +45,41 @@ def _tester_defaults(config_path: Path) -> dict[str, Any]:
     return (raw.get("tester") or {}) if isinstance(raw, dict) else {}
 
 
+def _auth_profile(defaults: dict[str, Any], name: str) -> dict[str, Any]:
+    profiles = defaults.get("auth_profiles") or {}
+    if not name:
+        return {}
+    if not isinstance(profiles, dict) or name not in profiles:
+        raise click.ClickException(f"unknown auth profile: {name}")
+    profile = profiles.get(name) or {}
+    if not isinstance(profile, dict):
+        raise click.ClickException(f"auth profile must be an object: {name}")
+    forbidden = {"password", "jwt", "token", "headers", "headers_json"}
+    leaked = sorted(forbidden & set(profile))
+    if leaked:
+        raise click.ClickException(
+            "auth profile must reference env vars, not secret values: "
+            + ", ".join(leaked)
+        )
+    return profile
+
+
+def _profile_setup_steps(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    steps = profile.get("auth_setup_steps", profile.get("setup_steps", []))
+    if steps in (None, ""):
+        return []
+    if not isinstance(steps, list) or not all(isinstance(step, dict) for step in steps):
+        raise click.ClickException("auth profile setup_steps must be a list of objects")
+    return [dict(step) for step in steps]
+
+
+def _profile_browser_settings(profile: dict[str, Any]) -> dict[str, Any]:
+    settings = profile.get("browser_settings") or {}
+    if not isinstance(settings, dict):
+        raise click.ClickException("auth profile browser_settings must be an object")
+    return dict(settings)
+
+
 def _single_failure_test_link_id(store: Storage, spec_id: str) -> str:
     links = store.list_failure_test_links(spec_id=spec_id, limit=2)
     return links[0].id if len(links) == 1 else ""
@@ -179,6 +214,7 @@ def _artifact_evidence_type(artifact_type: str) -> str:
 @click.option("--auth-password-env", default="RETRACE_TESTER_AUTH_PASSWORD")
 @click.option("--auth-jwt-env", default="RETRACE_TESTER_AUTH_JWT")
 @click.option("--auth-headers-env", default="RETRACE_TESTER_AUTH_HEADERS")
+@click.option("--auth-profile", default="", help="Reusable auth profile from config.")
 @click.option(
     "--engine",
     "execution_engine",
@@ -216,6 +252,7 @@ def tester_create(
     auth_password_env: str,
     auth_jwt_env: str,
     auth_headers_env: str,
+    auth_profile: str,
     execution_engine: str,
     goals: tuple[str, ...],
     max_steps: int,
@@ -229,7 +266,31 @@ def tester_create(
             "Systematically explore the app and propose a full regression test suite."
         )
     exploratory_goals = [g.strip() for g in goals if g.strip()]
-    browser_settings: dict[str, Any] = {}
+    profile_name = auth_profile.strip()
+    profile = _auth_profile(defaults, profile_name)
+    if profile:
+        auth_required = True
+        auth_mode = str(profile.get("mode") or auth_mode).strip() or auth_mode
+        auth_login_url = (
+            auth_login_url.strip() or str(profile.get("login_url") or "")
+        )
+        auth_username = auth_username.strip() or str(profile.get("username") or "")
+        auth_password_env = (
+            auth_password_env.strip()
+            if auth_password_env.strip() != "RETRACE_TESTER_AUTH_PASSWORD"
+            else str(profile.get("password_env") or auth_password_env)
+        )
+        auth_jwt_env = (
+            auth_jwt_env.strip()
+            if auth_jwt_env.strip() != "RETRACE_TESTER_AUTH_JWT"
+            else str(profile.get("jwt_env") or auth_jwt_env)
+        )
+        auth_headers_env = (
+            auth_headers_env.strip()
+            if auth_headers_env.strip() != "RETRACE_TESTER_AUTH_HEADERS"
+            else str(profile.get("headers_env") or auth_headers_env)
+        )
+    browser_settings: dict[str, Any] = _profile_browser_settings(profile) if profile else {}
     if max_steps > 0:
         browser_settings["explore_max_steps"] = int(max_steps)
     spec = create_spec(
@@ -250,6 +311,8 @@ def tester_create(
         auth_password_env=auth_password_env,
         auth_jwt_env=auth_jwt_env,
         auth_headers_env=auth_headers_env,
+        auth_profile=profile_name,
+        auth_setup_steps=_profile_setup_steps(profile) if profile else [],
         execution_engine=execution_engine.lower(),
         exploratory_goals=exploratory_goals,
         browser_settings=browser_settings,
@@ -278,6 +341,7 @@ def tester_create(
 )
 @click.option("--auth-login-url", default="")
 @click.option("--auth-username", default="")
+@click.option("--auth-profile", default="", help="Reusable auth profile from config.")
 @click.option(
     "--goal",
     "goals",
@@ -294,6 +358,7 @@ def tester_create_suite(
     auth_mode: str,
     auth_login_url: str,
     auth_username: str,
+    auth_profile: str,
     goals: tuple[str, ...],
 ) -> None:
     exploratory_goals = tuple(g.strip() for g in goals if g.strip()) or (
@@ -316,6 +381,7 @@ def tester_create_suite(
         auth_password_env="RETRACE_TESTER_AUTH_PASSWORD",
         auth_jwt_env="RETRACE_TESTER_AUTH_JWT",
         auth_headers_env="RETRACE_TESTER_AUTH_HEADERS",
+        auth_profile=auth_profile,
         execution_engine="explore",
         goals=exploratory_goals,
         max_steps=0,

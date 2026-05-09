@@ -2760,6 +2760,13 @@ def ui_command(
             if path == "/api/tester/specs":
                 body = self._read_json_body()
                 settings = current_settings()
+                auth_setup_steps = body.get("auth_setup_steps") or []
+                if not isinstance(auth_setup_steps, list):
+                    self._json(
+                        {"ok": False, "error": "auth_setup_steps must be a list"},
+                        status=400,
+                    )
+                    return
                 try:
                     spec = create_spec(
                         specs_dir=specs_dir_for_data_dir(data_dir),
@@ -2776,6 +2783,10 @@ def ui_command(
                         auth_mode=str(settings["tester_auth_mode"] or "none"),
                         auth_login_url=str(settings["tester_auth_login_url"] or ""),
                         auth_username=str(settings["tester_auth_username"] or ""),
+                        auth_profile=str(body.get("auth_profile", "")).strip(),
+                        auth_setup_steps=[
+                            dict(step) for step in auth_setup_steps if isinstance(step, dict)
+                        ],
                     )
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc)}, status=400)
