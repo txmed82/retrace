@@ -9,7 +9,8 @@ from retrace.fix_suggestions import (
     parsed_finding_from_replay_issue,
     replay_issue_report_key,
 )
-from retrace.repair import build_repair_bundle
+from retrace.repair import build_repair_bundle, repair_task_from_fix_suggestion
+from retrace.repo_inspection import infer_validation_commands
 from retrace.storage import Storage
 
 
@@ -276,6 +277,104 @@ def test_repair_bundle_can_be_built_for_api_failure(tmp_path: Path) -> None:
     assert bundle.linked_tests[0]["spec_id"] == "api_checkout"
     assert bundle.likely_files == ["server/routes/checkout.ts"]
     assert bundle.validation_commands == ["retrace api run api_checkout"]
+
+
+def test_repair_bundle_infers_explainable_linked_validation_commands(
+    tmp_path: Path,
+) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+
+    class Spec:
+        spec_id = "api_checkout"
+        name = "Checkout API"
+        method = "POST"
+        url = "http://example.test/api/checkout"
+        query = {}
+        expected_status = 200
+
+    class Result:
+        run_id = "run_1"
+        spec_id = "api_checkout"
+        ok = False
+        status_code = 500
+        status = "failed"
+        error = ""
+        artifacts = []
+        assertion_results = []
+
+    failure_id = store.upsert_failure(
+        canonical_failure_from_api_run(
+            project_id="proj_1",
+            environment_id="env_1",
+            spec=Spec(),
+            run_result=Result(),
+        )
+    )
+    store.upsert_failure_test_link(
+        failure_id=failure_id,
+        spec_id="api_checkout",
+        spec_name="Checkout API",
+        spec_path="retrace/api/checkout.json",
+    )
+
+    bundle = build_repair_bundle(store, failure_id)
+
+    assert bundle.validation_commands == ["retrace tester api-run api_checkout"]
+    assert bundle.validation_plan == [
+        {
+            "command": "retrace tester api-run api_checkout",
+            "reason": "Runs linked API spec api_checkout.",
+            "source": "linked_test",
+        }
+    ]
+
+
+def test_repair_task_infers_repo_validation_commands(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "tests").mkdir()
+    (repo / "pyproject.toml").write_text("[project]\nname='demo'\n")
+    (repo / "src/checkout.py").write_text("def checkout(): return False\n")
+    (repo / "tests/test_checkout.py").write_text("def test_checkout(): assert True\n")
+
+    draft = repair_task_from_fix_suggestion(
+        failure_id="flr_1",
+        issue_public_id="bug_1",
+        title="Checkout broken",
+        repo_full_name="acme/widgets",
+        repo_path=str(repo),
+        out_dir=tmp_path / "out",
+        candidates=[type("Candidate", (), {"file_path": "src/checkout.py"})()],
+        prompt_files={},
+        artifact_json="manifest.json",
+        evidence_ids=[],
+    )
+
+    assert draft.validation_commands == [
+        "uv run pytest tests/test_checkout.py",
+        "uv run pytest",
+    ]
+    assert draft.metadata["validation_plan"][0]["reason"].startswith(
+        "Runs the nearest Python regression test"
+    )
+
+
+def test_validation_command_inference_rejects_unsafe_spec_ids(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    commands = infer_validation_commands(
+        repo_path=repo,
+        linked_tests=[
+            {
+                "spec_id": "api_checkout; rm -rf /",
+                "spec_path": "retrace/api/checkout.json",
+            }
+        ],
+    )
+
+    assert commands == []
 
 
 def test_repair_task_failure_does_not_block_prompt_generation(
