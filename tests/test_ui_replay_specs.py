@@ -96,6 +96,10 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert 'role="button" tabindex="0"' in _INDEX_HTML
     assert 'rel="noopener noreferrer"' in _INDEX_HTML
     assert "hashchange" in _INDEX_HTML
+    assert "safeExternalUrl" in _INDEX_HTML
+    assert "safeHashUrl(issue.share_url, '#issue=')" in _INDEX_HTML
+    assert "#issue=${encodeURIComponent(issue.public_id)}" in _INDEX_HTML
+    assert "#replay=${encodeURIComponent(replayId)}" in _INDEX_HTML
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(

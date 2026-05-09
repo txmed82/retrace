@@ -1319,6 +1319,18 @@ _INDEX_HTML = """<!doctype html>
 
     function copyText(s){ navigator.clipboard.writeText(String(s || \"\")); }
     function copyPrompt(key){ if(active?.prompts?.[key]) copyText(active.prompts[key]); }
+    function safeExternalUrl(raw){
+      try {
+        const url = new URL(String(raw || ''), window.location.origin);
+        return (url.protocol === 'http:' || url.protocol === 'https:') ? url.href : '';
+      } catch(_err) {
+        return '';
+      }
+    }
+    function safeHashUrl(raw, allowedPrefix){
+      const value = String(raw || '');
+      return value.startsWith(allowedPrefix) ? value : '';
+    }
 
     function switchView(view){
       document.querySelectorAll('.view').forEach(el => el.classList.toggle('active', el.id === `view-${view}`));
@@ -1340,6 +1352,12 @@ _INDEX_HTML = """<!doctype html>
 
     function openReplayIssue(issueId){
       const issue = replayState.issues.find(i => i.public_id === issueId);
+      if(!issue){ return; }
+      const nextHash = `#issue=${encodeURIComponent(issue.public_id)}`;
+      if(window.location.hash !== nextHash){
+        window.location.hash = nextHash;
+        return;
+      }
       renderReplayIssueDetail(issue);
       switchView('issues');
     }
@@ -2107,13 +2125,15 @@ const retrace = init({
 
     function renderExternalLinks(issue){
       const links = [];
-      if(issue.external_ticket_url) links.push(`<a href="${esc(issue.external_ticket_url)}" target="_blank" rel="noopener noreferrer">${esc(issue.external_ticket_id || 'External ticket')}</a>`);
-      if(issue.share_url) links.push(`<a href="${esc(issue.share_url)}">Issue permalink</a>`);
+      const externalTicketUrl = safeExternalUrl(issue.external_ticket_url);
+      if(externalTicketUrl) links.push(`<a href="${esc(externalTicketUrl)}" target="_blank" rel="noopener noreferrer">${esc(issue.external_ticket_id || 'External ticket')}</a>`);
+      const issueUrl = safeHashUrl(issue.share_url, '#issue=');
+      if(issueUrl) links.push(`<a href="${esc(issueUrl)}">Issue permalink</a>`);
       for(const session of issue.sessions || []){
         const replay = replayState.sessions.find(s => s.stable_id === session.session_id || s.public_id === session.public_id) || {};
         const replayId = replay.public_id || session.public_id || session.session_id;
         const playerId = replay.stable_id || session.stable_id || session.session_id;
-        links.push(`<a href="#replay=${esc(replayId)}" data-replay-session="${esc(playerId)}">Replay ${esc(replayId)}</a>`);
+        if(replayId) links.push(`<a href="#replay=${encodeURIComponent(replayId)}" data-replay-session="${esc(playerId)}">Replay ${esc(replayId)}</a>`);
       }
       return links.length ? `<ul>${links.map(link => `<li>${link}</li>`).join('')}</ul>` : `<div class="empty">${esc(issue.external_ticket_state || 'No external links yet.')}</div>`;
     }
