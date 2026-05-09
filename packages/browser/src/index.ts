@@ -423,7 +423,13 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
         password?: string | null,
       ) {
         this.__retrace = { method, url: String(url), traceparent: ensureTraceparent() };
-        return originalOpen.call(this, method, url, async ?? true, username, password);
+        const result = originalOpen.call(this, method, url, async ?? true, username, password);
+        try {
+          this.setRequestHeader("traceparent", this.__retrace.traceparent);
+        } catch {
+          // Some browser states reject header mutation; still record context.
+        }
+        return result;
       };
       OriginalXHR.prototype.send = function send(
         this: XMLHttpRequest & { __retrace?: { method: string; url: string; traceparent: string } },
@@ -431,11 +437,6 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
       ) {
         const startedAt = Date.now();
         const requestTraceparent = this.__retrace?.traceparent || ensureTraceparent();
-        try {
-          this.setRequestHeader("traceparent", requestTraceparent);
-        } catch {
-          // Some browser states reject late header mutation; still record context.
-        }
         this.addEventListener("loadend", () => {
           const responseTraceparent = this.getResponseHeader("traceparent");
           rememberTraceparent(responseTraceparent);
