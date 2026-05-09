@@ -429,10 +429,10 @@ def _collect_trace_ids(value: Any, out: list[str]) -> None:
         return
     if isinstance(value, dict):
         for key, nested in value.items():
-            key_s = str(key)
-            if key_s in {"trace_id", "traceId", "requestTraceId", "responseTraceId"}:
+            key_s = str(key).casefold()
+            if key_s in {"trace_id", "traceid", "requesttraceid", "responsetraceid"}:
                 _append_trace_id(str(nested or ""), out)
-            elif key_s in {"traceparent", "requestTraceparent", "responseTraceparent"}:
+            elif key_s in {"traceparent", "requesttraceparent", "responsetraceparent"}:
                 _append_trace_id(_trace_id_from_traceparent(str(nested or "")), out)
             _collect_trace_ids(nested, out)
     elif isinstance(value, list):

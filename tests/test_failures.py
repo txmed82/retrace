@@ -444,7 +444,7 @@ def test_test_run_failure_extracts_backend_trace_ids_from_network_artifacts(
                     "url": "https://app.example/api/checkout",
                     "status": 500,
                     "headers": {
-                        "traceparent": (
+                        "Traceparent": (
                             "00-4bf92f3577b34da6a3ce929d0e0e4736-"
                             "00f067aa0ba902b7-01"
                         )
@@ -452,7 +452,7 @@ def test_test_run_failure_extracts_backend_trace_ids_from_network_artifacts(
                 },
                 {
                     "url": "https://app.example/api/cart",
-                    "trace_id": "trace-short-1",
+                    "Trace_ID": "trace-short-1",
                 },
             ]
         )
