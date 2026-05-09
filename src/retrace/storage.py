@@ -1876,6 +1876,16 @@ class Storage:
 
     def list_incident_failures(self, *, incident_id: str) -> list[FailureRow]:
         with self._conn() as conn:
+            incident = conn.execute(
+                """
+                SELECT id
+                FROM incidents
+                WHERE id = ? OR public_id = ?
+                """,
+                (incident_id, incident_id),
+            ).fetchone()
+            if incident is None:
+                return []
             rows = conn.execute(
                 """
                 SELECT f.*
@@ -1884,7 +1894,7 @@ class Storage:
                 WHERE inf.incident_id = ?
                 ORDER BY f.updated_at DESC, f.public_id
                 """,
-                (incident_id,),
+                (str(incident["id"]),),
             ).fetchall()
         return [self._failure_from_row(row) for row in rows]
 

@@ -140,6 +140,12 @@ def test_equivalent_monitor_failures_group_into_one_incident(tmp_path: Path) -> 
     refreshed = get_incident_detail(store=store, incident_id=first.incident_id)
     assert refreshed.incident.evidence_count == 3
     assert refreshed.incident.severity == "medium"
+    assert {
+        failure.id
+        for failure in store.list_incident_failures(
+            incident_id=refreshed.incident.public_id,
+        )
+    } == {first_failure_id, second_failure_id}
 
 
 def test_incident_can_generate_one_repair_task(tmp_path: Path) -> None:
