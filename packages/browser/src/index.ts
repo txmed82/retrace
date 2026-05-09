@@ -79,6 +79,11 @@ function messageFromError(error: unknown): string {
   return String(error || "");
 }
 
+function ensureGlobalPattern(pattern: RegExp): RegExp {
+  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  return new RegExp(pattern.source, flags);
+}
+
 export function init(options: RetraceBrowserOptions): RetraceClient {
   if (!options.apiKey) {
     throw new Error("[retrace] apiKey is required");
@@ -98,11 +103,10 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
   let flushTimer: ReturnType<typeof setInterval> | undefined;
   let flushInFlight: Promise<void> | undefined;
   const cleanupFns: Array<() => void> = [];
-
-  function redactionPatterns(): RegExp[] {
+  const compiledRedactionPatterns = (() => {
     const custom = options.privacy?.redactionPatterns || [];
     const compiled = custom.flatMap((pattern) => {
-      if (pattern instanceof RegExp) return [pattern];
+      if (pattern instanceof RegExp) return [ensureGlobalPattern(pattern)];
       try {
         return [new RegExp(pattern, "gi")];
       } catch {
@@ -110,10 +114,10 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
       }
     });
     return DEFAULT_REDACTION_PATTERNS.concat(compiled);
-  }
+  })();
 
   function redactText(value: string): string {
-    return redactionPatterns().reduce(
+    return compiledRedactionPatterns.reduce(
       (text, pattern) => text.replace(pattern, "[redacted]"),
       value,
     );

@@ -44,18 +44,20 @@ class ConsoleErrorDetector:
             if plugin.startswith("retrace/exception"):
                 message = _redact(str(payload.get("message") or "Browser exception"))
                 stack = _redact(str(payload.get("stack") or ""))
+                event_url = _redact(str(payload.get("url") or url))
                 out.append(
                     Signal(
                         session_id=session_id,
                         detector=self.name,
                         timestamp_ms=event_timestamp_ms(e),
-                        url=str(payload.get("url") or url),
+                        url=event_url,
                         details={
                             "message": message,
                             "level": "error",
                             "exception_kind": str(payload.get("kind") or ""),
                             "stack": stack,
-                            "source": str(payload.get("source") or ""),
+                            "source": _redact(str(payload.get("source") or "")),
+                            "url": event_url,
                             "line": payload.get("line"),
                             "column": payload.get("column"),
                             "trace": payload.get("trace") if isinstance(payload.get("trace"), dict) else {},

@@ -61,10 +61,10 @@ def test_console_error_detects_browser_exception_with_stack_and_trace():
                     "kind": "onerror",
                     "message": "Checkout failed for dev@example.com",
                     "stack": "Error: Checkout failed\n    at pay (src/pay.ts:10:2)",
-                    "source": "https://example.com/app.js",
+                    "source": "https://example.com/app.js?token=abc123",
                     "line": 10,
                     "column": 2,
-                    "url": "https://example.com/checkout",
+                    "url": "https://example.com/checkout?password=hunter2",
                     "sessionId": "browser-session-1",
                     "trace": {"traceId": "trace-1"},
                 },
@@ -83,5 +83,8 @@ def test_console_error_detects_browser_exception_with_stack_and_trace():
     assert "src/pay.ts:10:2" in signal.details["stack"]
     assert signal.details["line"] == 10
     assert signal.details["column"] == 2
+    assert signal.url == "https://example.com/checkout?[redacted]"
+    assert signal.details["url"] == "https://example.com/checkout?[redacted]"
+    assert signal.details["source"] == "https://example.com/app.js?[redacted]"
     assert signal.details["trace"] == {"traceId": "trace-1"}
     assert signal.details["session_id"] == "browser-session-1"
