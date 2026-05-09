@@ -395,6 +395,12 @@ or locally with `retrace api record-deploy --sha <commit> --changed-file <path>`
 Failures after the deploy are linked to the nearest marker, and incident repair
 tasks include the deploy's changed files as likely repair context.
 
+Retrace also accepts compact OpenTelemetry-style JSON at
+`POST /api/otel/v1/logs?environment_id=...` and
+`POST /api/otel/v1/traces?environment_id=...`. Logs and spans are stored as
+local excerpts and linked into failure evidence when their trace/span IDs match
+known failure metadata.
+
 Process queued final replay batches locally:
 
 ```bash

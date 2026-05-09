@@ -360,6 +360,24 @@ CREATE TABLE IF NOT EXISTS deploy_markers (
 CREATE INDEX IF NOT EXISTS idx_deploy_markers_scope_time
 ON deploy_markers(project_id, environment_id, deployed_at_ms DESC);
 
+CREATE TABLE IF NOT EXISTS otel_events (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    trace_id TEXT NOT NULL DEFAULT '',
+    span_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    occurred_at_ms INTEGER NOT NULL DEFAULT 0,
+    attributes_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_otel_events_trace
+ON otel_events(project_id, environment_id, trace_id, occurred_at_ms);
+
 CREATE TABLE IF NOT EXISTS failure_test_links (
     id TEXT PRIMARY KEY,
     failure_id TEXT NOT NULL,
@@ -698,6 +716,22 @@ class DeployMarkerRow:
     metadata: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass
+class OtelEventRow:
+    id: str
+    project_id: str
+    environment_id: str
+    signal_type: str
+    trace_id: str
+    span_id: str
+    name: str
+    severity: str
+    body: str
+    occurred_at_ms: int
+    attributes: dict[str, Any]
+    created_at: datetime
 
 
 @dataclass
@@ -2363,6 +2397,96 @@ class Storage:
             metadata=dict(self._safe_json_obj(row["metadata_json"])),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    def append_otel_event(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        signal_type: str,
+        trace_id: str = "",
+        span_id: str = "",
+        name: str = "",
+        severity: str = "",
+        body: str = "",
+        occurred_at_ms: int = 0,
+        attributes: Optional[dict[str, Any]] = None,
+    ) -> str:
+        event_id = self._id("otel")
+        try:
+            attributes_json = json.dumps(attributes or {}, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("otel attributes must be JSON-serializable") from exc
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO otel_events
+                (id, project_id, environment_id, signal_type, trace_id, span_id, name,
+                 severity, body, occurred_at_ms, attributes_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    project_id,
+                    environment_id,
+                    signal_type,
+                    trace_id,
+                    span_id,
+                    name,
+                    severity,
+                    body[:2000],
+                    int(occurred_at_ms),
+                    attributes_json,
+                ),
+            )
+        return event_id
+
+    def list_otel_events(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        trace_id: str = "",
+        signal_type: str = "",
+        limit: int = 100,
+    ) -> list[OtelEventRow]:
+        where = "project_id = ? AND environment_id = ?"
+        params: list[object] = [project_id, environment_id]
+        if trace_id:
+            where += " AND trace_id = ?"
+            params.append(trace_id)
+        if signal_type:
+            where += " AND signal_type = ?"
+            params.append(signal_type)
+        params.append(max(1, min(int(limit), 500)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM otel_events
+                WHERE {where}
+                ORDER BY occurred_at_ms, created_at, id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._otel_event_from_row(row) for row in rows]
+
+    def _otel_event_from_row(self, row: sqlite3.Row) -> OtelEventRow:
+        return OtelEventRow(
+            id=str(row["id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            signal_type=str(row["signal_type"]),
+            trace_id=str(row["trace_id"] or ""),
+            span_id=str(row["span_id"] or ""),
+            name=str(row["name"] or ""),
+            severity=str(row["severity"] or ""),
+            body=str(row["body"] or ""),
+            occurred_at_ms=int(row["occurred_at_ms"] or 0),
+            attributes=dict(self._safe_json_obj(row["attributes_json"])),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
         )
 
     def upsert_failure_with_evidence_and_repair_task(

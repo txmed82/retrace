@@ -25,6 +25,7 @@ from retrace.observability import collect_local_observability, record_api_reques
 from retrace.enrichment import CorrelationEnricher
 from retrace.deploys import correlate_recent_failures_to_deploys, record_deploy
 from retrace.monitoring_ingest import ingest_monitoring_webhook
+from retrace.otel_ingest import ingest_otel_logs, ingest_otel_traces
 from retrace.replay_api import (
     MAX_REPLAY_BODY_BYTES,
     ReplayIngestError,
@@ -232,6 +233,7 @@ def _handler(
             if (
                 parsed.path != "/api/sdk/replay"
                 and parsed.path != "/api/deploys"
+                and not parsed.path.startswith("/api/otel/")
                 and not parsed.path.startswith("/api/monitoring/webhook")
             ):
                 _json_response(self, 404, {"error": "not_found"})
@@ -252,6 +254,9 @@ def _handler(
                 return
             if parsed.path == "/api/deploys":
                 self._handle_record_deploy(parsed.query)
+                return
+            if parsed.path in {"/api/otel/v1/logs", "/api/otel/v1/traces"}:
+                self._handle_otel_ingest(parsed.path, parsed.query)
                 return
             if parsed.path == "/api/monitoring/webhook" or parsed.path.startswith(
                 "/api/monitoring/webhook/"
@@ -489,6 +494,54 @@ def _handler(
                     ],
                 },
             )
+
+        def _handle_otel_ingest(self, path: str, query: str) -> None:
+            token = _require_service_token(
+                self, store, scopes={"otel:write", "ingest", "admin"}
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length <= 0:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            if length > MAX_REPLAY_BODY_BYTES:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            body = self.rfile.read(length)
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                _json_response(self, 400, {"error": "invalid_json"})
+                return
+            if not isinstance(payload, dict) or not payload:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            result = (
+                ingest_otel_logs(
+                    store=store,
+                    project_id=token.project_id,
+                    environment_id=environment_id,
+                    payload=payload,
+                )
+                if path.endswith("/logs")
+                else ingest_otel_traces(
+                    store=store,
+                    project_id=token.project_id,
+                    environment_id=environment_id,
+                    payload=payload,
+                )
+            )
+            _json_response(self, 202, result.to_dict())
 
         def _handle_list_replays(self, query: str) -> None:
             token = _require_service_token(
