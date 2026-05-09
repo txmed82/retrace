@@ -182,6 +182,86 @@ def test_github_client_raises_on_http_error() -> None:
             client.create_issue(repo="acme/web", title="t", body="b")
 
 
+def test_github_client_upserts_existing_issue_comment() -> None:
+    requests: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = (
+            json.loads(request.content.decode("utf-8")) if request.content else None
+        )
+        requests.append((request.method, str(request.url), payload))
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 55,
+                        "body": "<!-- retrace-pr-review-summary --> old",
+                        "html_url": "https://github.com/acme/web/pull/12#issuecomment-55",
+                    }
+                ],
+            )
+        assert request.method == "PATCH"
+        return httpx.Response(
+            200,
+            json={
+                "id": 55,
+                "body": payload["body"],
+                "html_url": "https://github.com/acme/web/pull/12#issuecomment-55",
+            },
+        )
+
+    with httpx.Client(transport=_mock_transport(handler)) as raw:
+        client = GitHubClient(api_key="ghp_test", client=raw)
+        result = client.upsert_issue_comment(
+            repo="acme/web",
+            number=12,
+            marker="<!-- retrace-pr-review-summary -->",
+            body="<!-- retrace-pr-review-summary --> new",
+        )
+
+    assert result["id"] == 55
+    assert requests[0][0] == "GET"
+    assert requests[0][1].endswith("/repos/acme/web/issues/12/comments")
+    assert requests[1][0] == "PATCH"
+    assert requests[1][1].endswith("/repos/acme/web/issues/comments/55")
+    assert requests[1][2] == {"body": "<!-- retrace-pr-review-summary --> new"}
+
+
+def test_github_client_creates_pull_request_review_comments() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = str(request.url)
+        captured["json"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"id": 77, "state": "COMMENTED"})
+
+    with httpx.Client(transport=_mock_transport(handler)) as raw:
+        client = GitHubClient(api_key="ghp_test", client=raw)
+        result = client.create_pull_request_review(
+            repo="acme/web",
+            number=12,
+            commit_id="abc123",
+            body="Retrace suggestions",
+            comments=[
+                {
+                    "path": "src/app/page.tsx",
+                    "line": 10,
+                    "side": "RIGHT",
+                    "body": "Add a spec",
+                }
+            ],
+        )
+
+    assert result["id"] == 77
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith("/repos/acme/web/pulls/12/reviews")
+    assert captured["json"]["event"] == "COMMENT"
+    assert captured["json"]["commit_id"] == "abc123"
+    assert captured["json"]["comments"][0]["line"] == 10
+
+
 # ---------- promote_replay_issue end-to-end ----------
 
 
