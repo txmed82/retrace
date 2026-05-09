@@ -23,6 +23,7 @@ from retrace.notification_sinks import (
 )
 from retrace.observability import collect_local_observability, record_api_request
 from retrace.enrichment import CorrelationEnricher
+from retrace.deploys import correlate_recent_failures_to_deploys, record_deploy
 from retrace.monitoring_ingest import ingest_monitoring_webhook
 from retrace.replay_api import (
     MAX_REPLAY_BODY_BYTES,
@@ -228,8 +229,10 @@ def _handler(
 
         def do_OPTIONS(self) -> None:  # noqa: N802
             parsed = urlsplit(self.path)
-            if parsed.path != "/api/sdk/replay" and not parsed.path.startswith(
-                "/api/monitoring/webhook"
+            if (
+                parsed.path != "/api/sdk/replay"
+                and parsed.path != "/api/deploys"
+                and not parsed.path.startswith("/api/monitoring/webhook")
             ):
                 _json_response(self, 404, {"error": "not_found"})
                 return
@@ -246,6 +249,9 @@ def _handler(
             parsed = urlsplit(self.path)
             if parsed.path == "/api/replays/process":
                 self._handle_process_replays()
+                return
+            if parsed.path == "/api/deploys":
+                self._handle_record_deploy(parsed.query)
                 return
             if parsed.path == "/api/monitoring/webhook" or parsed.path.startswith(
                 "/api/monitoring/webhook/"
@@ -381,6 +387,95 @@ def _handler(
                 )
                 return
             _json_response(self, 202, result.to_dict())
+
+        def _handle_record_deploy(self, query: str) -> None:
+            token = _require_service_token(
+                self, store, scopes={"deploy:write", "ingest", "admin"}
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length <= 0:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            body = self.rfile.read(length)
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                _json_response(self, 400, {"error": "invalid_json"})
+                return
+            if not isinstance(payload, dict) or not payload:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            sha = str(payload.get("sha") or payload.get("commit_sha") or "").strip()
+            if not sha:
+                _json_response(self, 400, {"error": "missing_sha"})
+                return
+            changed_files = payload.get("changed_files") or payload.get("changedFiles") or []
+            if not isinstance(changed_files, list):
+                _json_response(self, 400, {"error": "invalid_changed_files"})
+                return
+            try:
+                deployed_at_ms = int(payload.get("deployed_at_ms") or 0)
+            except (TypeError, ValueError):
+                _json_response(self, 400, {"error": "invalid_deployed_at_ms"})
+                return
+            try:
+                deploy = record_deploy(
+                    store=store,
+                    project_id=token.project_id,
+                    environment_id=environment_id,
+                    sha=sha,
+                    branch=str(payload.get("branch") or ""),
+                    author=str(payload.get("author") or ""),
+                    deployed_at_ms=deployed_at_ms,
+                    changed_files=[str(item) for item in changed_files],
+                    metadata=dict(payload.get("metadata") or {}),
+                )
+                correlations = correlate_recent_failures_to_deploys(
+                    store=store,
+                    project_id=token.project_id,
+                    environment_id=environment_id,
+                )
+            except Exception:
+                logger.exception("Unhandled deploy ingest error")
+                _json_response(
+                    self,
+                    500,
+                    {
+                        "error": "internal_error",
+                        "message": "An internal server error occurred.",
+                    },
+                )
+                return
+            _json_response(
+                self,
+                202,
+                {
+                    "deploy": {
+                        "id": deploy.id,
+                        "public_id": deploy.public_id,
+                        "sha": deploy.sha,
+                        "branch": deploy.branch,
+                        "author": deploy.author,
+                        "deployed_at_ms": deploy.deployed_at_ms,
+                        "changed_files": deploy.changed_files,
+                    },
+                    "correlated_failures": [
+                        {"failure_id": item.failure_id, "deploy_sha": item.deploy_sha}
+                        for item in correlations
+                    ],
+                },
+            )
 
         def _handle_list_replays(self, query: str) -> None:
             token = _require_service_token(
@@ -1247,6 +1342,73 @@ def api_verify_resolved(
                 "plan": plan,
                 "verified": verified,
                 "regressed": regressed,
+            },
+            indent=2,
+        )
+    )
+
+
+@api_group.command("record-deploy")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--project-id", default="", help="Project ID override.")
+@click.option("--environment-id", default="", help="Environment ID override.")
+@click.option("--sha", required=True, help="Deploy commit SHA.")
+@click.option("--branch", default="", help="Deploy branch.")
+@click.option("--author", default="", help="Deploy author.")
+@click.option("--deployed-at-ms", default=0, type=int, help="Deploy timestamp in ms.")
+@click.option("--changed-file", "changed_files", multiple=True, help="Changed file path.")
+def api_record_deploy(
+    config_path: Path,
+    project_id: str,
+    environment_id: str,
+    sha: str,
+    branch: str,
+    author: str,
+    deployed_at_ms: int,
+    changed_files: tuple[str, ...],
+) -> None:
+    """Record a deploy marker and correlate recent failures."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Default")
+    pid = project_id.strip() or workspace.project_id
+    eid = environment_id.strip() or workspace.environment_id
+    deploy = record_deploy(
+        store=store,
+        project_id=pid,
+        environment_id=eid,
+        sha=sha,
+        branch=branch,
+        author=author,
+        deployed_at_ms=deployed_at_ms,
+        changed_files=list(changed_files),
+        metadata={"source": "cli"},
+    )
+    correlations = correlate_recent_failures_to_deploys(
+        store=store,
+        project_id=pid,
+        environment_id=eid,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "deploy": {
+                    "id": deploy.id,
+                    "public_id": deploy.public_id,
+                    "sha": deploy.sha,
+                    "changed_files": deploy.changed_files,
+                },
+                "correlated_failures": [
+                    {"failure_id": item.failure_id, "deploy_sha": item.deploy_sha}
+                    for item in correlations
+                ],
             },
             indent=2,
         )

@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from retrace.deploys import changed_files_for_failure
 from retrace.storage import EvidenceRow, FailureRow, IncidentRow, RepairTaskRow, Storage
 
 
@@ -95,12 +96,18 @@ def ensure_incident_repair_task(*, store: Storage, incident_id: str) -> str:
     evidence_ids = [
         item.id for item in detail.evidence if item.failure_id == representative.id
     ]
+    changed_files = _unique_strings(
+        file
+        for failure in detail.failures
+        for file in changed_files_for_failure(store=store, failure=failure)
+    )
     repair_task_id = store.upsert_repair_task(
         failure_id=representative.id,
         title=f"Repair incident: {detail.incident.title}",
         source_type="incident",
         source_external_id=detail.incident.public_id,
         status="open",
+        likely_files=changed_files,
         risk_notes=(
             "Review all linked incident failures and monitoring evidence before "
             "applying a fix."
@@ -111,6 +118,7 @@ def ensure_incident_repair_task(*, store: Storage, incident_id: str) -> str:
             "group_key": detail.incident.group_key,
             "failure_ids": [failure.id for failure in detail.failures],
             "evidence_ids": [item.id for item in detail.evidence],
+            "deploy_changed_files": changed_files,
         },
         evidence_ids=evidence_ids,
     )
@@ -214,3 +222,14 @@ def _first_list_item(value: Any) -> str:
                 return text
     text = str(value or "").strip()
     return text
+
+
+def _unique_strings(values: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value or "").strip()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
