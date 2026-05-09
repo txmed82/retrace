@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import Thread
 
 from retrace.commands.api import _handler
+from retrace.notification_sinks import NotificationPayload
 from retrace.monitoring_ingest import ingest_monitoring_webhook
 from retrace.sdk_keys import create_sdk_key, create_service_token
 from retrace.sentry_compat import parse_sentry_envelope
@@ -26,8 +27,8 @@ def _store(tmp_path: Path) -> tuple[Storage, WorkspaceIds]:
 
 
 @contextmanager
-def _server(store: Storage):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(store))
+def _server(store: Storage, **handler_kwargs: object):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(store, **handler_kwargs))
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -305,6 +306,65 @@ def test_sentry_store_endpoint_ingests_sdk_event_with_query_key(tmp_path: Path) 
     )
     assert failure is not None
     assert failure.metadata["trace_ids"] == ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+
+
+def test_sentry_store_endpoint_dispatches_app_error_notification(
+    tmp_path: Path,
+) -> None:
+    class CaptureSink:
+        name = "capture"
+
+        def __init__(self) -> None:
+            self.payloads: list[NotificationPayload] = []
+
+        def send(self, payload: NotificationPayload) -> object:
+            self.payloads.append(payload)
+            return type(
+                "Result",
+                (),
+                {"ok": True, "sink": self.name, "target": "", "status_code": 200},
+            )()
+
+    store, workspace = _store(tmp_path)
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Browser",
+    )
+    sink = CaptureSink()
+
+    with _server(store, notification_sinks=[sink]) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/sentry/{workspace.project_id}/store/?sentry_key={sdk.key}",
+            body=json.dumps(
+                {
+                    "event_id": "evt-notify-1",
+                    "title": "TypeError in billing",
+                    "level": "fatal",
+                    "contexts": {
+                        "trace": {"trace_id": "dddddddddddddddddddddddddddddddd"}
+                    },
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 202
+    assert payload["results"][0]["created"] is True
+    assert len(sink.payloads) == 1
+    notification = sink.payloads[0]
+    assert notification.event == "app_error.created"
+    assert notification.severity == "critical"
+    assert notification.public_id == payload["results"][0]["incident_public_id"]
+    assert notification.extra["failure_public_id"] == payload["results"][0]["failure_public_id"]
+    assert notification.extra["trace_ids"] == ["dddddddddddddddddddddddddddddddd"]
 
 
 def test_sentry_envelope_endpoint_accepts_x_sentry_auth(tmp_path: Path) -> None:

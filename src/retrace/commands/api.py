@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import parse_qs, urlsplit
 
 import click
@@ -270,6 +270,54 @@ def _repair_task_api_dict(task: Any) -> dict[str, Any]:
     }
 
 
+def _app_error_notification_payload(
+    *,
+    store: Storage,
+    result: Any,
+) -> NotificationPayload | None:
+    failure = store.get_failure_by_id(str(result.failure_id))
+    if failure is None:
+        return None
+    incident_public_id = str(getattr(result, "incident_public_id", "") or "")
+    public_id = incident_public_id or str(getattr(result, "failure_public_id", "") or "")
+    provider = str(getattr(result, "provider", "") or "")
+    return NotificationPayload(
+        event=NotificationEvent.APP_ERROR_CREATED.value,
+        title=f"{provider.title() or 'App'} error: {failure.title}",
+        summary=failure.summary,
+        severity=failure.severity,
+        public_id=public_id,
+        extra={
+            "provider": provider,
+            "incident_id": str(getattr(result, "incident_id", "") or ""),
+            "incident_public_id": incident_public_id,
+            "failure_id": failure.id,
+            "failure_public_id": failure.public_id,
+            "evidence_id": str(getattr(result, "evidence_id", "") or ""),
+            "source_external_id": failure.source_external_id,
+            "trace_ids": list((failure.metadata or {}).get("trace_ids") or []),
+            "top_stack_frame": str((failure.metadata or {}).get("top_stack_frame") or ""),
+        },
+    )
+
+
+def _dispatch_app_error_notifications(
+    *,
+    sinks: Iterable[Any],
+    store: Storage,
+    results: Iterable[Any],
+) -> None:
+    sink_list = list(sinks)
+    if not sink_list:
+        return
+    for result in results:
+        if not bool(getattr(result, "created", False)):
+            continue
+        payload = _app_error_notification_payload(store=store, result=result)
+        if payload is not None:
+            dispatch_notification(sink_list, payload)
+
+
 def _build_enricher(cfg: Any, store: Storage) -> CorrelationEnricher | None:
     """Construct a best-effort correlation enricher when PostHog is configured.
 
@@ -321,6 +369,7 @@ def _handler(
     *,
     enricher: CorrelationEnricher | None = None,
     github_webhook_secret: str = "",
+    notification_sinks: Iterable[Any] = (),
 ) -> type[BaseHTTPRequestHandler]:
     class RetraceAPIHandler(BaseHTTPRequestHandler):
         server_version = "retrace-api/0.1"
@@ -511,6 +560,11 @@ def _handler(
                     body=body,
                     query=_query_dict(query),
                 )
+                _dispatch_app_error_notifications(
+                    sinks=notification_sinks,
+                    store=store,
+                    results=result.results,
+                )
             except SentryCompatIngestError as exc:
                 _json_response(
                     self,
@@ -600,6 +654,11 @@ def _handler(
                     environment_id=environment_id,
                     provider=provider,
                     payload=payload,
+                )
+                _dispatch_app_error_notifications(
+                    sinks=notification_sinks,
+                    store=store,
+                    results=[result],
                 )
             except Exception:
                 logger.exception("Unhandled monitoring webhook ingest error")
@@ -1214,12 +1273,16 @@ def api_serve(config_path: Path, host: str, port: int) -> None:
     cfg = load_config(config_path)
     store = Storage(cfg.run.data_dir / "retrace.db")
     store.init_schema()
+    notification_sinks = (
+        build_sinks_from_config(cfg.notifications) if cfg.notifications.enabled else []
+    )
     httpd = ThreadingHTTPServer(
         (host, port),
         _handler(
             store,
             enricher=_build_enricher(cfg, store),
             github_webhook_secret=cfg.github_app.webhook_secret,
+            notification_sinks=notification_sinks,
         ),
     )
     click.echo(f"Retrace API running at http://{host}:{port}")
@@ -1230,6 +1293,7 @@ def api_serve(config_path: Path, host: str, port: int) -> None:
     except KeyboardInterrupt:
         click.echo("Stopping Retrace API")
     finally:
+        close_sinks(notification_sinks)
         httpd.server_close()
 
 
