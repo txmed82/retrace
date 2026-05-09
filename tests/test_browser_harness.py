@@ -162,3 +162,56 @@ def test_failed_harness_run_can_be_mapped_to_canonical_failure(
     assert failure.source_external_id == result.run_id
     assert failure.status == "new"
     assert failure.metadata["assertion_results"][0]["source"] == "harness"
+
+
+def test_harness_retries_do_not_reuse_previous_attempt_artifacts(
+    tmp_path: Path,
+) -> None:
+    script = """
+import json
+import pathlib
+import sys
+
+run_dir = pathlib.Path(sys.argv[1])
+artifacts_dir = run_dir / "artifacts"
+artifacts_dir.mkdir(parents=True, exist_ok=True)
+marker = run_dir / "retry-ready"
+passed = marker.exists()
+if not passed:
+    marker.write_text("ready")
+payload = {
+    "status": "passed" if passed else "failed",
+    "error": "" if passed else "first attempt failed",
+    "assertions": [
+        {
+            "id": "second-pass" if passed else "first-fail",
+            "ok": passed,
+            "message": "current attempt only",
+        }
+    ],
+}
+(run_dir / "browser-harness-result.json").write_text(json.dumps(payload))
+sys.exit(0 if passed else 1)
+"""
+    spec = create_spec(
+        specs_dir=tmp_path / "specs",
+        name="Retry isolation",
+        prompt="Verify checkout",
+        app_url="http://app.test",
+        start_command="",
+        harness_command=_python_harness_command(tmp_path, script),
+        mode="describe",
+        execution_engine="harness",
+    )
+
+    result = run_spec(
+        spec=spec,
+        runs_dir=runs_dir_for_data_dir(tmp_path),
+        max_retries=1,
+    )
+
+    assert result.ok is True
+    assert result.attempts == 2
+    assert result.assertion_results[0]["assertion_id"] == "second-pass"
+    assert Path(result.harness_log_path).name == "harness.log"
+    assert all("first-fail" not in json.dumps(artifact) for artifact in result.artifacts)

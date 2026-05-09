@@ -19,7 +19,10 @@ from typing import Any, Callable, Optional
 import httpx
 
 from retrace.artifacts import tester_artifact_manifest_items, write_artifact_manifest
-from retrace.browser_harness import BrowserHarnessAdapter
+from retrace.browser_harness import (
+    BrowserHarnessAdapter,
+    clear_browser_harness_attempt_outputs,
+)
 from retrace.llm.client import build_llm_http_request, extract_llm_text_content
 from retrace.script_steps import (
     render_template,
@@ -2267,6 +2270,7 @@ def run_spec(
     attempts = 0
     last_exit = 1
     last_error = ""
+    last_failed_classification = ""
     artifacts: list[dict[str, Any]] = []
     assertion_results: list[dict[str, Any]] = []
     try:
@@ -2314,11 +2318,10 @@ def run_spec(
                 log_path=harness_log_path,
             )
         else:
-            for attempt in range(max(0, int(max_retries)) + 1):
+            retry_count = max(0, int(max_retries))
+            for attempt in range(retry_count + 1):
                 attempts += 1
-                if attempt > 0:
-                    with harness_log_path.open("a") as harness_log:
-                        harness_log.write(f"\n--- retry attempt {attempt} ---\n")
+                clear_browser_harness_attempt_outputs(run_dir, harness_log_path)
                 harness_run = BrowserHarnessAdapter(
                     command=harness_cmd,
                     run_dir=run_dir,
@@ -2334,6 +2337,12 @@ def run_spec(
                 assertion_results = harness_run.assertion_results
                 if last_exit == 0:
                     break
+                last_failed_classification = _classify_failure(
+                    harness_log_path=harness_log_path,
+                    error=last_error,
+                    assertion_results=assertion_results,
+                    exit_code=last_exit,
+                )
 
         failure_classification = _classify_failure(
             harness_log_path=harness_log_path,
@@ -2341,6 +2350,8 @@ def run_spec(
             assertion_results=assertion_results,
             exit_code=last_exit,
         )
+        if last_exit == 0 and last_failed_classification:
+            failure_classification = last_failed_classification
         flake_reason = _flake_reason_from_classification(failure_classification)
         flaky = attempts > 1 and last_exit == 0
         ok = last_exit == 0

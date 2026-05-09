@@ -100,6 +100,21 @@ class BrowserHarnessAdapter:
         )
 
 
+def clear_browser_harness_attempt_outputs(run_dir: Path, log_path: Path) -> None:
+    if log_path.exists():
+        _unlink_quietly(log_path)
+    if not run_dir.exists():
+        return
+    removable_suffixes = {".json", ".png", ".jpg", ".jpeg", ".webp"}
+    for path in sorted(run_dir.rglob("*"), reverse=True):
+        if path.is_dir():
+            continue
+        if path.name in {"run.json", "artifact-manifest.json"}:
+            continue
+        if path == log_path or path.suffix.lower() in removable_suffixes:
+            _unlink_quietly(path)
+
+
 def normalize_browser_harness_output(
     *,
     run_dir: Path,
@@ -120,10 +135,11 @@ def normalize_browser_harness_output(
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
-        final_status = final_status or _first_text(
+        payload_status = _first_text(
             payload, ["final_status", "status", "outcome", "result"]
         )
-        payload_error = payload_error or _first_text(payload, ["error", "message"])
+        final_status = final_status or payload_status
+        payload_error = payload_error or _payload_error(payload, payload_status)
         steps.extend(_normalize_steps(_first_list(payload, ["steps", "actions"])))
         screenshots.extend(
             _normalize_screenshots(_first_list(payload, ["screenshots"]), run_dir)
@@ -312,7 +328,7 @@ def _normalize_steps(records: list[Any]) -> list[dict[str, Any]]:
         elif isinstance(record, dict):
             out.append(
                 {
-                    "index": int(record.get("index") or record.get("step") or idx),
+                    "index": _safe_int(_first_present(record, ["index", "step"], idx), idx),
                     "action": str(
                         record.get("action")
                         or record.get("type")
@@ -320,7 +336,7 @@ def _normalize_steps(records: list[Any]) -> list[dict[str, Any]]:
                         or ""
                     ),
                     "target": record.get("target") or record.get("selector") or "",
-                    "ok": bool(record.get("ok", record.get("status") != "failed")),
+                    "ok": _step_ok(record),
                     "message": str(record.get("message") or ""),
                     "raw": record,
                 }
@@ -381,12 +397,15 @@ def _normalize_assertions(records: list[Any]) -> list[dict[str, Any]]:
                     or f"harness-assertion-{idx}"
                 ),
                 "assertion_type": str(record.get("assertion_type") or "harness"),
-                "ok": bool(record.get("ok", record.get("passed", False))),
+                "ok": _assertion_ok(record),
                 "expected": record.get("expected"),
                 "actual": record.get("actual"),
                 "message": str(record.get("message") or record.get("name") or ""),
                 "source": "harness",
-                "confidence": float(record.get("confidence") or 1.0),
+                "confidence": _safe_float(
+                    record.get("confidence") if "confidence" in record else None,
+                    1.0,
+                ),
             }
         )
     return out
@@ -405,8 +424,14 @@ def _normalize_declared_artifacts(
             continue
         out.append(
             {
-                "artifact_id": str(record.get("artifact_id") or f"harness-artifact-{idx}"),
-                "artifact_type": str(record.get("artifact_type") or record.get("type") or "harness_artifact"),
+                "artifact_id": str(
+                    record.get("artifact_id") or f"harness-artifact-{idx}"
+                ),
+                "artifact_type": str(
+                    record.get("artifact_type")
+                    or record.get("type")
+                    or "harness_artifact"
+                ),
                 "path": path,
                 "label": str(record.get("label") or f"Harness artifact {idx}"),
                 "metadata": dict(record.get("metadata") or {}),
@@ -444,3 +469,85 @@ def _resolve_artifact_path(value: str, run_dir: Path) -> str:
     if path.is_absolute():
         return str(path)
     return str(run_dir / path)
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def _payload_error(payload: dict[str, Any], status: str) -> str:
+    explicit = _first_text(payload, ["error", "exception"])
+    if explicit:
+        return explicit
+    if _failed_status(status):
+        return _first_text(payload, ["message"])
+    return ""
+
+
+def _failed_status(status: object) -> bool:
+    return str(status or "").strip().lower() in {
+        "error",
+        "errored",
+        "fail",
+        "failed",
+        "failure",
+    }
+
+
+def _first_present(
+    record: dict[str, Any],
+    keys: list[str],
+    default: Any,
+) -> Any:
+    for key in keys:
+        if key in record and record[key] is not None:
+            return record[key]
+    return default
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "passed", "pass"}:
+            return True
+        if normalized in {"0", "false", "no", "failed", "fail", "error"}:
+            return False
+        return default
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _step_ok(record: dict[str, Any]) -> bool:
+    if "ok" in record:
+        return _safe_bool(record.get("ok"), default=False)
+    if "passed" in record:
+        return _safe_bool(record.get("passed"), default=False)
+    return not _failed_status(record.get("status"))
+
+
+def _assertion_ok(record: dict[str, Any]) -> bool:
+    if "ok" in record:
+        return _safe_bool(record.get("ok"), default=False)
+    if "passed" in record:
+        return _safe_bool(record.get("passed"), default=False)
+    return not _failed_status(record.get("status"))
