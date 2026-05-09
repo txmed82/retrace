@@ -1775,15 +1775,40 @@ class Storage:
 
     def link_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
         with self._conn() as conn:
+            incident = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM incidents
+                WHERE id = ? OR public_id = ?
+                """,
+                (incident_id, incident_id),
+            ).fetchone()
+            if incident is None:
+                raise ValueError(f"unknown incident_id: {incident_id}")
+            failure = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM failures
+                WHERE id = ? OR public_id = ?
+                """,
+                (failure_id, failure_id),
+            ).fetchone()
+            if failure is None:
+                raise ValueError(f"unknown failure_id: {failure_id}")
+            if (
+                str(incident["project_id"]) != str(failure["project_id"])
+                or str(incident["environment_id"]) != str(failure["environment_id"])
+            ):
+                raise ValueError("incident and failure must belong to the same workspace")
             conn.execute(
                 """
                 INSERT OR IGNORE INTO incident_failures
                 (incident_id, failure_id)
                 VALUES (?, ?)
                 """,
-                (incident_id, failure_id),
+                (str(incident["id"]), str(failure["id"])),
             )
-            self._refresh_incident_rollup(conn, incident_id=incident_id)
+            self._refresh_incident_rollup(conn, incident_id=str(incident["id"]))
 
     def get_incident(self, incident_id: str) -> Optional[IncidentRow]:
         with self._conn() as conn:
@@ -1875,7 +1900,10 @@ class Storage:
                 FROM incident_failures inf
                 JOIN failure_evidence ev ON ev.failure_id = inf.failure_id
                 WHERE {where}
-                ORDER BY ev.occurred_at_ms, ev.created_at, ev.id
+                ORDER BY
+                    ev.occurred_at_ms,
+                    replace(replace(ev.created_at, ' ', 'T'), '+00:00', 'Z'),
+                    ev.id
                 """,
                 params,
             ).fetchall()
@@ -1884,13 +1912,40 @@ class Storage:
     def set_incident_repair_task(self, *, incident_id: str, repair_task_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
+            incident = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM incidents
+                WHERE id = ? OR public_id = ?
+                """,
+                (incident_id, incident_id),
+            ).fetchone()
+            if incident is None:
+                raise ValueError(f"unknown incident_id: {incident_id}")
+            repair_task = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM repair_tasks
+                WHERE id = ? OR public_id = ?
+                """,
+                (repair_task_id, repair_task_id),
+            ).fetchone()
+            if repair_task is None:
+                raise ValueError(f"unknown repair_task_id: {repair_task_id}")
+            if (
+                str(incident["project_id"]) != str(repair_task["project_id"])
+                or str(incident["environment_id"]) != str(repair_task["environment_id"])
+            ):
+                raise ValueError(
+                    "incident and repair task must belong to the same workspace"
+                )
             conn.execute(
                 """
                 UPDATE incidents
                 SET repair_task_id = ?, updated_at = ?
                 WHERE id = ? OR public_id = ?
                 """,
-                (repair_task_id, now, incident_id, incident_id),
+                (str(repair_task["id"]), now, str(incident["id"]), str(incident["id"])),
             )
 
     def _incident_from_row(self, row: sqlite3.Row) -> IncidentRow:

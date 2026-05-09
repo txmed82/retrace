@@ -169,6 +169,11 @@ def test_incident_public_id_is_scoped_by_project_and_environment(tmp_path: Path)
         project_name="API",
         environment_name="production",
     )
+    third = store.ensure_workspace(
+        org_name="Acme",
+        project_name="Web",
+        environment_name="staging",
+    )
 
     first_incident_id = store.upsert_incident(
         project_id=first.project_id,
@@ -182,9 +187,95 @@ def test_incident_public_id_is_scoped_by_project_and_environment(tmp_path: Path)
         group_key="same-group",
         title="Same group",
     )
+    third_incident_id = store.upsert_incident(
+        project_id=third.project_id,
+        environment_id=third.environment_id,
+        group_key="same-group",
+        title="Same group",
+    )
 
     first_incident = store.get_incident(first_incident_id)
     second_incident = store.get_incident(second_incident_id)
+    third_incident = store.get_incident(third_incident_id)
     assert first_incident is not None
     assert second_incident is not None
+    assert third_incident is not None
     assert first_incident.public_id != second_incident.public_id
+    assert first_incident.public_id != third_incident.public_id
+
+
+def test_incident_rejects_cross_workspace_failure_link(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    first = store.ensure_workspace(
+        org_name="Acme",
+        project_name="Web",
+        environment_name="production",
+    )
+    second = store.ensure_workspace(
+        org_name="Acme",
+        project_name="API",
+        environment_name="production",
+    )
+    incident_id = store.upsert_incident(
+        project_id=first.project_id,
+        environment_id=first.environment_id,
+        group_key="group",
+        title="Incident",
+    )
+    failure_id = _monitor_failure(
+        store,
+        second,
+        external_id="evt-cross",
+        severity="high",
+    )
+
+    try:
+        store.link_failure_to_incident(incident_id=incident_id, failure_id=failure_id)
+    except ValueError as exc:
+        assert "same workspace" in str(exc)
+    else:
+        raise AssertionError("expected cross-workspace link failure")
+
+
+def test_incident_rejects_cross_workspace_repair_task(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    first = store.ensure_workspace(
+        org_name="Acme",
+        project_name="Web",
+        environment_name="production",
+    )
+    second = store.ensure_workspace(
+        org_name="Acme",
+        project_name="API",
+        environment_name="production",
+    )
+    incident_id = store.upsert_incident(
+        project_id=first.project_id,
+        environment_id=first.environment_id,
+        group_key="group",
+        title="Incident",
+    )
+    failure_id = _monitor_failure(
+        store,
+        second,
+        external_id="evt-task",
+        severity="high",
+    )
+    repair_task_id = store.upsert_repair_task(
+        failure_id=failure_id,
+        title="Repair other workspace",
+        source_type="incident",
+        source_external_id="inc_other",
+    )
+
+    try:
+        store.set_incident_repair_task(
+            incident_id=incident_id,
+            repair_task_id=repair_task_id,
+        )
+    except ValueError as exc:
+        assert "same workspace" in str(exc)
+    else:
+        raise AssertionError("expected cross-workspace repair task failure")
