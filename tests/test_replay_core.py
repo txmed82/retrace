@@ -12,7 +12,11 @@ from retrace.replay_core import (
     summarize_replay_issue,
 )
 from retrace.issue_sinks import promote_replay_issue
-from retrace.replay_specs import generate_spec_from_replay_issue
+from retrace.api_testing import load_api_spec
+from retrace.replay_specs import (
+    generate_api_spec_from_replay_issue,
+    generate_spec_from_replay_issue,
+)
 from retrace.sinks.base import Cluster
 from retrace.storage import Storage
 
@@ -931,6 +935,83 @@ def test_generate_spec_adds_signal_assertions_and_generation_notes(
     assert "Run the app at https://app.example." in generation["preconditions"]
     assert any("redacted" in note for note in generation["fixture_notes"])
     assert generation["unsupported_step_warnings"] == []
+
+
+def test_generate_api_spec_from_failed_replay_network_call(tmp_path: Path) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-api-spec",
+        sequence=0,
+        events=[_navigation("https://app.example/checkout")],
+        flush_type="final",
+    )
+    created = store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="checkout-api-500",
+        session_ids=["sess-api-spec"],
+        signal_summary={"network_5xx": 1},
+        first_seen_ms=100,
+        last_seen_ms=500,
+        title="Checkout API failed",
+        evidence={
+            "signals": [
+                {
+                    "detector": "network_5xx",
+                    "timestamp_ms": 300,
+                    "details": {
+                        "method": "POST",
+                        "request_url": "/api/checkout?cart=abc",
+                        "status": 500,
+                        "request_headers": {
+                            "content-type": "application/json",
+                            "authorization": "Bearer secret-token",
+                            "x-api-key": "secret-key",
+                        },
+                        "request_body": {
+                            "cart_id": "abc",
+                            "token": "secret-token",
+                        },
+                    },
+                }
+            ]
+        },
+    )
+
+    generated = generate_api_spec_from_replay_issue(
+        store=store,
+        specs_dir=tmp_path / "api-specs",
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=created.public_id,
+    )
+
+    spec = generated.spec
+    persisted = (tmp_path / "api-specs" / f"{spec.spec_id}.json").read_text()
+    loaded = load_api_spec(tmp_path / "api-specs", spec.spec_id)
+    assert loaded.method == "POST"
+    assert loaded.url == "https://app.example/api/checkout"
+    assert loaded.query == {"cart": "abc"}
+    assert loaded.expected_status == 200
+    assert loaded.headers == {"content-type": "application/json"}
+    assert loaded.auth == {
+        "type": "headers",
+        "headers_env": "RETRACE_API_AUTH_HEADERS",
+    }
+    assert loaded.body == {"cart_id": "abc", "token": "[redacted-api-input]"}
+    assert "secret-token" not in persisted
+    assert "secret-key" not in persisted
+    assert loaded.fixtures["source"] == "replay_issue_api"
+    assert loaded.fixtures["issue_public_id"] == created.public_id
+    assert loaded.fixtures["canonical_failure_id"]
+    links = store.list_failure_test_links(
+        failure_id=str(loaded.fixtures["canonical_failure_id"])
+    )
+    assert len(links) == 1
+    assert links[0].spec_id == spec.spec_id
+    assert links[0].source == "replay_issue_api"
 
 
 def test_promote_replay_issue_dedupes_external_ticket(

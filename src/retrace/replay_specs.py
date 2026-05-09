@@ -5,8 +5,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
+from retrace.api_testing import APITestSpec, create_api_spec
 from retrace.storage import Storage
 from retrace.tester import TesterSpec, create_spec
 
@@ -18,6 +19,14 @@ class GeneratedReplaySpec:
     replay_public_id: str
     confidence: str
     known_gaps: list[str]
+
+
+@dataclass(frozen=True)
+class GeneratedReplayAPISpec:
+    spec: APITestSpec
+    issue_public_id: str
+    replay_public_id: str
+    source_signal: dict[str, Any]
 
 
 def generate_spec_from_replay_issue(
@@ -105,6 +114,106 @@ def generate_spec_from_replay_issue(
         replay_public_id=str(playback.session["public_id"]),
         confidence=_generation_confidence(exact_steps, gaps),
         known_gaps=gaps,
+    )
+
+
+def generate_api_spec_from_replay_issue(
+    *,
+    store: Storage,
+    specs_dir: Path,
+    project_id: str,
+    environment_id: str,
+    issue_id: str,
+    app_url: str = "",
+) -> GeneratedReplayAPISpec:
+    issue = store.get_replay_issue(
+        project_id=project_id,
+        environment_id=environment_id,
+        issue_id=issue_id,
+    )
+    if issue is None:
+        raise ValueError(f"Replay issue not found: {issue_id}")
+
+    representative_session_id = str(issue["representative_session_id"] or "")
+    sessions = store.list_replay_issue_sessions(str(issue["id"]))
+    if not representative_session_id and sessions:
+        representative_session_id = str(sessions[0]["session_id"])
+    if not representative_session_id:
+        raise ValueError(f"Replay issue has no linked session: {issue_id}")
+
+    playback = store.get_replay_playback(
+        project_id=project_id,
+        environment_id=environment_id,
+        session_id=representative_session_id,
+    )
+    if playback is None:
+        raise ValueError(f"Replay session not found: {representative_session_id}")
+
+    evidence = _json_obj(issue["evidence_json"])
+    signal = _first_signal(_evidence_signals(evidence), {"network_4xx", "network_5xx"})
+    if signal is None:
+        raise ValueError(f"Replay issue has no failed network signal: {issue_id}")
+    details = _json_obj(signal.get("details"))
+    base_url = app_url.strip() or _infer_base_url(playback.events) or "http://127.0.0.1:3000"
+    method = str(details.get("method") or details.get("request_method") or "GET").upper()
+    raw_url = str(details.get("request_url") or details.get("url") or "").strip()
+    if not raw_url:
+        raise ValueError(f"Network signal has no request_url: {issue_id}")
+    url, query = _api_url_and_query(raw_url, base_url)
+    headers, auth, header_notes = _safe_api_headers(details)
+    body, body_notes = _safe_api_body(details)
+    original_status = _status_int(details.get("status") or details.get("status_code"))
+    expected_status = 200 if original_status >= 500 or original_status == 0 else original_status
+    spec = create_api_spec(
+        specs_dir=specs_dir,
+        name=f"{issue['public_id']} API regression",
+        method=method,
+        url=url,
+        query=query,
+        headers=headers,
+        body=body,
+        auth=auth,
+        expected_status=expected_status,
+        json_assertions=[],
+        schema_assertions=[],
+        latency_ms=0,
+        fixtures={
+            "source": "replay_issue_api",
+            "issue_id": str(issue["id"]),
+            "issue_public_id": str(issue["public_id"]),
+            "canonical_failure_id": str(issue["canonical_failure_id"] or ""),
+            "replay_id": str(playback.session["id"]),
+            "replay_public_id": str(playback.session["public_id"]),
+            "session_id": representative_session_id,
+            "source_network_signal": {
+                "detector": signal.get("detector"),
+                "method": method,
+                "url": raw_url,
+                "status": original_status,
+            },
+            "fixture_notes": [
+                *header_notes,
+                *body_notes,
+                "Generated from a failed replay network call; confirm expected status for your app.",
+            ],
+        },
+    )
+    canonical_failure_id = str(issue["canonical_failure_id"] or "")
+    if canonical_failure_id:
+        store.upsert_failure_test_link(
+            failure_id=canonical_failure_id,
+            issue_id=str(issue["id"]),
+            issue_public_id=str(issue["public_id"]),
+            spec_id=spec.spec_id,
+            spec_name=spec.name,
+            spec_path=str(specs_dir / f"{spec.spec_id}.json"),
+            source="replay_issue_api",
+        )
+    return GeneratedReplayAPISpec(
+        spec=spec,
+        issue_public_id=str(issue["public_id"]),
+        replay_public_id=str(playback.session["public_id"]),
+        source_signal=dict(signal),
     )
 
 
@@ -641,6 +750,105 @@ def _json_obj(raw: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+_SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+    "x-api-key",
+    "x-csrf-token",
+    "x-xsrf-token",
+}
+_SENSITIVE_BODY_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "jwt",
+    "password",
+    "secret",
+    "token",
+}
+
+
+def _api_url_and_query(raw_url: str, base_url: str) -> tuple[str, dict[str, Any]]:
+    absolute = raw_url if raw_url.startswith(("http://", "https://")) else urljoin(base_url, raw_url)
+    parsed = urlparse(absolute)
+    query = {
+        key: values[-1] if len(values) == 1 else values
+        for key, values in parse_qs(parsed.query, keep_blank_values=True).items()
+    }
+    clean_url = urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, "", parsed.fragment)
+    )
+    return clean_url, query
+
+
+def _safe_api_headers(details: dict[str, Any]) -> tuple[dict[str, str], dict[str, Any], list[str]]:
+    raw = (
+        details.get("request_headers")
+        or details.get("headers")
+        or details.get("requestHeaders")
+        or {}
+    )
+    if not isinstance(raw, dict):
+        return {}, {}, []
+    headers: dict[str, str] = {}
+    sensitive: list[str] = []
+    for key, value in raw.items():
+        key_s = str(key)
+        if key_s.lower() in _SENSITIVE_HEADER_NAMES:
+            sensitive.append(key_s)
+            continue
+        headers[key_s] = str(value)
+    if not sensitive:
+        return headers, {}, []
+    return (
+        headers,
+        {"type": "headers", "headers_env": "RETRACE_API_AUTH_HEADERS"},
+        [
+            "Sensitive request headers were not persisted; set "
+            "RETRACE_API_AUTH_HEADERS to a JSON object before running.",
+        ],
+    )
+
+
+def _safe_api_body(details: dict[str, Any]) -> tuple[Any, list[str]]:
+    body = (
+        details.get("request_body")
+        if "request_body" in details
+        else details.get("body", details.get("requestBody"))
+    )
+    if body in (None, ""):
+        return None, []
+    redacted = _redact_api_body(body)
+    notes = []
+    if redacted != body:
+        notes.append("Sensitive request body values were replaced with redacted placeholders.")
+    return redacted, notes
+
+
+def _redact_api_body(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "[redacted-api-input]"
+                if str(key).lower() in _SENSITIVE_BODY_KEYS
+                else _redact_api_body(child)
+            )
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_api_body(item) for item in value]
+    return value
+
+
+def _status_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _generation_confidence(steps: list[dict[str, Any]], gaps: list[str]) -> str:
