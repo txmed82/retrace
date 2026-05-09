@@ -9,6 +9,14 @@ from typing import Any, Optional
 import click
 import yaml
 
+from retrace.api_testing import (
+    api_runs_dir_for_data_dir,
+    api_specs_dir_for_data_dir,
+    create_api_spec,
+    list_api_specs,
+    load_api_spec,
+    run_api_spec,
+)
 from retrace.config import load_config
 from retrace.evidence import EvidenceItem, evidence_dedupe_key
 from retrace.failures import canonical_failure_from_harness_run
@@ -43,6 +51,16 @@ def _tester_defaults(config_path: Path) -> dict[str, Any]:
         return {}
     raw = yaml.safe_load(config_path.read_text()) or {}
     return (raw.get("tester") or {}) if isinstance(raw, dict) else {}
+
+
+def _json_option(value: str, *, label: str, default: Any) -> Any:
+    raw = value.strip()
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"{label} must be valid JSON: {exc}") from exc
 
 
 def _auth_profile(defaults: dict[str, Any], name: str) -> dict[str, Any]:
@@ -462,6 +480,120 @@ def tester_list(config_path: Path) -> None:
         return
     for s in specs:
         click.echo(f"{s.spec_id}\t{s.mode}\t{s.name}")
+
+
+@tester_group.command("api-create")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--name", required=True, help="Friendly API test name.")
+@click.option("--method", default="GET", show_default=True)
+@click.option("--url", required=True, help="Absolute API URL.")
+@click.option("--query-json", default="", help="JSON object for query params.")
+@click.option("--headers-json", default="", help="JSON object for static headers.")
+@click.option("--body-json", default="", help="JSON request body.")
+@click.option("--auth-bearer-env", default="", help="Env var containing bearer token.")
+@click.option("--expected-status", default=200, show_default=True, type=int)
+@click.option(
+    "--json-assertion",
+    "json_assertions",
+    multiple=True,
+    help="JSON assertion object, repeatable.",
+)
+@click.option(
+    "--schema-assertion-json",
+    default="",
+    help="JSON schema assertion object.",
+)
+@click.option("--latency-ms", default=0, type=int, help="Latency budget in ms.")
+@click.option("--timeout-seconds", default=15.0, show_default=True, type=float)
+def tester_api_create(
+    config_path: Path,
+    name: str,
+    method: str,
+    url: str,
+    query_json: str,
+    headers_json: str,
+    body_json: str,
+    auth_bearer_env: str,
+    expected_status: int,
+    json_assertions: tuple[str, ...],
+    schema_assertion_json: str,
+    latency_ms: int,
+    timeout_seconds: float,
+) -> None:
+    cfg = load_config(config_path)
+    auth = (
+        {"type": "bearer", "token_env": auth_bearer_env.strip()}
+        if auth_bearer_env.strip()
+        else {}
+    )
+    parsed_json_assertions = []
+    for item in json_assertions:
+        parsed = _json_option(item, label="json-assertion", default={})
+        if parsed:
+            parsed_json_assertions.append(parsed)
+    schema_assertions = []
+    if schema_assertion_json.strip():
+        schema_assertions.append(
+            _json_option(schema_assertion_json, label="schema-assertion-json", default={})
+        )
+    spec = create_api_spec(
+        specs_dir=api_specs_dir_for_data_dir(cfg.run.data_dir),
+        name=name,
+        method=method,
+        url=url,
+        query=_json_option(query_json, label="query-json", default={}),
+        headers=_json_option(headers_json, label="headers-json", default={}),
+        body=_json_option(body_json, label="body-json", default=None),
+        auth=auth,
+        expected_status=expected_status,
+        json_assertions=parsed_json_assertions,
+        schema_assertions=schema_assertions,
+        latency_ms=latency_ms,
+        timeout_seconds=timeout_seconds,
+    )
+    click.echo(f"Created API test spec: {spec.spec_id}")
+
+
+@tester_group.command("api-list")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def tester_api_list(config_path: Path) -> None:
+    cfg = load_config(config_path)
+    specs = list_api_specs(api_specs_dir_for_data_dir(cfg.run.data_dir))
+    if not specs:
+        click.echo("No API test specs found.")
+        return
+    for spec in specs:
+        click.echo(f"{spec.spec_id}\t{spec.method}\t{spec.url}\t{spec.name}")
+
+
+@tester_group.command("api-run")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.argument("spec_id")
+def tester_api_run(config_path: Path, spec_id: str) -> None:
+    cfg = load_config(config_path)
+    spec = load_api_spec(api_specs_dir_for_data_dir(cfg.run.data_dir), spec_id)
+    result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(cfg.run.data_dir))
+    click.echo(json.dumps(result.__dict__, indent=2))
+    if not result.ok:
+        raise click.ClickException("API test run failed.")
 
 
 @tester_group.command("show")

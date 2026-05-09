@@ -136,6 +136,43 @@ def test_tester_create_suite_defaults_to_explore_mode(
     assert "\texplore_suite\t" in listed.output
 
 
+def test_tester_api_create_list_and_run(tmp_path: Path, monkeypatch) -> None:
+    server, server_thread, app_url = _server_url()
+    try:
+        (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+
+        create = runner.invoke(
+            main,
+            [
+                "tester",
+                "api-create",
+                "--name",
+                "Health API",
+                "--url",
+                app_url,
+                "--json-assertion",
+                '{"path":"$.ok","equals":false}',
+            ],
+        )
+        assert create.exit_code == 0, create.output
+        spec_id = create.output.strip().split(": ")[1]
+
+        listed = runner.invoke(main, ["tester", "api-list"])
+        assert listed.exit_code == 0, listed.output
+        assert spec_id in listed.output
+
+        ran = runner.invoke(main, ["tester", "api-run", spec_id])
+        assert ran.exit_code != 0
+        assert '"status_code": 200' in ran.output
+        assert '"assertion_id": "json-0"' in ran.output
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+
 def test_tester_create_uses_auth_profile_without_persisting_secret(
     tmp_path: Path, monkeypatch
 ) -> None:
