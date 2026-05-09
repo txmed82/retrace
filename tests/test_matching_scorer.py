@@ -208,3 +208,4 @@ def test_score_repo_for_finding_ignores_opaque_route_ids(
 
     assert out
     assert out[0].file_path == "server/routes/customers.ts"
+    assert "api_route_pattern:/api/customers/cus_123456789/invoices" in out[0].rationale
