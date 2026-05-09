@@ -15,6 +15,7 @@ import click
 from retrace.config import load_config
 from retrace.github_app import GitHubWebhookError, handle_github_webhook
 from retrace.ingester import PostHogIngester
+from retrace.incidents import get_incident_detail
 from retrace.issue_sink_clients import GitHubClient, IssueSinkError, LinearClient
 from retrace.issue_sinks import build_issue_card, compact_issue_card, promote_replay_issue
 from retrace.llm.client import LLMClient
@@ -139,6 +140,123 @@ def _row_dict(row: Any, *, include_payload: bool = False) -> dict[str, Any]:
     return out
 
 
+def _dt_api(value: Any) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else ""
+
+
+def _incident_api_dict(
+    *,
+    store: Storage,
+    incident: Any,
+    failures: list[Any] | None = None,
+) -> dict[str, Any]:
+    linked_failures = failures
+    if linked_failures is None:
+        linked_failures = store.list_incident_failures(incident_id=incident.id)
+    representative = linked_failures[0] if linked_failures else None
+    trace_ids: list[str] = []
+    top_stack_frame = ""
+    transaction = ""
+    release = ""
+    provider = ""
+    if representative is not None:
+        metadata = dict(getattr(representative, "metadata", {}) or {})
+        trace_value = metadata.get("trace_ids")
+        if isinstance(trace_value, list):
+            trace_ids = [str(item) for item in trace_value if str(item).strip()]
+        top_stack_frame = str(metadata.get("top_stack_frame") or "")
+        transaction = str(metadata.get("transaction") or metadata.get("route") or "")
+        release = str(metadata.get("release") or metadata.get("deploy_sha") or "")
+        provider = str(metadata.get("provider") or "")
+    return {
+        "id": incident.id,
+        "public_id": incident.public_id,
+        "title": incident.title,
+        "summary": incident.summary,
+        "severity": incident.severity,
+        "status": incident.status,
+        "failure_count": incident.failure_count,
+        "evidence_count": incident.evidence_count,
+        "repair_task_id": incident.repair_task_id,
+        "group_key": incident.group_key,
+        "metadata": dict(incident.metadata or {}),
+        "first_seen_at": _dt_api(incident.created_at),
+        "last_seen_at": _dt_api(incident.updated_at),
+        "latest_failure": (
+            _failure_api_dict(representative, include_metadata=False)
+            if representative is not None
+            else None
+        ),
+        "trace_ids": trace_ids,
+        "top_stack_frame": top_stack_frame,
+        "transaction": transaction,
+        "release": release,
+        "provider": provider,
+    }
+
+
+def _failure_api_dict(failure: Any, *, include_metadata: bool = True) -> dict[str, Any]:
+    payload = {
+        "id": failure.id,
+        "public_id": failure.public_id,
+        "source_type": failure.source_type,
+        "source_external_id": failure.source_external_id,
+        "fingerprint": failure.fingerprint,
+        "title": failure.title,
+        "summary": failure.summary,
+        "severity": failure.severity,
+        "confidence": failure.confidence,
+        "status": failure.status,
+        "affected_users": failure.affected_users,
+        "affected_sessions": failure.affected_sessions,
+        "first_seen_ms": failure.first_seen_ms,
+        "last_seen_ms": failure.last_seen_ms,
+        "related_deploy_sha": failure.related_deploy_sha,
+        "linked_tests": list(failure.linked_tests or []),
+        "linked_repair_task_id": failure.linked_repair_task_id,
+        "created_at": _dt_api(failure.created_at),
+        "updated_at": _dt_api(failure.updated_at),
+    }
+    if include_metadata:
+        payload["metadata"] = dict(failure.metadata or {})
+    return payload
+
+
+def _evidence_api_dict(evidence: Any) -> dict[str, Any]:
+    return {
+        "id": evidence.id,
+        "failure_id": evidence.failure_id,
+        "evidence_type": evidence.evidence_type,
+        "occurred_at_ms": evidence.occurred_at_ms,
+        "source": evidence.source,
+        "redaction_state": evidence.redaction_state,
+        "payload": dict(evidence.payload or {}),
+        "artifact_path": evidence.artifact_path,
+        "created_at": _dt_api(evidence.created_at),
+    }
+
+
+def _repair_task_api_dict(task: Any) -> dict[str, Any]:
+    return {
+        "id": task.id,
+        "public_id": task.public_id,
+        "failure_id": task.failure_id,
+        "source_type": task.source_type,
+        "source_external_id": task.source_external_id,
+        "title": task.title,
+        "status": task.status,
+        "likely_files": list(task.likely_files or []),
+        "validation_commands": list(task.validation_commands or []),
+        "branch": task.branch,
+        "pr_url": task.pr_url,
+        "risk_notes": task.risk_notes,
+        "metadata": dict(task.metadata or {}),
+        "evidence_ids": list(task.evidence_ids or []),
+        "created_at": _dt_api(task.created_at),
+        "updated_at": _dt_api(task.updated_at),
+    }
+
+
 def _build_enricher(cfg: Any, store: Storage) -> CorrelationEnricher | None:
     """Construct a best-effort correlation enricher when PostHog is configured.
 
@@ -241,6 +359,13 @@ def _handler(
             if parsed.path.startswith("/api/replays/"):
                 replay_id = parsed.path.removeprefix("/api/replays/").strip("/")
                 self._handle_get_replay(replay_id, parsed.query)
+                return
+            if parsed.path == "/api/app-errors":
+                self._handle_list_app_error_incidents(parsed.query)
+                return
+            if parsed.path.startswith("/api/app-errors/"):
+                incident_id = parsed.path.removeprefix("/api/app-errors/").strip("/")
+                self._handle_get_app_error_incident(incident_id, parsed.query)
                 return
             if parsed.path == "/api/issues":
                 self._handle_list_issues(parsed.query)
@@ -834,6 +959,104 @@ def _handler(
                     "project_id": token.project_id,
                     "environment_id": environment_id,
                     "issues": [_row_dict(r) for r in rows],
+                },
+            )
+
+        def _handle_list_app_error_incidents(self, query: str) -> None:
+            token = _require_service_token(
+                self,
+                store,
+                scopes={"app_errors:read", "issues:read", "mcp:read", "admin"},
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            status = str(params.get("status") or "").strip() or None
+            try:
+                limit = int(params.get("limit") or "100")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_limit"})
+                return
+            incidents = store.list_incidents(
+                project_id=token.project_id,
+                environment_id=environment_id,
+                status=status,
+                limit=limit,
+            )
+            _json_response(
+                self,
+                200,
+                {
+                    "project_id": token.project_id,
+                    "environment_id": environment_id,
+                    "incidents": [
+                        _incident_api_dict(store=store, incident=incident)
+                        for incident in incidents
+                    ],
+                },
+            )
+
+        def _handle_get_app_error_incident(self, incident_id: str, query: str) -> None:
+            token = _require_service_token(
+                self,
+                store,
+                scopes={"app_errors:read", "issues:read", "mcp:read", "admin"},
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            incident_id = incident_id.strip()
+            if not incident_id:
+                _json_response(self, 404, {"error": "not_found"})
+                return
+            include_sensitive = str(
+                params.get("include_sensitive") or "false"
+            ).strip().lower() in {"1", "true", "yes"}
+            try:
+                detail = get_incident_detail(
+                    store=store,
+                    incident_id=incident_id,
+                    include_sensitive_evidence=include_sensitive,
+                )
+            except ValueError:
+                _json_response(self, 404, {"error": "not_found"})
+                return
+            if (
+                detail.incident.project_id != token.project_id
+                or detail.incident.environment_id != environment_id
+            ):
+                _json_response(self, 404, {"error": "not_found"})
+                return
+            _json_response(
+                self,
+                200,
+                {
+                    "project_id": token.project_id,
+                    "environment_id": environment_id,
+                    "incident": _incident_api_dict(
+                        store=store,
+                        incident=detail.incident,
+                        failures=detail.failures,
+                    ),
+                    "failures": [
+                        _failure_api_dict(failure) for failure in detail.failures
+                    ],
+                    "evidence": [
+                        _evidence_api_dict(evidence) for evidence in detail.evidence
+                    ],
+                    "repair_task": (
+                        _repair_task_api_dict(detail.repair_task)
+                        if detail.repair_task is not None
+                        else None
+                    ),
                 },
             )
 

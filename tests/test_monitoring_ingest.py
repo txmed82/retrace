@@ -441,6 +441,132 @@ def test_sentry_endpoint_rejects_extra_path_segments(tmp_path: Path) -> None:
     assert payload["error"] == "not_found"
 
 
+def test_app_error_incident_api_lists_monitoring_incidents(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Reader",
+        scopes=["issues:read"],
+    )
+    event = {
+        "event_id": "evt-list-1",
+        "title": "TypeError in checkout",
+        "level": "error",
+        "transaction": "/checkout",
+        "release": "abc123",
+        "contexts": {"trace": {"trace_id": "cccccccccccccccccccccccccccccccc"}},
+        "exception": {
+            "values": [
+                {
+                    "type": "TypeError",
+                    "value": "Cannot read cart total",
+                    "stacktrace": {
+                        "frames": [
+                            {
+                                "filename": "src/checkout.ts",
+                                "function": "submit",
+                                "lineno": 42,
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
+    }
+    result = ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={"event": event},
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "GET",
+            f"/api/app-errors?environment_id={workspace.environment_id}",
+            headers={"Authorization": f"Bearer {service.token}"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 200
+    assert payload["project_id"] == workspace.project_id
+    assert len(payload["incidents"]) == 1
+    incident = payload["incidents"][0]
+    assert incident["public_id"] == result.incident_public_id
+    assert incident["failure_count"] == 1
+    assert incident["evidence_count"] == 1
+    assert incident["trace_ids"] == ["cccccccccccccccccccccccccccccccc"]
+    assert incident["top_stack_frame"] == "src/checkout.ts:submit:42"
+    assert incident["transaction"] == "/checkout"
+    assert incident["release"] == "abc123"
+    assert incident["latest_failure"]["source_external_id"] == "sentry:evt-list-1"
+
+
+def test_app_error_incident_api_detail_controls_sensitive_evidence(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Reader",
+        scopes=["app_errors:read"],
+    )
+    result = ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={
+            "event": {
+                "event_id": "evt-detail-1",
+                "title": "ReferenceError in settings",
+                "level": "error",
+            }
+        },
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "GET",
+            f"/api/app-errors/{result.incident_public_id}?environment_id={workspace.environment_id}",
+            headers={"Authorization": f"Bearer {service.token}"},
+        )
+        safe_response = conn.getresponse()
+        safe_payload = json.loads(safe_response.read().decode("utf-8"))
+        conn.close()
+
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "GET",
+            (
+                f"/api/app-errors/{result.incident_public_id}"
+                f"?environment_id={workspace.environment_id}&include_sensitive=true"
+            ),
+            headers={"Authorization": f"Bearer {service.token}"},
+        )
+        sensitive_response = conn.getresponse()
+        sensitive_payload = json.loads(sensitive_response.read().decode("utf-8"))
+        conn.close()
+
+    assert safe_response.status == 200
+    assert safe_payload["incident"]["public_id"] == result.incident_public_id
+    assert len(safe_payload["failures"]) == 1
+    assert safe_payload["evidence"] == []
+    assert sensitive_response.status == 200
+    assert len(sensitive_payload["evidence"]) == 1
+    assert sensitive_payload["evidence"][0]["redaction_state"] == "sensitive"
+    assert sensitive_payload["evidence"][0]["payload"]["external_id"] == "evt-detail-1"
+
+
 def test_monitoring_webhook_endpoint_rejects_empty_payload(tmp_path: Path) -> None:
     store, workspace = _store(tmp_path)
     service = create_service_token(
