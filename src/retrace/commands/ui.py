@@ -1261,6 +1261,7 @@ _INDEX_HTML = """<!doctype html>
       <button class=\"nav-btn active\" type=\"button\" data-view=\"dashboard\">Dashboard</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"issues\">Issues</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"replays\">Replays</button>
+      <button class=\"nav-btn\" type=\"button\" data-view=\"findings\">Findings</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"tests\">Tests</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"runs\">Runs</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"settings\">Settings</button>
@@ -1326,6 +1327,7 @@ _INDEX_HTML = """<!doctype html>
       if(byId('findings')) byId('findings').style.display = view === 'findings' ? '' : 'none';
     }
     document.querySelectorAll('.nav-btn').forEach(el => el.addEventListener('click', () => switchView(el.dataset.view)));
+    window.addEventListener('hashchange', () => applyReplayHash(replayState.issues, replayState.sessions));
 
     function statusClass(value){
       const v = String(value || '').toLowerCase();
@@ -1349,6 +1351,13 @@ _INDEX_HTML = """<!doctype html>
           openReplayIssue(el.dataset.replayIssue);
         });
       });
+    }
+
+    async function refreshTesterAndReplay(issueId = '', processStatus = ''){
+      await Promise.all([loadTesterPanel(), loadReplayDashboard(processStatus)]);
+      const targetId = issueId || replayState.activeIssueId;
+      const refreshed = replayState.issues.find(i => i.public_id === targetId);
+      if(refreshed) renderReplayIssueDetail(refreshed);
     }
 
     function llmKeyLabel(provider){
@@ -1752,11 +1761,11 @@ const retrace = init({
       if(!res.ok || !data.ok){
         const msg = data?.result?.error || data.error || 'Run failed';
         byId('testerRunStatus').textContent = `Failed: ${msg}`;
-        await loadTesterPanel();
+        await refreshTesterAndReplay();
         return;
       }
       byId('testerRunStatus').textContent = `OK run ${data.result.run_id} (${data.result.status || 'passed'})`;
-      await loadTesterPanel();
+      await refreshTesterAndReplay();
     }
 
     async function generateReplayIssueSpec(issue){
@@ -1779,7 +1788,7 @@ const retrace = init({
         return;
       }
       if(status) status.textContent = `Created ${data.spec.spec_id} (${data.confidence} confidence)`;
-      await loadTesterPanel();
+      await refreshTesterAndReplay(issue.public_id);
     }
 
     async function generateReplayIssueFixPrompts(issue){
@@ -1827,7 +1836,8 @@ const retrace = init({
       Object.assign(issue, updated);
       if(status) status.textContent = `Status: ${updated.status}`;
       await loadReplayDashboard(`Updated ${updated.public_id || issue.public_id} to ${updated.status}.`);
-      renderReplayIssueDetail(updated);
+      const refreshed = replayState.issues.find(i => i.public_id === (updated.public_id || issue.public_id));
+      renderReplayIssueDetail(refreshed || issue);
     }
 
     function renderReplayFixSuggestions(data){
