@@ -736,6 +736,108 @@ def _failure_test_link_payload(link: Any) -> dict[str, Any]:
     }
 
 
+def _repair_task_payload(task: Any | None) -> dict[str, Any] | None:
+    if task is None:
+        return None
+    return {
+        "id": task.id,
+        "public_id": task.public_id,
+        "failure_id": task.failure_id,
+        "source_type": task.source_type,
+        "source_external_id": task.source_external_id,
+        "title": task.title,
+        "status": task.status,
+        "likely_files": task.likely_files,
+        "prompt_artifacts": task.prompt_artifacts,
+        "validation_commands": task.validation_commands,
+        "branch": task.branch,
+        "pr_url": task.pr_url,
+        "risk_notes": task.risk_notes,
+        "metadata": task.metadata,
+        "evidence_ids": task.evidence_ids,
+        "created_at": task.created_at.isoformat(),
+        "updated_at": task.updated_at.isoformat(),
+    }
+
+
+def _issue_workflow_payload(issue: dict[str, Any]) -> dict[str, Any]:
+    timeline_count = len(issue.get("timeline") or [])
+    reproduction_count = len(issue.get("reproduction_steps") or [])
+    test_links = issue.get("test_links") if isinstance(issue.get("test_links"), list) else []
+    repair_task = issue.get("repair_task") if isinstance(issue.get("repair_task"), dict) else None
+    api_call_count = len(issue.get("api_calls") or [])
+    replay_count = len(issue.get("sessions") or [])
+    status = str(issue.get("status") or "")
+    coverage_states = [str(link.get("coverage_state") or "") for link in test_links]
+    latest_statuses = [str(link.get("latest_run_status") or "") for link in test_links]
+    if not test_links:
+        coverage_state = "not_covered"
+    elif "covered_failing" in coverage_states:
+        coverage_state = "covered_failing"
+    elif "covered_passing" in coverage_states:
+        coverage_state = "covered_passing"
+    elif "covered_flaky" in coverage_states:
+        coverage_state = "covered_flaky"
+    else:
+        coverage_state = coverage_states[0] or "covered_unverified"
+
+    stages = {
+        "evidence": "complete" if timeline_count else "blocked",
+        "reproduction": "complete" if reproduction_count or replay_count else "blocked",
+        "test": "complete" if test_links else "current",
+        "repair": "complete" if repair_task else "current",
+        "verification": "complete" if coverage_state == "covered_passing" else "current",
+    }
+    if not test_links:
+        stages["repair"] = "blocked"
+        stages["verification"] = "blocked"
+    elif coverage_state == "covered_failing":
+        stages["verification"] = "blocked"
+    if status == "ignored":
+        primary_label = "Ignored fingerprint"
+        primary_action = "none"
+    elif not timeline_count:
+        primary_label = "Review raw evidence"
+        primary_action = "review_timeline"
+    elif not test_links:
+        primary_label = "Generate regression test"
+        primary_action = "generate_replay_spec"
+    elif coverage_state == "covered_failing" and not repair_task:
+        primary_label = "Generate repair task"
+        primary_action = "generate_repair"
+    elif coverage_state == "covered_failing":
+        primary_label = "Fix and rerun linked tests"
+        primary_action = "run_tests"
+    elif not repair_task and status not in {"resolved", "ignored"}:
+        primary_label = "Generate repair task"
+        primary_action = "generate_repair"
+    elif status == "resolved" and coverage_state != "covered_passing":
+        primary_label = "Verify resolved issue"
+        primary_action = "verify_resolved"
+    elif coverage_state == "covered_passing":
+        primary_label = "Covered by passing test"
+        primary_action = "none"
+    else:
+        primary_label = "Run linked tests"
+        primary_action = "run_tests"
+
+    return {
+        "coverage_state": coverage_state,
+        "latest_run_statuses": latest_statuses,
+        "primary_action": primary_action,
+        "primary_label": primary_label,
+        "stage_states": stages,
+        "counts": {
+            "timeline": timeline_count,
+            "reproduction_steps": reproduction_count,
+            "replays": replay_count,
+            "api_calls": api_call_count,
+            "tests": len(test_links),
+            "repair_tasks": 1 if repair_task else 0,
+        },
+    }
+
+
 def _replay_issue_payload(
     row: Any, *, sessions: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -777,6 +879,8 @@ def _replay_issue_payload(
         "sessions": sessions,
         "timeline": _replay_evidence_timeline(evidence),
         "test_links": [],
+        "repair_task": None,
+        "workflow": {},
         "share_url": f"#issue={str(row['public_id'])}",
     }
 
@@ -911,6 +1015,11 @@ def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
                 _failure_test_link_payload(link)
                 for link in store.list_failure_test_links(failure_id=failure_id)
             ]
+            repair_tasks = store.list_repair_tasks(failure_id=failure_id, limit=1)
+            payload["repair_task"] = _repair_task_payload(
+                repair_tasks[0] if repair_tasks else None
+            )
+        payload["workflow"] = _issue_workflow_payload(payload)
         issues.append(payload)
     sessions = []
     for row in store.list_recent_replay_sessions(limit=50):
@@ -1458,6 +1567,14 @@ _INDEX_HTML = """<!doctype html>
     .timeline-row.detector { background:#172033; border-left:3px solid #f59e0b; }
     .timeline-kind { color:#93c5fd; text-transform:uppercase; font-size:11px; letter-spacing:.08em; }
     .timeline-summary { color:var(--muted); margin-top:2px; overflow-wrap:anywhere; }
+    .workflow-strip { display:grid; grid-template-columns: repeat(5, minmax(110px, 1fr)); gap:8px; margin:10px 0 12px 0; }
+    .workflow-step { border:1px solid #26364f; border-radius:8px; padding:9px; background:#0b1220; min-height:58px; }
+    .workflow-step.complete { border-color:#14532d; background:#0d1f19; }
+    .workflow-step.current { border-color:#0e7490; background:#102235; }
+    .workflow-step.blocked { border-color:#4b5563; color:#9ca3af; }
+    .workflow-step strong { display:block; font-size:12px; margin-bottom:3px; }
+    .workflow-step span { display:block; font-size:12px; color:var(--muted); }
+    .workflow-action { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
     .ok { color:#86efac; } .bad { color:#fca5a5; }
     @media (max-width: 980px) {
       .app-shell { grid-template-columns: 1fr; height:auto; min-height:100vh; }
@@ -1465,7 +1582,7 @@ _INDEX_HTML = """<!doctype html>
       .nav-btn { display:inline-block; width:auto; margin-right:4px; }
       .rail { border-right:0; border-bottom:1px solid var(--line); max-height:42vh; }
       .main { padding:12px; }
-      .metric-grid, .detail-grid, .grid { grid-template-columns: 1fr; }
+      .metric-grid, .detail-grid, .grid, .workflow-strip { grid-template-columns: 1fr; }
       .timeline-row { grid-template-columns: 1fr; }
     }
   </style>
@@ -2089,6 +2206,7 @@ const retrace = init({
       }
       if(status) status.textContent = `Wrote ${data.generated || 0} prompt set(s) for ${data.repo || 'repo'}`;
       renderReplayFixSuggestions(data);
+      await refreshTesterAndReplay(issue.public_id);
     }
 
     async function transitionReplayIssue(issue, statusValue){
@@ -2429,6 +2547,68 @@ const retrace = init({
       `;
     }
 
+    function renderIssueWorkflow(issue){
+      const workflow = issue.workflow || {};
+      const stages = workflow.stage_states || {};
+      const counts = workflow.counts || {};
+      const stageLabels = [
+        ['evidence', 'Evidence', `${counts.timeline || 0} item(s)`],
+        ['reproduction', 'Reproduce', `${counts.replays || 0} replay(s)`],
+        ['test', 'Test', `${counts.tests || 0} linked`],
+        ['repair', 'Repair', `${counts.repair_tasks || 0} task(s)`],
+        ['verification', 'Verify', workflow.coverage_state || 'not_covered'],
+      ];
+      const action = workflow.primary_action || 'none';
+      const button = action !== 'none'
+        ? `<button class="btn" type="button" data-workflow-action="${esc(action)}">${esc(workflow.primary_label || 'Continue')}</button>`
+        : '';
+      return `
+        <div class="workflow-strip">
+          ${stageLabels.map(([key, label, detail]) => `<div class="workflow-step ${esc(stages[key] || 'current')}"><strong>${esc(label)}</strong><span>${esc(detail)}</span></div>`).join('')}
+        </div>
+        <div class="workflow-action">
+          ${button}
+          <span class="empty">Next: ${esc(workflow.primary_label || 'Review issue')}</span>
+        </div>
+      `;
+    }
+
+    function handleIssueWorkflowAction(issue, action){
+      if(action === 'generate_replay_spec') return generateReplayIssueSpec(issue);
+      if(action === 'generate_repair') return generateReplayIssueFixPrompts(issue);
+      if(action === 'verify_resolved') return verifyResolvedReplayIssues();
+      if(action === 'review_timeline'){
+        byId('issueTimeline')?.scrollIntoView({behavior:'smooth', block:'start'});
+        return;
+      }
+      if(action === 'run_tests'){
+        switchView('tests');
+        return;
+      }
+    }
+
+    function renderRepairTask(issue){
+      const task = issue.repair_task || null;
+      if(!task){
+        return '<div class="empty">No repair task yet. Generate fix prompts to package evidence, likely files, validation commands, and agent-ready prompts.</div>';
+      }
+      const files = (task.likely_files || []).map(file => `<li><code>${esc(file)}</code></li>`).join('');
+      const commands = (task.validation_commands || []).map(command => `<li><code>${esc(command)}</code></li>`).join('');
+      const artifacts = (task.prompt_artifacts || []).map(artifact => {
+        const label = artifact.label || artifact.path || artifact.type || 'artifact';
+        return `<li>${esc(label)}</li>`;
+      }).join('');
+      const prUrl = safeExternalUrl(task.pr_url);
+      return `
+        <div class="empty"><code>${esc(task.public_id || task.id)}</code> · ${esc(task.status || 'open')} · ${esc(task.title || 'Repair task')}</div>
+        ${files ? `<div class="lbl">Likely Files</div><ul>${files}</ul>` : ''}
+        ${commands ? `<div class="lbl">Validation Commands</div><ul>${commands}</ul>` : ''}
+        ${artifacts ? `<div class="lbl">Prompt Artifacts</div><ul>${artifacts}</ul>` : ''}
+        ${task.risk_notes ? `<div class="lbl">Risk Notes</div><div>${esc(task.risk_notes)}</div>` : ''}
+        ${prUrl ? `<div class="lbl">PR</div><a href="${esc(prUrl)}" target="_blank" rel="noopener noreferrer">${esc(prUrl)}</a>` : ''}
+      `;
+    }
+
     function renderExternalLinks(issue){
       const links = [];
       const externalTicketUrl = safeExternalUrl(issue.external_ticket_url);
@@ -2490,6 +2670,7 @@ const retrace = init({
           </div>
         </div>
         <div class="empty" id="replayLifecycleStatus"></div>
+        ${renderIssueWorkflow(issue)}
         <div class="detail-grid">
           <div>
             <div class="card">
@@ -2507,6 +2688,7 @@ const retrace = init({
               <button class="btn" id="generateReplayFixPromptsBtn" type="button">Generate Fix Prompts</button>
               <span class="empty" id="replayFixPromptStatus"></span>
               <div style="height:10px"></div>
+              ${renderRepairTask(issue)}
               <div id="replayFixPrompts"></div>
             </div>
           </div>
@@ -2538,6 +2720,9 @@ const retrace = init({
       byId('generateReplaySpecBtn')?.addEventListener('click', () => generateReplayIssueSpec(issue));
       byId('generateReplayApiSpecBtn')?.addEventListener('click', () => generateReplayIssueApiSpec(issue));
       byId('generateReplayFixPromptsBtn')?.addEventListener('click', () => generateReplayIssueFixPrompts(issue));
+      root.querySelectorAll('[data-workflow-action]').forEach(el => {
+        el.addEventListener('click', () => handleIssueWorkflowAction(issue, el.dataset.workflowAction));
+      });
       root.querySelectorAll('[data-run-api-spec]').forEach(el => {
         el.addEventListener('click', () => runReplayIssueApiSpec(el.dataset.runApiSpec, el.dataset.issueId));
       });

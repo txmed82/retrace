@@ -110,6 +110,9 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "X-Retrace-Key" in _INDEX_HTML
     assert "copyEvidenceBundle" in _INDEX_HTML
     assert "timelineTypeFilter" in _INDEX_HTML
+    assert "renderIssueWorkflow" in _INDEX_HTML
+    assert "renderRepairTask" in _INDEX_HTML
+    assert "data-workflow-action" in _INDEX_HTML
     assert "Confidence:" in _INDEX_HTML
     assert "Reasons:" in _INDEX_HTML
     assert 'data-view="issues"' in _INDEX_HTML
@@ -263,6 +266,16 @@ def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> N
             error="Checkout still returns 500",
         ),
     )
+    repair_task_id = store.upsert_repair_task(
+        failure_id=str(issue_row["canonical_failure_id"]),
+        title="Fix checkout failure",
+        source_type="replay_issue",
+        source_external_id=created.public_id,
+        status="open",
+        likely_files=["src/checkout.tsx"],
+        validation_commands=["uv run pytest tests/test_checkout.py"],
+        risk_notes="Checkout remains covered by a failing replay regression.",
+    )
 
     payload = _to_replay_dashboard_payload(store)
     issue = payload["issues"][0]
@@ -289,6 +302,19 @@ def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> N
     assert issue["test_links"][0]["coverage_state"] == "covered_failing"
     assert issue["test_links"][0]["latest_run_status"] == "failed"
     assert issue["test_links"][0]["latest_run_classification"] == "app_bug"
+    assert issue["repair_task"]["id"] == repair_task_id
+    assert issue["repair_task"]["likely_files"] == ["src/checkout.tsx"]
+    assert issue["repair_task"]["validation_commands"] == [
+        "uv run pytest tests/test_checkout.py"
+    ]
+    assert issue["workflow"]["coverage_state"] == "covered_failing"
+    assert issue["workflow"]["primary_action"] == "run_tests"
+    assert issue["workflow"]["stage_states"]["evidence"] == "complete"
+    assert issue["workflow"]["stage_states"]["test"] == "complete"
+    assert issue["workflow"]["stage_states"]["repair"] == "complete"
+    assert issue["workflow"]["stage_states"]["verification"] == "blocked"
+    assert issue["workflow"]["counts"]["timeline"] == 4
+    assert issue["workflow"]["counts"]["repair_tasks"] == 1
 
 
 def test_create_sdk_key_payload_reports_creation_error(
