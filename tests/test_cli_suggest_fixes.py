@@ -159,6 +159,24 @@ def test_suggest_fixes_generates_from_replay_issue(tmp_path: Path, monkeypatch):
     assert "checkout.tsx" in artifact
     assert issue_id in codex_files[0].read_text()
 
+    store = Storage(tmp_path / "data" / "retrace.db")
+    store.init_schema()
+    tasks = store.list_repair_tasks()
+    assert len(tasks) == 1
+    assert tasks[0].source_type == "replay_issue"
+    assert tasks[0].source_external_id == issue_id
+    assert "src/checkout.tsx" in tasks[0].likely_files
+    assert len(tasks[0].prompt_artifacts) == 3
+    workspace = store.ensure_workspace(project_name="Default")
+    failure = store.find_failure_by_source(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        source_type="replay_issue",
+        source_external_id=issue_id,
+    )
+    assert failure is not None
+    assert failure.linked_repair_task_id == tasks[0].id
+
 
 def test_suggest_fixes_replay_issue_honors_project_environment_scope(
     tmp_path: Path, monkeypatch

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,8 +9,11 @@ from typing import Any
 
 from retrace.matching import CodeCandidate, score_repo_for_finding
 from retrace.prompts import build_claude_code_prompt, build_codex_prompt
+from retrace.repair import repair_task_from_fix_suggestion
 from retrace.reports.parser import ParsedFinding
 from retrace.storage import GitHubRepoRow, Storage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -21,6 +25,7 @@ class FixSuggestionArtifact:
     prompts: dict[str, str]
     prompt_files: dict[str, str]
     artifact_json: str
+    repair_task_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,8 @@ def generate_fix_suggestions(
     source_label: str,
     artifact_stem: str,
     findings: list[ParsedFinding],
+    project_id: str = "",
+    environment_id: str = "",
 ) -> FixSuggestionResult:
     out_dir.mkdir(parents=True, exist_ok=True)
     stored = 0
@@ -191,6 +198,23 @@ def generate_fix_suggestions(
         (out_dir / prompt_files["claude_code"]).write_text(
             prompts["claude_code"] + "\n", encoding="utf-8"
         )
+        try:
+            repair_task_id = _upsert_replay_issue_repair_task(
+                store=store,
+                report_key=report_key,
+                repo=repo,
+                repo_path=str(effective_repo_path) if effective_repo_path else "",
+                out_dir=out_dir,
+                finding=finding,
+                candidates=candidates,
+                prompt_files=prompt_files,
+                artifact_json=artifact_json,
+                project_id=project_id,
+                environment_id=environment_id,
+            )
+        except Exception:
+            logger.exception("failed to persist repair task for %s", report_key)
+            repair_task_id = ""
         generated += 1
         artifacts.append(
             FixSuggestionArtifact(
@@ -201,6 +225,7 @@ def generate_fix_suggestions(
                 prompts=prompts,
                 prompt_files=prompt_files,
                 artifact_json=artifact_json,
+                repair_task_id=repair_task_id,
             )
         )
 
@@ -242,3 +267,62 @@ def _json_list(raw: Any) -> list[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item) for item in parsed if str(item)]
+
+
+def _upsert_replay_issue_repair_task(
+    *,
+    store: Storage,
+    report_key: str,
+    repo: GitHubRepoRow,
+    repo_path: str,
+    out_dir: Path,
+    finding: ParsedFinding,
+    candidates: list[CodeCandidate],
+    prompt_files: dict[str, str],
+    artifact_json: str,
+    project_id: str = "",
+    environment_id: str = "",
+) -> str:
+    prefix = "replay://issue/"
+    if not report_key.startswith(prefix) or not project_id or not environment_id:
+        return ""
+    issue_public_id = report_key.removeprefix(prefix)
+    failure = store.find_failure_by_source(
+        project_id=project_id,
+        environment_id=environment_id,
+        source_type="replay_issue",
+        source_external_id=issue_public_id,
+    )
+    if failure is None:
+        return ""
+    evidence = store.list_failure_evidence(
+        failure_id=failure.id,
+        include_sensitive=False,
+    )
+    draft = repair_task_from_fix_suggestion(
+        failure_id=failure.id,
+        issue_public_id=issue_public_id,
+        title=finding.title,
+        repo_full_name=repo.repo_full_name,
+        repo_path=repo_path,
+        out_dir=out_dir,
+        candidates=candidates,
+        prompt_files=prompt_files,
+        artifact_json=artifact_json,
+        evidence_ids=[item.id for item in evidence],
+    )
+    return store.upsert_repair_task(
+        failure_id=draft.failure_id,
+        title=draft.title,
+        source_type=draft.source_type,
+        source_external_id=draft.source_external_id,
+        status=draft.status,
+        likely_files=draft.likely_files,
+        prompt_artifacts=draft.prompt_artifacts,
+        validation_commands=draft.validation_commands,
+        branch=draft.branch,
+        pr_url=draft.pr_url,
+        risk_notes=draft.risk_notes,
+        metadata=draft.metadata,
+        evidence_ids=draft.evidence_ids,
+    )

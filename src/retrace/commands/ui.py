@@ -903,6 +903,8 @@ def _generate_replay_issue_fix_prompts_payload(
             source_label=f"replay issue {issue['public_id']}",
             artifact_stem=f"replay-{slugify(str(issue['public_id']))}",
             findings=[finding],
+            project_id=project_id,
+            environment_id=environment_id,
         )
     except Exception as exc:
         return {"ok": False, "error": str(exc)}, 400
@@ -931,6 +933,7 @@ def _generate_replay_issue_fix_prompts_payload(
             "prompts": artifact.prompts if artifact else {},
             "prompt_files": artifact.prompt_files if artifact else {},
             "artifact_json": artifact.artifact_json if artifact else "",
+            "repair_task_id": artifact.repair_task_id if artifact else "",
         },
         200,
     )

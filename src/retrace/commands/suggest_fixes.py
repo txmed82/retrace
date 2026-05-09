@@ -125,15 +125,22 @@ def suggest_fixes_command(
 
     source_label = ""
     artifact_stem = ""
+    effective_project_id = ""
+    effective_environment_id = ""
     if replay_issue_id.strip():
-        workspace = store.ensure_workspace(project_name="Default")
-        effective_project_id = project_id.strip() or workspace.project_id
-        effective_environment_id = environment_id.strip() or workspace.environment_id
-        issue = store.get_replay_issue(
-            project_id=effective_project_id,
-            environment_id=effective_environment_id,
-            issue_id=replay_issue_id.strip(),
-        )
+        if project_id.strip() and environment_id.strip():
+            effective_project_id = project_id.strip()
+            effective_environment_id = environment_id.strip()
+            issue = store.get_replay_issue(
+                project_id=effective_project_id,
+                environment_id=effective_environment_id,
+                issue_id=replay_issue_id.strip(),
+            )
+        else:
+            issue = store.find_replay_issue(replay_issue_id.strip())
+            if issue is not None:
+                effective_project_id = str(issue["project_id"])
+                effective_environment_id = str(issue["environment_id"])
         if issue is None:
             raise click.ClickException(f"Replay issue not found: {replay_issue_id}")
         findings = [parsed_finding_from_replay_issue(issue)]
@@ -161,6 +168,8 @@ def suggest_fixes_command(
         source_label=source_label,
         artifact_stem=artifact_stem,
         findings=findings,
+        project_id=effective_project_id,
+        environment_id=effective_environment_id,
     )
 
     click.echo(
