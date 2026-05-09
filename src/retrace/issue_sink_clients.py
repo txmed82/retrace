@@ -447,6 +447,8 @@ class GitHubClient:
     ) -> dict[str, Any]:
         if not marker.strip():
             raise ValueError("marker is required")
+        if marker not in body:
+            body = f"{marker}\n{body}"
         for comment in self.list_issue_comments(repo=repo, number=number):
             if marker in str(comment.get("body") or ""):
                 comment_id = int(comment["id"])

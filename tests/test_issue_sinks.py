@@ -285,6 +285,38 @@ def test_github_client_creates_pull_request_review_comments() -> None:
     assert captured["json"]["comments"][0]["line"] == 10
 
 
+def test_github_client_upsert_comment_prepends_missing_marker() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[])
+        captured["method"] = request.method
+        captured["json"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            201,
+            json={
+                "id": 88,
+                "body": captured["json"]["body"],
+                "html_url": "https://github.com/acme/web/pull/12#issuecomment-88",
+            },
+        )
+
+    with httpx.Client(transport=_mock_transport(handler)) as raw:
+        client = GitHubClient(api_key="ghp_test", client=raw)
+        client.upsert_issue_comment(
+            repo="acme/web",
+            number=12,
+            marker="<!-- retrace-pr-review-summary -->",
+            body="summary without marker",
+        )
+
+    assert captured["method"] == "POST"
+    assert captured["json"]["body"] == (
+        "<!-- retrace-pr-review-summary -->\nsummary without marker"
+    )
+
+
 # ---------- promote_replay_issue end-to-end ----------
 
 
