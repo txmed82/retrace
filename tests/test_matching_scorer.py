@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from retrace.matching.scorer import score_repo_for_finding
 
@@ -209,3 +210,101 @@ def test_score_repo_for_finding_ignores_opaque_route_ids(
     assert out
     assert out[0].file_path == "server/routes/customers.ts"
     assert "api_route_pattern:/api/customers/cus_123456789/invoices" in out[0].rationale
+
+
+def test_score_repo_for_finding_uses_sourcemap_sources_for_stack_frames(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    (repo / "dist").mkdir(parents=True, exist_ok=True)
+    (repo / "src/components").mkdir(parents=True, exist_ok=True)
+    (repo / "src/pages").mkdir(parents=True, exist_ok=True)
+    (repo / "dist/app.js").write_text("function minified(){throw Error('boom')}")
+    (repo / "dist/app.js.map").write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "file": "app.js",
+                "sources": ["../src/components/CheckoutButton.tsx"],
+                "mappings": "",
+            }
+        )
+    )
+    (repo / "src/components/CheckoutButton.tsx").write_text(
+        "export function CheckoutButton(){ return <button />; }"
+    )
+    (repo / "src/pages/checkout.tsx").write_text(
+        "export function Checkout(){ return <CheckoutButton />; }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Checkout crash",
+        category="frontend_error",
+        evidence_text="TypeError at dist/app.js:1:143",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "src/components/CheckoutButton.tsx"
+    assert "stack_frame:src/components/CheckoutButton.tsx" in out[0].rationale
+    assert out[0].symbol == "CheckoutButton"
+
+
+def test_score_repo_for_finding_uses_framework_route_manifest(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / ".next/server").mkdir(parents=True, exist_ok=True)
+    (repo / "src/app/api/accounts/[accountId]").mkdir(parents=True, exist_ok=True)
+    (repo / "src/components").mkdir(parents=True, exist_ok=True)
+    (repo / ".next/server/app-paths-manifest.json").write_text(
+        json.dumps(
+            {
+                "/api/accounts/[accountId]": "app/api/accounts/[accountId]/route.js",
+            }
+        )
+    )
+    (repo / "src/app/api/accounts/[accountId]/route.ts").write_text(
+        "export async function GET(){ return Response.json({ok:false}); }"
+    )
+    (repo / "src/components/AccountLink.tsx").write_text(
+        "export function AccountLink(){ return fetch('/api/accounts/acct_123'); }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Account API returns 500",
+        category="api_failure",
+        evidence_text="GET /api/accounts/acct_123 returned 500.",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "src/app/api/accounts/[accountId]/route.ts"
+    assert "route_manifest:/api/accounts/acct_123" in out[0].rationale
+    assert out[0].symbol == "GET"
+
+
+def test_score_repo_for_finding_includes_codeowners_context(tmp_path: Path):
+    repo = tmp_path / "repo"
+    (repo / ".github").mkdir(parents=True, exist_ok=True)
+    (repo / "server/routes").mkdir(parents=True, exist_ok=True)
+    (repo / ".github/CODEOWNERS").write_text(
+        "server/routes/ @backend-team @api-reviewer\n"
+        "**/routes/*.ts @recursive-owner\n"
+    )
+    (repo / "server/routes/billing.ts").write_text(
+        "export function billingHandler(){ router.post('/api/billing/pay', billingHandler); }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Billing API returns 500",
+        category="api_failure",
+        evidence_text="POST /api/billing/pay returned 500.",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "server/routes/billing.ts"
+    assert out[0].owners == ["@recursive-owner"]
+    assert "codeowners:@recursive-owner" in out[0].rationale
