@@ -320,6 +320,7 @@ retrace tester api-create \
 retrace tester api-list
 retrace tester api-run <api_spec_id>
 retrace tester api-from-replay-issue <bug_public_id>
+retrace tester api-import-openapi ./openapi.yaml --base-url http://127.0.0.1:3000
 ```
 
 API specs support query params, headers, JSON bodies, bearer-token auth via env
@@ -328,6 +329,9 @@ setup/teardown script steps. Request and response artifacts are saved with
 authorization, cookies, API keys, tokens, passwords, and secrets redacted.
 `api-from-replay-issue` creates an API regression spec from a failed replay
 network signal and links it to the source failure as coverage.
+`api-import-openapi` imports OpenAPI JSON/YAML into contract-derived smoke specs,
+with optional `--path-filter` and `--method` selection and response schema
+assertions generated from the contract.
 
 ## First-Party Replay API
 
