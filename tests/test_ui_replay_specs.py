@@ -20,7 +20,7 @@ from retrace.commands.ui import (
     _transition_replay_issue_payload,
     _verify_resolved_issues_payload,
 )
-from retrace.api_testing import api_specs_dir_for_data_dir
+from retrace.api_testing import APITestRunResult, api_specs_dir_for_data_dir, create_api_spec
 from retrace.replay_core import ReplaySignalConfig, process_replay_sessions
 from retrace.sdk_keys import authenticate_sdk_key
 from retrace.storage import Storage
@@ -977,6 +977,138 @@ def test_verify_resolved_issues_payload_marks_failed_specs_regressed(
     )
     assert row is not None
     assert row["status"] == "regressed"
+
+
+def test_verify_resolved_issues_payload_marks_passing_ui_spec_verified(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    issue_public_id = _resolved_replay_issue(store, workspace)
+    create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Replay passing regression",
+        prompt="",
+        app_url="https://app.example",
+        start_command="",
+        harness_command=DEFAULT_HARNESS_COMMAND,
+        execution_engine="native",
+        exact_steps=[{"action": "navigate", "url": "https://app.example"}],
+        fixtures={"issue_public_id": issue_public_id},
+    )
+
+    def fake_run_spec(**_: object) -> RetraceTesterRunResult:
+        return RetraceTesterRunResult(
+            run_id="run_passed",
+            spec_id="spec_passed",
+            ok=True,
+            exit_code=0,
+            run_dir=str(tmp_path / "run_passed"),
+            harness_log_path="",
+            app_log_path="",
+            command="",
+            final_prompt="",
+            attempts=1,
+            flaky=False,
+            flake_reason="",
+            status="passed",
+            execution_engine="native",
+        )
+
+    monkeypatch.setattr("retrace.commands.ui.run_spec", fake_run_spec)
+
+    payload, status = _verify_resolved_issues_payload(
+        store=store,
+        data_dir=tmp_path,
+        cwd=tmp_path,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+
+    assert status == 200
+    assert payload["verified"] == [issue_public_id]
+    assert payload["regressed"] == []
+    row = store.get_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=issue_public_id,
+    )
+    assert row is not None
+    assert row["status"] == "verified"
+
+
+def test_verify_resolved_issues_payload_runs_linked_api_specs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    issue_public_id = _resolved_replay_issue(store, workspace)
+    issue = store.get_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=issue_public_id,
+    )
+    assert issue is not None
+    api_spec = create_api_spec(
+        specs_dir=api_specs_dir_for_data_dir(tmp_path),
+        name="Replay API verification",
+        method="GET",
+        url="https://app.example/api/health",
+        expected_status=200,
+        fixtures={
+            "issue_id": str(issue["id"]),
+            "issue_public_id": issue_public_id,
+            "canonical_failure_id": str(issue["canonical_failure_id"]),
+            "source": "replay_issue_api",
+        },
+    )
+    link_id = store.upsert_failure_test_link(
+        failure_id=str(issue["canonical_failure_id"]),
+        issue_id=str(issue["id"]),
+        issue_public_id=issue_public_id,
+        spec_id=api_spec.spec_id,
+        spec_name=api_spec.name,
+        spec_path=str(api_specs_dir_for_data_dir(tmp_path) / f"{api_spec.spec_id}.json"),
+        source="replay_issue_api",
+    )
+
+    def fake_run_api_spec(**_: object) -> APITestRunResult:
+        return APITestRunResult(
+            run_id="api_run_passed",
+            spec_id=api_spec.spec_id,
+            ok=True,
+            status="passed",
+            status_code=200,
+            elapsed_ms=12,
+            run_dir=str(tmp_path / "api_run_passed"),
+        )
+
+    monkeypatch.setattr("retrace.commands.ui.run_api_spec", fake_run_api_spec)
+
+    payload, status = _verify_resolved_issues_payload(
+        store=store,
+        data_dir=tmp_path,
+        cwd=tmp_path,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+
+    assert status == 200
+    assert payload["plan"][0]["tests"] == [
+        {"kind": "api", "spec_id": api_spec.spec_id, "coverage_link_id": link_id}
+    ]
+    assert payload["verified"] == [issue_public_id]
+    row = store.get_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=issue_public_id,
+    )
+    assert row is not None
+    assert row["status"] == "verified"
+    links = store.list_failure_test_links(
+        failure_id=str(issue["canonical_failure_id"]),
+        spec_id=api_spec.spec_id,
+    )
+    assert links[0].coverage_state == "covered_passing"
+    assert links[0].latest_run_id == "api_run_passed"
 
 
 def _resolved_replay_issue(store: Storage, workspace: object) -> str:

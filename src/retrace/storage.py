@@ -4686,6 +4686,7 @@ class Storage:
             "unresolved",
             "ticket_created",
             "resolved",
+            "verified",
             "ongoing",
             "regressed",
             "ignored",
@@ -4693,7 +4694,7 @@ class Storage:
         if status not in allowed:
             raise ValueError(f"invalid replay issue status: {status}")
         now = datetime.now(timezone.utc).isoformat()
-        resolved_at = now if status == "resolved" else None
+        resolved_at = now if status in {"resolved", "verified"} else None
         external_state = "created" if status == "ticket_created" else ""
         with self._conn() as conn:
             cur = conn.execute(

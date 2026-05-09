@@ -1427,6 +1427,20 @@ def _verify_resolved_issues_payload(
         existing = specs_by_issue.get(public_id)
         if existing is None or spec.updated_at > existing.updated_at:
             specs_by_issue[public_id] = spec
+    api_specs_by_id: dict[str, Any] = {}
+    api_specs_by_issue: dict[str, Any] = {}
+    for spec_path in api_specs_dir_for_data_dir(data_dir).glob("*.json"):
+        try:
+            spec = load_api_spec(api_specs_dir_for_data_dir(data_dir), spec_path.stem)
+        except Exception:
+            continue
+        api_specs_by_id[spec.spec_id] = spec
+        public_id = str(spec.fixtures.get("issue_public_id") or "").strip()
+        if not public_id:
+            continue
+        existing = api_specs_by_issue.get(public_id)
+        if existing is None or spec.updated_at > existing.updated_at:
+            api_specs_by_issue[public_id] = spec
 
     resolved = store.list_replay_issues(
         project_id=project_id,
@@ -1436,27 +1450,54 @@ def _verify_resolved_issues_payload(
     plan: list[dict[str, Any]] = []
     for row in resolved[:limit_v]:
         public_id = str(row["public_id"])
-        spec = None
-        link_id = ""
         failure_id = str(row["canonical_failure_id"] or "")
+        planned_tests: list[dict[str, str]] = []
         if failure_id:
             for link in store.list_failure_test_links(failure_id=failure_id):
                 linked_spec = specs_by_id.get(link.spec_id)
                 if linked_spec is not None:
-                    spec = linked_spec
-                    link_id = link.id
-                    break
-        if spec is None:
+                    planned_tests.append(
+                        {
+                            "kind": "ui",
+                            "spec_id": linked_spec.spec_id,
+                            "coverage_link_id": link.id,
+                        }
+                    )
+                    continue
+                linked_api_spec = api_specs_by_id.get(link.spec_id)
+                if linked_api_spec is not None:
+                    planned_tests.append(
+                        {
+                            "kind": "api",
+                            "spec_id": linked_api_spec.spec_id,
+                            "coverage_link_id": link.id,
+                        }
+                    )
+        if not planned_tests:
             spec = specs_by_issue.get(public_id)
+            if spec is not None:
+                planned_tests.append(
+                    {"kind": "ui", "spec_id": spec.spec_id, "coverage_link_id": ""}
+                )
+        if not planned_tests:
+            api_spec = api_specs_by_issue.get(public_id)
+            if api_spec is not None:
+                planned_tests.append(
+                    {"kind": "api", "spec_id": api_spec.spec_id, "coverage_link_id": ""}
+                )
         plan.append(
             {
                 "public_id": public_id,
                 "issue_id": str(row["id"]),
                 "failure_id": failure_id,
-                "coverage_link_id": link_id,
                 "title": str(row["title"] or "Replay issue"),
-                "spec_id": spec.spec_id if spec else "",
-                "has_spec": spec is not None,
+                "spec_id": planned_tests[0]["spec_id"] if planned_tests else "",
+                "spec_kind": planned_tests[0]["kind"] if planned_tests else "",
+                "coverage_link_id": (
+                    planned_tests[0]["coverage_link_id"] if planned_tests else ""
+                ),
+                "tests": planned_tests,
+                "has_spec": bool(planned_tests),
             }
         )
 
@@ -1464,42 +1505,62 @@ def _verify_resolved_issues_payload(
         return {"ok": True, "plan": plan, "verified": [], "regressed": []}, 200
 
     verified: list[str] = []
-    regressed: list[dict[str, str]] = []
+    regressed: list[dict[str, Any]] = []
     for entry in plan:
-        spec_id = entry["spec_id"]
-        if not spec_id:
+        tests = entry.get("tests") if isinstance(entry.get("tests"), list) else []
+        if not tests:
             continue
-        spec = specs_by_id.get(spec_id) or specs_by_issue[entry["public_id"]]
-        try:
-            result = run_spec(
-                spec=spec,
-                runs_dir=runs_dir_for_data_dir(data_dir),
-                cwd=cwd,
-            )
-        except Exception as exc:
-            regressed.append(
-                {
-                    "public_id": entry["public_id"],
-                    "issue_id": entry["issue_id"],
-                    "error": f"run_spec raised: {exc}",
-                }
-            )
-            continue
-        coverage_link_id = str(entry.get("coverage_link_id") or "")
-        if coverage_link_id:
+        failures: list[dict[str, str]] = []
+        for test in tests:
+            spec_id = str(test.get("spec_id") or "")
+            kind = str(test.get("kind") or "ui")
+            coverage_link_id = str(test.get("coverage_link_id") or "")
             try:
-                store.update_failure_test_link_run(
-                    spec_id=result.spec_id,
-                    run_result=result,
-                    link_id=coverage_link_id,
+                if kind == "api":
+                    api_spec = api_specs_by_id.get(spec_id)
+                    if api_spec is None:
+                        raise FileNotFoundError(f"API spec not found: {spec_id}")
+                    result = run_api_spec(
+                        spec=api_spec,
+                        runs_dir=api_runs_dir_for_data_dir(data_dir),
+                    )
+                else:
+                    spec = specs_by_id.get(spec_id) or specs_by_issue[entry["public_id"]]
+                    result = run_spec(
+                        spec=spec,
+                        runs_dir=runs_dir_for_data_dir(data_dir),
+                        cwd=cwd,
+                    )
+            except Exception as exc:
+                failures.append(
+                    {"spec_id": spec_id, "kind": kind, "error": f"run raised: {exc}"}
                 )
-            except Exception:
-                logger.warning(
-                    "failed to persist failure_test_link run metadata",
-                    extra={"spec_id": result.spec_id, "run_id": result.run_id},
-                    exc_info=True,
+                continue
+            if coverage_link_id:
+                try:
+                    store.update_failure_test_link_run(
+                        spec_id=result.spec_id,
+                        run_result=result,
+                        link_id=coverage_link_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "failed to persist failure_test_link run metadata",
+                        extra={"spec_id": result.spec_id, "run_id": result.run_id},
+                        exc_info=True,
+                    )
+            if not result.ok:
+                failures.append(
+                    {
+                        "spec_id": result.spec_id,
+                        "kind": kind,
+                        "run_id": result.run_id,
+                        "exit_code": str(getattr(result, "exit_code", "")),
+                        "error": result.error,
+                    }
                 )
-        if result.ok:
+        if not failures:
+            store.transition_replay_issue(entry["issue_id"], status="verified")
             verified.append(entry["public_id"])
             continue
         store.transition_replay_issue(entry["issue_id"], status="regressed")
@@ -1507,9 +1568,10 @@ def _verify_resolved_issues_payload(
             {
                 "public_id": entry["public_id"],
                 "issue_id": entry["issue_id"],
-                "run_id": result.run_id,
-                "exit_code": str(result.exit_code),
-                "error": result.error,
+                "spec_id": failures[0].get("spec_id", ""),
+                "run_id": failures[0].get("run_id", ""),
+                "error": failures[0].get("error", ""),
+                "failures": failures,
             }
         )
     return {"ok": True, "plan": plan, "verified": verified, "regressed": regressed}, 200
@@ -1783,7 +1845,7 @@ _INDEX_HTML = """<!doctype html>
 
     function statusClass(value){
       const v = String(value || '').toLowerCase();
-      if(v.includes('pass') || v === 'resolved' || v === 'covered_passing') return 'ok';
+      if(v.includes('pass') || v === 'resolved' || v === 'verified' || v === 'covered_passing') return 'ok';
       if(v.includes('fail') || v.includes('regressed') || v === 'unresolved' || v === 'covered_failing') return 'bad';
       return '';
     }
@@ -2543,7 +2605,7 @@ const retrace = init({
           <a href="${esc(s.share_url)}"><code>${esc(s.public_id)}</code></a> · ${esc(s.stable_id)}<br>
           <span class="empty">${esc(s.status)} · events=${esc(s.event_count)} · ${esc(s.last_seen_at)} · ${esc(JSON.stringify(s.preview || {}))}</span>
         </li>`).join('');
-      const unresolved = issues.filter(i => i.status !== 'resolved' && i.status !== 'ignored').length;
+      const unresolved = issues.filter(i => !['resolved', 'verified', 'ignored'].includes(i.status)).length;
       const covered = issues.filter(i => (i.test_links || []).length > 0).length;
       const high = issues.filter(i => i.severity === 'high' || i.priority === 'high').length;
       byId('issueWorkflowList').innerHTML = `
