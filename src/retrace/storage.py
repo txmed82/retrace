@@ -1819,6 +1819,7 @@ class Storage:
             return str(row["id"])
 
     def link_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
+        """Strictly attach a failure to an incident without changing existing ownership."""
         with self._conn() as conn:
             incident = conn.execute(
                 """
@@ -1873,6 +1874,7 @@ class Storage:
             self._refresh_incident_rollup(conn, incident_id=str(incident["id"]))
 
     def move_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
+        """Attach a failure to this incident, replacing prior incident membership."""
         with self._conn() as conn:
             incident = conn.execute(
                 """

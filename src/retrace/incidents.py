@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from retrace.storage import EvidenceRow, FailureRow, IncidentRow, RepairTaskRow, Storage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -105,12 +108,10 @@ def ensure_incident_repair_task(*, store: Storage, incident_id: str) -> str:
     evidence_ids = [
         item.id for item in detail.evidence if item.failure_id == representative.id
     ]
-    from retrace.deploys import changed_files_for_failure
-
     changed_files = _unique_strings(
         file
         for failure in detail.failures
-        for file in changed_files_for_failure(store=store, failure=failure)
+        for file in _safe_changed_files_for_failure(store=store, failure=failure)
     )
     repair_task_id = store.upsert_repair_task(
         failure_id=representative.id,
@@ -245,3 +246,17 @@ def _unique_strings(values: Any) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def _safe_changed_files_for_failure(*, store: Storage, failure: FailureRow) -> list[str]:
+    from retrace.deploys import changed_files_for_failure
+
+    try:
+        return changed_files_for_failure(store=store, failure=failure)
+    except Exception:
+        logger.warning(
+            "failed to load deploy changed files for incident repair context",
+            extra={"failure_id": failure.id, "deploy_sha": failure.related_deploy_sha},
+            exc_info=True,
+        )
+        return []
