@@ -10,6 +10,7 @@ from retrace.commands.ui import (
     _generate_replay_issue_api_spec_payload,
     _generate_replay_issue_fix_prompts_payload,
     _INDEX_HTML,
+    _issue_workflow_payload,
     _replay_api_calls,
     _replay_api_check,
     _generate_replay_issue_spec_payload,
@@ -113,6 +114,9 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "renderIssueWorkflow" in _INDEX_HTML
     assert "renderRepairTask" in _INDEX_HTML
     assert "data-workflow-action" in _INDEX_HTML
+    assert _INDEX_HTML.index("await refreshTesterAndReplay(issue.public_id);") < (
+        _INDEX_HTML.index("renderReplayFixSuggestions(data);")
+    )
     assert "Confidence:" in _INDEX_HTML
     assert "Reasons:" in _INDEX_HTML
     assert 'data-view="issues"' in _INDEX_HTML
@@ -150,6 +154,25 @@ def test_replay_api_calls_redacts_sensitive_query_values() -> None:
         "https://app.example/api/me?token=%5Bredacted-api-input%5D&tab=profile"
     )
     assert "secret" not in calls[0]["url"]
+
+
+def test_issue_workflow_treats_covered_passing_as_terminal_without_repair() -> None:
+    workflow = _issue_workflow_payload(
+        {
+            "status": "unresolved",
+            "timeline": [{"type": "replay_signal"}],
+            "reproduction_steps": ["Open checkout"],
+            "sessions": [{"session_id": "sess-1"}],
+            "api_calls": [],
+            "test_links": [{"coverage_state": "covered_passing"}],
+            "repair_task": None,
+        }
+    )
+
+    assert workflow["coverage_state"] == "covered_passing"
+    assert workflow["primary_action"] == "none"
+    assert workflow["primary_label"] == "Covered by passing test"
+    assert workflow["stage_states"]["verification"] == "complete"
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(

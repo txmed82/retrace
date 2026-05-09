@@ -808,15 +808,15 @@ def _issue_workflow_payload(issue: dict[str, Any]) -> dict[str, Any]:
     elif coverage_state == "covered_failing":
         primary_label = "Fix and rerun linked tests"
         primary_action = "run_tests"
-    elif not repair_task and status not in {"resolved", "ignored"}:
-        primary_label = "Generate repair task"
-        primary_action = "generate_repair"
     elif status == "resolved" and coverage_state != "covered_passing":
         primary_label = "Verify resolved issue"
         primary_action = "verify_resolved"
     elif coverage_state == "covered_passing":
         primary_label = "Covered by passing test"
         primary_action = "none"
+    elif not repair_task and status not in {"resolved", "ignored"}:
+        primary_label = "Generate repair task"
+        primary_action = "generate_repair"
     else:
         primary_label = "Run linked tests"
         primary_action = "run_tests"
@@ -2205,8 +2205,8 @@ const retrace = init({
         return;
       }
       if(status) status.textContent = `Wrote ${data.generated || 0} prompt set(s) for ${data.repo || 'repo'}`;
-      renderReplayFixSuggestions(data);
       await refreshTesterAndReplay(issue.public_id);
+      renderReplayFixSuggestions(data);
     }
 
     async function transitionReplayIssue(issue, statusValue){
