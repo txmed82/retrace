@@ -21,6 +21,13 @@ class CreatedIssue:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class CreatedPullRequest:
+    external_id: str
+    external_url: str
+    raw: dict[str, Any]
+
+
 def _request_with_retry(
     client: httpx.Client,
     method: str,
@@ -287,6 +294,51 @@ class GitHubClient:
             raise IssueSinkError(f"GitHub create-issue response missing fields: {data}")
         external_id = f"{owner}/{name}#{number}"
         return CreatedIssue(external_id=external_id, external_url=html_url, raw=data)
+
+    def create_pull_request(
+        self,
+        *,
+        repo: str,
+        title: str,
+        head: str,
+        base: str,
+        body: str = "",
+        draft: bool = True,
+    ) -> CreatedPullRequest:
+        owner, name = _parse_repo(repo)
+        url = f"{self.base_url}/repos/{owner}/{name}/pulls"
+        payload: dict[str, Any] = {
+            "title": title,
+            "head": head,
+            "base": base,
+            "body": body,
+            "draft": bool(draft),
+        }
+        resp = _request_with_retry(
+            self._client,
+            "POST",
+            url,
+            headers=self._headers(),
+            json=payload,
+        )
+        if resp.status_code >= 400:
+            raise IssueSinkError(
+                f"GitHub API HTTP {resp.status_code}: {_truncate(resp.text)}"
+            )
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise IssueSinkError(f"GitHub API returned non-JSON: {exc}") from exc
+        number = data.get("number")
+        html_url = data.get("html_url") or ""
+        if number is None or not html_url:
+            raise IssueSinkError(f"GitHub create-PR response missing fields: {data}")
+        external_id = f"{owner}/{name}#{number}"
+        return CreatedPullRequest(
+            external_id=external_id,
+            external_url=html_url,
+            raw=data,
+        )
 
     def get_issue_state(self, *, repo: str, number: int) -> dict[str, Any]:
         owner, name = _parse_repo(repo)
