@@ -2921,14 +2921,23 @@ class Storage:
         with self._conn() as conn:
             return conn.execute(
                 f"""
-                SELECT *
-                FROM replay_issue_sessions
-                WHERE issue_id IN ({placeholders})
+                SELECT
+                    ris.*,
+                    rs.public_id AS replay_public_id,
+                    rs.stable_id AS replay_stable_id
+                FROM replay_issue_sessions ris
+                LEFT JOIN replay_issues ri
+                  ON ri.id = ris.issue_id
+                LEFT JOIN replay_sessions rs
+                  ON rs.project_id = ri.project_id
+                 AND rs.environment_id = ri.environment_id
+                 AND rs.stable_id = ris.session_id
+                WHERE ris.issue_id IN ({placeholders})
                 ORDER BY
-                    issue_id,
-                    CASE role WHEN 'representative' THEN 0 ELSE 1 END,
-                    created_at,
-                    session_id
+                    ris.issue_id,
+                    CASE ris.role WHEN 'representative' THEN 0 ELSE 1 END,
+                    ris.created_at,
+                    ris.session_id
                 """,
                 clean_ids,
             ).fetchall()
