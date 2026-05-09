@@ -9,6 +9,7 @@ from retrace.commands.ui import (
     _create_sdk_key_payload,
     _generate_replay_issue_api_spec_payload,
     _generate_replay_issue_fix_prompts_payload,
+    _generate_replay_issue_specs_payload,
     _INDEX_HTML,
     _issue_workflow_payload,
     _replay_api_calls,
@@ -124,6 +125,9 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "linkedFailureTests" in _INDEX_HTML
     assert "generateReplayIssueApiSpec" in _INDEX_HTML
     assert "runReplayIssueApiSpec" in _INDEX_HTML
+    assert "generateGroupedReplayIssueSpecs" in _INDEX_HTML
+    assert "/api/replay-issues/specs" in _INDEX_HTML
+    assert "data-issue-select" in _INDEX_HTML
     assert 'role="button" tabindex="0"' in _INDEX_HTML
     assert 'rel="noopener noreferrer"' in _INDEX_HTML
     assert "hashchange" in _INDEX_HTML
@@ -435,6 +439,77 @@ def test_generate_replay_issue_spec_payload_reports_missing_issue(
 
     assert status == 404
     assert payload == {"ok": False, "error": "Replay issue not found: bug_missing"}
+
+
+def test_generate_replay_issue_specs_payload_creates_missing_group_specs(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    issue_ids: list[str] = []
+    for index in range(2):
+        session_id = f"sess-group-{index}"
+        store.insert_replay_batch(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            session_id=session_id,
+            sequence=0,
+            events=[
+                {
+                    "type": 4,
+                    "timestamp": 0,
+                    "data": {"href": f"https://app.example/flow-{index}"},
+                },
+                {
+                    "type": 3,
+                    "timestamp": 100,
+                    "data": {"source": 2, "type": 2, "id": index + 10},
+                },
+            ],
+            flush_type="final",
+        )
+        created = store.upsert_replay_issue(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            fingerprint=f"grouped-error-{index}",
+            session_ids=[session_id],
+            signal_summary={"dead_click": 1},
+            first_seen_ms=100,
+            last_seen_ms=200,
+            title=f"Grouped error {index}",
+        )
+        issue_ids.append(created.public_id)
+
+    payload, status = _generate_replay_issue_specs_payload(
+        store=store,
+        data_dir=tmp_path,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_ids=issue_ids,
+        app_url="",
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["considered"] == 2
+    assert payload["generated"] == 2
+    assert payload["skipped"] == []
+    assert {item["issue_public_id"] for item in payload["results"]} == set(issue_ids)
+    for item in payload["results"]:
+        assert (specs_dir_for_data_dir(tmp_path) / f"{item['spec_id']}.json").exists()
+
+    second_payload, second_status = _generate_replay_issue_specs_payload(
+        store=store,
+        data_dir=tmp_path,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        status="new",
+    )
+
+    assert second_status == 200
+    assert second_payload["generated"] == 0
+    assert {item["reason"] for item in second_payload["skipped"]} == {
+        "already_covered"
+    }
 
 
 def test_generate_and_run_replay_issue_api_spec_payload_updates_coverage(
