@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
+from urllib.parse import urlparse
 
 from retrace.monitoring_ingest import MonitoringIngestResult, ingest_monitoring_webhook
 from retrace.sdk_keys import authenticate_sdk_key
@@ -45,7 +46,16 @@ def ingest_sentry_compat_request(
     body: bytes,
     query: dict[str, str] | None = None,
 ) -> SentryCompatIngestResponse:
+    clean_endpoint = endpoint.strip().strip("/").lower()
+    raw = _decode_body(body, content_encoding=_header(headers, "content-encoding"))
+    content_type = _header(headers, "content-type").lower()
+    is_envelope = (
+        clean_endpoint == "envelope" or "application/x-sentry-envelope" in content_type
+    )
+
     sdk_key = _authenticate_sentry_sdk_key(store, headers=headers, query=query)
+    if sdk_key is None and is_envelope:
+        sdk_key = authenticate_sdk_key(store, _extract_sentry_key_from_envelope(raw))
     if sdk_key is None:
         raise SentryCompatIngestError(
             401, "unauthorized", "Missing or invalid Sentry SDK key."
@@ -55,10 +65,7 @@ def ingest_sentry_compat_request(
             403, "forbidden", "SDK key does not belong to this project."
         )
 
-    raw = _decode_body(body, content_encoding=_header(headers, "content-encoding"))
-    clean_endpoint = endpoint.strip().strip("/").lower()
-    content_type = _header(headers, "content-type").lower()
-    if clean_endpoint == "envelope" or "application/x-sentry-envelope" in content_type:
+    if is_envelope:
         events = parse_sentry_envelope(raw)
     elif clean_endpoint == "store":
         events = [parse_sentry_store_event(raw)]
@@ -169,6 +176,18 @@ def _extract_sentry_key(
     if bearer.lower().startswith("bearer "):
         return bearer[7:].strip()
     return ""
+
+
+def _extract_sentry_key_from_envelope(body: bytes) -> str:
+    try:
+        envelope_header = _consume_json_line(body, 0)[0]
+    except SentryCompatIngestError:
+        return ""
+    dsn = str(envelope_header.get("dsn") or "").strip()
+    if not dsn:
+        return ""
+    parsed = urlparse(dsn)
+    return parsed.username or ""
 
 
 def _decode_body(body: bytes, *, content_encoding: str) -> bytes:

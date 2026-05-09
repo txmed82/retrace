@@ -348,6 +348,47 @@ def test_sentry_envelope_endpoint_accepts_x_sentry_auth(tmp_path: Path) -> None:
     assert payload["results"][0]["external_id"] == "evt-envelope-api-1"
 
 
+def test_sentry_envelope_endpoint_accepts_dsn_key_fallback(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Browser",
+    )
+    event = {
+        "event_id": "evt-envelope-dsn-1",
+        "title": "TypeError in billing",
+        "level": "error",
+    }
+    body = (
+        json.dumps({"dsn": f"https://{sdk.key}@retrace.local/{workspace.project_id}"}).encode(
+            "utf-8"
+        )
+        + b"\n"
+        + b'{"type":"event"}\n'
+        + json.dumps(event).encode("utf-8")
+        + b"\n"
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/sentry/{workspace.project_id}/envelope/",
+            body=body,
+            headers={"Content-Type": "application/x-sentry-envelope"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 202
+    assert payload["event_count"] == 1
+    assert payload["results"][0]["external_id"] == "evt-envelope-dsn-1"
+
+
 def test_sentry_endpoint_rejects_project_mismatch(tmp_path: Path) -> None:
     store, workspace = _store(tmp_path)
     sdk = create_sdk_key(

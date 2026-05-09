@@ -41,7 +41,11 @@ from retrace.sdk_keys import (
     create_sdk_key,
     create_service_token,
 )
-from retrace.sentry_compat import SentryCompatIngestError, ingest_sentry_compat_request
+from retrace.sentry_compat import (
+    MAX_SENTRY_BODY_BYTES,
+    SentryCompatIngestError,
+    ingest_sentry_compat_request,
+)
 from retrace.storage import Storage
 
 
@@ -297,7 +301,7 @@ def _handler(
             if length < 0:
                 _json_response(self, 400, {"error": "invalid_content_length"})
                 return
-            if length > MAX_REPLAY_BODY_BYTES:
+            if length > MAX_SENTRY_BODY_BYTES:
                 _json_response(
                     self,
                     413,
