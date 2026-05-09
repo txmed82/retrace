@@ -38,6 +38,7 @@ SPEC_SCHEMA_VERSION = 2
 ALLOWED_MODES = {"describe", "explore_suite"}
 ALLOWED_AUTH_MODES = {"none", "form", "jwt", "headers"}
 ALLOWED_EXECUTION_ENGINES = {"harness", "native", "explore", "visual", "auto"}
+SUITE_PROPOSAL_SCHEMA_VERSION = "suite_proposal.v1"
 FAILURE_CLASSIFICATIONS = {
     "app_bug",
     "test_bug",
@@ -1289,6 +1290,7 @@ def _run_explore_spec(
     run_dir: Path,
     runs_dir: Path,
     log_path: Path,
+    run_id: str,
 ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]], str]:
     from retrace.explorer import run_explorer
 
@@ -1356,9 +1358,197 @@ def _run_explore_spec(
                 pass
 
     artifacts = list(result.artifacts)
+    if spec.mode == "explore_suite" and result.ok:
+        artifacts.extend(
+            _write_suite_proposal_and_drafts(
+                spec=spec,
+                app_url=app_url,
+                run_dir=run_dir,
+                specs_dir=runs_dir.parent / "specs",
+                source_run=run_id,
+                explore_result=result,
+            )
+        )
     error = result.error
     exit_code = 0 if result.ok else 1
     return exit_code, artifacts, assertion_results, error
+
+
+def _write_suite_proposal_and_drafts(
+    *,
+    spec: TesterSpec,
+    app_url: str,
+    run_dir: Path,
+    specs_dir: Path,
+    source_run: str,
+    explore_result: Any,
+) -> list[dict[str, Any]]:
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    goals = [str(goal).strip() for goal in spec.exploratory_goals if str(goal).strip()]
+    if not goals:
+        goals = [spec.name or "Primary user journey"]
+    exact_steps = _exact_steps_from_exploration(app_url, explore_result.steps)
+    proposal_id = f"suite_{uuid.uuid4().hex[:12]}"
+    proposals: list[dict[str, Any]] = []
+    for rank, goal in enumerate(goals, start=1):
+        criticality = _criticality_for_goal(goal)
+        reason = _proposal_reason(
+            goal=goal,
+            criticality=criticality,
+            finish_summary=str(explore_result.finish_summary or ""),
+        )
+        draft = create_spec(
+            specs_dir=specs_dir,
+            name=f"{goal[:72]} regression",
+            prompt=goal,
+            app_url=app_url,
+            start_command=spec.start_command or "",
+            harness_command=spec.harness_command or DEFAULT_HARNESS_COMMAND,
+            mode="describe",
+            execution_engine="native",
+            exact_steps=exact_steps,
+            assertions=[
+                {
+                    "id": "page-loads",
+                    "type": "status_code",
+                    "expected_status": 200,
+                    "source": "suite_proposal",
+                }
+            ],
+            env_overrides=dict(spec.env_overrides or {}),
+            browser_settings={**dict(spec.browser_settings or {}), "runtime": "http"},
+            fixtures={
+                "draft_status": "draft",
+                "draft_reason": reason,
+                "source_exploration_run": source_run,
+                "suite_proposal_id": proposal_id,
+                "source_explore_spec_id": spec.spec_id,
+                "criticality": criticality,
+                "rank": rank,
+                "source_auth": {
+                    "auth_required": spec.auth_required,
+                    "auth_mode": spec.auth_mode,
+                    "auth_login_url": spec.auth_login_url,
+                    "auth_username": spec.auth_username,
+                    "auth_password_env": spec.auth_password_env,
+                    "auth_jwt_env": spec.auth_jwt_env,
+                    "auth_headers_env": spec.auth_headers_env,
+                },
+            },
+        )
+        proposals.append(
+            {
+                "rank": rank,
+                "criticality": criticality,
+                "name": draft.name,
+                "draft_spec_id": draft.spec_id,
+                "reason": reason,
+                "source_goal": goal,
+                "source_exploration_run": source_run,
+                "exact_steps": exact_steps,
+            }
+        )
+    payload = {
+        "schema_version": SUITE_PROPOSAL_SCHEMA_VERSION,
+        "proposal_id": proposal_id,
+        "source_spec_id": spec.spec_id,
+        "source_exploration_run": source_run,
+        "generated_at": now_iso(),
+        "finish_summary": str(explore_result.finish_summary or ""),
+        "proposals": proposals,
+    }
+    proposal_path = artifacts_dir / "suite-proposal.json"
+    proposal_path.write_text(json.dumps(payload, indent=2) + "\n")
+    return [
+        {
+            "artifact_id": "suite-proposal",
+            "artifact_type": "suite_proposal",
+            "path": str(proposal_path),
+            "label": "AI exploration suite proposal",
+            "metadata": {
+                "proposal_id": proposal_id,
+                "draft_count": len(proposals),
+                "source_exploration_run": source_run,
+            },
+        }
+    ]
+
+
+def _exact_steps_from_exploration(
+    app_url: str,
+    steps: list[Any],
+) -> list[dict[str, Any]]:
+    exact_steps: list[dict[str, Any]] = []
+    for step in steps:
+        if not getattr(step, "ok", False):
+            continue
+        call = getattr(step, "call", None)
+        tool = str(getattr(call, "tool", "") or "")
+        args = dict(getattr(call, "args", {}) or {})
+        step_id = f"explore-{len(exact_steps) + 1}"
+        if tool == "navigate":
+            exact_steps.append(
+                {"id": step_id, "action": "navigate", "url": str(args.get("url") or app_url)}
+            )
+        elif tool == "click" and args.get("selector"):
+            exact_steps.append(
+                {"id": step_id, "action": "click", "selector": str(args["selector"])}
+            )
+        elif tool == "type" and args.get("selector"):
+            exact_steps.append(
+                {
+                    "id": step_id,
+                    "action": "type",
+                    "selector": str(args["selector"]),
+                    "text": str(args.get("text") or ""),
+                }
+            )
+        elif tool == "press":
+            exact_steps.append(
+                {
+                    "id": step_id,
+                    "action": "keypress",
+                    "selector": str(args.get("selector") or ""),
+                    "key": str(args.get("key") or ""),
+                }
+            )
+        elif tool == "wait_for" and args.get("selector"):
+            wait_step = {
+                "id": step_id,
+                "action": "wait_for",
+                "selector": str(args["selector"]),
+                "timeout_ms": int(args.get("timeout_ms") or 5000),
+            }
+            if args.get("state"):
+                wait_step["state"] = str(args["state"])
+            exact_steps.append(wait_step)
+    if not exact_steps:
+        exact_steps.append({"id": "page-load", "action": "navigate", "url": app_url})
+    return exact_steps
+
+
+def _criticality_for_goal(goal: str) -> str:
+    normalized = goal.lower()
+    if any(
+        term in normalized
+        for term in ["checkout", "payment", "billing", "signup", "login", "purchase"]
+    ):
+        return "high"
+    if any(term in normalized for term in ["settings", "profile", "search", "invite"]):
+        return "medium"
+    return "low"
+
+
+def _proposal_reason(
+    *,
+    goal: str,
+    criticality: str,
+    finish_summary: str,
+) -> str:
+    summary = finish_summary.strip()
+    suffix = f" Exploration summary: {summary}" if summary else ""
+    return f"{criticality.title()} criticality flow discovered for goal: {goal}.{suffix}"
 
 
 def _run_native_spec(
@@ -2308,6 +2498,7 @@ def run_spec(
                 run_dir=run_dir,
                 runs_dir=runs_dir,
                 log_path=harness_log_path,
+                run_id=run_id,
             )
         elif execution_engine == "visual":
             attempts += 1

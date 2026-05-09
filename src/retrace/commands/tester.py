@@ -20,6 +20,7 @@ from retrace.tester import (
     list_specs,
     load_run_summaries,
     load_spec,
+    now_iso,
     queue_dir_for_data_dir,
     run_queued_spec_once,
     run_spec,
@@ -182,6 +183,12 @@ def tester_create(
 )
 @click.option("--auth-login-url", default="")
 @click.option("--auth-username", default="")
+@click.option(
+    "--goal",
+    "goals",
+    multiple=True,
+    help="Exploratory goal to turn into a draft spec (repeatable).",
+)
 def tester_create_suite(
     config_path: Path,
     name: str,
@@ -192,7 +199,11 @@ def tester_create_suite(
     auth_mode: str,
     auth_login_url: str,
     auth_username: str,
+    goals: tuple[str, ...],
 ) -> None:
+    exploratory_goals = tuple(g.strip() for g in goals if g.strip()) or (
+        "Explore primary user journeys and propose regression tests.",
+    )
     ctx = click.get_current_context()
     ctx.invoke(
         tester_create,
@@ -210,7 +221,53 @@ def tester_create_suite(
         auth_password_env="RETRACE_TESTER_AUTH_PASSWORD",
         auth_jwt_env="RETRACE_TESTER_AUTH_JWT",
         auth_headers_env="RETRACE_TESTER_AUTH_HEADERS",
-        execution_engine="harness",
+        execution_engine="explore",
+        goals=exploratory_goals,
+        max_steps=0,
+    )
+
+
+@tester_group.command("accept-draft")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.argument("spec_id")
+@click.option("--name", default="", help="Optional accepted spec name.")
+@click.option("--prompt", default="", help="Optional accepted spec prompt.")
+def tester_accept_draft(
+    config_path: Path,
+    spec_id: str,
+    name: str,
+    prompt: str,
+) -> None:
+    cfg = load_config(config_path)
+    specs_dir = specs_dir_for_data_dir(cfg.run.data_dir)
+    spec = load_spec(specs_dir, spec_id)
+    if dict(spec.fixtures or {}).get("draft_status") != "draft":
+        raise click.ClickException("Spec is not an unaccepted draft.")
+    if name.strip():
+        spec.name = name.strip()
+    if prompt.strip():
+        spec.prompt = prompt.strip()
+    spec.fixtures = dict(spec.fixtures or {})
+    spec.fixtures["draft_status"] = "accepted"
+    if not spec.fixtures.get("accepted_at"):
+        spec.fixtures["accepted_at"] = now_iso()
+    save_spec(specs_dir, spec)
+    click.echo(
+        json.dumps(
+            {
+                "ok": True,
+                "spec_id": spec.spec_id,
+                "draft_status": spec.fixtures["draft_status"],
+                "source_exploration_run": spec.fixtures.get("source_exploration_run", ""),
+            },
+            indent=2,
+        )
     )
 
 
