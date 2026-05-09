@@ -144,7 +144,8 @@ def _render_path(raw_path: str, parameters: list[dict[str, Any]]) -> str:
     }
 
     def repl(match: re.Match[str]) -> str:
-        return str(values.get(match.group(1)) or "1")
+        value = values.get(match.group(1))
+        return "1" if value is None else str(value)
 
     return re.sub(r"\{([^}]+)\}", repl, raw_path)
 
@@ -186,8 +187,9 @@ def _response_contract(
     responses = operation.get("responses") or {}
     if not isinstance(responses, dict) or not responses:
         return 200, {}
-    status_key = _preferred_status_key(responses)
-    response = _resolve_ref(document, responses.get(status_key))
+    normalized_responses = {str(key): value for key, value in responses.items()}
+    status_key = _preferred_status_key(normalized_responses)
+    response = _resolve_ref(document, normalized_responses.get(status_key))
     schema: dict[str, Any] = {}
     if isinstance(response, dict):
         content = response.get("content") or {}

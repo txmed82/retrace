@@ -12,8 +12,8 @@ from retrace.openapi_import import import_openapi_specs
 
 class _OpenAPIHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path.startswith("/v1/users/7"):
-            body = json.dumps({"id": 7, "email": "dev@example.com"}).encode()
+        if self.path.startswith("/v1/users/0"):
+            body = json.dumps({"id": 0, "email": "dev@example.com"}).encode()
             self.send_response(200)
         elif self.path.startswith("/v1/health"):
             body = b'{"ok":true}'
@@ -56,7 +56,7 @@ paths:
           required: true
           schema:
             type: integer
-            default: 7
+            default: 0
         - name: include
           in: query
           required: true
@@ -64,7 +64,7 @@ paths:
             type: string
             default: profile
       responses:
-        "200":
+        200:
           description: User
           content:
             application/json:
@@ -102,7 +102,7 @@ paths:
     assert result.skipped == []
     assert len(result.specs) == 1
     assert spec.method == "GET"
-    assert spec.url == f"{base_url}/v1/users/7"
+    assert spec.url == f"{base_url}/v1/users/0"
     assert spec.query == {"include": "profile"}
     assert spec.expected_status == 200
     assert spec.schema_assertions == [
@@ -218,6 +218,8 @@ paths:
                 properties:
                   ok:
                     type: boolean
+servers:
+  - url: http://api.example.test
 """
     )
     monkeypatch.chdir(tmp_path)
@@ -227,8 +229,6 @@ paths:
         [
             "tester",
             "api-import-openapi",
-            "--base-url",
-            "http://api.example.test",
             str(openapi_path),
         ],
     )

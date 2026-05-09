@@ -608,7 +608,11 @@ def tester_api_run(config_path: Path, spec_id: str) -> None:
     default=Path("config.yaml"),
     show_default=True,
 )
-@click.option("--base-url", required=True, help="Base URL for generated runnable specs.")
+@click.option(
+    "--base-url",
+    default="",
+    help="Base URL for generated runnable specs.",
+)
 @click.option(
     "--path-filter",
     default="",
