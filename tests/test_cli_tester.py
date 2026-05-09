@@ -38,12 +38,12 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
-def _server_url() -> tuple[ThreadingHTTPServer, str]:
+def _server_url() -> tuple[ThreadingHTTPServer, threading.Thread, str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
-    return server, f"http://{host}:{port}"
+    return server, thread, f"http://{host}:{port}"
 
 
 class _ExploreDriver:
@@ -137,7 +137,7 @@ def test_tester_create_suite_defaults_to_explore_mode(
 def test_create_suite_run_generates_accepts_and_runs_draft_specs(
     tmp_path: Path, monkeypatch
 ) -> None:
-    server, app_url = _server_url()
+    server, server_thread, app_url = _server_url()
     try:
         (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
         monkeypatch.chdir(tmp_path)
@@ -206,6 +206,7 @@ def test_create_suite_run_generates_accepts_and_runs_draft_specs(
         set_explore_factories(driver_factory=None, llm_factory=None)
         server.shutdown()
         server.server_close()
+        server_thread.join(timeout=2)
 
 
 def test_tester_run_retries_and_marks_flaky(tmp_path: Path, monkeypatch) -> None:
