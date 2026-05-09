@@ -301,7 +301,7 @@ def _handler(
             if length < 0:
                 _json_response(self, 400, {"error": "invalid_content_length"})
                 return
-            if length > MAX_SENTRY_BODY_BYTES:
+            if length > MAX_REPLAY_BODY_BYTES:
                 _json_response(
                     self,
                     413,
@@ -353,7 +353,7 @@ def _handler(
             if length < 0:
                 _json_response(self, 400, {"error": "invalid_content_length"})
                 return
-            if length > MAX_REPLAY_BODY_BYTES:
+            if length > MAX_SENTRY_BODY_BYTES:
                 _json_response(
                     self,
                     413,
