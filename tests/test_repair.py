@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from retrace.evidence import EvidenceItem, evidence_dedupe_key
-from retrace.failures import canonical_failure_from_api_run
+from retrace.failures import canonical_failure_from_api_run, canonical_failure_from_test_run
 from retrace.fix_suggestions import (
     generate_fix_suggestions,
     parsed_finding_from_replay_issue,
@@ -390,6 +391,62 @@ def test_repair_bundle_groups_backend_request_route_and_log_context(
     assert backend["logs"]["items"][0]["untrusted_payload"]["message"].startswith(
         "checkout handler"
     )
+
+
+def test_repair_bundle_carries_ui_failure_backend_trace_ids(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    network_path = tmp_path / "network.json"
+    network_path.write_text(
+        json.dumps(
+            [
+                {
+                    "url": "https://app.example/api/checkout",
+                    "headers": {
+                        "traceparent": (
+                            "00-4bf92f3577b34da6a3ce929d0e0e4736-"
+                            "00f067aa0ba902b7-01"
+                        )
+                    },
+                }
+            ]
+        )
+    )
+
+    class Result:
+        run_id = "ui_run_1"
+        spec_id = "checkout_ui"
+        ok = False
+        exit_code = 1
+        status = "failed"
+        error = "Checkout button produced a 500."
+        failure_classification = "app_bug"
+        execution_engine = "harness"
+        flaky = False
+        flake_reason = ""
+        artifacts = [
+            {
+                "artifact_id": "browser-harness-network",
+                "artifact_type": "network_output",
+                "path": str(network_path),
+            }
+        ]
+        assertion_results = []
+
+    failure_id = store.upsert_failure(
+        canonical_failure_from_test_run(
+            project_id="proj_1",
+            environment_id="env_1",
+            run_result=Result(),
+            spec_name="Checkout UI",
+        )
+    )
+
+    bundle = build_repair_bundle(store, failure_id)
+
+    assert bundle.backend_context["logs"]["trace_ids"] == [
+        "4bf92f3577b34da6a3ce929d0e0e4736"
+    ]
 
 
 def test_repair_bundle_infers_explainable_linked_validation_commands(
