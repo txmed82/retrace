@@ -414,29 +414,41 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     if (OriginalXHR) {
       const originalOpen = OriginalXHR.prototype.open;
       const originalSend = OriginalXHR.prototype.send;
+      const originalSetRequestHeader = OriginalXHR.prototype.setRequestHeader;
       OriginalXHR.prototype.open = function open(
-        this: XMLHttpRequest & { __retrace?: { method: string; url: string; traceparent: string } },
+        this: XMLHttpRequest & { __retrace?: { method: string; url: string; traceparent: string; headers: Record<string, true> } },
         method: string,
         url: string | URL,
         async?: boolean,
         username?: string | null,
         password?: string | null,
       ) {
-        this.__retrace = { method, url: String(url), traceparent: ensureTraceparent() };
-        const result = originalOpen.call(this, method, url, async ?? true, username, password);
-        try {
-          this.setRequestHeader("traceparent", this.__retrace.traceparent);
-        } catch {
-          // Some browser states reject header mutation; still record context.
+        this.__retrace = { method, url: String(url), traceparent: ensureTraceparent(), headers: {} };
+        return originalOpen.call(this, method, url, async ?? true, username, password);
+      };
+      OriginalXHR.prototype.setRequestHeader = function setRequestHeader(
+        this: XMLHttpRequest & { __retrace?: { method: string; url: string; traceparent: string; headers: Record<string, true> } },
+        name: string,
+        value: string,
+      ) {
+        if (this.__retrace) {
+          this.__retrace.headers[String(name).toLowerCase()] = true;
         }
-        return result;
+        return originalSetRequestHeader.call(this, name, value);
       };
       OriginalXHR.prototype.send = function send(
-        this: XMLHttpRequest & { __retrace?: { method: string; url: string; traceparent: string } },
+        this: XMLHttpRequest & { __retrace?: { method: string; url: string; traceparent: string; headers: Record<string, true> } },
         body?: Document | XMLHttpRequestBodyInit | null,
       ) {
         const startedAt = Date.now();
         const requestTraceparent = this.__retrace?.traceparent || ensureTraceparent();
+        if (!this.__retrace?.headers.traceparent) {
+          try {
+            this.setRequestHeader("traceparent", requestTraceparent);
+          } catch {
+            // Some browser states reject header mutation; still record context.
+          }
+        }
         this.addEventListener("loadend", () => {
           const responseTraceparent = this.getResponseHeader("traceparent");
           rememberTraceparent(responseTraceparent);
@@ -458,6 +470,7 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
       cleanupFns.push(() => {
         OriginalXHR.prototype.open = originalOpen;
         OriginalXHR.prototype.send = originalSend;
+        OriginalXHR.prototype.setRequestHeader = originalSetRequestHeader;
       });
     }
   }
