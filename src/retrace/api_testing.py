@@ -1,0 +1,590 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+import httpx
+
+from retrace.script_steps import run_script_step
+
+
+API_SPEC_SCHEMA_VERSION = 1
+SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+    "x-api-key",
+    "x-csrf-token",
+    "x-xsrf-token",
+}
+SENSITIVE_BODY_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "jwt",
+    "password",
+    "secret",
+    "token",
+}
+
+
+@dataclass
+class APIAssertionResult:
+    assertion_id: str
+    assertion_type: str
+    ok: bool
+    expected: Any
+    actual: Any
+    message: str
+
+
+@dataclass
+class APITestArtifact:
+    artifact_id: str
+    artifact_type: str
+    path: str
+    label: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class APITestSpec:
+    schema_version: int
+    spec_id: str
+    name: str
+    method: str
+    url: str
+    query: dict[str, Any] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+    body: Any = None
+    auth: dict[str, Any] = field(default_factory=dict)
+    expected_status: int = 200
+    json_assertions: list[dict[str, Any]] = field(default_factory=list)
+    schema_assertions: list[dict[str, Any]] = field(default_factory=list)
+    latency_ms: int = 0
+    setup_steps: list[dict[str, Any]] = field(default_factory=list)
+    teardown_steps: list[dict[str, Any]] = field(default_factory=list)
+    created_at: str = ""
+    updated_at: str = ""
+    fixtures: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class APITestRunResult:
+    run_id: str
+    spec_id: str
+    ok: bool
+    status: str
+    status_code: int
+    elapsed_ms: int
+    run_dir: str
+    error: str = ""
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
+    assertion_results: list[dict[str, Any]] = field(default_factory=list)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def slugify(value: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    return s or "api-test"
+
+
+def api_specs_dir_for_data_dir(data_dir: Path) -> Path:
+    return data_dir / "api-tests" / "specs"
+
+
+def api_runs_dir_for_data_dir(data_dir: Path) -> Path:
+    return data_dir / "api-tests" / "runs"
+
+
+def _spec_path(specs_dir: Path, spec_id: str) -> Path:
+    if not spec_id or not re.match(r"^[a-zA-Z0-9_-]+$", spec_id):
+        raise ValueError("Invalid API spec_id")
+    candidate = (specs_dir / f"{spec_id}.json").resolve()
+    candidate.relative_to(specs_dir.resolve())
+    return candidate
+
+
+def _coerce_spec(data: dict[str, Any]) -> APITestSpec:
+    data = dict(data)
+    data.setdefault("schema_version", API_SPEC_SCHEMA_VERSION)
+    data.setdefault("query", {})
+    data.setdefault("headers", {})
+    data.setdefault("auth", {})
+    data.setdefault("expected_status", 200)
+    data.setdefault("json_assertions", [])
+    data.setdefault("schema_assertions", [])
+    data.setdefault("latency_ms", 0)
+    data.setdefault("setup_steps", [])
+    data.setdefault("teardown_steps", [])
+    data.setdefault("fixtures", {})
+    return APITestSpec(**data)
+
+
+def validate_api_spec(spec: APITestSpec) -> None:
+    if spec.schema_version != API_SPEC_SCHEMA_VERSION:
+        raise ValueError("unsupported API spec schema_version")
+    if not spec.spec_id.strip():
+        raise ValueError("spec_id is required")
+    if not spec.name.strip():
+        raise ValueError("name is required")
+    if spec.method.upper() not in {
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "HEAD",
+        "OPTIONS",
+    }:
+        raise ValueError("method is not supported")
+    if not spec.url.strip():
+        raise ValueError("url is required")
+    if not isinstance(spec.query, dict):
+        raise ValueError("query must be an object")
+    if not isinstance(spec.headers, dict):
+        raise ValueError("headers must be an object")
+    leaked_headers = sorted(
+        key for key in spec.headers if str(key).lower() in SENSITIVE_HEADER_NAMES
+    )
+    if leaked_headers:
+        raise ValueError(
+            "sensitive static headers must use auth env vars: "
+            + ", ".join(leaked_headers)
+        )
+    if not isinstance(spec.auth, dict):
+        raise ValueError("auth must be an object")
+    for field_name in ("json_assertions", "schema_assertions", "setup_steps", "teardown_steps"):
+        if not isinstance(getattr(spec, field_name), list):
+            raise ValueError(f"{field_name} must be a list")
+
+
+def create_api_spec(
+    *,
+    specs_dir: Path,
+    name: str,
+    method: str,
+    url: str,
+    query: Optional[dict[str, Any]] = None,
+    headers: Optional[dict[str, str]] = None,
+    body: Any = None,
+    auth: Optional[dict[str, Any]] = None,
+    expected_status: int = 200,
+    json_assertions: Optional[list[dict[str, Any]]] = None,
+    schema_assertions: Optional[list[dict[str, Any]]] = None,
+    latency_ms: int = 0,
+    setup_steps: Optional[list[dict[str, Any]]] = None,
+    teardown_steps: Optional[list[dict[str, Any]]] = None,
+    fixtures: Optional[dict[str, Any]] = None,
+) -> APITestSpec:
+    created_at = now_iso()
+    spec = APITestSpec(
+        schema_version=API_SPEC_SCHEMA_VERSION,
+        spec_id=f"api_{slugify(name)}_{uuid.uuid4().hex[:8]}",
+        name=name.strip(),
+        method=method.upper().strip(),
+        url=url.strip(),
+        query=dict(query or {}),
+        headers={str(k): str(v) for k, v in dict(headers or {}).items()},
+        body=body,
+        auth=dict(auth or {}),
+        expected_status=int(expected_status),
+        json_assertions=list(json_assertions or []),
+        schema_assertions=list(schema_assertions or []),
+        latency_ms=max(0, int(latency_ms or 0)),
+        setup_steps=list(setup_steps or []),
+        teardown_steps=list(teardown_steps or []),
+        created_at=created_at,
+        updated_at=created_at,
+        fixtures=dict(fixtures or {}),
+    )
+    validate_api_spec(spec)
+    save_api_spec(specs_dir, spec)
+    return spec
+
+
+def save_api_spec(specs_dir: Path, spec: APITestSpec) -> None:
+    validate_api_spec(spec)
+    specs_dir.mkdir(parents=True, exist_ok=True)
+    _spec_path(specs_dir, spec.spec_id).write_text(
+        json.dumps(asdict(spec), indent=2) + "\n"
+    )
+
+
+def load_api_spec(specs_dir: Path, spec_id: str) -> APITestSpec:
+    path = _spec_path(specs_dir, spec_id)
+    if not path.exists():
+        raise FileNotFoundError(spec_id)
+    return _coerce_spec(json.loads(path.read_text()))
+
+
+def list_api_specs(specs_dir: Path) -> list[APITestSpec]:
+    if not specs_dir.exists():
+        return []
+    specs: list[APITestSpec] = []
+    for path in sorted(specs_dir.glob("*.json")):
+        try:
+            specs.append(load_api_spec(specs_dir, path.stem))
+        except Exception:
+            continue
+    return specs
+
+
+def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
+    validate_api_spec(spec)
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    run_dir = runs_dir / f"{run_id}-{slugify(spec.name)[:40]}"
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=False)
+    artifacts: list[APITestArtifact] = []
+    assertion_results: list[APIAssertionResult] = []
+    status_code = 0
+    elapsed_ms = 0
+    error = ""
+    scope: dict[str, Any] = {"vars": {}, "env": dict(os.environ)}
+
+    try:
+        for idx, step in enumerate(spec.setup_steps):
+            _record_script_step(
+                artifacts=artifacts,
+                assertion_results=assertion_results,
+                artifacts_dir=artifacts_dir,
+                scope=scope,
+                step=step,
+                phase="setup",
+                idx=idx,
+            )
+        headers = _resolve_headers(spec)
+        request_body = _render_body(spec.body, scope)
+        request_payload = {
+            "method": spec.method,
+            "url": spec.url,
+            "query": spec.query,
+            "headers": _redact_headers(headers),
+            "body": _redact_json(request_body),
+        }
+        request_path = artifacts_dir / "request.json"
+        request_path.write_text(json.dumps(request_payload, indent=2) + "\n")
+        artifacts.append(
+            APITestArtifact(
+                artifact_id="request",
+                artifact_type="api_request",
+                path=str(request_path),
+                label="API request",
+            )
+        )
+        started = time.perf_counter()
+        with httpx.Client(timeout=15, follow_redirects=True) as client:
+            response = client.request(
+                spec.method,
+                spec.url,
+                params=spec.query,
+                headers=headers,
+                json=request_body if isinstance(request_body, (dict, list)) else None,
+                content=request_body if isinstance(request_body, (str, bytes)) else None,
+            )
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        status_code = response.status_code
+        response_json, response_body = _response_body(response)
+        scope["response"] = {
+            "status_code": status_code,
+            "headers": dict(response.headers),
+            "json": response_json,
+            "body": response_body,
+            "elapsed_ms": elapsed_ms,
+        }
+        response_payload = {
+            "status_code": status_code,
+            "elapsed_ms": elapsed_ms,
+            "headers": _redact_headers(dict(response.headers)),
+            "body": _redact_json(response_json if response_json is not None else response_body),
+        }
+        response_path = artifacts_dir / "response.json"
+        response_path.write_text(json.dumps(response_payload, indent=2) + "\n")
+        artifacts.append(
+            APITestArtifact(
+                artifact_id="response",
+                artifact_type="api_response",
+                path=str(response_path),
+                label="API response",
+                metadata={"status_code": status_code, "elapsed_ms": elapsed_ms},
+            )
+        )
+        assertion_results.extend(_evaluate_api_assertions(spec, response_json, elapsed_ms, status_code))
+    except Exception as exc:
+        error = str(exc)
+    finally:
+        for idx, step in enumerate(spec.teardown_steps):
+            _record_script_step(
+                artifacts=artifacts,
+                assertion_results=assertion_results,
+                artifacts_dir=artifacts_dir,
+                scope=scope,
+                step=step,
+                phase="teardown",
+                idx=idx,
+            )
+
+    assertions_payload = [asdict(item) for item in assertion_results]
+    assertions_path = artifacts_dir / "assertions.json"
+    assertions_path.write_text(json.dumps(assertions_payload, indent=2) + "\n")
+    artifacts.append(
+        APITestArtifact(
+            artifact_id="assertions",
+            artifact_type="api_assertion_results",
+            path=str(assertions_path),
+            label="API assertion results",
+            metadata={"count": len(assertion_results)},
+        )
+    )
+    ok = not error and all(item.ok for item in assertion_results)
+    result = APITestRunResult(
+        run_id=run_id,
+        spec_id=spec.spec_id,
+        ok=ok,
+        status="passed" if ok else "failed",
+        status_code=status_code,
+        elapsed_ms=elapsed_ms,
+        run_dir=str(run_dir),
+        error=error,
+        artifacts=[asdict(item) for item in artifacts],
+        assertion_results=assertions_payload,
+    )
+    (run_dir / "run.json").write_text(json.dumps(asdict(result), indent=2) + "\n")
+    return result
+
+
+def _resolve_headers(spec: APITestSpec) -> dict[str, str]:
+    headers = {str(k): str(v) for k, v in spec.headers.items()}
+    auth_type = str(spec.auth.get("type") or "none").strip().lower()
+    if auth_type in {"", "none"}:
+        return headers
+    if auth_type == "bearer":
+        token_env = str(spec.auth.get("token_env") or "").strip()
+        token = os.environ.get(token_env, "").strip()
+        if not token:
+            raise RuntimeError(f"auth failure: missing bearer token env var {token_env}")
+        headers["Authorization"] = f"Bearer {token}"
+        return headers
+    if auth_type == "headers":
+        headers_env = str(spec.auth.get("headers_env") or "").strip()
+        raw = os.environ.get(headers_env, "").strip()
+        if not raw:
+            raise RuntimeError(f"auth failure: missing headers env var {headers_env}")
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("auth failure: headers auth env var must be a JSON object")
+        headers.update({str(k): str(v) for k, v in parsed.items()})
+        return headers
+    raise RuntimeError(f"unsupported auth type: {auth_type}")
+
+
+def _render_body(body: Any, scope: dict[str, Any]) -> Any:
+    if isinstance(body, str):
+        from retrace.script_steps import render_template
+
+        return render_template(body, scope)
+    return body
+
+
+def _response_body(response: httpx.Response) -> tuple[Any, Any]:
+    try:
+        return response.json(), None
+    except Exception:
+        return None, response.text[:5000]
+
+
+def _record_script_step(
+    *,
+    artifacts: list[APITestArtifact],
+    assertion_results: list[APIAssertionResult],
+    artifacts_dir: Path,
+    scope: dict[str, Any],
+    step: dict[str, Any],
+    phase: str,
+    idx: int,
+) -> None:
+    outcome = run_script_step(step, scope=scope)
+    path = artifacts_dir / f"{phase}-script-{idx}.json"
+    path.write_text(json.dumps(asdict(outcome), indent=2) + "\n")
+    artifacts.append(
+        APITestArtifact(
+            artifact_id=f"{phase}-script-{idx}",
+            artifact_type="api_script_step",
+            path=str(path),
+            label=f"API {phase} script step",
+            metadata={"phase": phase},
+        )
+    )
+    if outcome.error:
+        assertion_results.append(
+            APIAssertionResult(
+                assertion_id=f"{phase}-script-{idx}",
+                assertion_type="script",
+                ok=False,
+                expected="script_step_ok",
+                actual=outcome.error,
+                message=outcome.error,
+            )
+        )
+    for raw in outcome.assertions:
+        assertion_results.append(
+            APIAssertionResult(
+                assertion_id=str(raw.get("id") or f"{phase}-script-{idx}"),
+                assertion_type="script",
+                ok=bool(raw.get("ok")),
+                expected=True,
+                actual=raw.get("ok"),
+                message=str(raw.get("message") or ""),
+            )
+        )
+
+
+def _evaluate_api_assertions(
+    spec: APITestSpec,
+    response_json: Any,
+    elapsed_ms: int,
+    status_code: int,
+) -> list[APIAssertionResult]:
+    results = [
+        APIAssertionResult(
+            assertion_id="expected-status",
+            assertion_type="status_code",
+            ok=status_code == spec.expected_status,
+            expected=spec.expected_status,
+            actual=status_code,
+            message=f"Expected status {spec.expected_status}, got {status_code}.",
+        )
+    ]
+    if spec.latency_ms > 0:
+        results.append(
+            APIAssertionResult(
+                assertion_id="latency-ms",
+                assertion_type="latency_ms",
+                ok=elapsed_ms <= spec.latency_ms,
+                expected=f"<={spec.latency_ms}",
+                actual=elapsed_ms,
+                message=f"Expected latency <= {spec.latency_ms}ms, got {elapsed_ms}ms.",
+            )
+        )
+    for idx, assertion in enumerate(spec.json_assertions):
+        results.append(_evaluate_json_assertion(assertion, response_json, idx))
+    for idx, assertion in enumerate(spec.schema_assertions):
+        schema = assertion.get("schema") if "schema" in assertion else assertion
+        results.append(_evaluate_schema_assertion(schema, response_json, idx))
+    return results
+
+
+def _evaluate_json_assertion(
+    assertion: dict[str, Any],
+    response_json: Any,
+    idx: int,
+) -> APIAssertionResult:
+    path = str(assertion.get("path") or "")
+    actual = _json_path(response_json, path)
+    assertion_id = str(assertion.get("id") or f"json-{idx}")
+    if assertion.get("exists") is True:
+        ok = actual is not None
+        return APIAssertionResult(assertion_id, "json_exists", ok, True, actual, path)
+    if "equals" in assertion:
+        expected = assertion.get("equals")
+        ok = actual == expected
+        return APIAssertionResult(assertion_id, "json_equals", ok, expected, actual, path)
+    if "contains" in assertion:
+        expected = str(assertion.get("contains"))
+        ok = expected in str(actual)
+        return APIAssertionResult(assertion_id, "json_contains", ok, expected, actual, path)
+    return APIAssertionResult(assertion_id, "json_assertion", False, "known assertion", actual, path)
+
+
+def _evaluate_schema_assertion(schema: Any, response_json: Any, idx: int) -> APIAssertionResult:
+    errors = _schema_errors(schema, response_json, "$")
+    return APIAssertionResult(
+        assertion_id=f"schema-{idx}",
+        assertion_type="json_schema",
+        ok=not errors,
+        expected=schema,
+        actual={"errors": errors},
+        message="schema matched" if not errors else "; ".join(errors[:5]),
+    )
+
+
+def _schema_errors(schema: Any, value: Any, path: str) -> list[str]:
+    if not isinstance(schema, dict):
+        return [f"{path}: schema must be an object"]
+    errors: list[str] = []
+    expected_type = schema.get("type")
+    if expected_type and not _matches_type(value, str(expected_type)):
+        errors.append(f"{path}: expected {expected_type}, got {type(value).__name__}")
+        return errors
+    required = schema.get("required") or []
+    if isinstance(required, list) and isinstance(value, dict):
+        for key in required:
+            if key not in value:
+                errors.append(f"{path}.{key}: required property missing")
+    properties = schema.get("properties") or {}
+    if isinstance(properties, dict) and isinstance(value, dict):
+        for key, child_schema in properties.items():
+            if key in value:
+                errors.extend(_schema_errors(child_schema, value[key], f"{path}.{key}"))
+    return errors
+
+
+def _matches_type(value: Any, expected_type: str) -> bool:
+    return {
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "boolean": isinstance(value, bool),
+        "null": value is None,
+    }.get(expected_type, True)
+
+
+def _json_path(value: Any, path: str) -> Any:
+    if path in {"", "$"}:
+        return value
+    cursor = value
+    for raw_part in path.removeprefix("$.").split("."):
+        if raw_part == "":
+            continue
+        if isinstance(cursor, dict):
+            cursor = cursor.get(raw_part)
+        elif isinstance(cursor, list) and raw_part.isdigit():
+            idx = int(raw_part)
+            cursor = cursor[idx] if idx < len(cursor) else None
+        else:
+            return None
+        if cursor is None:
+            return None
+    return cursor
+
+
+def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, value in headers.items():
+        out[key] = "[redacted]" if key.lower() in SENSITIVE_HEADER_NAMES else value
+    return out
+
+
+def _redact_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(k): "[redacted]" if str(k).lower() in SENSITIVE_BODY_KEYS else _redact_json(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json(item) for item in value]
+    return value

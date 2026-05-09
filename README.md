@@ -307,6 +307,25 @@ UI support:
 - Tester runs are flake-aware (retry count + flake classification shown in recent runs).
 - Native tester runs write structured assertion and artifact metadata under the run directory.
 
+API tests use first-class specs under `data/api-tests/`:
+
+```bash
+retrace tester api-create \
+  --name "Health API" \
+  --method GET \
+  --url http://127.0.0.1:3000/api/health \
+  --expected-status 200 \
+  --json-assertion '{"path":"$.ok","equals":true}'
+
+retrace tester api-list
+retrace tester api-run <api_spec_id>
+```
+
+API specs support query params, headers, JSON bodies, bearer-token auth via env
+vars, JSON body assertions, simple JSON schema assertions, latency budgets, and
+setup/teardown script steps. Request and response artifacts are saved with
+authorization, cookies, API keys, tokens, passwords, and secrets redacted.
+
 ## First-Party Replay API
 
 Retrace can ingest browser SDK replays directly and process them into replay-backed issues.
