@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,8 @@ from retrace.prompts import build_claude_code_prompt, build_codex_prompt
 from retrace.repair import repair_task_from_fix_suggestion
 from retrace.reports.parser import ParsedFinding
 from retrace.storage import GitHubRepoRow, Storage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -193,17 +196,21 @@ def generate_fix_suggestions(
         (out_dir / prompt_files["claude_code"]).write_text(
             prompts["claude_code"] + "\n", encoding="utf-8"
         )
-        repair_task_id = _upsert_replay_issue_repair_task(
-            store=store,
-            report_key=report_key,
-            repo=repo,
-            repo_path=str(effective_repo_path) if effective_repo_path else "",
-            out_dir=out_dir,
-            finding=finding,
-            candidates=candidates,
-            prompt_files=prompt_files,
-            artifact_json=artifact_json,
-        )
+        try:
+            repair_task_id = _upsert_replay_issue_repair_task(
+                store=store,
+                report_key=report_key,
+                repo=repo,
+                repo_path=str(effective_repo_path) if effective_repo_path else "",
+                out_dir=out_dir,
+                finding=finding,
+                candidates=candidates,
+                prompt_files=prompt_files,
+                artifact_json=artifact_json,
+            )
+        except Exception:
+            logger.exception("failed to persist repair task for %s", report_key)
+            repair_task_id = ""
         generated += 1
         artifacts.append(
             FixSuggestionArtifact(

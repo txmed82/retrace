@@ -15,6 +15,7 @@ from retrace.evidence import (
     evidence_items_from_replay_issue,
 )
 from retrace.failures import CanonicalFailure, canonical_failure_from_replay_issue
+from retrace.repair import normalize_repair_task_status
 
 FAILURE_TEST_COVERAGE_STATES = (
     "not_covered",
@@ -1638,6 +1639,7 @@ class Storage:
         now = datetime.now(timezone.utc).isoformat()
         task_id = self._id("rpr")
         public_id = self._public_id("rpr", failure_id)
+        normalized_status = normalize_repair_task_status(status)
         clean_likely_files = self._merge_string_lists(likely_files or [])
         clean_validation = self._merge_string_lists(validation_commands or [])
         clean_evidence_ids = self._merge_string_lists(evidence_ids or [])
@@ -1683,7 +1685,7 @@ class Storage:
                     source_type.strip(),
                     source_external_id.strip(),
                     title.strip() or "Repair task",
-                    status.strip() or "open",
+                    normalized_status,
                     json.dumps(clean_likely_files, sort_keys=True),
                     prompt_json,
                     json.dumps(clean_validation, sort_keys=True),
@@ -1702,6 +1704,16 @@ class Storage:
             assert row is not None
             persisted_task_id = str(row["id"])
             for evidence_id in clean_evidence_ids:
+                evidence_row = conn.execute(
+                    """
+                    SELECT 1
+                    FROM failure_evidence
+                    WHERE id = ? AND failure_id = ?
+                    """,
+                    (evidence_id, failure_id),
+                ).fetchone()
+                if evidence_row is None:
+                    continue
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO repair_task_evidence
