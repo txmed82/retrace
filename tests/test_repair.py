@@ -279,6 +279,119 @@ def test_repair_bundle_can_be_built_for_api_failure(tmp_path: Path) -> None:
     assert bundle.validation_commands == ["retrace api run api_checkout"]
 
 
+def test_repair_bundle_groups_backend_request_route_and_log_context(
+    tmp_path: Path,
+) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+
+    class Spec:
+        spec_id = "api_checkout"
+        name = "Checkout API"
+        method = "POST"
+        url = "http://example.test/api/checkout/42"
+        query = {}
+        expected_status = 200
+        fixtures = {"api_regression": {"trace_ids": ["trace-1"]}}
+
+    class Result:
+        run_id = "run_1"
+        spec_id = "api_checkout"
+        ok = False
+        status_code = 500
+        status = "failed"
+        error = "internal server error"
+        artifacts = []
+        assertion_results = []
+
+    failure_id = store.upsert_failure(
+        canonical_failure_from_api_run(
+            project_id="proj_1",
+            environment_id="env_1",
+            spec=Spec(),
+            run_result=Result(),
+        )
+    )
+    evidence_payloads = [
+        (
+            "api_request",
+            {
+                "artifact": {
+                    "method": "POST",
+                    "url": "http://example.test/api/checkout/42",
+                    "body": {"cart_id": "cart_1"},
+                }
+            },
+        ),
+        (
+            "api_response",
+            {
+                "artifact": {
+                    "status_code": 500,
+                    "body": {"error": "checkout failed"},
+                }
+            },
+        ),
+        (
+            "otel_log",
+            {
+                "trace_id": "trace-1",
+                "message": "checkout handler raised ValueError",
+            },
+        ),
+    ]
+    for idx, (evidence_type, payload) in enumerate(evidence_payloads):
+        store.append_failure_evidence(
+            EvidenceItem(
+                failure_id=failure_id,
+                evidence_type=evidence_type,
+                occurred_at_ms=100 + idx,
+                source="api_run:run_1" if evidence_type.startswith("api_") else "otel",
+                redaction_state="redacted",
+                payload=payload,
+                dedupe_key=evidence_dedupe_key(
+                    failure_id=failure_id,
+                    evidence_type=evidence_type,
+                    source="api_run:run_1" if evidence_type.startswith("api_") else "otel",
+                    occurred_at_ms=100 + idx,
+                    payload=payload,
+                ),
+            )
+        )
+    store.upsert_repair_task(
+        failure_id=failure_id,
+        title="Repair checkout",
+        likely_files=["server/routes/checkout.ts"],
+        metadata={
+            "candidate_rationale": [
+                {
+                    "file_path": "server/routes/checkout.ts",
+                    "score": 42,
+                    "rationale": ["route_manifest:/api/checkout/{cartId}"],
+                }
+            ]
+        },
+    )
+
+    bundle = build_repair_bundle(store, failure_id)
+
+    backend = bundle.backend_context
+    assert backend["request_response"][0]["request"]["artifact"]["method"] == "POST"
+    assert backend["request_response"][0]["response"]["artifact"]["status_code"] == 500
+    assert backend["route"]["route_path"] == "/api/checkout/42"
+    assert backend["route"]["matches"] == [
+        {
+            "file_path": "server/routes/checkout.ts",
+            "score": 42,
+            "rationale": ["route_manifest:/api/checkout/{cartId}"],
+        }
+    ]
+    assert backend["logs"]["trace_ids"] == ["trace-1"]
+    assert backend["logs"]["items"][0]["untrusted_payload"]["message"].startswith(
+        "checkout handler"
+    )
+
+
 def test_repair_bundle_infers_explainable_linked_validation_commands(
     tmp_path: Path,
 ) -> None:
