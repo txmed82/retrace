@@ -19,6 +19,12 @@ import click
 import httpx
 import yaml
 
+from retrace.api_testing import (
+    api_runs_dir_for_data_dir,
+    api_specs_dir_for_data_dir,
+    load_api_spec,
+    run_api_spec,
+)
 from retrace.fix_suggestions import (
     generate_fix_suggestions,
     parsed_finding_from_replay_issue,
@@ -30,7 +36,10 @@ from retrace.ingester import PostHogIngester
 from retrace.llm.client import LLMClient
 from retrace.llm.client import build_llm_http_request
 from retrace.reports.parser import parse_report_findings
-from retrace.replay_specs import generate_spec_from_replay_issue
+from retrace.replay_specs import (
+    generate_api_spec_from_replay_issue,
+    generate_spec_from_replay_issue,
+)
 from retrace.sdk_keys import create_sdk_key
 from retrace.storage import GitHubRepoRow, Storage
 from retrace.tester import (
@@ -746,6 +755,7 @@ def _replay_issue_payload(
         "reproduction_steps": _json_field(row, "reproduction_steps_json", []),
         "signal_summary": _json_field(row, "signal_summary_json", {}),
         "evidence": evidence,
+        "api_calls": _replay_api_calls(evidence),
         "fingerprint": str(row["fingerprint"]),
         "analysis_status": str(row["analysis_status"]),
         "analysis_model": str(row["analysis_model"]),
@@ -844,6 +854,30 @@ def _replay_evidence_timeline(evidence: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(items, key=lambda item: (int(item.get("occurred_at_ms") or 0), str(item.get("title") or "")))
 
 
+def _replay_api_calls(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    for signal in evidence.get("signals") if isinstance(evidence.get("signals"), list) else []:
+        if not isinstance(signal, dict):
+            continue
+        detector = str(signal.get("detector") or "")
+        if detector not in {"network_4xx", "network_5xx"}:
+            continue
+        details = signal.get("details") if isinstance(signal.get("details"), dict) else {}
+        calls.append(
+            {
+                "detector": detector,
+                "timestamp_ms": int(signal.get("timestamp_ms") or 0),
+                "method": str(details.get("method") or details.get("request_method") or "GET").upper(),
+                "url": str(details.get("request_url") or details.get("url") or ""),
+                "status": details.get("status") or details.get("status_code") or "",
+                "confidence": str(signal.get("confidence") or ""),
+                "reason_codes": signal.get("reason_codes") if isinstance(signal.get("reason_codes"), list) else [],
+                "trace": details.get("trace") if isinstance(details.get("trace"), dict) else {},
+            }
+        )
+    return calls
+
+
 def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
     issues = []
     issue_rows = store.list_recent_replay_issues(limit=50)
@@ -931,6 +965,97 @@ def _generate_replay_issue_spec_payload(
             "known_gaps": generated.known_gaps,
         },
         200,
+    )
+
+
+def _generate_replay_issue_api_spec_payload(
+    *,
+    store: Storage,
+    data_dir: Path,
+    issue_id: str,
+    project_id: str,
+    environment_id: str,
+    app_url: str = "",
+) -> tuple[dict[str, Any], int]:
+    try:
+        generated = generate_api_spec_from_replay_issue(
+            store=store,
+            specs_dir=api_specs_dir_for_data_dir(data_dir),
+            project_id=project_id,
+            environment_id=environment_id,
+            issue_id=issue_id,
+            app_url=app_url,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        status = 404 if "not found" in message.lower() else 400
+        return {"ok": False, "error": message}, status
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 400
+    return (
+        {
+            "ok": True,
+            "spec": generated.spec.__dict__,
+            "issue_public_id": generated.issue_public_id,
+            "replay_public_id": generated.replay_public_id,
+            "source_signal": generated.source_signal,
+        },
+        200,
+    )
+
+
+def _run_replay_issue_api_spec_payload(
+    *,
+    store: Storage,
+    data_dir: Path,
+    spec_id: str,
+) -> tuple[dict[str, Any], int]:
+    try:
+        spec = load_api_spec(api_specs_dir_for_data_dir(data_dir), spec_id)
+        result = run_api_spec(
+            spec=spec,
+            runs_dir=api_runs_dir_for_data_dir(data_dir),
+        )
+        links = store.list_failure_test_links(spec_id=result.spec_id, limit=10)
+        if not links:
+            failure_id = str(spec.fixtures.get("canonical_failure_id") or "")
+            issue_id = str(spec.fixtures.get("issue_id") or "")
+            issue_public_id = str(spec.fixtures.get("issue_public_id") or "")
+            if failure_id:
+                link_id = store.upsert_failure_test_link(
+                    failure_id=failure_id,
+                    issue_id=issue_id,
+                    issue_public_id=issue_public_id,
+                    spec_id=spec.spec_id,
+                    spec_name=spec.name,
+                    spec_path=str(api_specs_dir_for_data_dir(data_dir) / f"{spec.spec_id}.json"),
+                    source=str(spec.fixtures.get("source") or "replay_issue_api"),
+                )
+                links = store.list_failure_test_links(
+                    spec_id=result.spec_id,
+                    limit=10,
+                )
+                links = [link for link in links if link.id == link_id] or links
+        updated = []
+        for link in links:
+            updated.extend(
+                store.update_failure_test_link_run(
+                    spec_id=result.spec_id,
+                    run_result=result,
+                    link_id=link.id,
+                )
+            )
+    except FileNotFoundError:
+        return {"ok": False, "error": f"API spec not found: {spec_id}"}, 404
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 400
+    return (
+        {
+            "ok": result.ok,
+            "result": result.__dict__,
+            "updated_links": [_failure_test_link_payload(link) for link in updated],
+        },
+        200 if result.ok else 400,
     )
 
 
@@ -1900,6 +2025,48 @@ const retrace = init({
       await refreshTesterAndReplay(issue.public_id);
     }
 
+    async function generateReplayIssueApiSpec(issue){
+      if(!issue){ return; }
+      const status = byId('replayApiSpecStatus');
+      if(status) status.textContent = 'Generating...';
+      const res = await fetch('/api/replay-issue/api-spec', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          issue_id: issue.public_id || issue.id,
+          project_id: issue.project_id,
+          environment_id: issue.environment_id,
+          app_url: byId('testerSpecAppUrl')?.value || '',
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        if(status) status.textContent = `Failed: ${data.error || 'could not generate API spec'}`;
+        return;
+      }
+      if(status) status.textContent = `Created ${data.spec.spec_id} (${data.spec.method} ${data.spec.url})`;
+      await refreshTesterAndReplay(issue.public_id);
+    }
+
+    async function runReplayIssueApiSpec(specId, issueId){
+      const status = byId('replayApiSpecStatus');
+      if(status) status.textContent = `Running ${specId}...`;
+      const res = await fetch('/api/replay-issue/api-run', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({spec_id: specId}),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        const msg = data?.result?.error || data.error || 'API run failed';
+        if(status) status.textContent = `Failed: ${msg}`;
+        await refreshTesterAndReplay(issueId || replayState.activeIssueId);
+        return;
+      }
+      if(status) status.textContent = `API passed: ${data.result.run_id}`;
+      await refreshTesterAndReplay(issueId || replayState.activeIssueId);
+    }
+
     async function generateReplayIssueFixPrompts(issue){
       if(!issue){ return; }
       const status = byId('replayFixPromptStatus');
@@ -2232,6 +2399,34 @@ const retrace = init({
       return rows ? `<ul>${rows}</ul>` : '<div class="empty">No linked regression tests yet.</div>';
     }
 
+    function renderApiRegressionPanel(issue){
+      const calls = issue.api_calls || [];
+      const apiLinks = (issue.test_links || []).filter(link => (link.source || '').includes('api'));
+      const callRows = calls.map(call => `
+        <li>
+          <code>${esc(call.method || 'GET')}</code> ${esc(call.url || '')}
+          <br><span class="empty">status=<code>${esc(call.status || '')}</code> · detector=<code>${esc(call.detector || '')}</code>${call.confidence ? ` · ${esc(call.confidence)} confidence` : ''}</span>
+        </li>
+      `).join('');
+      const linkRows = apiLinks.map(link => `
+        <li>
+          <button class="btn" type="button" data-run-api-spec="${esc(link.spec_id)}" data-issue-id="${esc(issue.public_id)}">Run</button>
+          <code>${esc(link.spec_id)}</code>${link.spec_name ? ` · ${esc(link.spec_name)}` : ''}
+          <br><span class="empty">coverage=<code class="${statusClass(link.coverage_state)}">${esc(link.coverage_state)}</code>${link.latest_run_status ? ` · latest=<code class="${statusClass(link.latest_run_status)}">${esc(link.latest_run_status)}</code>` : ''}</span>
+          ${link.spec_path ? `<br><span class="empty">${esc(link.spec_path)}</span>` : ''}
+        </li>
+      `).join('');
+      return `
+        <div class="lbl">Triggered API Calls</div>
+        ${callRows ? `<ul>${callRows}</ul>` : '<div class="empty">No failed API call evidence on this issue.</div>'}
+        <div style="height:8px"></div>
+        <button class="btn" id="generateReplayApiSpecBtn" type="button" ${calls.length ? '' : 'disabled'}>Generate API Regression</button>
+        <span class="empty" id="replayApiSpecStatus"></span>
+        <div style="height:8px"></div>
+        ${linkRows ? `<ul>${linkRows}</ul>` : '<div class="empty">No linked API regression tests yet.</div>'}
+      `;
+    }
+
     function renderExternalLinks(issue){
       const links = [];
       const externalTicketUrl = safeExternalUrl(issue.external_ticket_url);
@@ -2324,6 +2519,8 @@ const retrace = init({
               ${renderTestLinks(issue)}
             </div>
             <div style="height:12px"></div>
+            <div class="card"><h3>API Regression</h3>${renderApiRegressionPanel(issue)}</div>
+            <div style="height:12px"></div>
             <div class="card"><h3>External Links</h3>${renderExternalLinks(issue)}</div>
             <div style="height:12px"></div>
             <div class="card"><h3>Signals</h3><pre>${esc(JSON.stringify(issue.signal_summary || {}, null, 2))}</pre></div>
@@ -2337,7 +2534,11 @@ const retrace = init({
       byId('unresolveReplayIssueBtn')?.addEventListener('click', () => transitionReplayIssue(issue, 'unresolved'));
       byId('ignoreReplayIssueBtn')?.addEventListener('click', () => transitionReplayIssue(issue, 'ignored'));
       byId('generateReplaySpecBtn')?.addEventListener('click', () => generateReplayIssueSpec(issue));
+      byId('generateReplayApiSpecBtn')?.addEventListener('click', () => generateReplayIssueApiSpec(issue));
       byId('generateReplayFixPromptsBtn')?.addEventListener('click', () => generateReplayIssueFixPrompts(issue));
+      root.querySelectorAll('[data-run-api-spec]').forEach(el => {
+        el.addEventListener('click', () => runReplayIssueApiSpec(el.dataset.runApiSpec, el.dataset.issueId));
+      });
       byId('timelineTypeFilter')?.addEventListener('change', ev => filterIssueTimeline(ev.target.value));
       byId('copyEvidenceBundleBtn')?.addEventListener('click', () => copyEvidenceBundle(issue));
     }
@@ -3060,6 +3261,32 @@ def ui_command(
                     environment_id=str(body.get("environment_id", "")).strip()
                     or workspace.environment_id,
                     app_url=str(body.get("app_url", "")).strip(),
+                )
+                self._json(payload, status=status)
+                return
+
+            if path == "/api/replay-issue/api-spec":
+                body = self._read_json_body()
+                workspace = store.ensure_workspace(project_name="Default")
+                payload, status = _generate_replay_issue_api_spec_payload(
+                    store=store,
+                    data_dir=data_dir,
+                    issue_id=str(body.get("issue_id", "")).strip(),
+                    project_id=str(body.get("project_id", "")).strip()
+                    or workspace.project_id,
+                    environment_id=str(body.get("environment_id", "")).strip()
+                    or workspace.environment_id,
+                    app_url=str(body.get("app_url", "")).strip(),
+                )
+                self._json(payload, status=status)
+                return
+
+            if path == "/api/replay-issue/api-run":
+                body = self._read_json_body()
+                payload, status = _run_replay_issue_api_spec_payload(
+                    store=store,
+                    data_dir=data_dir,
+                    spec_id=str(body.get("spec_id", "")).strip(),
                 )
                 self._json(payload, status=status)
                 return
