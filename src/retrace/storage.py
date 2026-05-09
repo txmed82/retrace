@@ -1517,7 +1517,9 @@ class Storage:
             ),
         ).fetchone()
         assert row is not None
-        return str(row["id"])
+        persisted_failure_id = str(row["id"])
+        self._refresh_incidents_for_failure(conn, failure_id=persisted_failure_id)
+        return persisted_failure_id
 
     def get_failure(
         self,
@@ -1671,7 +1673,12 @@ class Storage:
                 (evidence.failure_id, evidence.dedupe_key),
             ).fetchone()
             assert row is not None
+            self._refresh_incidents_for_failure(
+                conn,
+                failure_id=evidence.failure_id,
+            )
             return str(row["id"])
+        self._refresh_incidents_for_failure(conn, failure_id=evidence.failure_id)
         return evidence_id
 
     def list_failure_evidence(
@@ -2009,6 +2016,26 @@ class Storage:
                 incident_id,
             ),
         )
+
+    def _refresh_incidents_for_failure(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        failure_id: str,
+    ) -> None:
+        rows = conn.execute(
+            """
+            SELECT incident_id
+            FROM incident_failures
+            WHERE failure_id = ?
+            """,
+            (failure_id,),
+        ).fetchall()
+        for row in rows:
+            self._refresh_incident_rollup(
+                conn,
+                incident_id=str(row["incident_id"]),
+            )
 
     def upsert_failure_with_evidence_and_repair_task(
         self,

@@ -100,6 +100,47 @@ def test_equivalent_monitor_failures_group_into_one_incident(tmp_path: Path) -> 
     }
     assert {item.source for item in detail.evidence} == {"sentry:evt-1", "sentry:evt-2"}
 
+    extra_payload = {"external_id": "evt-1", "message": "repeat alert"}
+    store.append_failure_evidence(
+        EvidenceItem(
+            failure_id=first_failure_id,
+            evidence_type="monitoring_alert",
+            occurred_at_ms=2000,
+            source="sentry:evt-1",
+            redaction_state="sensitive",
+            payload=extra_payload,
+            dedupe_key=evidence_dedupe_key(
+                failure_id=first_failure_id,
+                evidence_type="monitoring_alert",
+                source="sentry:evt-1",
+                occurred_at_ms=2000,
+                payload=extra_payload,
+            ),
+        )
+    )
+    store.upsert_failure(
+        canonical_failure_from_monitor_incident(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            provider="sentry",
+            external_id="evt-2",
+            title="TypeError in checkout",
+            summary="Cannot read cart total.",
+            severity="low",
+            fingerprint="checkout-type-error",
+            metadata={
+                "provider": "sentry",
+                "service": "web",
+                "route": "/checkout",
+                "top_stack_frame": "src/checkout.ts:submit:42",
+                "trace_ids": ["trace-1"],
+            },
+        )
+    )
+    refreshed = get_incident_detail(store=store, incident_id=first.incident_id)
+    assert refreshed.incident.evidence_count == 3
+    assert refreshed.incident.severity == "medium"
+
 
 def test_incident_can_generate_one_repair_task(tmp_path: Path) -> None:
     store, workspace = _store(tmp_path)
