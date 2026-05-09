@@ -4321,7 +4321,7 @@ class Storage:
                 VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, environment_id, fingerprint) DO UPDATE SET
                     status = CASE
-                        WHEN replay_issues.status = 'resolved' THEN 'regressed'
+                        WHEN replay_issues.status IN ('resolved', 'verified') THEN 'regressed'
                         WHEN replay_issues.status = 'new' THEN 'ongoing'
                         WHEN replay_issues.status = 'unresolved' THEN 'ongoing'
                         WHEN replay_issues.status = 'ongoing' THEN 'ongoing'
@@ -4380,7 +4380,7 @@ class Storage:
                     first_seen_ms = MIN(replay_issues.first_seen_ms, excluded.first_seen_ms),
                     last_seen_ms = MAX(replay_issues.last_seen_ms, excluded.last_seen_ms),
                     resolved_at = CASE
-                        WHEN replay_issues.status = 'resolved' THEN NULL
+                        WHEN replay_issues.status IN ('resolved', 'verified') THEN NULL
                         ELSE replay_issues.resolved_at
                     END,
                     updated_at = excluded.updated_at
@@ -4704,7 +4704,10 @@ class Storage:
                     external_ticket_state = COALESCE(NULLIF(?, ''), external_ticket_state),
                     external_ticket_id = COALESCE(NULLIF(?, ''), external_ticket_id),
                     external_ticket_url = COALESCE(NULLIF(?, ''), external_ticket_url),
-                    resolved_at = CASE WHEN ? = 'resolved' THEN ? ELSE NULL END,
+                    resolved_at = CASE
+                        WHEN ? IN ('resolved', 'verified') THEN ?
+                        ELSE NULL
+                    END,
                     updated_at = ?
                 WHERE id = ?
                 """,

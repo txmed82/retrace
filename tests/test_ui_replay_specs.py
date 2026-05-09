@@ -1034,6 +1034,7 @@ def test_verify_resolved_issues_payload_marks_passing_ui_spec_verified(
     )
     assert row is not None
     assert row["status"] == "verified"
+    assert row["resolved_at"]
 
 
 def test_verify_resolved_issues_payload_runs_linked_api_specs(
@@ -1103,6 +1104,7 @@ def test_verify_resolved_issues_payload_runs_linked_api_specs(
     )
     assert row is not None
     assert row["status"] == "verified"
+    assert row["resolved_at"]
     links = store.list_failure_test_links(
         failure_id=str(issue["canonical_failure_id"]),
         spec_id=api_spec.spec_id,

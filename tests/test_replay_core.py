@@ -470,6 +470,60 @@ def test_replay_core_clusters_sessions_and_regresses_resolved_issue(tmp_path: Pa
     ]
 
 
+def test_replay_core_regresses_verified_issue_on_recurrence(tmp_path: Path) -> None:
+    store, workspace = _workspace(tmp_path)
+    events = [
+        _navigation("https://app.example/checkout"),
+        _console_error("TypeError: verified issue recurred"),
+    ]
+    for session_id in ["sess-verified-a", "sess-verified-b"]:
+        store.insert_replay_batch(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            session_id=session_id,
+            sequence=0,
+            events=events,
+            flush_type="final",
+        )
+
+    first = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-verified-a"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    assert store.transition_replay_issue(first.issues[0].issue_id, status="verified")
+    verified = store.get_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=first.issues[0].public_id,
+    )
+    assert verified is not None
+    assert verified["status"] == "verified"
+    assert verified["resolved_at"]
+
+    second = process_replay_sessions(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_ids=["sess-verified-a", "sess-verified-b"],
+        config=ReplaySignalConfig.from_names(["console_error"]),
+    )
+    issue = store.get_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=first.issues[0].public_id,
+    )
+
+    assert second.issues[0].previous_status == "verified"
+    assert second.issues[0].current_status == "regressed"
+    assert second.issues[0].previous_resolved_at
+    assert issue is not None
+    assert issue["status"] == "regressed"
+    assert issue["resolved_at"] is None
+
+
 def test_replay_core_counts_anonymous_sessions_with_identified_users(
     tmp_path: Path,
 ) -> None:
