@@ -182,6 +182,7 @@ def test_github_webhook_redelivery_is_idempotent_by_comment(tmp_path: Path) -> N
     secret = "webhook-secret"
     body = json.dumps(_payload()).encode("utf-8")
     headers = _headers(secret, body)
+    redelivery_headers = {**headers, "X-GitHub-Delivery": "delivery-2"}
 
     first = handle_github_webhook(
         store=store,
@@ -192,7 +193,7 @@ def test_github_webhook_redelivery_is_idempotent_by_comment(tmp_path: Path) -> N
     second = handle_github_webhook(
         store=store,
         body=body,
-        headers=headers,
+        headers=redelivery_headers,
         webhook_secret=secret,
     )
 

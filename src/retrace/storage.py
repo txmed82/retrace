@@ -26,6 +26,8 @@ FAILURE_TEST_COVERAGE_STATES = (
     "covered_flaky",
 )
 
+GITHUB_REVIEW_RUN_STATUSES = ("queued", "running", "succeeded", "failed", "canceled")
+
 _SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
@@ -46,6 +48,15 @@ def _string_values(value: object) -> list[str]:
         return [str(item).strip() for item in value if str(item).strip()]
     text = str(value or "").strip()
     return [text] if text else []
+
+
+def _normalize_github_review_run_status(value: str) -> str:
+    status = value.strip().lower()
+    if status not in GITHUB_REVIEW_RUN_STATUSES:
+        allowed = ", ".join(GITHUB_REVIEW_RUN_STATUSES)
+        raise ValueError(f"invalid github review run status: {value!r}; allowed: {allowed}")
+    return status
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -3012,6 +3023,7 @@ class Storage:
             raise ValueError("repo_full_name is required")
         if pr_number <= 0:
             raise ValueError("pr_number must be positive")
+        clean_status = _normalize_github_review_run_status(status or "queued")
         run_id = self._id("ghrr")
         now = datetime.now(timezone.utc).isoformat()
         try:
@@ -3036,7 +3048,7 @@ class Storage:
                     sender_login.strip(),
                     clean_comment_id,
                     comment_url.strip(),
-                    status.strip() or "queued",
+                    clean_status,
                     trigger_phrase.strip() or "@retrace review",
                     metadata_json,
                     now,
@@ -3086,7 +3098,7 @@ class Storage:
             params.append(int(pr_number))
         if status is not None:
             where.append("status = ?")
-            params.append(status.strip())
+            params.append(_normalize_github_review_run_status(status))
         clause = " AND ".join(where) if where else "1 = 1"
         params.append(max(1, min(int(limit), 500)))
         with self._conn() as conn:
@@ -3109,9 +3121,7 @@ class Storage:
         status: str,
         metadata: Optional[dict[str, Any]] = None,
     ) -> Optional[GitHubReviewRunRow]:
-        clean_status = status.strip()
-        if not clean_status:
-            raise ValueError("status is required")
+        clean_status = _normalize_github_review_run_status(status)
         now = datetime.now(timezone.utc).isoformat()
         metadata_json = None
         if metadata is not None:
