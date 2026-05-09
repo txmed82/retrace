@@ -691,6 +691,7 @@ def tester_run(
                 "failure_classification": result.failure_classification,
                 "error": result.error,
                 "execution_engine": result.execution_engine,
+                "engine_reason": result.engine_reason,
                 "canonical_failure_id": failure_metadata.get("failure_id", ""),
                 "repair_task_id": failure_metadata.get("repair_task_id", ""),
                 "artifacts": result.artifacts,
