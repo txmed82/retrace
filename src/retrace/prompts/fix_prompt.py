@@ -117,7 +117,12 @@ def build_repair_bundle_prompt(bundle: RepairBundle) -> str:
         else "- No linked tests are recorded."
     )
     validation = (
-        "\n".join(f"- `{command}`" for command in bundle.validation_commands)
+        "\n".join(
+            f"- `{item.get('command')}` - {item.get('reason')}"
+            for item in bundle.validation_plan
+        )
+        if bundle.validation_plan
+        else "\n".join(f"- `{command}`" for command in bundle.validation_commands)
         if bundle.validation_commands
         else "- Add or identify a targeted validation command before finishing."
     )
