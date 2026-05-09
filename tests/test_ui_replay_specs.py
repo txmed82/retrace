@@ -362,8 +362,9 @@ def test_generate_replay_issue_spec_payload_creates_native_spec(
     assert payload["spec"]["fixtures"]["issue_public_id"] == issue_public_id
     assert payload["issue_public_id"] == issue_public_id
     assert payload["replay_public_id"].startswith("rpl_")
-    assert payload["confidence"] == "medium"
+    assert payload["confidence"] == "low"
     assert payload["known_gaps"]
+    assert payload["spec"]["fixtures"]["generation"]["quality"]["status"] == "needs_locator"
     assert (
         specs_dir_for_data_dir(tmp_path) / f"{payload['spec']['spec_id']}.json"
     ).exists()

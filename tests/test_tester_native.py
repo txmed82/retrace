@@ -357,6 +357,32 @@ def test_auto_engine_policy_explains_playwright_runtime(tmp_path: Path) -> None:
     assert "Playwright" in selection.reason
 
 
+def test_auto_engine_policy_uses_playwright_for_target_selector_steps(
+    tmp_path: Path,
+) -> None:
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Auto replay selector",
+        prompt="",
+        app_url="http://127.0.0.1:3000",
+        start_command="",
+        harness_command="",
+        execution_engine="auto",
+        exact_steps=[
+            {
+                "id": "click",
+                "action": "click",
+                "target": {"selector": '[data-testid="checkout-pay"]'},
+            }
+        ],
+    )
+
+    selection = select_execution_engine(spec)
+
+    assert selection.execution_engine == "native"
+    assert "Playwright" in selection.reason
+
+
 def test_auto_engine_policy_routes_exploration_and_open_prompts(
     tmp_path: Path,
 ) -> None:
