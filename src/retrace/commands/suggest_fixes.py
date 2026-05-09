@@ -161,6 +161,8 @@ def suggest_fixes_command(
         source_label=source_label,
         artifact_stem=artifact_stem,
         findings=findings,
+        project_id=effective_project_id if replay_issue_id.strip() else "",
+        environment_id=effective_environment_id if replay_issue_id.strip() else "",
     )
 
     click.echo(

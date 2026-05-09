@@ -1459,6 +1459,8 @@ class Storage:
     def find_failure_by_source(
         self,
         *,
+        project_id: str,
+        environment_id: str,
         source_type: str,
         source_external_id: str,
     ) -> Optional[FailureRow]:
@@ -1467,11 +1469,12 @@ class Storage:
                 """
                 SELECT *
                 FROM failures
-                WHERE source_type = ? AND source_external_id = ?
+                WHERE project_id = ? AND environment_id = ?
+                  AND source_type = ? AND source_external_id = ?
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
-                (source_type, source_external_id),
+                (project_id, environment_id, source_type, source_external_id),
             ).fetchone()
         return self._failure_from_row(row) if row is not None else None
 
@@ -1703,6 +1706,13 @@ class Storage:
             ).fetchone()
             assert row is not None
             persisted_task_id = str(row["id"])
+            conn.execute(
+                """
+                DELETE FROM repair_task_evidence
+                WHERE repair_task_id = ? AND role = 'supporting'
+                """,
+                (persisted_task_id,),
+            )
             for evidence_id in clean_evidence_ids:
                 evidence_row = conn.execute(
                     """

@@ -148,6 +148,8 @@ def seed_demo(
             source_label=f"replay issue {issue.public_id}",
             artifact_stem=f"replay-{slugify(issue.public_id)}",
             findings=[parsed_finding_from_replay_issue(issue_row)],
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
         )
         artifact = suggestions.artifacts[0] if suggestions.artifacts else None
         fix_prompts_payload = {

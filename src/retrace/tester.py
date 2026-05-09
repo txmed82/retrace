@@ -2066,6 +2066,10 @@ def _run_playwright_spec(
                 )
             screenshot_path = artifacts_dir / "playwright-final.png"
             try:
+                current_url = str(page.url or "")
+            except Exception:
+                current_url = ""
+            try:
                 page.screenshot(path=str(screenshot_path), full_page=True)
                 artifacts.append(
                     TesterArtifact(
@@ -2073,7 +2077,7 @@ def _run_playwright_spec(
                         artifact_type="screenshot",
                         path=str(screenshot_path),
                         label="Final Playwright screenshot",
-                        metadata={"url": page.url},
+                        metadata={"url": current_url},
                     )
                 )
             except Exception as exc:
@@ -2083,7 +2087,7 @@ def _run_playwright_spec(
                         artifact_type="screenshot_error",
                         path="",
                         label="Final Playwright screenshot error",
-                        metadata={"url": page.url, "error": str(exc)},
+                        metadata={"url": current_url, "error": str(exc)},
                     )
                 )
             context.close()

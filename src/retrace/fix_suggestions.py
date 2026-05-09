@@ -91,6 +91,8 @@ def generate_fix_suggestions(
     source_label: str,
     artifact_stem: str,
     findings: list[ParsedFinding],
+    project_id: str = "",
+    environment_id: str = "",
 ) -> FixSuggestionResult:
     out_dir.mkdir(parents=True, exist_ok=True)
     stored = 0
@@ -207,6 +209,8 @@ def generate_fix_suggestions(
                 candidates=candidates,
                 prompt_files=prompt_files,
                 artifact_json=artifact_json,
+                project_id=project_id,
+                environment_id=environment_id,
             )
         except Exception:
             logger.exception("failed to persist repair task for %s", report_key)
@@ -276,12 +280,16 @@ def _upsert_replay_issue_repair_task(
     candidates: list[CodeCandidate],
     prompt_files: dict[str, str],
     artifact_json: str,
+    project_id: str = "",
+    environment_id: str = "",
 ) -> str:
     prefix = "replay://issue/"
-    if not report_key.startswith(prefix):
+    if not report_key.startswith(prefix) or not project_id or not environment_id:
         return ""
     issue_public_id = report_key.removeprefix(prefix)
     failure = store.find_failure_by_source(
+        project_id=project_id,
+        environment_id=environment_id,
         source_type="replay_issue",
         source_external_id=issue_public_id,
     )

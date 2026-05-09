@@ -167,7 +167,10 @@ def test_suggest_fixes_generates_from_replay_issue(tmp_path: Path, monkeypatch):
     assert tasks[0].source_external_id == issue_id
     assert "src/checkout.tsx" in tasks[0].likely_files
     assert len(tasks[0].prompt_artifacts) == 3
+    workspace = store.ensure_workspace(project_name="Default")
     failure = store.find_failure_by_source(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
         source_type="replay_issue",
         source_external_id=issue_id,
     )

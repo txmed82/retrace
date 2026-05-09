@@ -94,6 +94,17 @@ def test_repair_task_links_failure_and_multiple_evidence_items(tmp_path: Path) -
     assert task.validation_commands == ["uv run pytest tests/test_checkout.py"]
     assert set(task.evidence_ids) == {item.id for item in evidence}
 
+    store.upsert_repair_task(
+        failure_id=failure_id,
+        title="Repair checkout click",
+        source_type="replay_issue",
+        source_external_id=created.public_id,
+        evidence_ids=[evidence[0].id],
+    )
+    refreshed_task = store.get_repair_task(task_id)
+    assert refreshed_task is not None
+    assert refreshed_task.evidence_ids == [evidence[0].id]
+
     failure = store.get_failure(
         project_id="proj_1",
         environment_id="env_1",
@@ -165,6 +176,8 @@ def test_repair_task_failure_does_not_block_prompt_generation(
         source_label=f"replay issue {created.public_id}",
         artifact_stem="replay-checkout",
         findings=[parsed_finding_from_replay_issue(issue)],
+        project_id="proj_1",
+        environment_id="env_1",
     )
 
     assert result.generated == 1
