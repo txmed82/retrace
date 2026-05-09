@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import subprocess
+import fnmatch
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -356,13 +357,19 @@ def _owners_for_path(rel: str, rules: list[tuple[str, list[str]]]) -> list[str]:
     matched: list[str] = []
     for pattern, owners in rules:
         clean = pattern.lstrip("/")
-        if clean == "*" or rel == clean or rel.startswith(clean.rstrip("/") + "/"):
-            matched = owners
-        elif clean.startswith("*.") and rel.endswith(clean[1:]):
-            matched = owners
-        elif clean.endswith("*") and rel.startswith(clean[:-1]):
+        if _codeowners_pattern_matches(clean, rel):
             matched = owners
     return matched
+
+
+def _codeowners_pattern_matches(pattern: str, rel: str) -> bool:
+    if pattern == "*":
+        return True
+    if pattern.endswith("/"):
+        return rel.startswith(pattern)
+    if "/" not in pattern:
+        return fnmatch.fnmatch(Path(rel).name, pattern) or fnmatch.fnmatch(rel, pattern)
+    return fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(rel, f"{pattern.rstrip('/')}/*")
 
 
 def _recent_churn_scores(repo_path: Path) -> dict[str, float]:

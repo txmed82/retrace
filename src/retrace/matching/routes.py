@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import re
 from dataclasses import dataclass
@@ -170,6 +171,7 @@ def _normalize_route(route: str) -> str:
     return clean or "/"
 
 
+@functools.lru_cache(maxsize=256)
 def _route_pattern(route: str) -> re.Pattern[str]:
     parts = []
     for segment in route.rstrip("/").split("/"):

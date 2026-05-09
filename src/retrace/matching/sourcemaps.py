@@ -9,7 +9,7 @@ from pathlib import Path
 @dataclass(frozen=True)
 class SourceMapIndex:
     generated_path: str
-    sources: list[str]
+    sources: tuple[str, ...]
 
 
 _STACK_PATH_RE = re.compile(
@@ -38,7 +38,12 @@ def load_source_maps(repo_path: Path) -> list[SourceMapIndex]:
             if source
         ]
         if generated and normalized_sources:
-            maps.append(SourceMapIndex(generated_path=generated, sources=normalized_sources))
+            maps.append(
+                SourceMapIndex(
+                    generated_path=generated,
+                    sources=tuple(normalized_sources),
+                )
+            )
     return maps
 
 
@@ -97,7 +102,8 @@ def _normalize_source(repo_path: Path, base: Path, source: str) -> str:
             path = (base / clean).resolve().relative_to(repo_path.resolve())
             return path.as_posix()
         except ValueError:
-            clean = clean.lstrip("../")
+            while clean.startswith("../"):
+                clean = clean[3:]
     if clean.startswith("webpack:/"):
         clean = clean.split("webpack:/", 1)[-1].lstrip("/")
     if (repo_path / clean).exists() or "/" in clean:

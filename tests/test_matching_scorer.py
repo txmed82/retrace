@@ -290,6 +290,7 @@ def test_score_repo_for_finding_includes_codeowners_context(tmp_path: Path):
     (repo / "server/routes").mkdir(parents=True, exist_ok=True)
     (repo / ".github/CODEOWNERS").write_text(
         "server/routes/ @backend-team @api-reviewer\n"
+        "**/routes/*.ts @recursive-owner\n"
     )
     (repo / "server/routes/billing.ts").write_text(
         "export function billingHandler(){ router.post('/api/billing/pay', billingHandler); }"
@@ -305,5 +306,5 @@ def test_score_repo_for_finding_includes_codeowners_context(tmp_path: Path):
 
     assert out
     assert out[0].file_path == "server/routes/billing.ts"
-    assert out[0].owners == ["@backend-team", "@api-reviewer"]
-    assert "codeowners:@backend-team @api-reviewer" in out[0].rationale
+    assert out[0].owners == ["@recursive-owner"]
+    assert "codeowners:@recursive-owner" in out[0].rationale
