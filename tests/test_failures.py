@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from retrace.failures import (
+    canonical_failure_from_api_run,
     canonical_failure_from_monitor_incident,
     canonical_failure_from_replay_issue,
     canonical_failure_from_test_run,
@@ -429,6 +430,43 @@ def test_test_run_failure_can_be_represented_as_canonical_failure() -> None:
     assert failure.metadata["assertion_results"] == [
         {"assertion_id": "a1", "ok": False}
     ]
+
+
+def test_api_run_failure_summary_uses_assertion_failure_when_status_matches() -> None:
+    class Spec:
+        spec_id = "api_health"
+        name = "Health API"
+        method = "GET"
+        url = "http://example.test/api/health"
+        query = {}
+        expected_status = 200
+
+    class Result:
+        run_id = "run_api_1"
+        spec_id = "api_health"
+        ok = False
+        status_code = 200
+        status = "failed"
+        error = ""
+        artifacts = []
+        assertion_results = [
+            {
+                "assertion_id": "json-0",
+                "ok": False,
+                "message": "Expected $.ok to equal true.",
+            }
+        ]
+
+    failure = canonical_failure_from_api_run(
+        project_id="proj_1",
+        environment_id="env_1",
+        spec=Spec(),
+        run_result=Result(),
+    )
+
+    assert "expected status 200, got 200" not in failure.summary
+    assert "assertion failed" in failure.summary
+    assert "Expected $.ok to equal true." in failure.summary
 
 
 def test_future_monitor_incident_needs_no_schema_specific_fields() -> None:

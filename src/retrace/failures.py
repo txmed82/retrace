@@ -220,6 +220,86 @@ def canonical_failure_from_harness_run(
     )
 
 
+def canonical_failure_from_api_run(
+    *,
+    project_id: str,
+    environment_id: str,
+    spec: Any,
+    run_result: Any,
+) -> CanonicalFailure:
+    spec_id = str(getattr(spec, "spec_id", "") or getattr(run_result, "spec_id", "") or "")
+    method = str(getattr(spec, "method", "") or "").upper()
+    url = str(getattr(spec, "url", "") or "")
+    expected_status = _safe_int(getattr(spec, "expected_status", 0))
+    status_code = _safe_int(getattr(run_result, "status_code", 0))
+    error = str(getattr(run_result, "error", "") or "")
+    assertion_results = list(getattr(run_result, "assertion_results", []) or [])
+    fingerprint_payload = {
+        "spec_id": spec_id,
+        "method": method,
+        "url": url,
+        "expected_status": expected_status,
+        "status_code": status_code,
+        "assertion_results": assertion_results,
+        "error": error,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    run_id = str(getattr(run_result, "run_id", "") or "")
+    source_external_id = f"api:{run_id or fingerprint[:16]}"
+    ok = bool(getattr(run_result, "ok", False))
+    failed_assertions = [
+        str(item.get("message") or item.get("assertion_id") or "")
+        for item in assertion_results
+        if isinstance(item, dict) and not bool(item.get("ok"))
+    ]
+    if status_code and status_code != expected_status:
+        summary = f"{method} {url} expected status {expected_status}, got {status_code}."
+        if error:
+            summary = f"{summary} Error: {error}"
+    elif status_code:
+        assertion_summary = error or "; ".join(item for item in failed_assertions if item)
+        summary = (
+            f"{method} {url} assertion failed: {assertion_summary}"
+            if assertion_summary
+            else f"{method} {url} failed after receiving status {status_code}."
+        )
+    else:
+        summary = f"{method} {url} failed before receiving a response."
+        if error:
+            summary = f"{summary} Error: {error}"
+    return CanonicalFailure(
+        public_id=stable_failure_public_id(
+            project_id, environment_id, "test_run", source_external_id
+        ),
+        project_id=project_id,
+        environment_id=environment_id,
+        source_type="test_run",
+        source_external_id=source_external_id,
+        fingerprint=fingerprint,
+        title=f"API test failed: {getattr(spec, 'name', '') or spec_id}",
+        summary=summary,
+        severity="medium",
+        confidence="high" if not ok else "low",
+        status="resolved" if ok else "new",
+        linked_tests=[spec_id] if spec_id else [],
+        metadata={
+            "run_id": run_id,
+            "spec_id": spec_id,
+            "method": method,
+            "url": url,
+            "query": dict(getattr(spec, "query", {}) or {}),
+            "expected_status": expected_status,
+            "status_code": status_code,
+            "status": str(getattr(run_result, "status", "") or ""),
+            "error": error,
+            "artifacts": list(getattr(run_result, "artifacts", []) or []),
+            "assertion_results": assertion_results,
+        },
+    )
+
+
 def canonical_failure_from_monitor_incident(
     *,
     project_id: str,

@@ -15,6 +15,7 @@ from retrace.api_testing import (
     create_api_spec,
     list_api_specs,
     load_api_spec,
+    persist_api_failure,
     run_api_spec,
 )
 from retrace.config import load_config
@@ -590,12 +591,51 @@ def tester_api_list(config_path: Path) -> None:
     default=Path("config.yaml"),
     show_default=True,
 )
+@click.option("--project-id", default="", help="Project ID override.")
+@click.option("--environment-id", default="", help="Environment ID override.")
+@click.option(
+    "--repo-path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Local repo path for route-based repair file scoring.",
+)
 @click.argument("spec_id")
-def tester_api_run(config_path: Path, spec_id: str) -> None:
+def tester_api_run(
+    config_path: Path,
+    project_id: str,
+    environment_id: str,
+    repo_path: Optional[Path],
+    spec_id: str,
+) -> None:
     cfg = load_config(config_path)
     spec = load_api_spec(api_specs_dir_for_data_dir(cfg.run.data_dir), spec_id)
     result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(cfg.run.data_dir))
-    click.echo(json.dumps(result.__dict__, indent=2))
+    failure_metadata: dict[str, Any] = {}
+    if not result.ok:
+        try:
+            store = Storage(cfg.run.data_dir / "retrace.db")
+            store.init_schema()
+            workspace = store.ensure_workspace(project_name="Default")
+            persisted = persist_api_failure(
+                store=store,
+                spec=spec,
+                result=result,
+                project_id=project_id.strip() or workspace.project_id,
+                environment_id=environment_id.strip() or workspace.environment_id,
+                repo_path=repo_path,
+            )
+            failure_metadata = {
+                "canonical_failure_id": persisted.failure_id,
+                "repair_task_id": persisted.repair_task_id,
+                "likely_files": persisted.likely_files,
+                "repair_prompt_path": persisted.prompt_path,
+            }
+        except Exception as exc:
+            click.echo(
+                f"warning: failed to persist API failure metadata: {exc}",
+                err=True,
+            )
+    click.echo(json.dumps({**result.__dict__, **failure_metadata}, indent=2))
     if not result.ok:
         raise click.ClickException("API test run failed.")
 

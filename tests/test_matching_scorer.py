@@ -157,3 +157,55 @@ def test_score_repo_for_finding_does_not_treat_all_src_as_server_route(
 
     assert out
     assert out[0].file_path == "src/routes/profile.ts"
+
+
+def test_score_repo_for_finding_matches_dynamic_api_route_handlers(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    (repo / "server/routes").mkdir(parents=True, exist_ok=True)
+    (repo / "client/src/pages").mkdir(parents=True, exist_ok=True)
+
+    (repo / "server/routes/checkout.ts").write_text(
+        "router.get('/api/checkout/:cartId', checkoutHandler);"
+    )
+    (repo / "client/src/pages/checkout.tsx").write_text(
+        "export function Checkout(){ return fetch('/api/checkout/42'); }"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Checkout API returns 500",
+        category="api_failure",
+        evidence_text="API reproduction: GET /api/checkout/42 expected 200 got 500.",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "server/routes/checkout.ts"
+    assert "api_route_pattern:/api/checkout/42" in out[0].rationale
+
+
+def test_score_repo_for_finding_ignores_opaque_route_ids(
+    tmp_path: Path,
+):
+    repo = tmp_path / "repo"
+    (repo / "server/routes").mkdir(parents=True, exist_ok=True)
+    (repo / "server/routes/customers.ts").write_text(
+        "router.get('/api/customers/:customerId/invoices', invoiceHandler);"
+    )
+    (repo / "server/routes/customer-fixtures.ts").write_text(
+        "export const sample = 'cus_123456789 invoices';"
+    )
+
+    out = score_repo_for_finding(
+        repo_path=repo,
+        title="Customer invoices API returns 500",
+        category="api_failure",
+        evidence_text="GET /api/customers/cus_123456789/invoices returned 500.",
+        top_n=3,
+    )
+
+    assert out
+    assert out[0].file_path == "server/routes/customers.ts"
+    assert "api_route_pattern:/api/customers/cus_123456789/invoices" in out[0].rationale
