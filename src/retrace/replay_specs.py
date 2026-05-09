@@ -164,7 +164,13 @@ def generate_api_spec_from_replay_issue(
     headers, auth, header_notes = _safe_api_headers(details)
     body, body_notes = _safe_api_body(details)
     original_status = _status_int(details.get("status") or details.get("status_code"))
-    expected_status = 200 if original_status >= 500 or original_status == 0 else original_status
+    is_recovery_regression = original_status >= 400 or original_status == 0
+    expected_status = original_status
+    trigger_context = _api_trigger_context(
+        evidence=evidence,
+        signal_timestamp_ms=_status_int(signal.get("timestamp_ms")),
+    )
+    trace_ids = _api_trace_ids(details)
     sanitized_signal = _sanitized_network_signal(
         signal=signal,
         method=method,
@@ -200,10 +206,22 @@ def generate_api_spec_from_replay_issue(
                 "url": sanitized_source_url,
                 "status": original_status,
             },
+            "api_regression": {
+                "original_status": original_status,
+                "forbidden_status": original_status if is_recovery_regression else None,
+                "status_assertion": "not_equal" if is_recovery_regression else "exact",
+                "trigger_context": trigger_context,
+                "trace_ids": trace_ids,
+                "assertion_strategy": (
+                    "The real user replay saw this request fail; the regression "
+                    "passes only when the same request no longer returns the "
+                    "captured failure status."
+                ),
+            },
             "fixture_notes": [
                 *header_notes,
                 *body_notes,
-                "Generated from a failed replay network call; confirm expected status for your app.",
+                "Generated from a failed replay network call; confirm auth and test data before relying on CI.",
             ],
         },
     )
@@ -942,6 +960,61 @@ def _redact_api_body(value: Any) -> Any:
     if isinstance(value, list):
         return [_redact_api_body(item) for item in value]
     return value
+
+
+def _api_trigger_context(
+    *, evidence: dict[str, Any], signal_timestamp_ms: int
+) -> list[dict[str, Any]]:
+    events = evidence.get("events") if isinstance(evidence.get("events"), list) else []
+    out: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        timestamp_ms = _status_int(event.get("timestamp_ms"))
+        if signal_timestamp_ms > 0 and abs(timestamp_ms - signal_timestamp_ms) > 10_000:
+            continue
+        event_type = event.get("type")
+        if event_type == 4:
+            out.append(
+                {
+                    "kind": "navigation",
+                    "timestamp_ms": timestamp_ms,
+                    "href": _redacted_url(str(event.get("href") or "")),
+                }
+            )
+        elif event_type == 3 and event.get("source") == 2:
+            out.append(
+                {
+                    "kind": "click",
+                    "timestamp_ms": timestamp_ms,
+                    "rrweb_id": event.get("id"),
+                }
+            )
+        elif event_type == 3 and event.get("source") == 5:
+            out.append(
+                {
+                    "kind": "input",
+                    "timestamp_ms": timestamp_ms,
+                    "rrweb_id": event.get("id"),
+                }
+            )
+    return out[-8:]
+
+
+def _api_trace_ids(details: dict[str, Any]) -> list[str]:
+    trace = details.get("trace") if isinstance(details.get("trace"), dict) else {}
+    values = [
+        trace.get("traceId"),
+        trace.get("trace_id"),
+        trace.get("requestTraceId"),
+        trace.get("responseTraceId"),
+    ]
+    out: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out
 
 
 def _status_int(value: Any) -> int:

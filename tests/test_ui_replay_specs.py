@@ -7,14 +7,18 @@ from unittest.mock import patch
 
 from retrace.commands.ui import (
     _create_sdk_key_payload,
+    _generate_replay_issue_api_spec_payload,
     _generate_replay_issue_fix_prompts_payload,
     _INDEX_HTML,
+    _replay_api_calls,
     _replay_api_check,
     _generate_replay_issue_spec_payload,
+    _run_replay_issue_api_spec_payload,
     _to_replay_dashboard_payload,
     _transition_replay_issue_payload,
     _verify_resolved_issues_payload,
 )
+from retrace.api_testing import api_specs_dir_for_data_dir
 from retrace.replay_core import ReplaySignalConfig, process_replay_sessions
 from retrace.sdk_keys import authenticate_sdk_key
 from retrace.storage import Storage
@@ -41,6 +45,24 @@ class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/healthz":
             body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+        return
+
+
+class _CheckoutHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/api/checkout":
+            _ = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
+            body = b'{"ok":true,"order_id":"ord_123"}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -93,6 +115,8 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert 'data-view="issues"' in _INDEX_HTML
     assert 'data-view="findings"' in _INDEX_HTML
     assert "linkedFailureTests" in _INDEX_HTML
+    assert "generateReplayIssueApiSpec" in _INDEX_HTML
+    assert "runReplayIssueApiSpec" in _INDEX_HTML
     assert 'role="button" tabindex="0"' in _INDEX_HTML
     assert 'rel="noopener noreferrer"' in _INDEX_HTML
     assert "hashchange" in _INDEX_HTML
@@ -100,6 +124,29 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "safeHashUrl(issue.share_url, '#issue=')" in _INDEX_HTML
     assert "#issue=${encodeURIComponent(issue.public_id)}" in _INDEX_HTML
     assert "#replay=${encodeURIComponent(replayId)}" in _INDEX_HTML
+
+
+def test_replay_api_calls_redacts_sensitive_query_values() -> None:
+    calls = _replay_api_calls(
+        {
+            "signals": [
+                {
+                    "detector": "network_5xx",
+                    "timestamp_ms": 120,
+                    "details": {
+                        "method": "GET",
+                        "request_url": "https://app.example/api/me?token=secret&tab=profile",
+                        "status": 500,
+                    },
+                }
+            ]
+        }
+    )
+
+    assert calls[0]["url"] == (
+        "https://app.example/api/me?token=%5Bredacted-api-input%5D&tab=profile"
+    )
+    assert "secret" not in calls[0]["url"]
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(
@@ -338,6 +385,103 @@ def test_generate_replay_issue_spec_payload_reports_missing_issue(
 
     assert status == 404
     assert payload == {"ok": False, "error": "Replay issue not found: bug_missing"}
+
+
+def test_generate_and_run_replay_issue_api_spec_payload_updates_coverage(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CheckoutHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    base_url = f"http://{host}:{port}"
+    try:
+        store.insert_replay_batch(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            session_id="sess-api-ui",
+            sequence=0,
+            events=[
+                {
+                    "type": 4,
+                    "timestamp": 0,
+                    "data": {"href": f"{base_url}/checkout"},
+                }
+            ],
+            flush_type="final",
+        )
+        created = store.upsert_replay_issue(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            fingerprint="checkout-api-ui",
+            session_ids=["sess-api-ui"],
+            signal_summary={"network_5xx": 1},
+            first_seen_ms=100,
+            last_seen_ms=500,
+            title="Checkout API failed",
+            evidence={
+                "signals": [
+                    {
+                        "detector": "network_5xx",
+                        "timestamp_ms": 300,
+                        "confidence": "high",
+                        "details": {
+                            "method": "POST",
+                            "request_url": "/api/checkout",
+                            "status": 500,
+                            "request_headers": {"content-type": "application/json"},
+                            "request_body": '{"cart_id":"abc"}',
+                        },
+                    }
+                ]
+            },
+        )
+
+        payload, status = _generate_replay_issue_api_spec_payload(
+            store=store,
+            data_dir=tmp_path,
+            issue_id=created.public_id,
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            app_url=base_url,
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        spec_id = payload["spec"]["spec_id"]
+        assert payload["spec"]["method"] == "POST"
+        assert payload["spec"]["url"] == f"{base_url}/api/checkout"
+        assert payload["spec"]["expected_status"] == 500
+        assert (
+            api_specs_dir_for_data_dir(tmp_path) / f"{spec_id}.json"
+        ).exists()
+
+        run_payload, run_status = _run_replay_issue_api_spec_payload(
+            store=store,
+            data_dir=tmp_path,
+            spec_id=spec_id,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert run_status == 200
+    assert run_payload["ok"] is True
+    assert run_payload["result"]["status"] == "passed"
+    issue = store.get_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=created.public_id,
+    )
+    assert issue is not None
+    links = store.list_failure_test_links(
+        failure_id=str(issue["canonical_failure_id"]),
+        spec_id=spec_id,
+    )
+    assert links[0].source == "replay_issue_api"
+    assert links[0].coverage_state == "covered_passing"
+    assert links[0].latest_run_status == "passed"
 
 
 def test_generate_replay_issue_fix_prompts_payload_creates_agent_prompts(

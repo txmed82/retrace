@@ -958,6 +958,13 @@ def test_generate_api_spec_from_failed_replay_network_call(tmp_path: Path) -> No
         last_seen_ms=500,
         title="Checkout API failed",
         evidence={
+            "events": [
+                {
+                    "type": 4,
+                    "timestamp_ms": 250,
+                    "href": "https://app.example/checkout?token=secret-token&step=pay",
+                }
+            ],
             "signals": [
                 {
                     "detector": "network_5xx",
@@ -994,7 +1001,7 @@ def test_generate_api_spec_from_failed_replay_network_call(tmp_path: Path) -> No
     assert loaded.method == "POST"
     assert loaded.url == "https://app.example/api/checkout"
     assert loaded.query == {"cart": "abc", "token": "[redacted-api-input]"}
-    assert loaded.expected_status == 200
+    assert loaded.expected_status == 500
     assert loaded.headers == {"content-type": "application/json"}
     assert loaded.auth == {
         "type": "headers",
@@ -1007,6 +1014,13 @@ def test_generate_api_spec_from_failed_replay_network_call(tmp_path: Path) -> No
     assert loaded.fixtures["source_network_signal"]["url"] == (
         "/api/checkout?cart=abc&token=%5Bredacted-api-input%5D"
     )
+    assert loaded.fixtures["api_regression"]["original_status"] == 500
+    assert loaded.fixtures["api_regression"]["forbidden_status"] == 500
+    assert loaded.fixtures["api_regression"]["status_assertion"] == "not_equal"
+    assert loaded.fixtures["api_regression"]["trigger_context"][0]["href"] == (
+        "https://app.example/checkout?token=%5Bredacted-api-input%5D&step=pay"
+    )
+    assert "assertion_strategy" in loaded.fixtures["api_regression"]
     assert generated.source_signal["details"]["request_url"] == (
         "/api/checkout?cart=abc&token=%5Bredacted-api-input%5D"
     )
@@ -1023,6 +1037,55 @@ def test_generate_api_spec_from_failed_replay_network_call(tmp_path: Path) -> No
     assert len(links) == 1
     assert links[0].spec_id == spec.spec_id
     assert links[0].source == "replay_issue_api"
+
+
+def test_generate_api_spec_treats_user_visible_4xx_as_regression(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-api-400",
+        sequence=0,
+        events=[_navigation("https://app.example/settings")],
+        flush_type="final",
+    )
+    created = store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="settings-api-400",
+        session_ids=["sess-api-400"],
+        signal_summary={"network_4xx": 1},
+        first_seen_ms=100,
+        last_seen_ms=500,
+        title="Settings API failed",
+        evidence={
+            "signals": [
+                {
+                    "detector": "network_4xx",
+                    "timestamp_ms": 300,
+                    "details": {
+                        "method": "PATCH",
+                        "request_url": "/api/settings",
+                        "status": 400,
+                    },
+                }
+            ]
+        },
+    )
+
+    generated = generate_api_spec_from_replay_issue(
+        store=store,
+        specs_dir=tmp_path / "api-specs",
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=created.public_id,
+    )
+
+    assert generated.spec.expected_status == 400
+    assert generated.spec.fixtures["api_regression"]["original_status"] == 400
+    assert generated.spec.fixtures["api_regression"]["status_assertion"] == "not_equal"
 
 
 def test_replay_api_body_redaction_handles_form_encoded_strings() -> None:
