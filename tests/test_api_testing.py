@@ -26,6 +26,7 @@ class _APIHandler(BaseHTTPRequestHandler):
                     {
                         "ok": True,
                         "user": {"id": 42, "email": "dev@example.com"},
+                        "optional": None,
                         "token": "server-secret",
                     }
                 ).encode()
@@ -57,12 +58,12 @@ class _APIHandler(BaseHTTPRequestHandler):
         return
 
 
-def _server_url() -> tuple[ThreadingHTTPServer, str]:
+def _server_url() -> tuple[ThreadingHTTPServer, str, threading.Thread]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), _APIHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
-    return server, f"http://{host}:{port}"
+    return server, f"http://{host}:{port}", thread
 
 
 def test_api_specs_can_be_saved_listed_and_loaded(tmp_path: Path) -> None:
@@ -96,7 +97,7 @@ def test_api_spec_rejects_sensitive_static_headers(tmp_path: Path) -> None:
 def test_api_spec_runs_with_auth_assertions_and_redacted_artifacts(
     tmp_path: Path, monkeypatch
 ) -> None:
-    server, base_url = _server_url()
+    server, base_url, thread = _server_url()
     monkeypatch.setenv(
         "RETRACE_API_HEADERS",
         json.dumps(
@@ -115,6 +116,7 @@ def test_api_spec_runs_with_auth_assertions_and_redacted_artifacts(
             json_assertions=[
                 {"id": "ok", "path": "$.ok", "equals": True},
                 {"id": "email", "path": "$.user.email", "contains": "example.com"},
+                {"id": "optional", "path": "$.optional", "exists": True},
             ],
             schema_assertions=[
                 {
@@ -131,6 +133,7 @@ def test_api_spec_runs_with_auth_assertions_and_redacted_artifacts(
                 }
             ],
             latency_ms=5000,
+            timeout_seconds=3.5,
             setup_steps=[
                 {
                     "id": "setup",
@@ -155,6 +158,7 @@ def test_api_spec_runs_with_auth_assertions_and_redacted_artifacts(
     finally:
         server.shutdown()
         server.server_close()
+        thread.join(timeout=2)
 
     assert result.ok is True
     assert result.status_code == 200
@@ -179,7 +183,7 @@ def test_api_spec_runs_with_auth_assertions_and_redacted_artifacts(
 
 
 def test_api_spec_reports_failed_json_assertion(tmp_path: Path) -> None:
-    server, base_url = _server_url()
+    server, base_url, thread = _server_url()
     try:
         spec = create_api_spec(
             specs_dir=api_specs_dir_for_data_dir(tmp_path),
@@ -197,6 +201,7 @@ def test_api_spec_reports_failed_json_assertion(tmp_path: Path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+        thread.join(timeout=2)
 
     assert result.ok is False
     assert any(

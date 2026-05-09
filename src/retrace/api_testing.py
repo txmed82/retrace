@@ -70,6 +70,7 @@ class APITestSpec:
     json_assertions: list[dict[str, Any]] = field(default_factory=list)
     schema_assertions: list[dict[str, Any]] = field(default_factory=list)
     latency_ms: int = 0
+    timeout_seconds: float = 15.0
     setup_steps: list[dict[str, Any]] = field(default_factory=list)
     teardown_steps: list[dict[str, Any]] = field(default_factory=list)
     created_at: str = ""
@@ -126,6 +127,7 @@ def _coerce_spec(data: dict[str, Any]) -> APITestSpec:
     data.setdefault("json_assertions", [])
     data.setdefault("schema_assertions", [])
     data.setdefault("latency_ms", 0)
+    data.setdefault("timeout_seconds", 15.0)
     data.setdefault("setup_steps", [])
     data.setdefault("teardown_steps", [])
     data.setdefault("fixtures", {})
@@ -165,6 +167,8 @@ def validate_api_spec(spec: APITestSpec) -> None:
         )
     if not isinstance(spec.auth, dict):
         raise ValueError("auth must be an object")
+    if float(spec.timeout_seconds) <= 0:
+        raise ValueError("timeout_seconds must be greater than 0")
     for field_name in ("json_assertions", "schema_assertions", "setup_steps", "teardown_steps"):
         if not isinstance(getattr(spec, field_name), list):
             raise ValueError(f"{field_name} must be a list")
@@ -184,6 +188,7 @@ def create_api_spec(
     json_assertions: Optional[list[dict[str, Any]]] = None,
     schema_assertions: Optional[list[dict[str, Any]]] = None,
     latency_ms: int = 0,
+    timeout_seconds: float = 15.0,
     setup_steps: Optional[list[dict[str, Any]]] = None,
     teardown_steps: Optional[list[dict[str, Any]]] = None,
     fixtures: Optional[dict[str, Any]] = None,
@@ -203,6 +208,7 @@ def create_api_spec(
         json_assertions=list(json_assertions or []),
         schema_assertions=list(schema_assertions or []),
         latency_ms=max(0, int(latency_ms or 0)),
+        timeout_seconds=float(timeout_seconds),
         setup_steps=list(setup_steps or []),
         teardown_steps=list(teardown_steps or []),
         created_at=created_at,
@@ -285,7 +291,7 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
             )
         )
         started = time.perf_counter()
-        with httpx.Client(timeout=15, follow_redirects=True) as client:
+        with httpx.Client(timeout=float(spec.timeout_seconds), follow_redirects=True) as client:
             response = client.request(
                 spec.method,
                 spec.url,
@@ -492,10 +498,10 @@ def _evaluate_json_assertion(
     idx: int,
 ) -> APIAssertionResult:
     path = str(assertion.get("path") or "")
-    actual = _json_path(response_json, path)
+    found, actual = _json_path_lookup(response_json, path)
     assertion_id = str(assertion.get("id") or f"json-{idx}")
     if assertion.get("exists") is True:
-        ok = actual is not None
+        ok = found
         return APIAssertionResult(assertion_id, "json_exists", ok, True, actual, path)
     if "equals" in assertion:
         expected = assertion.get("equals")
@@ -554,22 +560,28 @@ def _matches_type(value: Any, expected_type: str) -> bool:
 
 
 def _json_path(value: Any, path: str) -> Any:
+    return _json_path_lookup(value, path)[1]
+
+
+def _json_path_lookup(value: Any, path: str) -> tuple[bool, Any]:
     if path in {"", "$"}:
-        return value
+        return True, value
     cursor = value
     for raw_part in path.removeprefix("$.").split("."):
         if raw_part == "":
             continue
         if isinstance(cursor, dict):
+            if raw_part not in cursor:
+                return False, None
             cursor = cursor.get(raw_part)
         elif isinstance(cursor, list) and raw_part.isdigit():
             idx = int(raw_part)
-            cursor = cursor[idx] if idx < len(cursor) else None
+            if idx >= len(cursor):
+                return False, None
+            cursor = cursor[idx]
         else:
-            return None
-        if cursor is None:
-            return None
-    return cursor
+            return False, None
+    return True, cursor
 
 
 def _redact_headers(headers: dict[str, str]) -> dict[str, str]:

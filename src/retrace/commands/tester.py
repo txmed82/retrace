@@ -510,6 +510,7 @@ def tester_list(config_path: Path) -> None:
     help="JSON schema assertion object.",
 )
 @click.option("--latency-ms", default=0, type=int, help="Latency budget in ms.")
+@click.option("--timeout-seconds", default=15.0, show_default=True, type=float)
 def tester_api_create(
     config_path: Path,
     name: str,
@@ -523,6 +524,7 @@ def tester_api_create(
     json_assertions: tuple[str, ...],
     schema_assertion_json: str,
     latency_ms: int,
+    timeout_seconds: float,
 ) -> None:
     cfg = load_config(config_path)
     auth = (
@@ -530,10 +532,11 @@ def tester_api_create(
         if auth_bearer_env.strip()
         else {}
     )
-    parsed_json_assertions = [
-        _json_option(item, label="json-assertion", default={})
-        for item in json_assertions
-    ]
+    parsed_json_assertions = []
+    for item in json_assertions:
+        parsed = _json_option(item, label="json-assertion", default={})
+        if parsed:
+            parsed_json_assertions.append(parsed)
     schema_assertions = []
     if schema_assertion_json.strip():
         schema_assertions.append(
@@ -552,6 +555,7 @@ def tester_api_create(
         json_assertions=parsed_json_assertions,
         schema_assertions=schema_assertions,
         latency_ms=latency_ms,
+        timeout_seconds=timeout_seconds,
     )
     click.echo(f"Created API test spec: {spec.spec_id}")
 
