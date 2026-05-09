@@ -11,6 +11,7 @@ from retrace.tester import (
     load_spec,
     run_spec,
     runs_dir_for_data_dir,
+    select_execution_engine,
     specs_dir_for_data_dir,
 )
 
@@ -304,6 +305,8 @@ def test_native_runner_writes_run_json_and_artifacts(tmp_path: Path) -> None:
 
     assert result.ok is True
     assert run_json["execution_engine"] == "native"
+    assert "engine_reason" in run_json
+    assert "native" in run_json["engine_reason"]
     assert len(run_json["assertion_results"]) == 2
     assert all(item["ok"] for item in run_json["assertion_results"])
     assert any(item["artifact_type"] == "assertion_results" for item in result.artifacts)
@@ -314,6 +317,124 @@ def test_native_runner_writes_run_json_and_artifacts(tmp_path: Path) -> None:
     assert manifest["schema_version"] == "artifact_manifest.v1"
     assert manifest["source_run"] == result.run_id
     assert any(item["artifact_type"] == "assertion_results" for item in manifest["artifacts"])
+
+
+def test_auto_engine_policy_prefers_native_for_deterministic_steps(
+    tmp_path: Path,
+) -> None:
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Auto native",
+        prompt="",
+        app_url="http://127.0.0.1:3000",
+        start_command="",
+        harness_command="",
+        execution_engine="auto",
+        exact_steps=[{"id": "home", "action": "get", "path": "/"}],
+    )
+
+    selection = select_execution_engine(spec)
+
+    assert selection.execution_engine == "native"
+    assert "deterministic" in selection.reason
+
+
+def test_auto_engine_policy_explains_playwright_runtime(tmp_path: Path) -> None:
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Auto Playwright",
+        prompt="",
+        app_url="http://127.0.0.1:3000",
+        start_command="",
+        harness_command="",
+        execution_engine="auto",
+        exact_steps=[{"id": "click", "action": "click", "selector": "#signup"}],
+    )
+
+    selection = select_execution_engine(spec)
+
+    assert selection.execution_engine == "native"
+    assert "Playwright" in selection.reason
+
+
+def test_auto_engine_policy_routes_exploration_and_open_prompts(
+    tmp_path: Path,
+) -> None:
+    explore = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Auto explore",
+        prompt="",
+        app_url="http://127.0.0.1:3000",
+        start_command="",
+        harness_command="",
+        execution_engine="auto",
+        exploratory_goals=["Map signup"],
+    )
+    harness = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Auto harness",
+        prompt="Click around and report issues",
+        app_url="http://127.0.0.1:3000",
+        start_command="",
+        harness_command="",
+        execution_engine="auto",
+    )
+    visual = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Auto visual",
+        prompt="",
+        app_url="http://127.0.0.1:3000",
+        start_command="",
+        harness_command="",
+        execution_engine="auto",
+        exploratory_goals=["Inspect a canvas editor"],
+        browser_settings={"visual": True},
+    )
+
+    assert select_execution_engine(explore).execution_engine == "explore"
+    assert select_execution_engine(harness).execution_engine == "harness"
+    assert select_execution_engine(visual).execution_engine == "visual"
+
+
+def test_auto_engine_policy_keeps_authenticated_exploration_on_harness(
+    tmp_path: Path,
+) -> None:
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Auto auth explore",
+        prompt="",
+        app_url="http://127.0.0.1:3000",
+        start_command="",
+        harness_command="echo {app_url_q} {prompt_q} {run_dir_q}",
+        execution_engine="auto",
+        exploratory_goals=["Explore authenticated checkout"],
+        auth_required=True,
+        auth_mode="jwt",
+        auth_jwt_env="RETRACE_TEST_JWT",
+    )
+
+    selection = select_execution_engine(spec)
+
+    assert selection.execution_engine == "harness"
+    assert "credential-aware" in selection.reason
+
+
+def test_auto_engine_policy_explains_api_only_specs(tmp_path: Path) -> None:
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Auto API",
+        prompt="",
+        app_url="http://127.0.0.1:3000",
+        start_command="",
+        harness_command="",
+        execution_engine="auto",
+        exact_steps=[{"id": "api", "action": "get", "path": "/api/health"}],
+    )
+
+    selection = select_execution_engine(spec)
+
+    assert selection.execution_engine == "native"
+    assert "API-only" in selection.reason
 
 
 def test_native_runner_records_consensus_and_step_cache(tmp_path: Path) -> None:

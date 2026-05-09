@@ -136,8 +136,15 @@ class TesterRunResult:
     failure_classification: str = "unknown"
     error: str = ""
     execution_engine: str = "harness"
+    engine_reason: str = ""
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     assertion_results: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class EngineSelection:
+    execution_engine: str
+    reason: str
 
 
 def now_iso() -> str:
@@ -252,6 +259,10 @@ def _apply_spec_defaults(data: dict[str, Any]) -> None:
     data["execution_engine"] = engine
 
 
+def _auth_needed_for_engine(spec: TesterSpec) -> bool:
+    return bool(spec.auth_required or spec.auth_profile or spec.auth_setup_steps)
+
+
 def validate_spec(spec: TesterSpec) -> None:
     if spec.schema_version != SPEC_SCHEMA_VERSION:
         raise ValueError(
@@ -275,9 +286,18 @@ def validate_spec(spec: TesterSpec) -> None:
         and bool(spec.exploratory_goals)
         and not (spec.exact_steps or spec.assertions)
     )
-    needs_harness_command = spec.execution_engine == "harness" or (
+    auto_explore_needs_harness_auth = (
         spec.execution_engine == "auto"
-        and not (spec.exact_steps or spec.assertions or spec.exploratory_goals)
+        and bool(spec.exploratory_goals)
+        and _auth_needed_for_engine(spec)
+    )
+    needs_harness_command = (
+        spec.execution_engine == "harness"
+        or auto_explore_needs_harness_auth
+        or (
+            spec.execution_engine == "auto"
+            and not (spec.exact_steps or spec.assertions or spec.exploratory_goals)
+        )
     )
     native_selected = spec.execution_engine == "native" or (
         spec.execution_engine == "auto" and bool(spec.exact_steps or spec.assertions)
@@ -418,6 +438,99 @@ def create_spec(
     validate_spec(spec)
     save_spec(specs_dir, spec)
     return spec
+
+
+def _api_only_spec(spec: TesterSpec) -> bool:
+    spec_type = str(
+        (spec.fixtures or {}).get("spec_type") or (spec.fixtures or {}).get("type") or ""
+    ).strip().lower()
+    if spec_type in {"api", "api_test", "api-only"}:
+        return True
+    if not spec.exact_steps:
+        return False
+    api_actions = {"get", "post", "put", "patch", "delete", "head", "options", "request"}
+    for step in spec.exact_steps:
+        action = str(step.get("action") or step.get("type") or "get").lower()
+        if action not in api_actions:
+            return False
+        target = str(step.get("url") or step.get("path") or "")
+        if "/api/" not in target and not target.rstrip("/").endswith("/api"):
+            return False
+        if step.get("selector") or step.get("target"):
+            return False
+    return True
+
+
+def _needs_playwright_runtime(spec: TesterSpec) -> bool:
+    steps = [*spec.auth_setup_steps, *(spec.exact_steps or [])]
+    return _should_use_playwright(spec, steps)
+
+
+def select_execution_engine(spec: TesterSpec) -> EngineSelection:
+    engine = spec.execution_engine
+    if engine != "auto":
+        if engine == "native":
+            runtime = "Playwright" if _needs_playwright_runtime(spec) else "native HTTP"
+            return EngineSelection(
+                execution_engine="native",
+                reason=f"explicit native engine; {runtime} runtime selected by steps",
+            )
+        if engine == "explore":
+            return EngineSelection(
+                execution_engine="explore",
+                reason="explicit explore engine for exploratory goals",
+            )
+        if engine == "visual":
+            return EngineSelection(
+                execution_engine="visual",
+                reason="explicit visual engine for screenshot-guided exploration",
+            )
+        return EngineSelection(
+            execution_engine="harness",
+            reason="explicit Browser Harness engine",
+        )
+
+    if _api_only_spec(spec):
+        return EngineSelection(
+            execution_engine="native",
+            reason=(
+                "auto selected native HTTP because the spec is API-only and "
+                "does not need a browser"
+            ),
+        )
+    if spec.exact_steps or spec.assertions:
+        runtime = "Playwright" if _needs_playwright_runtime(spec) else "native HTTP"
+        return EngineSelection(
+            execution_engine="native",
+            reason=(
+                "auto selected native because deterministic steps/assertions are "
+                f"present; {runtime} runtime selected by steps"
+            ),
+        )
+    if spec.exploratory_goals and _auth_needed_for_engine(spec):
+        return EngineSelection(
+            execution_engine="harness",
+            reason=(
+                "auto selected Browser Harness because exploratory auth setup "
+                "requires credential-aware execution"
+            ),
+        )
+    if spec.exploratory_goals:
+        if bool((spec.fixtures or {}).get("requires_visual")) or bool(
+            (spec.browser_settings or {}).get("visual")
+        ):
+            return EngineSelection(
+                execution_engine="visual",
+                reason="auto selected visual because exploratory goals require visual inspection",
+            )
+        return EngineSelection(
+            execution_engine="explore",
+            reason="auto selected explore because exploratory goals are present",
+        )
+    return EngineSelection(
+        execution_engine="harness",
+        reason="auto selected Browser Harness for an open-ended prompt",
+    )
 
 
 def _run_shell(
@@ -2488,14 +2601,9 @@ def run_spec(
         prompt=prompt,
         auth_context=auth_context,
     )
-    execution_engine = spec.execution_engine
-    if execution_engine == "auto":
-        if spec.exact_steps or spec.assertions:
-            execution_engine = "native"
-        elif spec.exploratory_goals:
-            execution_engine = "explore"
-        else:
-            execution_engine = "harness"
+    engine_selection = select_execution_engine(spec)
+    execution_engine = engine_selection.execution_engine
+    engine_reason = engine_selection.reason
     harness_cmd = ""
     if execution_engine == "harness":
         harness_cmd = _format_harness_command(
@@ -2624,6 +2732,7 @@ def run_spec(
             failure_classification=failure_classification,
             error=last_error,
             execution_engine=execution_engine,
+            engine_reason=engine_reason,
             artifacts=artifacts,
             assertion_results=assertion_results,
         )
@@ -2652,6 +2761,7 @@ def run_spec(
             failure_classification=failure_classification,
             error=str(exc),
             execution_engine=execution_engine,
+            engine_reason=engine_reason,
             artifacts=artifacts,
             assertion_results=assertion_results,
         )

@@ -250,6 +250,23 @@ retrace tester create \
   --app-url http://127.0.0.1:3000
 ```
 
+Use `--engine auto` when the spec should declare intent and let Retrace choose
+the runner. The run JSON includes `execution_engine` plus `engine_reason` so CI
+logs explain the choice:
+
+- Exact deterministic steps, assertions, and API-only HTTP steps run on the
+  native engine. Retrace uses the native HTTP runtime unless the steps require a
+  browser selector/action, then it uses Playwright.
+- Exploratory goals run on the explore engine. Mark the spec fixture
+  `requires_visual` or set `browser_settings.visual` to route exploratory work
+  to the visual engine.
+- Open-ended prompts without deterministic steps or exploratory goals use
+  Browser Harness.
+- Authenticated exploratory specs also use Browser Harness because that runner
+  receives the auth context.
+- Explicit `harness`, `native`, `explore`, or `visual` engine settings are
+  honored and still explain the selected runtime.
+
 List specs and runs:
 
 ```bash

@@ -113,6 +113,7 @@ def test_tester_create_list_and_run(tmp_path: Path, monkeypatch) -> None:
     ran = runner.invoke(main, ["tester", "run", spec_id])
     assert ran.exit_code == 0, ran.output
     assert '"ok": true' in ran.output
+    assert '"engine_reason": "explicit Browser Harness engine"' in ran.output
 
     specs_dir = tmp_path / "data" / "ui-tests" / "specs"
     runs_dir = tmp_path / "data" / "ui-tests" / "runs"
