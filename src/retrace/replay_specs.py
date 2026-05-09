@@ -774,8 +774,11 @@ _SENSITIVE_BODY_KEYS = {
     "api_key",
     "apikey",
     "authorization",
+    "access_token",
+    "client_secret",
     "jwt",
     "password",
+    "refresh_token",
     "secret",
     "token",
 }
@@ -875,6 +878,20 @@ def _safe_api_body(details: dict[str, Any]) -> tuple[Any, list[str]]:
         try:
             parsed_body = json.loads(body)
         except json.JSONDecodeError:
+            parsed_form = parse_qs(body, keep_blank_values=True)
+            if parsed_form:
+                redacted_form = {
+                    key: (
+                        ["[redacted-api-input]"] * len(values)
+                        if str(key).lower() in _SENSITIVE_BODY_KEYS
+                        else values
+                    )
+                    for key, values in parsed_form.items()
+                }
+                if redacted_form != parsed_form:
+                    return urlencode(redacted_form, doseq=True), [
+                        "Sensitive form-encoded body values were replaced with redacted placeholders."
+                    ]
             return body, []
         redacted_body = _redact_api_body(parsed_body)
         notes = []

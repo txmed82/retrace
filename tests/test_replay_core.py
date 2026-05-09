@@ -14,6 +14,7 @@ from retrace.replay_core import (
 from retrace.issue_sinks import promote_replay_issue
 from retrace.api_testing import load_api_spec
 from retrace.replay_specs import (
+    _safe_api_body,
     generate_api_spec_from_replay_issue,
     generate_spec_from_replay_issue,
 )
@@ -1022,6 +1023,16 @@ def test_generate_api_spec_from_failed_replay_network_call(tmp_path: Path) -> No
     assert len(links) == 1
     assert links[0].spec_id == spec.spec_id
     assert links[0].source == "replay_issue_api"
+
+
+def test_replay_api_body_redaction_handles_form_encoded_strings() -> None:
+    body, notes = _safe_api_body(
+        {"request_body": "grant_type=password&username=dev&password=secret"}
+    )
+
+    assert body == "grant_type=password&username=dev&password=%5Bredacted-api-input%5D"
+    assert notes
+    assert "secret" not in body
 
 
 def test_promote_replay_issue_dedupes_external_ticket(
