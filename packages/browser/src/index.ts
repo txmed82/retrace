@@ -7,6 +7,7 @@ export type RetracePrivacyOptions = {
   maskTextSelector?: string | null;
   blockSelector?: string | null;
   ignoreClass?: string | RegExp;
+  redactionPatterns?: Array<string | RegExp>;
 };
 
 export type RetraceBrowserOptions = {
@@ -29,6 +30,11 @@ export type RetraceClient = {
 };
 
 const DEFAULT_INGEST_URL = "http://127.0.0.1:8788/api/sdk/replay";
+const DEFAULT_REDACTION_PATTERNS = [
+  /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
+  /\b(?:token|secret|password|api[_-]?key)=([^&\s]+)/gi,
+  /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/-]+=*/gi,
+];
 
 function makeSessionId(): string {
   const cryptoObj = globalThis.crypto;
@@ -55,6 +61,24 @@ function safeSerializeConsoleArg(item: unknown): string {
   }
 }
 
+function stackFromError(error: unknown): string {
+  if (error instanceof Error) return error.stack || "";
+  if (typeof error === "object" && error !== null && "stack" in error) {
+    const stack = (error as { stack?: unknown }).stack;
+    return typeof stack === "string" ? stack : "";
+  }
+  return "";
+}
+
+function messageFromError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    return typeof message === "string" ? message : String(message || "");
+  }
+  return String(error || "");
+}
+
 export function init(options: RetraceBrowserOptions): RetraceClient {
   if (!options.apiKey) {
     throw new Error("[retrace] apiKey is required");
@@ -74,6 +98,37 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
   let flushTimer: ReturnType<typeof setInterval> | undefined;
   let flushInFlight: Promise<void> | undefined;
   const cleanupFns: Array<() => void> = [];
+
+  function redactionPatterns(): RegExp[] {
+    const custom = options.privacy?.redactionPatterns || [];
+    const compiled = custom.flatMap((pattern) => {
+      if (pattern instanceof RegExp) return [pattern];
+      try {
+        return [new RegExp(pattern, "gi")];
+      } catch {
+        return [];
+      }
+    });
+    return DEFAULT_REDACTION_PATTERNS.concat(compiled);
+  }
+
+  function redactText(value: string): string {
+    return redactionPatterns().reduce(
+      (text, pattern) => text.replace(pattern, "[redacted]"),
+      value,
+    );
+  }
+
+  function traceContext(): Record<string, unknown> {
+    const globals = globalThis as unknown as {
+      __RETRACE_TRACE_ID__?: string;
+      __RETRACE_TRACEPARENT__?: string;
+    };
+    return {
+      traceId: globals.__RETRACE_TRACE_ID__ || undefined,
+      traceparent: globals.__RETRACE_TRACEPARENT__ || undefined,
+    };
+  }
 
   function emitCustom(source: string, payload: Record<string, unknown>): void {
     events.push({
@@ -188,8 +243,8 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
       globalThis.console[level] = (...data: unknown[]) => {
         emitCustom("console", {
           level,
-          payload: data.map(safeSerializeConsoleArg),
-          url: globalThis.location?.href,
+          payload: data.map((item) => redactText(safeSerializeConsoleArg(item))),
+          url: redactText(globalThis.location?.href || ""),
         });
         originals[level]?.(...data);
       };
@@ -200,6 +255,38 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
           globalThis.console[level] = originals[level];
         }
       });
+    });
+  }
+
+  function installErrorCapture(): void {
+    const onError = (event: ErrorEvent) => {
+      emitCustom("exception", {
+        kind: "onerror",
+        message: redactText(event.message || messageFromError(event.error)),
+        stack: redactText(stackFromError(event.error)),
+        source: redactText(event.filename || ""),
+        line: event.lineno || undefined,
+        column: event.colno || undefined,
+        url: redactText(globalThis.location?.href || ""),
+        sessionId,
+        trace: traceContext(),
+      });
+    };
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      emitCustom("exception", {
+        kind: "unhandledrejection",
+        message: redactText(messageFromError(event.reason)),
+        stack: redactText(stackFromError(event.reason)),
+        url: redactText(globalThis.location?.href || ""),
+        sessionId,
+        trace: traceContext(),
+      });
+    };
+    globalThis.addEventListener?.("error", onError);
+    globalThis.addEventListener?.("unhandledrejection", onUnhandledRejection);
+    cleanupFns.push(() => {
+      globalThis.removeEventListener?.("error", onError);
+      globalThis.removeEventListener?.("unhandledrejection", onUnhandledRejection);
     });
   }
 
@@ -338,6 +425,7 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     if (!enabled || stopRecording) return;
     installInteractionCapture();
     installConsoleCapture();
+    installErrorCapture();
     installNetworkCapture();
     stopRecording = record({
       emit(event) {
