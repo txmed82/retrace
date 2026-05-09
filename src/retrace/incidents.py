@@ -87,11 +87,21 @@ def get_incident_detail(
 
 def ensure_incident_repair_task(*, store: Storage, incident_id: str) -> str:
     detail = get_incident_detail(store=store, incident_id=incident_id)
-    if detail.incident.repair_task_id:
-        return detail.incident.repair_task_id
     if not detail.failures:
         raise ValueError(f"incident has no linked failures: {incident_id}")
-    representative = detail.failures[0]
+    existing_task = (
+        store.get_repair_task(detail.incident.repair_task_id)
+        if detail.incident.repair_task_id
+        else None
+    )
+    representative = next(
+        (
+            failure
+            for failure in detail.failures
+            if existing_task is not None and failure.id == existing_task.failure_id
+        ),
+        detail.failures[0],
+    )
     evidence_ids = [
         item.id for item in detail.evidence if item.failure_id == representative.id
     ]
@@ -123,11 +133,12 @@ def ensure_incident_repair_task(*, store: Storage, incident_id: str) -> str:
         },
         evidence_ids=evidence_ids,
     )
-    store.set_incident_repair_task(
-        incident_id=detail.incident.id,
-        repair_task_id=repair_task_id,
-    )
-    return repair_task_id
+    if not detail.incident.repair_task_id:
+        store.set_incident_repair_task(
+            incident_id=detail.incident.id,
+            repair_task_id=repair_task_id,
+        )
+    return detail.incident.repair_task_id or repair_task_id
 
 
 def incident_group_key(failure: FailureRow) -> str:

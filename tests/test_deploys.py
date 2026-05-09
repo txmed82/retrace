@@ -170,6 +170,26 @@ def test_incident_repair_task_includes_deploy_changed_files(tmp_path: Path) -> N
         "src/cart.ts",
     ]
 
+    record_deploy(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        sha="abc123",
+        changed_files=["src/checkout.ts", "src/cart.ts", "src/tax.ts"],
+    )
+    refreshed_task_id = ensure_incident_repair_task(
+        store=store,
+        incident_id=incident.incident_id,
+    )
+    refreshed_task = store.get_repair_task(refreshed_task_id)
+    assert refreshed_task is not None
+    assert refreshed_task_id == repair_task_id
+    assert refreshed_task.likely_files == [
+        "src/checkout.ts",
+        "src/cart.ts",
+        "src/tax.ts",
+    ]
+
 
 def test_deploy_endpoint_records_marker_and_correlates_failures(tmp_path: Path) -> None:
     store, workspace = _store(tmp_path)
