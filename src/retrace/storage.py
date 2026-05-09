@@ -881,7 +881,8 @@ class ReplayIssueUpsertResult:
     @property
     def regressed(self) -> bool:
         return (
-            self.previous_status == "resolved" and self.current_status == "regressed"
+            self.previous_status in {"resolved", "verified"}
+            and self.current_status == "regressed"
         )
 
 
@@ -4666,6 +4667,7 @@ class Storage:
                   AND external_ticket_id IS NOT NULL
                   AND external_ticket_id != ''
                   AND status != 'resolved'
+                  AND status != 'verified'
                   AND status != 'ignored'
                 ORDER BY updated_at DESC
                 LIMIT ?
