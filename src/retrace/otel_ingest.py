@@ -63,11 +63,6 @@ def _ingest_items(
 ) -> OtelIngestResult:
     stored_event_ids: list[str] = []
     linked_evidence_ids: list[str] = []
-    failures = store.list_failures(
-        project_id=project_id,
-        environment_id=environment_id,
-        limit=500,
-    )
     for item in items:
         event_id = store.append_otel_event(
             project_id=project_id,
@@ -85,7 +80,8 @@ def _ingest_items(
         linked_evidence_ids.extend(
             _link_evidence_to_trace_failures(
                 store=store,
-                failures=failures,
+                project_id=project_id,
+                environment_id=environment_id,
                 signal_type=signal_type,
                 item={**item, "otel_event_id": event_id},
             )
@@ -100,7 +96,8 @@ def _ingest_items(
 def _link_evidence_to_trace_failures(
     *,
     store: Storage,
-    failures: list[Any],
+    project_id: str,
+    environment_id: str,
     signal_type: str,
     item: dict[str, Any],
 ) -> list[str]:
@@ -108,16 +105,16 @@ def _link_evidence_to_trace_failures(
     span_id = str(item.get("span_id") or "").strip()
     if not trace_id and not span_id:
         return []
+    failures = store.list_failures_by_trace(
+        project_id=project_id,
+        environment_id=environment_id,
+        trace_id=trace_id,
+        span_id=span_id,
+    )
     out: list[str] = []
     for failure in failures:
-        metadata = dict(getattr(failure, "metadata", {}) or {})
-        trace_ids = _string_list(metadata.get("trace_ids"))
-        span_ids = _string_list(metadata.get("span_ids"))
-        if trace_id and trace_id not in trace_ids:
-            continue
-        if span_id and span_ids and span_id not in span_ids:
-            continue
         payload = _compact_payload(signal_type=signal_type, item=item)
+        stable_payload = {k: v for k, v in payload.items() if k != "otel_event_id"}
         evidence = EvidenceItem(
             failure_id=failure.id,
             evidence_type=f"otel_{signal_type}",
@@ -130,7 +127,7 @@ def _link_evidence_to_trace_failures(
                 evidence_type=f"otel_{signal_type}",
                 source=f"otel:{trace_id or span_id}",
                 occurred_at_ms=int(item.get("occurred_at_ms") or 0),
-                payload=payload,
+                payload=stable_payload,
             ),
         )
         out.append(store.append_failure_evidence(evidence))
@@ -166,7 +163,10 @@ def _normalize_log(record: dict[str, Any]) -> dict[str, Any]:
         "name": "",
         "severity": _first(record, "severityText", "severity", "severityNumber"),
         "body": _value(record.get("body")) or _first(record, "message", "body"),
-        "occurred_at_ms": _time_ms(record.get("timeUnixNano") or record.get("timestamp_ms")),
+        "occurred_at_ms": (
+            _time_unix_nano_ms(record.get("timeUnixNano"))
+            or _time_ms(record.get("timestamp_ms"))
+        ),
         "attributes": _attributes(record.get("attributes")),
     }
 
@@ -178,8 +178,9 @@ def _normalize_span(span: dict[str, Any]) -> dict[str, Any]:
         "name": _first(span, "name"),
         "severity": _first(span, "status"),
         "body": _first(span, "name"),
-        "occurred_at_ms": _time_ms(
-            span.get("startTimeUnixNano") or span.get("timestamp_ms")
+        "occurred_at_ms": (
+            _time_unix_nano_ms(span.get("startTimeUnixNano"))
+            or _time_ms(span.get("timestamp_ms"))
         ),
         "attributes": _attributes(span.get("attributes")),
     }
@@ -255,3 +256,11 @@ def _time_ms(value: Any) -> int:
     if raw > 10_000_000_000:
         return raw
     return raw * 1000 if raw else 0
+
+
+def _time_unix_nano_ms(value: Any) -> int:
+    try:
+        raw = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return raw // 1_000_000 if raw else 0

@@ -59,35 +59,42 @@ def test_otlp_like_log_payload_is_stored_and_linked_to_failure(tmp_path: Path) -
     store, workspace = _store(tmp_path)
     failure_id = _failure_with_trace(store, workspace)
 
+    otlp_payload = {
+        "resourceLogs": [
+            {
+                "scopeLogs": [
+                    {
+                        "logRecords": [
+                            {
+                                "traceId": "trace-1",
+                                "spanId": "span-1",
+                                "timeUnixNano": "2000000000",
+                                "severityText": "ERROR",
+                                "body": {"stringValue": "database failed"},
+                                "attributes": [
+                                    {
+                                        "key": "service.name",
+                                        "value": {"stringValue": "api"},
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
     result = ingest_otel_logs(
         store=store,
         project_id=workspace.project_id,
         environment_id=workspace.environment_id,
-        payload={
-            "resourceLogs": [
-                {
-                    "scopeLogs": [
-                        {
-                            "logRecords": [
-                                {
-                                    "traceId": "trace-1",
-                                    "spanId": "span-1",
-                                    "timeUnixNano": "2000000000",
-                                    "severityText": "ERROR",
-                                    "body": {"stringValue": "database failed"},
-                                    "attributes": [
-                                        {
-                                            "key": "service.name",
-                                            "value": {"stringValue": "api"},
-                                        }
-                                    ],
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        },
+        payload=otlp_payload,
+    )
+    second = ingest_otel_logs(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        payload=otlp_payload,
     )
 
     events = store.list_otel_events(
@@ -97,6 +104,7 @@ def test_otlp_like_log_payload_is_stored_and_linked_to_failure(tmp_path: Path) -
     )
     evidence = store.list_failure_evidence(failure_id=failure_id)
     assert result.accepted == 1
+    assert second.stored_event_ids == result.stored_event_ids
     assert len(events) == 1
     assert events[0].body == "database failed"
     assert events[0].attributes["service.name"] == "api"

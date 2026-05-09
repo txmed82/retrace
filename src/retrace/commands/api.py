@@ -526,21 +526,33 @@ def _handler(
             if not isinstance(payload, dict) or not payload:
                 _json_response(self, 400, {"error": "invalid_payload"})
                 return
-            result = (
-                ingest_otel_logs(
-                    store=store,
-                    project_id=token.project_id,
-                    environment_id=environment_id,
-                    payload=payload,
+            try:
+                result = (
+                    ingest_otel_logs(
+                        store=store,
+                        project_id=token.project_id,
+                        environment_id=environment_id,
+                        payload=payload,
+                    )
+                    if path.endswith("/logs")
+                    else ingest_otel_traces(
+                        store=store,
+                        project_id=token.project_id,
+                        environment_id=environment_id,
+                        payload=payload,
+                    )
                 )
-                if path.endswith("/logs")
-                else ingest_otel_traces(
-                    store=store,
-                    project_id=token.project_id,
-                    environment_id=environment_id,
-                    payload=payload,
+            except Exception:
+                logger.exception("Unhandled OpenTelemetry ingest error")
+                _json_response(
+                    self,
+                    500,
+                    {
+                        "error": "internal_error",
+                        "message": "An internal server error occurred.",
+                    },
                 )
-            )
+                return
             _json_response(self, 202, result.to_dict())
 
         def _handle_list_replays(self, query: str) -> None:

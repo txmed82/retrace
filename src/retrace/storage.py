@@ -40,6 +40,29 @@ def _rollup_severity(values: list[str]) -> str:
             highest_score = score
     return highest
 
+
+def _trace_matches_failure(
+    failure: "FailureRow",
+    *,
+    trace_id: str,
+    span_id: str = "",
+) -> bool:
+    metadata = dict(failure.metadata or {})
+    trace_ids = _string_values(metadata.get("trace_ids"))
+    span_ids = _string_values(metadata.get("span_ids"))
+    if trace_id.strip() and trace_id.strip() not in trace_ids:
+        return False
+    if span_id.strip() and span_ids and span_id.strip() not in span_ids:
+        return False
+    return True
+
+
+def _string_values(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    return [text] if text else []
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -2413,15 +2436,27 @@ class Storage:
         occurred_at_ms: int = 0,
         attributes: Optional[dict[str, Any]] = None,
     ) -> str:
-        event_id = self._id("otel")
         try:
             attributes_json = json.dumps(attributes or {}, sort_keys=True)
         except (TypeError, ValueError) as exc:
             raise ValueError("otel attributes must be JSON-serializable") from exc
+        event_id = self._public_id(
+            "otel",
+            project_id,
+            environment_id,
+            signal_type,
+            trace_id,
+            span_id,
+            name,
+            severity,
+            body,
+            int(occurred_at_ms),
+            attributes_json,
+        )
         with self._conn() as conn:
             conn.execute(
                 """
-                INSERT INTO otel_events
+                INSERT OR IGNORE INTO otel_events
                 (id, project_id, environment_id, signal_type, trace_id, span_id, name,
                  severity, body, occurred_at_ms, attributes_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2441,6 +2476,44 @@ class Storage:
                 ),
             )
         return event_id
+
+    def list_failures_by_trace(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        trace_id: str,
+        span_id: str = "",
+        limit: int = 1000,
+    ) -> list[FailureRow]:
+        if not trace_id.strip() and not span_id.strip():
+            return []
+        params: list[object] = [project_id, environment_id]
+        where = "project_id = ? AND environment_id = ?"
+        if trace_id.strip():
+            where += " AND metadata_json LIKE ?"
+            params.append(f"%{trace_id.strip()}%")
+        if span_id.strip():
+            where += " AND metadata_json LIKE ?"
+            params.append(f"%{span_id.strip()}%")
+        params.append(max(1, min(int(limit), 5000)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM failures
+                WHERE {where}
+                ORDER BY updated_at DESC, public_id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        failures = [self._failure_from_row(row) for row in rows]
+        return [
+            failure
+            for failure in failures
+            if _trace_matches_failure(failure, trace_id=trace_id, span_id=span_id)
+        ]
 
     def list_otel_events(
         self,
