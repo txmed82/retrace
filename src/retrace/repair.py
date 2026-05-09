@@ -44,6 +44,7 @@ class RepairBundle:
     evidence: list[dict[str, Any]] = field(default_factory=list)
     reproduction: dict[str, Any] = field(default_factory=dict)
     linked_tests: list[dict[str, Any]] = field(default_factory=list)
+    backend_context: dict[str, Any] = field(default_factory=dict)
     likely_files: list[str] = field(default_factory=list)
     deploy_context: dict[str, Any] = field(default_factory=dict)
     external_thread_context: dict[str, Any] = field(default_factory=dict)
@@ -166,15 +167,21 @@ def build_repair_bundle(
         validation_commands=validation_commands,
     )
 
+    evidence_items = [_evidence_bundle_item(item) for item in evidence]
     return RepairBundle(
         failure_id=failure.id,
         public_id=failure.public_id,
         source_type=failure.source_type,
         source_external_id=failure.source_external_id,
         failure_summary=_failure_summary(failure),
-        evidence=[_evidence_bundle_item(item) for item in evidence],
+        evidence=evidence_items,
         reproduction=_reproduction_context(failure),
         linked_tests=[_linked_test_item(item) for item in test_links],
+        backend_context=_backend_context(
+            failure=failure,
+            evidence=evidence_items,
+            repair_task=repair_task,
+        ),
         likely_files=bundle_likely_files,
         deploy_context=_deploy_context(deploy),
         external_thread_context=_external_thread_context(failure),
@@ -343,6 +350,116 @@ def _linked_test_item(link: Any) -> dict[str, Any]:
         "latest_run_classification": link.latest_run_classification,
         "latest_run_ok": link.latest_run_ok,
     }
+
+
+def _backend_context(
+    *,
+    failure: Any,
+    evidence: list[dict[str, Any]],
+    repair_task: Any,
+) -> dict[str, Any]:
+    metadata = dict(failure.metadata)
+    request_response = _request_response_pairs(evidence)
+    route_matches = _route_match_context(metadata=metadata, repair_task=repair_task)
+    log_evidence = _log_evidence_context(evidence)
+    trace_ids = _unique_strings(metadata.get("trace_ids", []) or [])
+    context = {
+        "request_response": request_response,
+        "route": {
+            "method": metadata.get("method", ""),
+            "url": metadata.get("url", ""),
+            "route_path": metadata.get("route_path", ""),
+            "matches": route_matches,
+        },
+        "logs": {
+            "trace_ids": trace_ids,
+            "logs_url": metadata.get("logs_url", ""),
+            "items": log_evidence,
+        },
+    }
+    return {
+        key: value
+        for key, value in context.items()
+        if value
+        and (
+            key != "route"
+            or any(value.get(field) for field in ("method", "url", "route_path", "matches"))
+        )
+        and (
+            key != "logs"
+            or value.get("trace_ids")
+            or value.get("logs_url")
+            or value.get("items")
+        )
+    }
+
+
+def _request_response_pairs(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pairs: dict[str, dict[str, Any]] = {}
+    for item in evidence:
+        evidence_type = str(item.get("evidence_type") or "")
+        if evidence_type not in {"api_request", "api_response", "api_request_response"}:
+            continue
+        source = str(item.get("source") or "")
+        key = source or str(item.get("id") or "")
+        pair = pairs.setdefault(key, {"source": source})
+        payload = dict(item.get("untrusted_payload") or {})
+        if evidence_type == "api_request_response":
+            pair["request_response"] = payload
+        elif evidence_type == "api_request":
+            pair["request"] = payload
+        elif evidence_type == "api_response":
+            pair["response"] = payload
+    return [pair for _, pair in sorted(pairs.items())]
+
+
+def _route_match_context(*, metadata: dict[str, Any], repair_task: Any) -> list[dict[str, Any]]:
+    raw_candidates: list[Any] = []
+    if repair_task is not None:
+        raw_candidates.extend(repair_task.metadata.get("candidate_rationale", []) or [])
+    raw_candidates.extend(metadata.get("candidate_rationale", []) or [])
+    matches: list[dict[str, Any]] = []
+    for candidate in raw_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        rationale = candidate.get("rationale")
+        file_path = str(candidate.get("file_path") or "").strip()
+        if not file_path:
+            continue
+        rationale_text = (
+            ", ".join(str(item) for item in rationale)
+            if isinstance(rationale, list)
+            else str(rationale or "")
+        )
+        if not any(token in rationale_text for token in ("route", "api_")):
+            continue
+        matches.append(
+            {
+                "file_path": file_path,
+                "score": candidate.get("score", 0),
+                "rationale": rationale,
+            }
+        )
+    return matches
+
+
+def _log_evidence_context(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    log_types = {"backend_log", "log", "otel_log", "monitoring_log", "trace_span"}
+    logs: list[dict[str, Any]] = []
+    for item in evidence:
+        evidence_type = str(item.get("evidence_type") or "")
+        if evidence_type not in log_types:
+            continue
+        logs.append(
+            {
+                "id": item.get("id", ""),
+                "type": evidence_type,
+                "source": item.get("source", ""),
+                "occurred_at_ms": item.get("occurred_at_ms", 0),
+                "untrusted_payload": item.get("untrusted_payload", {}),
+            }
+        )
+    return logs
 
 
 def _bundle_likely_files(

@@ -5,6 +5,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 
 FailureStatus = Literal[
@@ -231,6 +232,7 @@ def canonical_failure_from_api_run(
     spec_id = str(getattr(spec, "spec_id", "") or getattr(run_result, "spec_id", "") or "")
     method = str(getattr(spec, "method", "") or "").upper()
     url = str(getattr(spec, "url", "") or "")
+    route_path = _url_path(url)
     expected_status = _safe_int(getattr(spec, "expected_status", 0))
     status_code = _safe_int(getattr(run_result, "status_code", 0))
     error = str(getattr(run_result, "error", "") or "")
@@ -290,6 +292,7 @@ def canonical_failure_from_api_run(
             "spec_id": spec_id,
             "method": method,
             "url": url,
+            "route_path": route_path,
             "query": dict(getattr(spec, "query", {}) or {}),
             "expected_status": expected_status,
             "status_code": status_code,
@@ -297,6 +300,7 @@ def canonical_failure_from_api_run(
             "error": error,
             "artifacts": list(getattr(run_result, "artifacts", []) or []),
             "assertion_results": assertion_results,
+            "trace_ids": _api_trace_ids_from_spec(spec),
         },
     )
 
@@ -366,3 +370,26 @@ def _json_list(raw: object) -> list[Any]:
     except Exception:
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def _url_path(url: str) -> str:
+    parsed = urlparse(url)
+    return parsed.path or url
+
+
+def _api_trace_ids_from_spec(spec: Any) -> list[str]:
+    fixtures = getattr(spec, "fixtures", {}) or {}
+    if not isinstance(fixtures, dict):
+        return []
+    api_regression = fixtures.get("api_regression") or {}
+    if not isinstance(api_regression, dict):
+        return []
+    values = api_regression.get("trace_ids") or []
+    if not isinstance(values, list):
+        return []
+    out: list[str] = []
+    for value in values:
+        item = str(value or "").strip()
+        if item and item not in out:
+            out.append(item)
+    return out
