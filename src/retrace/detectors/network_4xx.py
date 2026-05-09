@@ -45,6 +45,9 @@ class Network4xxDetector:
                         "status": status,
                         "request_url": payload.get("url", ""),
                         "method": payload.get("method", "GET"),
+                        "trace": payload.get("trace")
+                        if isinstance(payload.get("trace"), dict)
+                        else {},
                     },
                     confidence="medium",
                     reason_codes=("network_4xx.status_4xx",),

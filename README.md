@@ -155,6 +155,9 @@ but cannot read replay data or issues.
 The `@retrace/browser` SDK captures console logs, failed network calls, clicks,
 inputs, `window.onerror`, and `unhandledrejection` evidence. Browser exception
 messages and stacks are redacted for common secrets and PII before ingestion.
+Outgoing fetch/XHR calls carry W3C `traceparent` context when possible, and
+captured network evidence preserves request/response trace IDs for repair
+prompts and log correlation.
 
 ## Fix Suggestions Workflow
 

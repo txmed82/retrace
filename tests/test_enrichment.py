@@ -124,6 +124,33 @@ def test_enricher_best_effort_without_api_key(tmp_path: Path):
     assert "/logs?" in out.logs_url
 
 
+def test_enricher_extracts_trace_ids_from_network_signals_without_api_key(
+    tmp_path: Path,
+):
+    store = Storage(tmp_path / "r.db")
+    store.init_schema()
+    traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    signals = [
+        Signal(
+            session_id="sess-1",
+            detector="network_5xx",
+            timestamp_ms=1_700_000_000_000,
+            url="https://example.com",
+            details={
+                "trace": {
+                    "requestTraceparent": traceparent,
+                }
+            },
+        )
+    ]
+
+    enricher = CorrelationEnricher(_cfg(api_key=""), store)
+    out = enricher.enrich(_finding(), signals)
+
+    assert out.trace_ids == ["4bf92f3577b34da6a3ce929d0e0e4736"]
+    assert "trace_id=4bf92f3577b34da6a3ce929d0e0e4736" in out.logs_url
+
+
 def test_enricher_extracts_issue_and_trace_ids_from_query_rows(tmp_path: Path):
     store = Storage(tmp_path / "r.db")
     store.init_schema()

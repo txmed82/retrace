@@ -44,6 +44,31 @@ function makeSessionId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+function makeHexId(bytes: number): string {
+  const cryptoObj = globalThis.crypto;
+  const buf = new Uint8Array(bytes);
+  if (cryptoObj?.getRandomValues) {
+    cryptoObj.getRandomValues(buf);
+  } else {
+    for (let i = 0; i < bytes; i += 1) {
+      buf[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return Array.from(buf)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function makeTraceparent(traceId?: string): string {
+  const tid = traceId && /^[a-f0-9]{32}$/i.test(traceId) ? traceId : makeHexId(16);
+  return `00-${tid.toLowerCase()}-${makeHexId(8)}-01`;
+}
+
+function traceIdFromTraceparent(traceparent: string | null | undefined): string {
+  const match = String(traceparent || "").match(/^00-([a-f0-9]{32})-[a-f0-9]{16}-[a-f0-9]{2}$/i);
+  return match ? match[1].toLowerCase() : "";
+}
+
 function shouldSample(sampleRate: number): boolean {
   if (sampleRate >= 1) return true;
   if (sampleRate <= 0) return false;
@@ -98,6 +123,7 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
   let distinctId = options.distinctId || "";
   let metadata = { ...(options.metadata || {}) };
   let sequence = 0;
+  let activeTraceparent = "";
   let events: ReplayEvent[] = [];
   let stopRecording: (() => void) | undefined;
   let flushTimer: ReturnType<typeof setInterval> | undefined;
@@ -130,7 +156,46 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     };
     return {
       traceId: globals.__RETRACE_TRACE_ID__ || undefined,
-      traceparent: globals.__RETRACE_TRACEPARENT__ || undefined,
+      traceparent: globals.__RETRACE_TRACEPARENT__ || activeTraceparent || undefined,
+    };
+  }
+
+  function ensureTraceparent(): string {
+    const globals = globalThis as unknown as {
+      __RETRACE_TRACE_ID__?: string;
+      __RETRACE_TRACEPARENT__?: string;
+    };
+    const existing = globals.__RETRACE_TRACEPARENT__ || activeTraceparent;
+    if (existing) return existing;
+    activeTraceparent = makeTraceparent(globals.__RETRACE_TRACE_ID__);
+    globals.__RETRACE_TRACEPARENT__ = activeTraceparent;
+    globals.__RETRACE_TRACE_ID__ = traceIdFromTraceparent(activeTraceparent);
+    return activeTraceparent;
+  }
+
+  function rememberTraceparent(traceparent: string | null): void {
+    if (!traceparent) return;
+    const traceId = traceIdFromTraceparent(traceparent);
+    if (!traceId) return;
+    const globals = globalThis as unknown as {
+      __RETRACE_TRACE_ID__?: string;
+      __RETRACE_TRACEPARENT__?: string;
+    };
+    activeTraceparent = traceparent;
+    globals.__RETRACE_TRACEPARENT__ = traceparent;
+    globals.__RETRACE_TRACE_ID__ = traceId;
+  }
+
+  function tracePayload(requestTraceparent: string, responseTraceparent?: string | null, fallbackTraceId?: string | null): Record<string, unknown> {
+    return {
+      traceparent: requestTraceparent,
+      requestTraceparent,
+      responseTraceparent: responseTraceparent || undefined,
+      traceId:
+        traceIdFromTraceparent(responseTraceparent) ||
+        String(fallbackTraceId || "") ||
+        traceIdFromTraceparent(requestTraceparent) ||
+        undefined,
     };
   }
 
@@ -299,18 +364,33 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     if (originalFetch) {
       globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         const startedAt = Date.now();
+        const requestTraceparent = ensureTraceparent();
+        const headers = new Headers(
+          init?.headers || (input instanceof Request ? input.headers : undefined),
+        );
+        if (!headers.has("traceparent")) {
+          headers.set("traceparent", requestTraceparent);
+        }
+        const nextInit: RequestInit = { ...(init || {}), headers };
         const method =
-          init?.method ||
+          nextInit.method ||
           (input instanceof Request ? input.method : "GET");
         const url = input instanceof Request ? input.url : String(input);
         try {
-          const response = await originalFetch(input, init);
+          const response = await originalFetch(input, nextInit);
+          const responseTraceparent = response.headers.get("traceparent");
+          rememberTraceparent(responseTraceparent);
           emitCustom("network", {
             kind: "fetch",
             method,
             url,
             status: response.status,
             durationMs: Date.now() - startedAt,
+            trace: tracePayload(
+              requestTraceparent,
+              responseTraceparent,
+              response.headers.get("x-retrace-trace-id"),
+            ),
           });
           return response;
         } catch (error) {
@@ -320,6 +400,7 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
             url,
             error: error instanceof Error ? error.message : String(error),
             durationMs: Date.now() - startedAt,
+            trace: tracePayload(requestTraceparent),
           });
           throw error;
         }
@@ -333,29 +414,55 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     if (OriginalXHR) {
       const originalOpen = OriginalXHR.prototype.open;
       const originalSend = OriginalXHR.prototype.send;
+      const originalSetRequestHeader = OriginalXHR.prototype.setRequestHeader;
       OriginalXHR.prototype.open = function open(
-        this: XMLHttpRequest & { __retrace?: { method: string; url: string } },
+        this: XMLHttpRequest & { __retrace?: { method: string; url: string; traceparent: string; headers: Record<string, true> } },
         method: string,
         url: string | URL,
         async?: boolean,
         username?: string | null,
         password?: string | null,
       ) {
-        this.__retrace = { method, url: String(url) };
+        this.__retrace = { method, url: String(url), traceparent: ensureTraceparent(), headers: {} };
         return originalOpen.call(this, method, url, async ?? true, username, password);
       };
+      OriginalXHR.prototype.setRequestHeader = function setRequestHeader(
+        this: XMLHttpRequest & { __retrace?: { method: string; url: string; traceparent: string; headers: Record<string, true> } },
+        name: string,
+        value: string,
+      ) {
+        if (this.__retrace) {
+          this.__retrace.headers[String(name).toLowerCase()] = true;
+        }
+        return originalSetRequestHeader.call(this, name, value);
+      };
       OriginalXHR.prototype.send = function send(
-        this: XMLHttpRequest & { __retrace?: { method: string; url: string } },
+        this: XMLHttpRequest & { __retrace?: { method: string; url: string; traceparent: string; headers: Record<string, true> } },
         body?: Document | XMLHttpRequestBodyInit | null,
       ) {
         const startedAt = Date.now();
+        const requestTraceparent = this.__retrace?.traceparent || ensureTraceparent();
+        if (!this.__retrace?.headers.traceparent) {
+          try {
+            this.setRequestHeader("traceparent", requestTraceparent);
+          } catch {
+            // Some browser states reject header mutation; still record context.
+          }
+        }
         this.addEventListener("loadend", () => {
+          const responseTraceparent = this.getResponseHeader("traceparent");
+          rememberTraceparent(responseTraceparent);
           emitCustom("network", {
             kind: "xhr",
             method: this.__retrace?.method || "GET",
             url: this.__retrace?.url || "",
             status: this.status,
             durationMs: Date.now() - startedAt,
+            trace: tracePayload(
+              requestTraceparent,
+              responseTraceparent,
+              this.getResponseHeader("x-retrace-trace-id"),
+            ),
           });
         });
         return originalSend.call(this, body);
@@ -363,6 +470,7 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
       cleanupFns.push(() => {
         OriginalXHR.prototype.open = originalOpen;
         OriginalXHR.prototype.send = originalSend;
+        OriginalXHR.prototype.setRequestHeader = originalSetRequestHeader;
       });
     }
   }
