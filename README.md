@@ -152,6 +152,9 @@ Common secret variables:
 First-party browser capture uses write-only public SDK keys generated from the
 local UI or `retrace api create-sdk-key`. Those keys can submit replay batches
 but cannot read replay data or issues.
+The `@retrace/browser` SDK captures console logs, failed network calls, clicks,
+inputs, `window.onerror`, and `unhandledrejection` evidence. Browser exception
+messages and stacks are redacted for common secrets and PII before ingestion.
 
 ## Fix Suggestions Workflow
 
