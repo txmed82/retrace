@@ -234,6 +234,8 @@ def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> N
     assert timeline[2]["reason_codes"] == ["network_5xx.status_5xx"]
     assert timeline[3]["summary"] == "Checkout total is undefined"
     assert issue["confidence"] == "medium"
+    assert issue["fingerprint"]
+    assert issue["analysis_status"] == ""
     assert issue["sessions"][0]["stable_id"] == "sess-timeline"
     assert issue["sessions"][0]["public_id"].startswith("rpl_")
     assert issue["test_links"][0]["spec_id"] == "checkout-replay-regression"

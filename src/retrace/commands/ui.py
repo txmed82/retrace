@@ -9,6 +9,7 @@ import re
 import socket
 import shutil
 import subprocess
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
@@ -25,6 +26,8 @@ from retrace.fix_suggestions import (
     slugify,
 )
 from retrace.evidence import build_evidence_timeline
+from retrace.ingester import PostHogIngester
+from retrace.llm.client import LLMClient
 from retrace.llm.client import build_llm_http_request
 from retrace.reports.parser import parse_report_findings
 from retrace.replay_specs import generate_spec_from_replay_issue
@@ -727,6 +730,7 @@ def _replay_issue_payload(
     row: Any, *, sessions: list[dict[str, Any]]
 ) -> dict[str, Any]:
     canonical_failure_id = row["canonical_failure_id"]
+    evidence = _json_field(row, "evidence_json", {})
     return {
         "id": str(row["id"]),
         "public_id": str(row["public_id"]),
@@ -741,7 +745,12 @@ def _replay_issue_payload(
         "likely_cause": str(row["likely_cause"]),
         "reproduction_steps": _json_field(row, "reproduction_steps_json", []),
         "signal_summary": _json_field(row, "signal_summary_json", {}),
-        "evidence": _json_field(row, "evidence_json", {}),
+        "evidence": evidence,
+        "fingerprint": str(row["fingerprint"]),
+        "analysis_status": str(row["analysis_status"]),
+        "analysis_model": str(row["analysis_model"]),
+        "analysis_prompt_version": str(row["analysis_prompt_version"]),
+        "analysis_error": str(row["analysis_error"]),
         "affected_count": int(row["affected_count"]),
         "affected_users": int(row["affected_users"]),
         "representative_session_id": str(row["representative_session_id"]),
@@ -755,10 +764,84 @@ def _replay_issue_payload(
         "last_seen_ms": int(row["last_seen_ms"]),
         "updated_at": str(row["updated_at"]),
         "sessions": sessions,
-        "timeline": [],
+        "timeline": _replay_evidence_timeline(evidence),
         "test_links": [],
         "share_url": f"#issue={str(row['public_id'])}",
     }
+
+
+def _replay_evidence_timeline(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for event in evidence.get("events") if isinstance(evidence.get("events"), list) else []:
+        if not isinstance(event, dict):
+            continue
+        data_type = event.get("data_type")
+        if event.get("type") == 4:
+            title = "Navigation"
+            summary = str(event.get("href") or "")
+            kind = "navigation"
+        elif event.get("type") == 3 and event.get("source") == 2 and data_type == 2:
+            title = "Click"
+            summary = f"Clicked element id {event.get('id', 'unknown')}"
+            kind = "interaction"
+        elif event.get("type") == 3 and event.get("source") == 5:
+            title = "Input"
+            summary = f"Entered text in element id {event.get('id', 'unknown')}"
+            kind = "interaction"
+        else:
+            continue
+        items.append(
+            {
+                "id": "",
+                "type": "replay_event",
+                "kind": kind,
+                "occurred_at_ms": int(event.get("timestamp_ms") or 0),
+                "source": "replay",
+                "title": title,
+                "summary": summary,
+                "detector": "",
+                "detector_hit": False,
+                "confidence": "",
+                "reason_codes": [],
+                "payload": event,
+            }
+        )
+    for signal in evidence.get("signals") if isinstance(evidence.get("signals"), list) else []:
+        if not isinstance(signal, dict):
+            continue
+        details = signal.get("details") if isinstance(signal.get("details"), dict) else {}
+        detector = str(signal.get("detector") or "")
+        status = details.get("status")
+        request_url = details.get("request_url") or details.get("url")
+        if detector.startswith("network") and request_url:
+            title = f"Network {status or ''}".strip()
+            summary = f"{details.get('method') or 'GET'} {request_url} returned {status or 'unknown'}"
+            kind = "network"
+        elif detector == "console_error":
+            title = "Console error"
+            summary = str(details.get("message") or details.get("payload") or detector)
+            kind = "error"
+        else:
+            title = detector.replace("_", " ").title() or "Detector signal"
+            summary = json.dumps(details, sort_keys=True) if details else title
+            kind = "detector"
+        items.append(
+            {
+                "id": "",
+                "type": "replay_signal",
+                "kind": kind,
+                "occurred_at_ms": int(signal.get("timestamp_ms") or 0),
+                "source": "replay",
+                "title": title,
+                "summary": summary,
+                "detector": detector,
+                "detector_hit": True,
+                "confidence": str(signal.get("confidence") or ""),
+                "reason_codes": signal.get("reason_codes") if isinstance(signal.get("reason_codes"), list) else [],
+                "payload": signal,
+            }
+        )
+    return sorted(items, key=lambda item: (int(item.get("occurred_at_ms") or 0), str(item.get("title") or "")))
 
 
 def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
@@ -1283,10 +1366,12 @@ _INDEX_HTML = """<!doctype html>
         <div class=\"view-head\">
           <div><h2>Issue Detail</h2><div class=\"empty\">Replay-backed failures are the primary workflow surface.</div></div>
           <div class=\"actions\">
+            <button class=\"btn\" id=\"importPostHogReplaysBtn\" type=\"button\">Import PostHog Replays</button>
             <button class=\"btn\" id=\"processReplayJobsBtn\" type=\"button\">Process Queued Replays</button>
             <button class=\"btn\" id=\"verifyResolvedBtn\" type=\"button\">Verify Resolved Issues</button>
           </div>
         </div>
+        <label class=\"empty\"><input id=\"replayAiAnalysis\" type=\"checkbox\" /> AI replay analysis</label>
         <div class=\"empty\" id=\"replayProcessStatus\"></div>
         <div class=\"empty\" id=\"verifyResolvedStatus\"></div>
         <div id=\"replayIssueDetail\"><div class=\"empty\">Select a replay-backed issue.</div></div>
@@ -1951,13 +2036,32 @@ const retrace = init({
     async function processReplayJobs(){
       const status = byId('replayProcessStatus');
       status.textContent = 'Processing...';
-      const res = await fetch('/api/replays/process', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({limit: 25})});
+      const ai = !!byId('replayAiAnalysis')?.checked;
+      const res = await fetch('/api/replays/process', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({limit: 25, ai})});
       const data = await res.json();
       if(!res.ok || !data.ok){
         status.textContent = data.error || 'Processing failed';
         return;
       }
-      await loadReplayDashboard(`Processed ${data.result.jobs_processed} job(s), updated ${data.result.issues_created_or_updated} issue(s).`);
+      await loadReplayDashboard(`Processed ${data.result.jobs_processed} job(s), updated ${data.result.issues_created_or_updated} issue(s)${ai ? ' with AI analysis' : ''}.`);
+    }
+
+    async function importPostHogReplays(){
+      const status = byId('replayProcessStatus');
+      status.textContent = 'Importing PostHog replays...';
+      const ai = !!byId('replayAiAnalysis')?.checked;
+      const res = await fetch('/api/replays/import-posthog', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({since_hours: 24, max_sessions: 50, process: true, ai}),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        status.textContent = data.error || 'PostHog import failed';
+        return;
+      }
+      const processed = data.processed || {};
+      await loadReplayDashboard(`Imported ${data.imported_sessions.length} PostHog replay(s); processed ${processed.jobs_processed || 0} job(s), updated ${processed.issues_created_or_updated || 0} issue(s).`);
     }
 
     async function verifyResolvedReplayIssues(){
@@ -1993,11 +2097,11 @@ const retrace = init({
       const sessionOptions = [...new Set(sessions.map(s => s.status || 'unknown'))].sort()
         .map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
       const issueRows = issues.map(i => `
-        <div class="issue-row ${replayState.activeIssueId === i.public_id ? 'active' : ''}" role="button" tabindex="0" data-issue-status="${esc(i.status)}" data-replay-issue="${esc(i.public_id)}">
-          <div class="sev">${esc(i.status)} · ${esc(i.severity)} · ${esc(i.confidence || 'medium')} confidence</div>
-          <div class="title">${esc(i.title || 'Untitled issue')}</div>
-          <div class="empty">${esc(i.public_id)} · affected=${esc(i.affected_count)} · tests=${esc((i.test_links || []).length)}</div>
-        </div>`).join('');
+          <div class="issue-row ${replayState.activeIssueId === i.public_id ? 'active' : ''}" role="button" tabindex="0" data-issue-status="${esc(i.status)}" data-replay-issue="${esc(i.public_id)}">
+            <div class="sev">${esc(i.status)} · ${esc(i.severity)} · ${esc(i.confidence || 'medium')} confidence</div>
+            <div class="title">${esc(i.title || 'Untitled issue')}</div>
+          <div class="empty">${esc(i.public_id)} · sessions=${esc(i.affected_count)} · users=${esc(i.affected_users || 0)} · evidence=${esc((i.timeline || []).length)} · tests=${esc((i.test_links || []).length)} · ${esc(i.analysis_status || 'fallback')}</div>
+          </div>`).join('');
       const sessionRows = sessions.map(s => `
         <li data-session-status="${esc(s.status)}"><button class="btn" type="button" data-replay-session="${esc(s.stable_id)}">Play</button>
           <a href="${esc(s.share_url)}"><code>${esc(s.public_id)}</code></a> · ${esc(s.stable_id)}<br>
@@ -2037,6 +2141,7 @@ const retrace = init({
         </div>
       `;
       if(byId('replayProcessStatus')) byId('replayProcessStatus').textContent = processStatus;
+      byId('importPostHogReplaysBtn').onclick = importPostHogReplays;
       byId('processReplayJobsBtn').onclick = processReplayJobs;
       byId('verifyResolvedBtn').onclick = verifyResolvedReplayIssues;
       document.querySelectorAll('[data-replay-session]').forEach(el => {
@@ -2192,6 +2297,7 @@ const retrace = init({
           <div>
             <div class="card">
               <h3>Failure Narrative</h3>
+              <div class="lbl">Analysis</div><div>${esc(issue.analysis_status || 'fallback')}${issue.analysis_model ? ` · ${esc(issue.analysis_model)}` : ''}${issue.analysis_error ? ` · ${esc(issue.analysis_error)}` : ''}</div>
               <div class="lbl">Summary</div><div>${esc(issue.summary || '')}</div>
               <div class="lbl">Likely Cause</div><div>${esc(issue.likely_cause || '')}</div>
               <div class="lbl">Reproduction Steps</div>${steps ? `<ul>${steps}</ul>` : '<div class="empty">No steps generated yet.</div>'}
@@ -3022,13 +3128,24 @@ def ui_command(
                     limit_v = max(1, min(int(body.get("limit") or 25), 100))
                 except (TypeError, ValueError):
                     limit_v = 25
+                ai_enabled = bool(body.get("ai") or False)
                 try:
-                    enricher = _build_enricher(load_config(config_path), store)
+                    loaded_cfg = load_config(config_path)
+                    enricher = _build_enricher(loaded_cfg, store)
                 except Exception:
+                    loaded_cfg = None
                     enricher = None
-                result = process_queued_replay_jobs(
-                    store=store, limit=limit_v, enricher=enricher
-                )
+                llm_client = LLMClient(loaded_cfg.llm) if ai_enabled and loaded_cfg else None
+                try:
+                    result = process_queued_replay_jobs(
+                        store=store,
+                        limit=limit_v,
+                        enricher=enricher,
+                        llm_client=llm_client,
+                    )
+                finally:
+                    if llm_client is not None:
+                        llm_client.close()
                 self._json(
                     {
                         "ok": True,
@@ -3038,7 +3155,76 @@ def ui_command(
                             "jobs_failed": result.jobs_failed,
                             "sessions_processed": result.sessions_processed,
                             "issues_created_or_updated": result.issues_created_or_updated,
+                            "ai_analysis": ai_enabled,
                         },
+                    }
+                )
+                return
+
+            if path == "/api/replays/import-posthog":
+                from retrace.commands.api import _build_enricher
+                from retrace.config import load_config
+                from retrace.replay_core import process_queued_replay_jobs
+
+                body = self._read_json_body()
+                try:
+                    since_hours = max(1, min(int(body.get("since_hours") or 24), 24 * 30))
+                except (TypeError, ValueError):
+                    since_hours = 24
+                try:
+                    max_sessions = max(1, min(int(body.get("max_sessions") or 50), 500))
+                except (TypeError, ValueError):
+                    max_sessions = 50
+                process_now = bool(body.get("process", True))
+                ai_enabled = bool(body.get("ai") or False)
+                try:
+                    loaded_cfg = load_config(config_path)
+                    workspace = store.ensure_workspace(project_name="Default")
+                    ingester = PostHogIngester(
+                        loaded_cfg.posthog,
+                        store,
+                        data_dir=loaded_cfg.run.data_dir,
+                    )
+                    imported = ingester.import_since_as_replays(
+                        datetime.now(timezone.utc) - timedelta(hours=since_hours),
+                        max_sessions,
+                        project_id=workspace.project_id,
+                        environment_id=workspace.environment_id,
+                    )
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                processed_payload: dict[str, Any] = {}
+                if process_now:
+                    llm_client = LLMClient(loaded_cfg.llm) if ai_enabled else None
+                    try:
+                        processed = process_queued_replay_jobs(
+                            store=store,
+                            limit=max_sessions,
+                            project_id=workspace.project_id,
+                            enricher=_build_enricher(loaded_cfg, store),
+                            llm_client=llm_client,
+                        )
+                    finally:
+                        if llm_client is not None:
+                            llm_client.close()
+                    processed_payload = {
+                        "jobs_seen": processed.jobs_seen,
+                        "jobs_processed": processed.jobs_processed,
+                        "jobs_failed": processed.jobs_failed,
+                        "sessions_processed": processed.sessions_processed,
+                        "issues_created_or_updated": processed.issues_created_or_updated,
+                        "issues_inserted": processed.issues_inserted,
+                        "issues_regressed": processed.issues_regressed,
+                    }
+                self._json(
+                    {
+                        "ok": True,
+                        "imported_sessions": imported.session_ids,
+                        "skipped_sessions": imported.skipped_session_ids,
+                        "processing_job_ids": imported.processing_job_ids,
+                        "processed": processed_payload,
+                        "ai_analysis": bool(ai_enabled and process_now),
                     }
                 )
                 return
