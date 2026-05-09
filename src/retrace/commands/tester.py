@@ -10,6 +10,8 @@ import click
 import yaml
 
 from retrace.config import load_config
+from retrace.evidence import EvidenceItem, evidence_dedupe_key
+from retrace.failures import canonical_failure_from_harness_run
 from retrace.replay_specs import generate_spec_from_replay_issue
 from retrace.storage import Storage
 from retrace.tester import (
@@ -46,6 +48,99 @@ def _tester_defaults(config_path: Path) -> dict[str, Any]:
 def _single_failure_test_link_id(store: Storage, spec_id: str) -> str:
     links = store.list_failure_test_links(spec_id=spec_id, limit=2)
     return links[0].id if len(links) == 1 else ""
+
+
+def _persist_harness_failure(
+    *,
+    store: Storage,
+    result: Any,
+    spec_name: str,
+) -> dict[str, str]:
+    workspace = store.ensure_workspace(project_name="Default")
+    failure = canonical_failure_from_harness_run(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        run_result=result,
+        spec_name=spec_name,
+    )
+    failure_id, _evidence_ids, repair_task_id = (
+        store.upsert_failure_with_evidence_and_repair_task(
+            failure=failure,
+            evidence_items=_harness_evidence_items(failure_id="", result=result),
+            repair_task={
+                "title": f"Repair harness failure: {spec_name or result.spec_id}",
+                "source_type": "test_run",
+                "source_external_id": failure.source_external_id,
+                "status": "open",
+                "prompt_artifacts": list(getattr(result, "artifacts", []) or []),
+                "validation_commands": [
+                    f"retrace tester run {result.spec_id} --retries 0"
+                ],
+                "risk_notes": "Review harness artifacts before applying a repair.",
+                "metadata": {
+            "run_id": result.run_id,
+            "spec_id": result.spec_id,
+            "failure_classification": result.failure_classification,
+                },
+            },
+        )
+    )
+    store.upsert_failure_test_link(
+        failure_id=failure_id,
+        spec_id=result.spec_id,
+        spec_name=spec_name,
+        source="test_run",
+    )
+    return {"failure_id": failure_id, "repair_task_id": repair_task_id}
+
+
+def _harness_evidence_items(*, failure_id: str, result: Any) -> list[EvidenceItem]:
+    items: list[EvidenceItem] = []
+    source = f"test_run:{result.run_id}"
+    for artifact in list(getattr(result, "artifacts", []) or []):
+        artifact_type = str(artifact.get("artifact_type") or "")
+        evidence_type = _artifact_evidence_type(artifact_type)
+        if not evidence_type:
+            continue
+        payload = {
+            "run_id": result.run_id,
+            "spec_id": result.spec_id,
+            "artifact_id": str(artifact.get("artifact_id") or ""),
+            "artifact_type": artifact_type,
+            "label": str(artifact.get("label") or ""),
+            "metadata": dict(artifact.get("metadata") or {}),
+        }
+        artifact_path = str(artifact.get("path") or "")
+        items.append(
+            EvidenceItem(
+                failure_id=failure_id,
+                evidence_type=evidence_type,
+                occurred_at_ms=0,
+                source=source,
+                redaction_state="redacted",
+                payload=payload,
+                artifact_path=artifact_path,
+                dedupe_key=evidence_dedupe_key(
+                    failure_id=failure_id,
+                    evidence_type=evidence_type,
+                    source=source,
+                    occurred_at_ms=0,
+                    payload=payload,
+                ),
+            )
+        )
+    return items
+
+
+def _artifact_evidence_type(artifact_type: str) -> str:
+    return {
+        "log": "test_transcript",
+        "browser_harness_output": "dom_snapshot",
+        "browser_harness_steps": "test_transcript",
+        "console_output": "console_log",
+        "network_output": "network_request",
+        "screenshot": "screenshot",
+    }.get(artifact_type, "")
 
 
 @tester_group.command("create")
@@ -470,6 +565,7 @@ def tester_run(
         max_retries=retries_v,
         cwd=config_path.parent,
     )
+    failure_metadata: dict[str, str] = {}
     try:
         store = Storage(cfg.run.data_dir / "retrace.db")
         store.init_schema()
@@ -480,9 +576,22 @@ def tester_run(
                 run_result=result,
                 link_id=link_id,
             )
+        if not result.ok and result.execution_engine == "harness":
+            failure_metadata = _persist_harness_failure(
+                store=store,
+                result=result,
+                spec_name=spec.name,
+            )
+            link_id = _single_failure_test_link_id(store, result.spec_id)
+            if link_id:
+                store.update_failure_test_link_run(
+                    spec_id=result.spec_id,
+                    run_result=result,
+                    link_id=link_id,
+                )
     except Exception as exc:
         click.echo(
-            f"warning: failed to persist failure_test_link metadata: {exc}",
+            f"warning: failed to persist tester failure metadata: {exc}",
             err=True,
         )
     click.echo(
@@ -502,6 +611,8 @@ def tester_run(
                 "failure_classification": result.failure_classification,
                 "error": result.error,
                 "execution_engine": result.execution_engine,
+                "canonical_failure_id": failure_metadata.get("failure_id", ""),
+                "repair_task_id": failure_metadata.get("repair_task_id", ""),
                 "artifacts": result.artifacts,
                 "assertion_results": result.assertion_results,
             },

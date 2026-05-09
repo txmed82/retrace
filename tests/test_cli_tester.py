@@ -6,6 +6,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from retrace.cli import main
+from retrace.storage import Storage
 from retrace.tester import set_explore_factories
 
 
@@ -238,6 +239,75 @@ def test_tester_run_retries_and_marks_flaky(tmp_path: Path, monkeypatch) -> None
     assert '"status": "flaky_passed"' in ran.output
     assert '"flaky": true' in ran.output
     assert '"failure_classification": "timeout"' in ran.output
+
+
+def test_failed_harness_run_persists_failure_evidence_and_repair(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    harness_payload_path = tmp_path / "harness-payload.json"
+    harness_payload_path.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "error": "checkout failed",
+                "network": [{"url": "/api/checkout", "status": 500}],
+                "console": [{"level": "error", "message": "boom"}],
+            }
+        )
+    )
+
+    create = runner.invoke(
+        main,
+        [
+            "tester",
+            "create",
+            "--name",
+            "Checkout failure",
+            "--prompt",
+            "Run checkout",
+            "--harness-cmd",
+            (
+                "echo {app_url_q} {prompt_q} >/dev/null; cp "
+                + str(harness_payload_path)
+                + " {run_dir_q}/browser-harness-result.json; exit 1"
+            ),
+        ],
+    )
+    assert create.exit_code == 0, create.output
+    spec_id = create.output.strip().split(": ")[1]
+
+    first = runner.invoke(main, ["tester", "run", spec_id, "--retries", "0"])
+    assert first.exit_code != 0
+    first_payload = json.loads(first.output.split("\nError:", 1)[0])
+    assert first_payload["canonical_failure_id"].startswith("flr_")
+    assert first_payload["repair_task_id"].startswith("rpr_")
+
+    second = runner.invoke(main, ["tester", "run", spec_id, "--retries", "0"])
+    assert second.exit_code != 0
+    second_payload = json.loads(second.output.split("\nError:", 1)[0])
+    assert second_payload["canonical_failure_id"] == first_payload["canonical_failure_id"]
+    assert second_payload["repair_task_id"] == first_payload["repair_task_id"]
+
+    store = Storage(tmp_path / "data" / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Default")
+    failures = store.list_failures(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+    assert len(failures) == 1
+    assert failures[0].linked_repair_task_id == first_payload["repair_task_id"]
+    evidence = store.list_failure_evidence(failure_id=failures[0].id)
+    evidence_types = {item.evidence_type for item in evidence}
+    assert {"test_transcript", "network_request", "console_log"} <= evidence_types
+    repair = store.get_repair_task(first_payload["repair_task_id"])
+    assert repair is not None
+    assert repair.evidence_ids
+    links = store.list_failure_test_links(failure_id=failures[0].id)
+    assert links[0].latest_run_id == second_payload["run_id"]
 
 
 def test_tester_enqueue_and_worker_runs_queued_spec(
