@@ -26,6 +26,20 @@ FAILURE_TEST_COVERAGE_STATES = (
     "covered_flaky",
 )
 
+_SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def _rollup_severity(values: list[str]) -> str:
+    highest = "medium"
+    highest_score = 0
+    for value in values:
+        severity = str(value or "medium").strip().lower()
+        score = _SEVERITY_ORDER.get(severity, 2)
+        if score > highest_score:
+            highest = severity if severity in _SEVERITY_ORDER else "medium"
+            highest_score = score
+    return highest
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -291,6 +305,41 @@ ON failure_evidence(failure_id, occurred_at_ms, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_failure_evidence_dedupe
 ON failure_evidence(failure_id, dedupe_key)
 WHERE dedupe_key != '';
+
+CREATE TABLE IF NOT EXISTS incidents (
+    id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'open',
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    evidence_count INTEGER NOT NULL DEFAULT 0,
+    repair_task_id TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, group_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_scope_status
+ON incidents(project_id, environment_id, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS incident_failures (
+    incident_id TEXT NOT NULL,
+    failure_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(incident_id, failure_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_incident_failures_failure
+ON incident_failures(failure_id, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_failures_one_incident_per_failure
+ON incident_failures(failure_id);
 
 CREATE TABLE IF NOT EXISTS failure_test_links (
     id TEXT PRIMARY KEY,
@@ -595,6 +644,25 @@ class EvidenceRow:
     @property
     def safe_for_prompts(self) -> bool:
         return self.redaction_state in PROMPT_SAFE_REDACTION_STATES
+
+
+@dataclass
+class IncidentRow:
+    id: str
+    public_id: str
+    project_id: str
+    environment_id: str
+    group_key: str
+    title: str
+    summary: str
+    severity: str
+    status: str
+    failure_count: int
+    evidence_count: int
+    repair_task_id: str
+    metadata: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass
@@ -1452,7 +1520,9 @@ class Storage:
             ),
         ).fetchone()
         assert row is not None
-        return str(row["id"])
+        persisted_failure_id = str(row["id"])
+        self._refresh_incidents_for_failure(conn, failure_id=persisted_failure_id)
+        return persisted_failure_id
 
     def get_failure(
         self,
@@ -1606,7 +1676,12 @@ class Storage:
                 (evidence.failure_id, evidence.dedupe_key),
             ).fetchone()
             assert row is not None
+            self._refresh_incidents_for_failure(
+                conn,
+                failure_id=evidence.failure_id,
+            )
             return str(row["id"])
+        self._refresh_incidents_for_failure(conn, failure_id=evidence.failure_id)
         return evidence_id
 
     def list_failure_evidence(
@@ -1635,6 +1710,377 @@ class Storage:
                 params,
             ).fetchall()
         return [self._evidence_from_row(row) for row in rows]
+
+    def get_failure_by_id(self, failure_id: str) -> Optional[FailureRow]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM failures
+                WHERE id = ? OR public_id = ?
+                """,
+                (failure_id, failure_id),
+            ).fetchone()
+        return self._failure_from_row(row) if row is not None else None
+
+    def upsert_incident(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        group_key: str,
+        title: str,
+        summary: str = "",
+        severity: str = "medium",
+        status: str = "open",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        incident_id = self._id("inc")
+        public_id = self._public_id("inc", project_id, environment_id, group_key)
+        try:
+            metadata_json = json.dumps(metadata or {}, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("incident metadata must be JSON-serializable") from exc
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO incidents
+                (id, public_id, project_id, environment_id, group_key, title, summary,
+                 severity, status, metadata_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, environment_id, group_key) DO UPDATE SET
+                    title = excluded.title,
+                    summary = excluded.summary,
+                    severity = excluded.severity,
+                    status = excluded.status,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    incident_id,
+                    public_id,
+                    project_id,
+                    environment_id,
+                    group_key,
+                    title,
+                    summary,
+                    severity,
+                    status,
+                    metadata_json,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT id
+                FROM incidents
+                WHERE project_id = ? AND environment_id = ? AND group_key = ?
+                """,
+                (project_id, environment_id, group_key),
+            ).fetchone()
+            assert row is not None
+            return str(row["id"])
+
+    def link_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
+        with self._conn() as conn:
+            incident = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM incidents
+                WHERE id = ? OR public_id = ?
+                """,
+                (incident_id, incident_id),
+            ).fetchone()
+            if incident is None:
+                raise ValueError(f"unknown incident_id: {incident_id}")
+            failure = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM failures
+                WHERE id = ? OR public_id = ?
+                """,
+                (failure_id, failure_id),
+            ).fetchone()
+            if failure is None:
+                raise ValueError(f"unknown failure_id: {failure_id}")
+            if (
+                str(incident["project_id"]) != str(failure["project_id"])
+                or str(incident["environment_id"]) != str(failure["environment_id"])
+            ):
+                raise ValueError("incident and failure must belong to the same workspace")
+            existing_link = conn.execute(
+                """
+                SELECT incident_id
+                FROM incident_failures
+                WHERE failure_id = ?
+                """,
+                (str(failure["id"]),),
+            ).fetchone()
+            if existing_link is not None:
+                linked_incident_id = str(existing_link["incident_id"])
+                if linked_incident_id != str(incident["id"]):
+                    raise ValueError("failure is already linked to another incident")
+                self._refresh_incident_rollup(
+                    conn,
+                    incident_id=linked_incident_id,
+                )
+                return
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO incident_failures
+                (incident_id, failure_id)
+                VALUES (?, ?)
+                """,
+                (str(incident["id"]), str(failure["id"])),
+            )
+            self._refresh_incident_rollup(conn, incident_id=str(incident["id"]))
+
+    def get_incident(self, incident_id: str) -> Optional[IncidentRow]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM incidents
+                WHERE id = ? OR public_id = ?
+                """,
+                (incident_id, incident_id),
+            ).fetchone()
+        return self._incident_from_row(row) if row is not None else None
+
+    def find_incident_by_group(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        group_key: str,
+    ) -> Optional[IncidentRow]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM incidents
+                WHERE project_id = ? AND environment_id = ? AND group_key = ?
+                """,
+                (project_id, environment_id, group_key),
+            ).fetchone()
+        return self._incident_from_row(row) if row is not None else None
+
+    def list_incidents(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[IncidentRow]:
+        params: list[object] = [project_id, environment_id]
+        where = "project_id = ? AND environment_id = ?"
+        if status is not None:
+            where += " AND status = ?"
+            params.append(status)
+        params.append(max(1, min(int(limit), 500)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM incidents
+                WHERE {where}
+                ORDER BY updated_at DESC, public_id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._incident_from_row(row) for row in rows]
+
+    def list_incident_failures(self, *, incident_id: str) -> list[FailureRow]:
+        with self._conn() as conn:
+            incident = conn.execute(
+                """
+                SELECT id
+                FROM incidents
+                WHERE id = ? OR public_id = ?
+                """,
+                (incident_id, incident_id),
+            ).fetchone()
+            if incident is None:
+                return []
+            rows = conn.execute(
+                """
+                SELECT f.*
+                FROM incident_failures inf
+                JOIN failures f ON f.id = inf.failure_id
+                WHERE inf.incident_id = ?
+                ORDER BY f.updated_at DESC, f.public_id
+                """,
+                (str(incident["id"]),),
+            ).fetchall()
+        return [self._failure_from_row(row) for row in rows]
+
+    def list_incident_evidence(
+        self,
+        *,
+        incident_id: str,
+        include_sensitive: bool = True,
+    ) -> list[EvidenceRow]:
+        resolved_incident_id = self._resolve_incident_id(incident_id)
+        if not resolved_incident_id:
+            return []
+        where = "inf.incident_id = ?"
+        params: list[object] = [resolved_incident_id]
+        if not include_sensitive:
+            placeholders = ",".join("?" for _ in PROMPT_SAFE_REDACTION_STATES)
+            where += f" AND ev.redaction_state IN ({placeholders})"
+            params.extend(PROMPT_SAFE_REDACTION_STATES)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT ev.*
+                FROM incident_failures inf
+                JOIN failure_evidence ev ON ev.failure_id = inf.failure_id
+                WHERE {where}
+                ORDER BY
+                    ev.occurred_at_ms,
+                    replace(replace(ev.created_at, ' ', 'T'), '+00:00', 'Z'),
+                    ev.id
+                """,
+                params,
+            ).fetchall()
+        return [self._evidence_from_row(row) for row in rows]
+
+    def _resolve_incident_id(self, incident_id: str) -> str:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM incidents
+                WHERE id = ? OR public_id = ?
+                """,
+                (incident_id, incident_id),
+            ).fetchone()
+        return str(row["id"]) if row is not None else ""
+
+    def set_incident_repair_task(self, *, incident_id: str, repair_task_id: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            incident = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM incidents
+                WHERE id = ? OR public_id = ?
+                """,
+                (incident_id, incident_id),
+            ).fetchone()
+            if incident is None:
+                raise ValueError(f"unknown incident_id: {incident_id}")
+            repair_task = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM repair_tasks
+                WHERE id = ? OR public_id = ?
+                """,
+                (repair_task_id, repair_task_id),
+            ).fetchone()
+            if repair_task is None:
+                raise ValueError(f"unknown repair_task_id: {repair_task_id}")
+            if (
+                str(incident["project_id"]) != str(repair_task["project_id"])
+                or str(incident["environment_id"]) != str(repair_task["environment_id"])
+            ):
+                raise ValueError(
+                    "incident and repair task must belong to the same workspace"
+                )
+            conn.execute(
+                """
+                UPDATE incidents
+                SET repair_task_id = ?, updated_at = ?
+                WHERE id = ? OR public_id = ?
+                """,
+                (str(repair_task["id"]), now, str(incident["id"]), str(incident["id"])),
+            )
+
+    def _incident_from_row(self, row: sqlite3.Row) -> IncidentRow:
+        return IncidentRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            group_key=str(row["group_key"]),
+            title=str(row["title"] or ""),
+            summary=str(row["summary"] or ""),
+            severity=str(row["severity"] or "medium"),
+            status=str(row["status"] or "open"),
+            failure_count=int(row["failure_count"] or 0),
+            evidence_count=int(row["evidence_count"] or 0),
+            repair_task_id=str(row["repair_task_id"] or ""),
+            metadata=dict(self._safe_json_obj(row["metadata_json"])),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    def _refresh_incident_rollup(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        incident_id: str,
+    ) -> None:
+        rows = conn.execute(
+            """
+            SELECT severity, updated_at
+            FROM incident_failures inf
+            JOIN failures f ON f.id = inf.failure_id
+            WHERE inf.incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchall()
+        evidence_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM incident_failures inf
+            JOIN failure_evidence ev ON ev.failure_id = inf.failure_id
+            WHERE inf.incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+        severity = _rollup_severity([str(row["severity"] or "") for row in rows])
+        conn.execute(
+            """
+            UPDATE incidents
+            SET failure_count = ?,
+                evidence_count = ?,
+                severity = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                len(rows),
+                int(evidence_count["count"] if evidence_count is not None else 0),
+                severity,
+                datetime.now(timezone.utc).isoformat(),
+                incident_id,
+            ),
+        )
+
+    def _refresh_incidents_for_failure(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        failure_id: str,
+    ) -> None:
+        rows = conn.execute(
+            """
+            SELECT incident_id
+            FROM incident_failures
+            WHERE failure_id = ?
+            """,
+            (failure_id,),
+        ).fetchall()
+        for row in rows:
+            self._refresh_incident_rollup(
+                conn,
+                incident_id=str(row["incident_id"]),
+            )
 
     def upsert_failure_with_evidence_and_repair_task(
         self,

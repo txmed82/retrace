@@ -386,6 +386,9 @@ Monitoring webhook ingest also uses service tokens. Create a token with
 Retrace normalizes those alerts into canonical `monitor_incident` failures and
 dedupes repeated alerts by provider external ID, so existing error-monitoring
 alerts can feed the same evidence and repair workflow as replay and API failures.
+Related monitor failures are also grouped into incidents by stack frame, route,
+service, trace, deploy, and fingerprint. Each incident rolls up severity,
+affected failures, evidence, and a single repair task.
 
 Process queued final replay batches locally:
 
