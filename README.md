@@ -319,12 +319,15 @@ retrace tester api-create \
 
 retrace tester api-list
 retrace tester api-run <api_spec_id>
+retrace tester api-from-replay-issue <bug_public_id>
 ```
 
 API specs support query params, headers, JSON bodies, bearer-token auth via env
 vars, JSON body assertions, simple JSON schema assertions, latency budgets, and
 setup/teardown script steps. Request and response artifacts are saved with
 authorization, cookies, API keys, tokens, passwords, and secrets redacted.
+`api-from-replay-issue` creates an API regression spec from a failed replay
+network signal and links it to the source failure as coverage.
 
 ## First-Party Replay API
 
