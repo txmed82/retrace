@@ -153,7 +153,7 @@ def _incident_api_dict(
     linked_failures = failures
     if linked_failures is None:
         linked_failures = store.list_incident_failures(incident_id=incident.id)
-    representative = linked_failures[0] if linked_failures else None
+    representative = _latest_failure(linked_failures)
     trace_ids: list[str] = []
     top_stack_frame = ""
     transaction = ""
@@ -193,6 +193,19 @@ def _incident_api_dict(
         "release": release,
         "provider": provider,
     }
+
+
+def _latest_failure(failures: list[Any]) -> Any | None:
+    if not failures:
+        return None
+    return max(
+        failures,
+        key=lambda failure: (
+            int(getattr(failure, "last_seen_ms", 0) or 0),
+            _dt_api(getattr(failure, "updated_at", "")),
+            str(getattr(failure, "id", "")),
+        ),
+    )
 
 
 def _failure_api_dict(failure: Any, *, include_metadata: bool = True) -> dict[str, Any]:
@@ -987,6 +1000,9 @@ def _handler(
                 status=status,
                 limit=limit,
             )
+            failures_by_incident = store.list_incident_failures_for_incidents(
+                incident_ids=[incident.id for incident in incidents]
+            )
             _json_response(
                 self,
                 200,
@@ -994,7 +1010,11 @@ def _handler(
                     "project_id": token.project_id,
                     "environment_id": environment_id,
                     "incidents": [
-                        _incident_api_dict(store=store, incident=incident)
+                        _incident_api_dict(
+                            store=store,
+                            incident=incident,
+                            failures=failures_by_incident.get(incident.id, []),
+                        )
                         for incident in incidents
                     ],
                 },
@@ -1020,6 +1040,18 @@ def _handler(
             include_sensitive = str(
                 params.get("include_sensitive") or "false"
             ).strip().lower() in {"1", "true", "yes"}
+            if include_sensitive and not {"app_errors:read", "admin"}.intersection(
+                set(token.scopes)
+            ):
+                _json_response(
+                    self,
+                    403,
+                    {
+                        "error": "forbidden",
+                        "message": "include_sensitive=true requires app_errors:read scope.",
+                    },
+                )
+                return
             try:
                 detail = get_incident_detail(
                     store=store,

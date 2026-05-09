@@ -481,6 +481,14 @@ def test_app_error_incident_api_lists_monitoring_incidents(tmp_path: Path) -> No
         provider="sentry",
         payload={"event": event},
     )
+    later_event = {**event, "event_id": "evt-list-2", "timestamp": "2026-05-09T07:00:00Z"}
+    ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={"event": later_event},
+    )
 
     with _server(store) as server:
         host, port = server.server_address
@@ -499,13 +507,13 @@ def test_app_error_incident_api_lists_monitoring_incidents(tmp_path: Path) -> No
     assert len(payload["incidents"]) == 1
     incident = payload["incidents"][0]
     assert incident["public_id"] == result.incident_public_id
-    assert incident["failure_count"] == 1
-    assert incident["evidence_count"] == 1
+    assert incident["failure_count"] == 2
+    assert incident["evidence_count"] == 2
     assert incident["trace_ids"] == ["cccccccccccccccccccccccccccccccc"]
     assert incident["top_stack_frame"] == "src/checkout.ts:submit:42"
     assert incident["transaction"] == "/checkout"
     assert incident["release"] == "abc123"
-    assert incident["latest_failure"]["source_external_id"] == "sentry:evt-list-1"
+    assert incident["latest_failure"]["source_external_id"] == "sentry:evt-list-2"
 
 
 def test_app_error_incident_api_detail_controls_sensitive_evidence(
@@ -517,6 +525,12 @@ def test_app_error_incident_api_detail_controls_sensitive_evidence(
         project_id=workspace.project_id,
         name="Reader",
         scopes=["app_errors:read"],
+    )
+    weak_service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Weak reader",
+        scopes=["issues:read"],
     )
     result = ingest_monitoring_webhook(
         store=store,
@@ -557,6 +571,19 @@ def test_app_error_incident_api_detail_controls_sensitive_evidence(
         sensitive_payload = json.loads(sensitive_response.read().decode("utf-8"))
         conn.close()
 
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "GET",
+            (
+                f"/api/app-errors/{result.incident_public_id}"
+                f"?environment_id={workspace.environment_id}&include_sensitive=true"
+            ),
+            headers={"Authorization": f"Bearer {weak_service.token}"},
+        )
+        weak_response = conn.getresponse()
+        weak_payload = json.loads(weak_response.read().decode("utf-8"))
+        conn.close()
+
     assert safe_response.status == 200
     assert safe_payload["incident"]["public_id"] == result.incident_public_id
     assert len(safe_payload["failures"]) == 1
@@ -565,6 +592,8 @@ def test_app_error_incident_api_detail_controls_sensitive_evidence(
     assert len(sensitive_payload["evidence"]) == 1
     assert sensitive_payload["evidence"][0]["redaction_state"] == "sensitive"
     assert sensitive_payload["evidence"][0]["payload"]["external_id"] == "evt-detail-1"
+    assert weak_response.status == 403
+    assert weak_payload["error"] == "forbidden"
 
 
 def test_monitoring_webhook_endpoint_rejects_empty_payload(tmp_path: Path) -> None:
