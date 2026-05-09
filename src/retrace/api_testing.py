@@ -71,6 +71,9 @@ class APITestSpec:
     headers: dict[str, str] = field(default_factory=dict)
     body: Any = None
     auth: dict[str, Any] = field(default_factory=dict)
+    auth_profile: str = ""
+    env_profile: str = ""
+    env_overrides: dict[str, str] = field(default_factory=dict)
     expected_status: int = 200
     json_assertions: list[dict[str, Any]] = field(default_factory=list)
     schema_assertions: list[dict[str, Any]] = field(default_factory=list)
@@ -78,6 +81,7 @@ class APITestSpec:
     timeout_seconds: float = 15.0
     setup_steps: list[dict[str, Any]] = field(default_factory=list)
     teardown_steps: list[dict[str, Any]] = field(default_factory=list)
+    steps: list[dict[str, Any]] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
     fixtures: dict[str, Any] = field(default_factory=dict)
@@ -137,6 +141,9 @@ def _coerce_spec(data: dict[str, Any]) -> APITestSpec:
     data.setdefault("query", {})
     data.setdefault("headers", {})
     data.setdefault("auth", {})
+    data.setdefault("auth_profile", "")
+    data.setdefault("env_profile", "")
+    data.setdefault("env_overrides", {})
     data.setdefault("expected_status", 200)
     data.setdefault("json_assertions", [])
     data.setdefault("schema_assertions", [])
@@ -144,6 +151,7 @@ def _coerce_spec(data: dict[str, Any]) -> APITestSpec:
     data.setdefault("timeout_seconds", 15.0)
     data.setdefault("setup_steps", [])
     data.setdefault("teardown_steps", [])
+    data.setdefault("steps", [])
     data.setdefault("fixtures", {})
     return APITestSpec(**data)
 
@@ -181,11 +189,36 @@ def validate_api_spec(spec: APITestSpec) -> None:
         )
     if not isinstance(spec.auth, dict):
         raise ValueError("auth must be an object")
+    if not isinstance(spec.env_overrides, dict):
+        raise ValueError("env_overrides must be an object")
     if float(spec.timeout_seconds) <= 0:
         raise ValueError("timeout_seconds must be greater than 0")
-    for field_name in ("json_assertions", "schema_assertions", "setup_steps", "teardown_steps"):
+    for field_name in (
+        "json_assertions",
+        "schema_assertions",
+        "setup_steps",
+        "teardown_steps",
+        "steps",
+    ):
         if not isinstance(getattr(spec, field_name), list):
             raise ValueError(f"{field_name} must be a list")
+    for idx, step in enumerate(spec.steps):
+        if not isinstance(step, dict):
+            raise ValueError("steps must be objects")
+        method = str(step.get("method") or spec.method).upper()
+        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+            raise ValueError(f"steps[{idx}].method is not supported")
+        headers = step.get("headers", {})
+        if headers is not None and not isinstance(headers, dict):
+            raise ValueError(f"steps[{idx}].headers must be an object")
+        leaked_step_headers = sorted(
+            key for key in dict(headers or {}) if str(key).lower() in SENSITIVE_HEADER_NAMES
+        )
+        if leaked_step_headers:
+            raise ValueError(
+                "sensitive static headers must use auth env vars: "
+                + ", ".join(leaked_step_headers)
+            )
 
 
 def create_api_spec(
@@ -198,6 +231,9 @@ def create_api_spec(
     headers: Optional[dict[str, str]] = None,
     body: Any = None,
     auth: Optional[dict[str, Any]] = None,
+    auth_profile: str = "",
+    env_profile: str = "",
+    env_overrides: Optional[dict[str, str]] = None,
     expected_status: int = 200,
     json_assertions: Optional[list[dict[str, Any]]] = None,
     schema_assertions: Optional[list[dict[str, Any]]] = None,
@@ -205,6 +241,7 @@ def create_api_spec(
     timeout_seconds: float = 15.0,
     setup_steps: Optional[list[dict[str, Any]]] = None,
     teardown_steps: Optional[list[dict[str, Any]]] = None,
+    steps: Optional[list[dict[str, Any]]] = None,
     fixtures: Optional[dict[str, Any]] = None,
 ) -> APITestSpec:
     created_at = now_iso()
@@ -218,6 +255,9 @@ def create_api_spec(
         headers={str(k): str(v) for k, v in dict(headers or {}).items()},
         body=body,
         auth=dict(auth or {}),
+        auth_profile=auth_profile.strip(),
+        env_profile=env_profile.strip(),
+        env_overrides={str(k): str(v) for k, v in dict(env_overrides or {}).items()},
         expected_status=int(expected_status),
         json_assertions=list(json_assertions or []),
         schema_assertions=list(schema_assertions or []),
@@ -225,6 +265,7 @@ def create_api_spec(
         timeout_seconds=float(timeout_seconds),
         setup_steps=list(setup_steps or []),
         teardown_steps=list(teardown_steps or []),
+        steps=list(steps or []),
         created_at=created_at,
         updated_at=created_at,
         fixtures=dict(fixtures or {}),
@@ -272,7 +313,9 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
     status_code = 0
     elapsed_ms = 0
     error = ""
-    scope: dict[str, Any] = {"vars": {}, "env": dict(os.environ)}
+    effective_env = dict(os.environ)
+    effective_env.update({str(k): str(v) for k, v in spec.env_overrides.items()})
+    scope: dict[str, Any] = {"vars": {}, "env": effective_env, "steps": []}
 
     try:
         for idx, step in enumerate(spec.setup_steps):
@@ -285,63 +328,98 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
                 phase="setup",
                 idx=idx,
             )
-        headers = _resolve_headers(spec)
-        request_body = _render_body(spec.body, scope)
-        request_payload = {
-            "method": spec.method,
-            "url": spec.url,
-            "query": spec.query,
-            "headers": _redact_headers(headers),
-            "body": _redact_json(request_body),
-        }
-        request_path = artifacts_dir / "request.json"
-        request_path.write_text(json.dumps(request_payload, indent=2) + "\n")
-        artifacts.append(
-            APITestArtifact(
-                artifact_id="request",
-                artifact_type="api_request",
-                path=str(request_path),
-                label="API request",
+        for idx, step in enumerate(_request_steps(spec)):
+            step_id = str(step.get("id") or f"request-{idx + 1}")
+            method = str(step.get("method") or spec.method).upper()
+            url = _render_text(str(step.get("url") or spec.url), scope)
+            query = _render_mapping(step.get("query", spec.query), scope)
+            headers = _resolve_headers(
+                spec,
+                step_auth=step.get("auth"),
+                env=effective_env,
             )
-        )
-        started = time.perf_counter()
-        with httpx.Client(timeout=float(spec.timeout_seconds), follow_redirects=True) as client:
-            response = client.request(
-                spec.method,
-                spec.url,
-                params=spec.query,
-                headers=headers,
-                json=request_body if isinstance(request_body, (dict, list)) else None,
-                content=request_body if isinstance(request_body, (str, bytes)) else None,
+            headers.update(
+                {
+                    str(k): _render_text(str(v), scope)
+                    for k, v in dict(step.get("headers") or {}).items()
+                }
             )
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        status_code = response.status_code
-        response_json, response_body = _response_body(response)
-        scope["response"] = {
-            "status_code": status_code,
-            "headers": dict(response.headers),
-            "json": response_json,
-            "body": response_body,
-            "elapsed_ms": elapsed_ms,
-        }
-        response_payload = {
-            "status_code": status_code,
-            "elapsed_ms": elapsed_ms,
-            "headers": _redact_headers(dict(response.headers)),
-            "body": _redact_json(response_json if response_json is not None else response_body),
-        }
-        response_path = artifacts_dir / "response.json"
-        response_path.write_text(json.dumps(response_payload, indent=2) + "\n")
-        artifacts.append(
-            APITestArtifact(
-                artifact_id="response",
-                artifact_type="api_response",
-                path=str(response_path),
-                label="API response",
-                metadata={"status_code": status_code, "elapsed_ms": elapsed_ms},
+            request_body = _render_body(step.get("body", spec.body), scope)
+            request_payload = {
+                "step_id": step_id,
+                "method": method,
+                "url": url,
+                "query": query,
+                "headers": _redact_headers(headers),
+                "body": _redact_json(request_body),
+            }
+            request_path = artifacts_dir / f"{step_id}-request.json"
+            request_path.write_text(json.dumps(request_payload, indent=2) + "\n")
+            artifacts.append(
+                APITestArtifact(
+                    artifact_id=f"{step_id}-request",
+                    artifact_type="api_request",
+                    path=str(request_path),
+                    label=f"API request: {step_id}",
+                    metadata={"step_id": step_id, "method": method, "url": url},
+                )
             )
-        )
-        assertion_results.extend(_evaluate_api_assertions(spec, response_json, elapsed_ms, status_code))
+            started = time.perf_counter()
+            with httpx.Client(timeout=float(spec.timeout_seconds), follow_redirects=True) as client:
+                response = client.request(
+                    method,
+                    url,
+                    params=query,
+                    headers=headers,
+                    json=request_body if isinstance(request_body, (dict, list)) else None,
+                    content=request_body if isinstance(request_body, (str, bytes)) else None,
+                )
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            status_code = response.status_code
+            response_json, response_body = _response_body(response)
+            scope["response"] = {
+                "status_code": status_code,
+                "headers": dict(response.headers),
+                "json": response_json,
+                "body": response_body,
+                "elapsed_ms": elapsed_ms,
+            }
+            step_summary = {
+                "id": step_id,
+                "status_code": status_code,
+                "json": response_json,
+                "body": response_body,
+                "elapsed_ms": elapsed_ms,
+            }
+            scope["steps"].append(step_summary)
+            _apply_extractors(step.get("extract", []), scope)
+            response_payload = {
+                "step_id": step_id,
+                "status_code": status_code,
+                "elapsed_ms": elapsed_ms,
+                "headers": _redact_headers(dict(response.headers)),
+                "body": _redact_json(response_json if response_json is not None else response_body),
+            }
+            response_path = artifacts_dir / f"{step_id}-response.json"
+            response_path.write_text(json.dumps(response_payload, indent=2) + "\n")
+            artifacts.append(
+                APITestArtifact(
+                    artifact_id=f"{step_id}-response",
+                    artifact_type="api_response",
+                    path=str(response_path),
+                    label=f"API response: {step_id}",
+                    metadata={"step_id": step_id, "status_code": status_code, "elapsed_ms": elapsed_ms},
+                )
+            )
+            assertion_results.extend(
+                _evaluate_api_assertions(
+                    _step_spec(spec, step, method=method, url=url, query=query),
+                    response_json,
+                    elapsed_ms,
+                    status_code,
+                    assertion_prefix=step_id if spec.steps else "",
+                )
+            )
     except Exception as exc:
         error = str(exc)
     finally:
@@ -674,21 +752,121 @@ def _url_path(url: str) -> str:
     return parsed.path or url
 
 
-def _resolve_headers(spec: APITestSpec) -> dict[str, str]:
+def _request_steps(spec: APITestSpec) -> list[dict[str, Any]]:
+    if spec.steps:
+        return [dict(step) for step in spec.steps]
+    return [
+        {
+            "id": "request",
+            "method": spec.method,
+            "url": spec.url,
+            "query": spec.query,
+            "headers": {},
+            "body": spec.body,
+            "auth": spec.auth,
+            "expected_status": spec.expected_status,
+            "json_assertions": spec.json_assertions,
+            "schema_assertions": spec.schema_assertions,
+            "latency_ms": spec.latency_ms,
+        }
+    ]
+
+
+def _step_spec(
+    spec: APITestSpec,
+    step: dict[str, Any],
+    *,
+    method: str,
+    url: str,
+    query: dict[str, Any],
+) -> APITestSpec:
+    return APITestSpec(
+        schema_version=spec.schema_version,
+        spec_id=spec.spec_id,
+        name=str(step.get("name") or step.get("id") or spec.name),
+        method=method,
+        url=url,
+        query=query,
+        headers=dict(step.get("headers") or {}),
+        body=step.get("body", spec.body),
+        auth=dict(step.get("auth") or spec.auth),
+        auth_profile=spec.auth_profile,
+        env_profile=spec.env_profile,
+        env_overrides=dict(spec.env_overrides),
+        expected_status=int(step.get("expected_status", spec.expected_status)),
+        json_assertions=list(step.get("json_assertions", spec.json_assertions)),
+        schema_assertions=list(step.get("schema_assertions", spec.schema_assertions)),
+        latency_ms=int(step.get("latency_ms", spec.latency_ms) or 0),
+        timeout_seconds=spec.timeout_seconds,
+        setup_steps=[],
+        teardown_steps=[],
+        steps=[],
+        created_at=spec.created_at,
+        updated_at=spec.updated_at,
+        fixtures=dict(spec.fixtures),
+    )
+
+
+def _render_text(value: str, scope: dict[str, Any]) -> str:
+    from retrace.script_steps import render_template
+
+    return render_template(value, scope)
+
+
+def _render_mapping(value: Any, scope: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        out[str(key)] = _render_body(item, scope)
+    return out
+
+
+def _apply_extractors(raw_extractors: Any, scope: dict[str, Any]) -> None:
+    if not isinstance(raw_extractors, list):
+        return
+    for extractor in raw_extractors:
+        if not isinstance(extractor, dict):
+            continue
+        name = str(extractor.get("name") or "").strip()
+        if not name:
+            continue
+        source = str(extractor.get("from") or "json").strip().lower()
+        if source == "header":
+            header_name = str(extractor.get("header") or extractor.get("path") or "")
+            value = (scope.get("response") or {}).get("headers", {}).get(
+                header_name
+            )
+        else:
+            _, value = _json_path_lookup(
+                (scope.get("response") or {}).get("json"),
+                str(extractor.get("path") or "$"),
+            )
+        scope.setdefault("vars", {})[name] = value
+
+
+def _resolve_headers(
+    spec: APITestSpec,
+    *,
+    step_auth: Any = None,
+    env: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
     headers = {str(k): str(v) for k, v in spec.headers.items()}
-    auth_type = str(spec.auth.get("type") or "none").strip().lower()
+    env_values = env if env is not None else dict(os.environ)
+    auth = step_auth if isinstance(step_auth, dict) else spec.auth
+    auth_type = str(auth.get("type") or "none").strip().lower()
     if auth_type in {"", "none"}:
         return headers
     if auth_type == "bearer":
-        token_env = str(spec.auth.get("token_env") or "").strip()
-        token = os.environ.get(token_env, "").strip()
+        token_env = str(auth.get("token_env") or "").strip()
+        token = env_values.get(token_env, "").strip()
         if not token:
             raise RuntimeError(f"auth failure: missing bearer token env var {token_env}")
         headers["Authorization"] = f"Bearer {token}"
         return headers
     if auth_type == "headers":
-        headers_env = str(spec.auth.get("headers_env") or "").strip()
-        raw = os.environ.get(headers_env, "").strip()
+        headers_env = str(auth.get("headers_env") or "").strip()
+        raw = env_values.get(headers_env, "").strip()
         if not raw:
             raise RuntimeError(f"auth failure: missing headers env var {headers_env}")
         parsed = json.loads(raw)
@@ -704,6 +882,10 @@ def _render_body(body: Any, scope: dict[str, Any]) -> Any:
         from retrace.script_steps import render_template
 
         return render_template(body, scope)
+    if isinstance(body, dict):
+        return {str(k): _render_body(v, scope) for k, v in body.items()}
+    if isinstance(body, list):
+        return [_render_body(item, scope) for item in body]
     return body
 
 
@@ -765,6 +947,7 @@ def _evaluate_api_assertions(
     response_json: Any,
     elapsed_ms: int,
     status_code: int,
+    assertion_prefix: str = "",
 ) -> list[APIAssertionResult]:
     api_regression = (
         spec.fixtures.get("api_regression")
@@ -779,7 +962,7 @@ def _evaluate_api_assertions(
         )
         results = [
             APIAssertionResult(
-                assertion_id="forbidden-status",
+                assertion_id=_assertion_id("forbidden-status", assertion_prefix),
                 assertion_type="status_code",
                 ok=status_code != forbidden_status,
                 expected=f"!={forbidden_status}",
@@ -790,7 +973,7 @@ def _evaluate_api_assertions(
     else:
         results = [
             APIAssertionResult(
-                assertion_id="expected-status",
+                assertion_id=_assertion_id("expected-status", assertion_prefix),
                 assertion_type="status_code",
                 ok=status_code == spec.expected_status,
                 expected=spec.expected_status,
@@ -801,7 +984,7 @@ def _evaluate_api_assertions(
     if spec.latency_ms > 0:
         results.append(
             APIAssertionResult(
-                assertion_id="latency-ms",
+                assertion_id=_assertion_id("latency-ms", assertion_prefix),
                 assertion_type="latency_ms",
                 ok=elapsed_ms <= spec.latency_ms,
                 expected=f"<={spec.latency_ms}",
@@ -810,21 +993,26 @@ def _evaluate_api_assertions(
             )
         )
     for idx, assertion in enumerate(spec.json_assertions):
-        results.append(_evaluate_json_assertion(assertion, response_json, idx))
+        results.append(_evaluate_json_assertion(assertion, response_json, idx, assertion_prefix))
     for idx, assertion in enumerate(spec.schema_assertions):
         schema = assertion.get("schema") if "schema" in assertion else assertion
-        results.append(_evaluate_schema_assertion(schema, response_json, idx))
+        results.append(_evaluate_schema_assertion(schema, response_json, idx, assertion_prefix))
     return results
+
+
+def _assertion_id(value: str, prefix: str) -> str:
+    return f"{prefix}:{value}" if prefix else value
 
 
 def _evaluate_json_assertion(
     assertion: dict[str, Any],
     response_json: Any,
     idx: int,
+    prefix: str = "",
 ) -> APIAssertionResult:
     path = str(assertion.get("path") or "")
     found, actual = _json_path_lookup(response_json, path)
-    assertion_id = str(assertion.get("id") or f"json-{idx}")
+    assertion_id = _assertion_id(str(assertion.get("id") or f"json-{idx}"), prefix)
     if assertion.get("exists") is True:
         ok = found
         return APIAssertionResult(assertion_id, "json_exists", ok, True, actual, path)
@@ -839,10 +1027,15 @@ def _evaluate_json_assertion(
     return APIAssertionResult(assertion_id, "json_assertion", False, "known assertion", actual, path)
 
 
-def _evaluate_schema_assertion(schema: Any, response_json: Any, idx: int) -> APIAssertionResult:
+def _evaluate_schema_assertion(
+    schema: Any,
+    response_json: Any,
+    idx: int,
+    prefix: str = "",
+) -> APIAssertionResult:
     errors = _schema_errors(schema, response_json, "$")
     return APIAssertionResult(
-        assertion_id=f"schema-{idx}",
+        assertion_id=_assertion_id(f"schema-{idx}", prefix),
         assertion_type="json_schema",
         ok=not errors,
         expected=schema,

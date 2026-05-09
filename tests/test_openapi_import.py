@@ -176,6 +176,39 @@ def test_openapi_import_resolves_json_refs_and_filters_methods(tmp_path: Path) -
     assert result.specs[0].fixtures["contract_derived"] is True
 
 
+def test_openapi_import_attaches_shared_auth_and_env_profiles(tmp_path: Path) -> None:
+    openapi_path = tmp_path / "openapi.yaml"
+    openapi_path.write_text(
+        """
+openapi: 3.0.3
+info:
+  title: Demo API
+  version: "1.0"
+paths:
+  /v1/private:
+    get:
+      responses:
+        "200":
+          description: OK
+"""
+    )
+
+    result = import_openapi_specs(
+        openapi_path=openapi_path,
+        specs_dir=api_specs_dir_for_data_dir(tmp_path),
+        base_url="http://api.example.test",
+        auth_profile="local-jwt",
+        env_profile="staging",
+        env_overrides={"TENANT_ID": "tenant-1"},
+    )
+
+    assert len(result.specs) == 1
+    spec = result.specs[0]
+    assert spec.auth_profile == "local-jwt"
+    assert spec.env_profile == "staging"
+    assert spec.env_overrides == {"TENANT_ID": "tenant-1"}
+
+
 def test_cli_imports_openapi_specs_with_base_url(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "config.yaml").write_text(
         """
