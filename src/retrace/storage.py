@@ -338,6 +338,9 @@ CREATE TABLE IF NOT EXISTS incident_failures (
 CREATE INDEX IF NOT EXISTS idx_incident_failures_failure
 ON incident_failures(failure_id, created_at);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_failures_one_incident_per_failure
+ON incident_failures(failure_id);
+
 CREATE TABLE IF NOT EXISTS failure_test_links (
     id TEXT PRIMARY KEY,
     failure_id TEXT NOT NULL,
@@ -1807,6 +1810,23 @@ class Storage:
                 or str(incident["environment_id"]) != str(failure["environment_id"])
             ):
                 raise ValueError("incident and failure must belong to the same workspace")
+            existing_link = conn.execute(
+                """
+                SELECT incident_id
+                FROM incident_failures
+                WHERE failure_id = ?
+                """,
+                (str(failure["id"]),),
+            ).fetchone()
+            if existing_link is not None:
+                linked_incident_id = str(existing_link["incident_id"])
+                if linked_incident_id != str(incident["id"]):
+                    raise ValueError("failure is already linked to another incident")
+                self._refresh_incident_rollup(
+                    conn,
+                    incident_id=linked_incident_id,
+                )
+                return
             conn.execute(
                 """
                 INSERT OR IGNORE INTO incident_failures
@@ -1904,8 +1924,11 @@ class Storage:
         incident_id: str,
         include_sensitive: bool = True,
     ) -> list[EvidenceRow]:
+        resolved_incident_id = self._resolve_incident_id(incident_id)
+        if not resolved_incident_id:
+            return []
         where = "inf.incident_id = ?"
-        params: list[object] = [incident_id]
+        params: list[object] = [resolved_incident_id]
         if not include_sensitive:
             placeholders = ",".join("?" for _ in PROMPT_SAFE_REDACTION_STATES)
             where += f" AND ev.redaction_state IN ({placeholders})"
@@ -1925,6 +1948,18 @@ class Storage:
                 params,
             ).fetchall()
         return [self._evidence_from_row(row) for row in rows]
+
+    def _resolve_incident_id(self, incident_id: str) -> str:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM incidents
+                WHERE id = ? OR public_id = ?
+                """,
+                (incident_id, incident_id),
+            ).fetchone()
+        return str(row["id"]) if row is not None else ""
 
     def set_incident_repair_task(self, *, incident_id: str, repair_task_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()

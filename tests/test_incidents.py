@@ -146,6 +146,40 @@ def test_equivalent_monitor_failures_group_into_one_incident(tmp_path: Path) -> 
             incident_id=refreshed.incident.public_id,
         )
     } == {first_failure_id, second_failure_id}
+    assert len(
+        store.list_incident_evidence(incident_id=refreshed.incident.public_id)
+    ) == 3
+
+
+def test_failure_can_only_link_to_one_incident(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    failure_id = _monitor_failure(
+        store,
+        workspace,
+        external_id="evt-1",
+        severity="high",
+    )
+    first = group_failure_into_incident(store=store, failure_id=failure_id)
+    second_incident_id = store.upsert_incident(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        group_key="different-group",
+        title="Different incident",
+    )
+
+    store.link_failure_to_incident(
+        incident_id=first.incident_id,
+        failure_id=failure_id,
+    )
+    try:
+        store.link_failure_to_incident(
+            incident_id=second_incident_id,
+            failure_id=failure_id,
+        )
+    except ValueError as exc:
+        assert "another incident" in str(exc)
+    else:
+        raise AssertionError("expected duplicate incident link failure")
 
 
 def test_incident_can_generate_one_repair_task(tmp_path: Path) -> None:
