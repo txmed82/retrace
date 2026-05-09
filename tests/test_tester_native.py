@@ -383,6 +383,26 @@ def test_auto_engine_policy_uses_playwright_for_target_selector_steps(
     assert "Playwright" in selection.reason
 
 
+def test_auto_engine_policy_uses_playwright_for_action_only_browser_steps(
+    tmp_path: Path,
+) -> None:
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Auto wait step",
+        prompt="",
+        app_url="http://127.0.0.1:3000",
+        start_command="",
+        harness_command="",
+        execution_engine="auto",
+        exact_steps=[{"id": "settle", "action": "wait", "ms": 250}],
+    )
+
+    selection = select_execution_engine(spec)
+
+    assert selection.execution_engine == "native"
+    assert "Playwright" in selection.reason
+
+
 def test_auto_engine_policy_routes_exploration_and_open_prompts(
     tmp_path: Path,
 ) -> None:

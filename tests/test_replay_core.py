@@ -950,12 +950,62 @@ def test_generate_spec_adds_signal_assertions_and_generation_notes(
         "Open https://app.example/checkout",
         'Click [data-testid="checkout-pay"]',
     ]
-    assert "network-failure-cleared" in generation["human_readable_assertions"][1]
+    network_assertion = next(
+        item
+        for item in generation["human_readable_assertions"]
+        if item.startswith("network-failure-cleared:")
+    )
+    assert network_assertion == (
+        "network-failure-cleared: expect model consensus on "
+        "No matching failed request or visible network error remains."
+    )
     assert "Run the app at https://app.example." in generation["preconditions"]
     assert any("redacted" in note for note in generation["fixture_notes"])
     assert generation["unsupported_step_warnings"] == []
     assert generation["quality"]["status"] == "runnable"
     assert generation["quality"]["requires_human_edit"] is False
+
+
+def test_generate_spec_marks_no_convertible_replay_steps_blocked(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-no-steps",
+        sequence=0,
+        events=[],
+        flush_type="final",
+    )
+    created = store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="no-convertible-steps",
+        session_ids=["sess-no-steps"],
+        signal_summary={"console_error": 1},
+        first_seen_ms=100,
+        last_seen_ms=500,
+        title="No convertible replay steps",
+        evidence={"signals": []},
+    )
+
+    generated = generate_spec_from_replay_issue(
+        store=store,
+        specs_dir=tmp_path / "specs",
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=created.public_id,
+        app_url="https://app.example",
+    )
+
+    quality = generated.spec.fixtures["generation"]["quality"]
+    assert generated.confidence == "low"
+    assert quality["status"] == "blocked"
+    assert quality["blocking_gaps"] == [
+        "Replay did not include convertible navigation, click, or input events."
+    ]
+    assert "Inspect replay coverage" in quality["recommended_next_action"]
 
 
 def test_generate_api_spec_from_failed_replay_network_call(tmp_path: Path) -> None:

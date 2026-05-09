@@ -789,6 +789,14 @@ def _human_readable_assertions(assertions: list[dict[str, Any]]) -> list[str]:
             readable.append(
                 f"{assertion_id}: expect HTTP status {assertion.get('expected', 200)}"
             )
+        elif kind == "model_consensus":
+            summary = str(
+                assertion.get("expected")
+                or assertion.get("prompt")
+                or assertion.get("description")
+                or "review replay outcome"
+            ).strip()
+            readable.append(f"{assertion_id}: expect model consensus on {summary}")
         elif kind == "selector_count":
             readable.append(
                 f"{assertion_id}: expect {assertion.get('selector', 'selector')} count {assertion.get('expected', 0)}"
@@ -837,18 +845,22 @@ def _generation_quality(
         if action == "unknown":
             unknown_steps += 1
 
+    no_convertible_steps_gap = (
+        "Replay did not include convertible navigation, click, or input events."
+    )
     blocking_gaps = [
         gap
         for gap in gaps
         if gap.startswith("unknown-")
         or "unsupported rrweb event" in gap
         or "needs a durable locator" in gap
+        or gap == no_convertible_steps_gap
     ]
     editable_gaps = [gap for gap in gaps if gap not in blocking_gaps]
-    if unknown_steps or unsupported_step_warnings:
+    if no_convertible_steps_gap in gaps or unknown_steps or unsupported_step_warnings:
         status = "blocked"
         confidence = "low"
-        next_action = "Inspect unsupported replay events before relying on this spec."
+        next_action = "Inspect replay coverage and unsupported events before relying on this spec."
     elif blocking_gaps:
         status = "needs_locator"
         confidence = "low"
