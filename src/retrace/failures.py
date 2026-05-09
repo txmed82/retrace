@@ -192,6 +192,34 @@ def canonical_failure_from_test_run(
     )
 
 
+def canonical_failure_from_harness_run(
+    *,
+    project_id: str,
+    environment_id: str,
+    run_result: Any,
+    spec_name: str = "",
+) -> CanonicalFailure:
+    failure = canonical_failure_from_test_run(
+        project_id=project_id,
+        environment_id=environment_id,
+        run_result=run_result,
+        spec_name=spec_name,
+    )
+    source_external_id = f"harness:{failure.fingerprint[:16]}"
+    return CanonicalFailure(
+        **{
+            **failure.to_storage_dict(),
+            "public_id": stable_failure_public_id(
+                project_id,
+                environment_id,
+                "test_run",
+                source_external_id,
+            ),
+            "source_external_id": source_external_id,
+        }
+    )
+
+
 def canonical_failure_from_monitor_incident(
     *,
     project_id: str,
