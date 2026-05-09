@@ -30,6 +30,9 @@ def import_openapi_specs(
     base_url: str,
     path_filter: str = "",
     method_filter: str = "",
+    auth_profile: str = "",
+    env_profile: str = "",
+    env_overrides: dict[str, str] | None = None,
 ) -> OpenAPIImportResult:
     document = load_openapi_document(openapi_path)
     base = _normalize_base_url(base_url or _server_url(document))
@@ -69,6 +72,9 @@ def import_openapi_specs(
                         method=method_l.upper(),
                         path_parameters=inherited_parameters,
                         operation=operation,
+                        auth_profile=auth_profile,
+                        env_profile=env_profile,
+                        env_overrides=dict(env_overrides or {}),
                     )
                 )
             except Exception as exc:
@@ -97,6 +103,9 @@ def _operation_to_spec(
     method: str,
     path_parameters: list[dict[str, Any]],
     operation: dict[str, Any],
+    auth_profile: str = "",
+    env_profile: str = "",
+    env_overrides: dict[str, str] | None = None,
 ) -> APITestSpec:
     operation_parameters = path_parameters + _parameters(document, operation.get("parameters"))
     request_path = _render_path(raw_path, operation_parameters)
@@ -111,6 +120,9 @@ def _operation_to_spec(
         method=method,
         url=_join_url(base_url, request_path),
         query=query,
+        auth_profile=auth_profile,
+        env_profile=env_profile,
+        env_overrides=env_overrides or {},
         expected_status=status,
         schema_assertions=[{"schema": response_schema}] if response_schema else [],
         fixtures={

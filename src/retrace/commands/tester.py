@@ -117,6 +117,56 @@ def _profile_browser_settings(profile: dict[str, Any]) -> dict[str, Any]:
     return dict(settings)
 
 
+def _env_profile(defaults: dict[str, Any], name: str) -> dict[str, Any]:
+    profiles = defaults.get("env_profiles") or {}
+    if not name:
+        return {}
+    if not isinstance(profiles, dict) or name not in profiles:
+        raise click.ClickException(f"unknown env profile: {name}")
+    profile = profiles.get(name) or {}
+    if not isinstance(profile, dict):
+        raise click.ClickException(f"env profile must be an object: {name}")
+    env_overrides = profile.get("env_overrides") or {}
+    if not isinstance(env_overrides, dict):
+        raise click.ClickException("env profile env_overrides must be an object")
+    return dict(profile)
+
+
+def _apply_api_profiles(
+    spec: Any,
+    *,
+    defaults: dict[str, Any],
+    auth_profile_name: str = "",
+    env_profile_name: str = "",
+) -> Any:
+    auth_name = auth_profile_name.strip() or str(getattr(spec, "auth_profile", "") or "")
+    env_name = env_profile_name.strip() or str(getattr(spec, "env_profile", "") or "")
+    if auth_name:
+        profile = _auth_profile(defaults, auth_name)
+        mode = str(profile.get("mode") or "headers").strip().lower()
+        if mode == "jwt":
+            spec.auth = {"type": "bearer", "token_env": str(profile.get("jwt_env") or "")}
+        elif mode == "headers":
+            spec.auth = {"type": "headers", "headers_env": str(profile.get("headers_env") or "")}
+        elif mode == "form":
+            raise click.ClickException("API tests do not support form auth profiles")
+        else:
+            raise click.ClickException(f"unsupported API auth profile mode: {mode}")
+        spec.auth_profile = auth_name
+    if env_name:
+        profile = _env_profile(defaults, env_name)
+        env_overrides = profile.get("env_overrides") or {}
+        spec.env_overrides = {
+            **{str(k): str(v) for k, v in dict(env_overrides).items()},
+            **{str(k): str(v) for k, v in dict(spec.env_overrides or {}).items()},
+        }
+        api_base_url = str(profile.get("api_base_url") or "").strip()
+        if api_base_url and spec.url.startswith("/"):
+            spec.url = api_base_url.rstrip("/") + "/" + spec.url.lstrip("/")
+        spec.env_profile = env_name
+    return spec
+
+
 def _single_failure_test_link_id(store: Storage, spec_id: str) -> str:
     links = store.list_failure_test_links(spec_id=spec_id, limit=2)
     return links[0].id if len(links) == 1 else ""
@@ -502,6 +552,8 @@ def tester_list(config_path: Path) -> None:
 @click.option("--headers-json", default="", help="JSON object for static headers.")
 @click.option("--body-json", default="", help="JSON request body.")
 @click.option("--auth-bearer-env", default="", help="Env var containing bearer token.")
+@click.option("--auth-profile", default="", help="Shared tester auth profile.")
+@click.option("--env-profile", default="", help="Shared tester environment profile.")
 @click.option("--expected-status", default=200, show_default=True, type=int)
 @click.option(
     "--json-assertion",
@@ -525,6 +577,8 @@ def tester_api_create(
     headers_json: str,
     body_json: str,
     auth_bearer_env: str,
+    auth_profile: str,
+    env_profile: str,
     expected_status: int,
     json_assertions: tuple[str, ...],
     schema_assertion_json: str,
@@ -532,11 +586,26 @@ def tester_api_create(
     timeout_seconds: float,
 ) -> None:
     cfg = load_config(config_path)
+    defaults = _tester_defaults(config_path)
+    profile_auth = _auth_profile(defaults, auth_profile.strip()) if auth_profile.strip() else {}
     auth = (
         {"type": "bearer", "token_env": auth_bearer_env.strip()}
         if auth_bearer_env.strip()
         else {}
     )
+    if profile_auth and not auth:
+        mode = str(profile_auth.get("mode") or "headers").strip().lower()
+        if mode == "jwt":
+            auth = {"type": "bearer", "token_env": str(profile_auth.get("jwt_env") or "")}
+        elif mode == "headers":
+            auth = {"type": "headers", "headers_env": str(profile_auth.get("headers_env") or "")}
+        else:
+            raise click.ClickException("API specs support jwt and headers auth profiles")
+    env_profile_data = _env_profile(defaults, env_profile.strip()) if env_profile.strip() else {}
+    final_url = url
+    api_base_url = str(env_profile_data.get("api_base_url") or "").strip()
+    if api_base_url and final_url.startswith("/"):
+        final_url = api_base_url.rstrip("/") + "/" + final_url.lstrip("/")
     parsed_json_assertions = []
     for item in json_assertions:
         parsed = _json_option(item, label="json-assertion", default={})
@@ -551,11 +620,14 @@ def tester_api_create(
         specs_dir=api_specs_dir_for_data_dir(cfg.run.data_dir),
         name=name,
         method=method,
-        url=url,
+        url=final_url,
         query=_json_option(query_json, label="query-json", default={}),
         headers=_json_option(headers_json, label="headers-json", default={}),
         body=_json_option(body_json, label="body-json", default=None),
         auth=auth,
+        auth_profile=auth_profile.strip(),
+        env_profile=env_profile.strip(),
+        env_overrides={},
         expected_status=expected_status,
         json_assertions=parsed_json_assertions,
         schema_assertions=schema_assertions,
@@ -599,16 +671,27 @@ def tester_api_list(config_path: Path) -> None:
     default=None,
     help="Local repo path for route-based repair file scoring.",
 )
+@click.option("--auth-profile", default="", help="Auth profile override for this run.")
+@click.option("--env-profile", default="", help="Environment profile override for this run.")
 @click.argument("spec_id")
 def tester_api_run(
     config_path: Path,
     project_id: str,
     environment_id: str,
     repo_path: Optional[Path],
+    auth_profile: str,
+    env_profile: str,
     spec_id: str,
 ) -> None:
     cfg = load_config(config_path)
+    defaults = _tester_defaults(config_path)
     spec = load_api_spec(api_specs_dir_for_data_dir(cfg.run.data_dir), spec_id)
+    spec = _apply_api_profiles(
+        spec,
+        defaults=defaults,
+        auth_profile_name=auth_profile,
+        env_profile_name=env_profile,
+    )
     result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(cfg.run.data_dir))
     failure_metadata: dict[str, Any] = {}
     if not result.ok:
@@ -664,21 +747,30 @@ def tester_api_run(
     default="",
     help="HTTP method filter, for example GET or POST.",
 )
+@click.option("--auth-profile", default="", help="Auth profile to attach to imported specs.")
+@click.option("--env-profile", default="", help="Environment profile to attach to imported specs.")
 @click.argument("openapi_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 def tester_api_import_openapi(
     config_path: Path,
     base_url: str,
     path_filter: str,
     method_filter: str,
+    auth_profile: str,
+    env_profile: str,
     openapi_path: Path,
 ) -> None:
     cfg = load_config(config_path)
+    defaults = _tester_defaults(config_path)
+    env_profile_data = _env_profile(defaults, env_profile.strip()) if env_profile.strip() else {}
+    effective_base_url = base_url or str(env_profile_data.get("api_base_url") or "")
     result = import_openapi_specs(
         openapi_path=openapi_path,
         specs_dir=api_specs_dir_for_data_dir(cfg.run.data_dir),
-        base_url=base_url,
+        base_url=effective_base_url,
         path_filter=path_filter,
         method_filter=method_filter,
+        auth_profile=auth_profile,
+        env_profile=env_profile,
     )
     click.echo(
         json.dumps(

@@ -223,6 +223,63 @@ tester:
     assert "secret-token" not in spec_path.read_text()
 
 
+def test_tester_api_create_and_run_use_shared_profiles(
+    tmp_path: Path, monkeypatch
+) -> None:
+    server, server_thread, app_url = _server_url()
+    try:
+        (tmp_path / "config.yaml").write_text(
+            _CONFIG_YAML
+            + """
+tester:
+  auth_profiles:
+    api-jwt:
+      mode: jwt
+      jwt_env: RETRACE_API_JWT
+  env_profiles:
+    local-api:
+      api_base_url: REPLACE_BASE_URL
+      env_overrides:
+        RETRACE_API_JWT: test-token
+""".replace("REPLACE_BASE_URL", app_url)
+        )
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+
+        create = runner.invoke(
+            main,
+            [
+                "tester",
+                "api-create",
+                "--name",
+                "Private profile API",
+                "--url",
+                "/api/private",
+                "--auth-profile",
+                "api-jwt",
+                "--env-profile",
+                "local-api",
+            ],
+        )
+        assert create.exit_code == 0, create.output
+        spec_id = create.output.strip().split(": ")[1]
+
+        ran = runner.invoke(main, ["tester", "api-run", spec_id])
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+    assert ran.exit_code == 0, ran.output
+    assert '"status_code": 200' in ran.output
+    spec_payload = json.loads(
+        next((tmp_path / "data" / "api-tests" / "specs").glob("*.json")).read_text()
+    )
+    assert spec_payload["auth_profile"] == "api-jwt"
+    assert spec_payload["env_profile"] == "local-api"
+    assert "test-token" not in json.dumps(spec_payload)
+
+
 def test_create_suite_run_generates_accepts_and_runs_draft_specs(
     tmp_path: Path, monkeypatch
 ) -> None:

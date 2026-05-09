@@ -67,6 +67,18 @@ class _APIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_PATCH(self) -> None:
+        if self.path.startswith("/api/cart/42"):
+            body = json.dumps({"ok": True, "cartId": 42, "state": "updated"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def log_message(self, format: str, *args: object) -> None:
         return
 
@@ -221,6 +233,56 @@ def test_api_spec_reports_failed_json_assertion(tmp_path: Path) -> None:
         item["assertion_id"] == "bad" and item["ok"] is False
         for item in result.assertion_results
     )
+
+
+def test_api_spec_runs_request_sequence_with_extracted_values(
+    tmp_path: Path,
+) -> None:
+    server, base_url, thread = _server_url()
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Cart sequence",
+            method="GET",
+            url=f"{base_url}/api/health",
+            steps=[
+                {
+                    "id": "create-cart",
+                    "method": "POST",
+                    "url": f"{base_url}/api/cart",
+                    "body": {"cartId": 42},
+                    "expected_status": 201,
+                    "extract": [{"name": "cart_id", "path": "$.received.cartId"}],
+                    "json_assertions": [{"path": "$.ok", "equals": True}],
+                },
+                {
+                    "id": "update-cart",
+                    "method": "PATCH",
+                    "url": f"{base_url}/api/cart/{{{{ vars.cart_id }}}}",
+                    "expected_status": 200,
+                    "json_assertions": [
+                        {"id": "cart", "path": "$.cartId", "equals": 42},
+                        {"id": "state", "path": "$.state", "equals": "updated"},
+                    ],
+                },
+            ],
+        )
+
+        result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is True
+    assert [item["assertion_id"] for item in result.assertion_results] == [
+        "create-cart:expected-status",
+        "create-cart:json-0",
+        "update-cart:expected-status",
+        "update-cart:cart",
+        "update-cart:state",
+    ]
+    assert sum(item["artifact_type"] == "api_request" for item in result.artifacts) == 2
 
 
 def test_failed_api_run_creates_failure_evidence_and_repair_task(

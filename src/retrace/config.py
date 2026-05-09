@@ -103,8 +103,16 @@ class TesterAuthProfileConfig(BaseModel):
     browser_settings: dict[str, Any] = Field(default_factory=dict)
 
 
+class TesterEnvProfileConfig(BaseModel):
+    app_url: str = ""
+    api_base_url: str = ""
+    env_overrides: dict[str, str] = Field(default_factory=dict)
+    headers_env: str = ""
+
+
 class TesterConfig(BaseModel):
     auth_profiles: dict[str, TesterAuthProfileConfig] = Field(default_factory=dict)
+    env_profiles: dict[str, TesterEnvProfileConfig] = Field(default_factory=dict)
 
 
 class RetraceConfig(BaseModel):
