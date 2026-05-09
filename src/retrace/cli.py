@@ -13,6 +13,7 @@ from retrace.commands.doctor import doctor_command
 from retrace.commands.github import github_group
 from retrace.commands.init import init_command
 from retrace.commands.mcp import mcp_group
+from retrace.commands.repair import repair_group
 from retrace.commands.suggest_fixes import suggest_fixes_command
 from retrace.commands.tester import tester_group
 from retrace.commands.ui import ui_command
@@ -82,3 +83,4 @@ main.add_command(mcp_group)
 main.add_command(api_group)
 main.add_command(digest_command)
 main.add_command(demo_group)
+main.add_command(repair_group)
