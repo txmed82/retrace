@@ -234,7 +234,7 @@ def _validation_plan(
         repo_path=Path(repo_path) if repo_path else None,
         linked_tests=[_linked_test_item(item) for item in test_links],
         likely_files=likely_files,
-        failure_metadata=dict(failure.metadata),
+        failure_metadata={**dict(failure.metadata), "source_type": failure.source_type},
     )
     return [
         {

@@ -47,10 +47,17 @@ def infer_validation_commands(
     metadata = failure_metadata or {}
     metadata_spec_id = _safe_spec_id(metadata.get("spec_id"))
     if metadata_spec_id:
+        source_type = str(metadata.get("source_type") or "").strip()
+        command = (
+            f"retrace tester api-run {metadata_spec_id}"
+            if source_type == "test_run"
+            else f"retrace tester run {metadata_spec_id}"
+        )
+        command_label = "API/test" if source_type == "test_run" else "UI"
         commands.append(
             ValidationCommand(
-                command=f"retrace tester api-run {metadata_spec_id}",
-                reason=f"Re-runs failing API/test spec {metadata_spec_id}.",
+                command=command,
+                reason=f"Re-runs failing {command_label} spec {metadata_spec_id}.",
                 source="failure_metadata",
             )
         )
@@ -66,8 +73,14 @@ def _targeted_repo_commands(
 ) -> list[ValidationCommand]:
     commands: list[ValidationCommand] = []
     for rel in likely_files:
+        if not _safe_repo_relative_path(rel):
+            continue
         path = repo_path / rel
-        if rel.startswith("tests/") and path.suffix == ".py" and path.exists():
+        resolved = path.resolve()
+        repo_resolved = repo_path.resolve()
+        if not resolved.is_relative_to(repo_resolved):
+            continue
+        if rel.startswith("tests/") and resolved.suffix == ".py" and resolved.exists():
             commands.append(
                 ValidationCommand(
                     command=f"uv run pytest {shlex.quote(rel)}",
@@ -77,7 +90,8 @@ def _targeted_repo_commands(
             )
             continue
         candidate = repo_path / "tests" / f"test_{Path(rel).stem}.py"
-        if candidate.exists():
+        candidate_resolved = candidate.resolve()
+        if candidate_resolved.is_relative_to(repo_resolved) and candidate.exists():
             test_rel = candidate.relative_to(repo_path).as_posix()
             commands.append(
                 ValidationCommand(
@@ -87,6 +101,11 @@ def _targeted_repo_commands(
                 )
             )
     return commands
+
+
+def _safe_repo_relative_path(value: str) -> bool:
+    path = Path(str(value or ""))
+    return bool(value) and not path.is_absolute() and ".." not in path.parts
 
 
 def _package_manager_commands(repo_path: Path) -> list[ValidationCommand]:

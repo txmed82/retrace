@@ -377,6 +377,36 @@ def test_validation_command_inference_rejects_unsafe_spec_ids(tmp_path: Path) ->
     assert commands == []
 
 
+def test_validation_command_inference_uses_ui_command_for_non_api_metadata(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    commands = infer_validation_commands(
+        repo_path=repo,
+        failure_metadata={"source_type": "replay_issue", "spec_id": "checkout_ui"},
+    )
+
+    assert [item.command for item in commands] == ["retrace tester run checkout_ui"]
+    assert commands[0].reason == "Re-runs failing UI spec checkout_ui."
+
+
+def test_validation_command_inference_rejects_traversal_likely_files(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests/test_checkout.py").write_text("def test_checkout(): pass\n")
+
+    commands = infer_validation_commands(
+        repo_path=repo,
+        likely_files=["tests/../../tmp/pwn.py", "/tmp/pwn.py"],
+    )
+
+    assert commands == []
+
+
 def test_repair_task_failure_does_not_block_prompt_generation(
     tmp_path: Path,
     monkeypatch,
