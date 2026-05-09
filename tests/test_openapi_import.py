@@ -92,6 +92,7 @@ paths:
             path_filter=r"/users/",
             method_filter="GET",
         )
+        assert result.specs
         spec = result.specs[0]
         run = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(tmp_path))
     finally:
@@ -236,7 +237,8 @@ servers:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["created_count"] == 1
-    spec_path = next((tmp_path / "data" / "api-tests" / "specs").glob("*.json"))
-    spec_payload = json.loads(spec_path.read_text())
+    spec_paths = list((tmp_path / "data" / "api-tests" / "specs").glob("*.json"))
+    assert len(spec_paths) == 1
+    spec_payload = json.loads(spec_paths[0].read_text())
     assert spec_payload["url"] == "http://api.example.test/v1/health"
     assert spec_payload["fixtures"]["contract_derived"] is True
