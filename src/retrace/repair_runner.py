@@ -79,31 +79,90 @@ def run_repair(
             error="agent_command is required for local repair execution",
         )
 
-    agent_result = _run_command(
-        config.agent_command,
-        repo_path=repo_path,
-        timeout_seconds=config.timeout_seconds,
-        stdin=prompt,
-    )
-    tests_run = [
-        _run_shell_command(
-            command,
+    try:
+        agent_result = _run_command(
+            config.agent_command,
             repo_path=repo_path,
             timeout_seconds=config.timeout_seconds,
+            stdin=prompt,
         )
-        for command in validation_commands
-    ]
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        return _exception_result(
+            status="agent_error",
+            prompt=prompt,
+            planned_commands=planned_commands,
+            exc=exc,
+        )
+    except Exception as exc:
+        return _exception_result(
+            status="agent_error",
+            prompt=prompt,
+            planned_commands=planned_commands,
+            exc=exc,
+        )
+
+    tests_run: list[RepairCommandResult] = []
+    for command in validation_commands:
+        try:
+            tests_run.append(
+                _run_shell_command(
+                    command,
+                    repo_path=repo_path,
+                    timeout_seconds=config.timeout_seconds,
+                )
+            )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+            return _exception_result(
+                status="validation_error",
+                prompt=prompt,
+                planned_commands=planned_commands,
+                exc=exc,
+                agent_result=agent_result,
+                tests_run=tests_run,
+            )
+        except Exception as exc:
+            return _exception_result(
+                status="validation_error",
+                prompt=prompt,
+                planned_commands=planned_commands,
+                exc=exc,
+                agent_result=agent_result,
+                tests_run=tests_run,
+            )
     changed_files = _changed_files(repo_path)
     diff = _diff(repo_path)
     draft_pr_url = ""
     if config.create_draft_pr:
-        draft_pr_url = _create_draft_pr(
-            repo_path=repo_path,
-            branch_name=config.branch_name,
-            repo_full_name=config.repo_full_name,
-            github_token=config.github_token,
-            timeout_seconds=config.timeout_seconds,
-        )
+        try:
+            draft_pr_url = _create_draft_pr(
+                repo_path=repo_path,
+                branch_name=config.branch_name,
+                repo_full_name=config.repo_full_name,
+                github_token=config.github_token,
+                timeout_seconds=config.timeout_seconds,
+            )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+            return _exception_result(
+                status="draft_pr_error",
+                prompt=prompt,
+                planned_commands=planned_commands,
+                exc=exc,
+                agent_result=agent_result,
+                tests_run=tests_run,
+                changed_files=changed_files,
+                diff=diff,
+            )
+        except Exception as exc:
+            return _exception_result(
+                status="draft_pr_error",
+                prompt=prompt,
+                planned_commands=planned_commands,
+                exc=exc,
+                agent_result=agent_result,
+                tests_run=tests_run,
+                changed_files=changed_files,
+                diff=diff,
+            )
     status = "completed"
     if agent_result.returncode != 0:
         status = "agent_failed"
@@ -152,9 +211,8 @@ def _run_shell_command(
     timeout_seconds: int,
 ) -> RepairCommandResult:
     result = subprocess.run(
-        command,
+        shlex.split(command),
         cwd=repo_path,
-        shell=True,
         text=True,
         capture_output=True,
         check=False,
@@ -240,3 +298,30 @@ def _create_draft_pr(
         env=env,
     )
     return result.stdout.strip()
+
+
+def _exception_result(
+    *,
+    status: str,
+    prompt: str,
+    planned_commands: list[str],
+    exc: Exception,
+    agent_result: RepairCommandResult | None = None,
+    tests_run: list[RepairCommandResult] | None = None,
+    changed_files: list[str] | None = None,
+    diff: str = "",
+) -> RepairRunResult:
+    stdout = str(getattr(exc, "stdout", "") or "")
+    stderr = str(getattr(exc, "stderr", "") or "")
+    message = str(exc)
+    detail = "\n".join(part for part in (message, stdout, stderr) if part)
+    return RepairRunResult(
+        status=status,
+        prompt=prompt,
+        planned_commands=planned_commands,
+        tests_run=tests_run or [],
+        agent_result=agent_result,
+        changed_files=changed_files or [],
+        diff=diff,
+        error=detail,
+    )

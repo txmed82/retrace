@@ -68,23 +68,32 @@ def repair_run_command(
         validation_commands=list(validation_command) or None,
     )
     repo = store.get_github_repo(repo_full_name) if repo_full_name.strip() else None
-    effective_repo_path = repo_path or (Path(repo.local_path) if repo and repo.local_path else None)
-    if effective_repo_path is None:
-        raise click.ClickException("Provide --repo-path or a connected --repo with local_path.")
-    result = run_repair(
-        bundle,
-        RepairRunnerConfig(
-            repo_path=effective_repo_path,
-            agent_command=shlex.split(agent_command) if agent_command.strip() else [],
-            validation_commands=list(validation_command),
-            dry_run=dry_run,
-            allow_draft_pr=allow_draft_pr,
-            create_draft_pr=create_draft_pr,
-            branch_name=branch_name,
-            repo_full_name=repo_full_name,
-            github_token=cfg.github_sink.api_key,
-        ),
+    effective_repo_path = repo_path or (
+        Path(repo.local_path) if repo and repo.local_path else None
     )
+    if effective_repo_path is None:
+        raise click.ClickException(
+            "Provide --repo-path or a connected --repo with local_path."
+        )
+    try:
+        result = run_repair(
+            bundle,
+            RepairRunnerConfig(
+                repo_path=effective_repo_path,
+                agent_command=(
+                    shlex.split(agent_command) if agent_command.strip() else []
+                ),
+                validation_commands=list(validation_command),
+                dry_run=dry_run,
+                allow_draft_pr=allow_draft_pr,
+                create_draft_pr=create_draft_pr,
+                branch_name=branch_name,
+                repo_full_name=repo_full_name,
+                github_token=cfg.github_sink.api_key,
+            ),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     click.echo(f"status={result.status}")
     click.echo(f"planned_commands={len(result.planned_commands)}")
     if result.changed_files:

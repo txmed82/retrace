@@ -314,8 +314,7 @@ class GitHubClient:
             "body": body,
             "draft": bool(draft),
         }
-        resp = _request_with_retry(
-            self._client,
+        resp = self._client.request(
             "POST",
             url,
             headers=self._headers(),
