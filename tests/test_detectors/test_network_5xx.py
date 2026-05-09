@@ -22,6 +22,33 @@ def test_network_5xx_detects_server_errors():
     assert s.details["method"] == "POST"
 
 
+def test_network_5xx_preserves_trace_context():
+    from retrace.detectors.network_5xx import detector
+
+    traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    events = [
+        meta(ts=0, href="https://app.example.com/orders"),
+        network_event(
+            ts=1000,
+            url="https://api.example.com/orders",
+            status=503,
+            method="POST",
+            trace={
+                "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                "requestTraceparent": traceparent,
+            },
+        ),
+    ]
+
+    signals = detector.detect("sess-1", events)
+
+    assert len(signals) == 1
+    assert signals[0].details["trace"] == {
+        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+        "requestTraceparent": traceparent,
+    }
+
+
 def test_network_5xx_ignores_4xx_and_2xx():
     from retrace.detectors.network_5xx import detector
 

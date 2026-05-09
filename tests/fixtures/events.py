@@ -28,18 +28,25 @@ def console_event(ts: int, level: str, message: str) -> dict[str, Any]:
 
 
 def network_event(
-    ts: int, url: str, status: int, method: str = "GET"
+    ts: int,
+    url: str,
+    status: int,
+    method: str = "GET",
+    trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "method": method,
+        "url": url,
+        "status_code": status,
+    }
+    if trace is not None:
+        payload["trace"] = trace
     return {
         "type": 6,
         "timestamp": ts,
         "data": {
             "plugin": "posthog/network@1",
-            "payload": {
-                "method": method,
-                "url": url,
-                "status_code": status,
-            },
+            "payload": payload,
         },
     }
 

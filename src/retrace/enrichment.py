@@ -53,7 +53,7 @@ class CorrelationEnricher:
         )
 
         issue_ids: list[str] = []
-        trace_ids: list[str] = []
+        trace_ids: list[str] = self._trace_ids_from_signals(signals)
         top_stack_frame = ""
 
         if self._can_query():
@@ -329,6 +329,35 @@ class CorrelationEnricher:
             if t and t not in out:
                 out.append(t)
         return out[:10]
+
+    @staticmethod
+    def _trace_ids_from_signals(signals: list[Signal]) -> list[str]:
+        out: list[str] = []
+        for signal in signals:
+            trace = signal.details.get("trace")
+            if not isinstance(trace, dict):
+                continue
+            for key in ("traceId", "trace_id"):
+                value = str(trace.get(key) or "").strip()
+                if value and value not in out:
+                    out.append(value)
+            for key in ("traceparent", "requestTraceparent", "responseTraceparent"):
+                trace_id = CorrelationEnricher._trace_id_from_traceparent(
+                    str(trace.get(key) or "")
+                )
+                if trace_id and trace_id not in out:
+                    out.append(trace_id)
+        return out[:10]
+
+    @staticmethod
+    def _trace_id_from_traceparent(value: str) -> str:
+        parts = value.strip().split("-")
+        if len(parts) < 4:
+            return ""
+        trace_id = parts[1].lower()
+        if len(trace_id) != 32 or any(c not in "0123456789abcdef" for c in trace_id):
+            return ""
+        return trace_id
 
     @staticmethod
     def _timestamp_bounds_from_rows(rows: list[dict[str, Any]]) -> tuple[int, int]:

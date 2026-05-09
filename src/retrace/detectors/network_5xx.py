@@ -41,6 +41,9 @@ class Network5xxDetector:
                         "status": status,
                         "request_url": payload.get("url", ""),
                         "method": payload.get("method", "GET"),
+                        "trace": payload.get("trace")
+                        if isinstance(payload.get("trace"), dict)
+                        else {},
                     },
                     confidence="high",
                     reason_codes=("network_5xx.status_5xx",),
