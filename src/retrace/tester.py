@@ -70,6 +70,8 @@ class TesterSpec:
     auth_headers_env: str
     created_at: str
     updated_at: str
+    auth_profile: str = ""
+    auth_setup_steps: list[dict[str, Any]] = field(default_factory=list)
     execution_engine: str = "harness"
     exact_steps: list[dict[str, Any]] = field(default_factory=list)
     exploratory_goals: list[str] = field(default_factory=list)
@@ -222,6 +224,8 @@ def _apply_spec_defaults(data: dict[str, Any]) -> None:
     data.setdefault("auth_password_env", "RETRACE_TESTER_AUTH_PASSWORD")
     data.setdefault("auth_jwt_env", "RETRACE_TESTER_AUTH_JWT")
     data.setdefault("auth_headers_env", "RETRACE_TESTER_AUTH_HEADERS")
+    data.setdefault("auth_profile", "")
+    data.setdefault("auth_setup_steps", [])
     data.setdefault("execution_engine", "harness")
     data.setdefault("exact_steps", [])
     data.setdefault("exploratory_goals", [])
@@ -278,8 +282,8 @@ def validate_spec(spec: TesterSpec) -> None:
     native_selected = spec.execution_engine == "native" or (
         spec.execution_engine == "auto" and bool(spec.exact_steps or spec.assertions)
     )
-    if native_selected and spec.auth_required:
-        raise ValueError("native execution does not yet support auth_required specs")
+    if native_selected and spec.auth_required and spec.auth_mode == "form":
+        raise ValueError("native execution does not support form auth profiles")
     if explore_selected and not spec.exploratory_goals:
         raise ValueError("explore execution requires at least one exploratory_goal")
     if spec.execution_engine == "explore" and (
@@ -326,6 +330,8 @@ def validate_spec(spec: TesterSpec) -> None:
         raise ValueError("assertions must be a list")
     if not isinstance(spec.env_overrides, dict):
         raise ValueError("env_overrides must be an object")
+    if not isinstance(spec.auth_setup_steps, list):
+        raise ValueError("auth_setup_steps must be a list")
     if not isinstance(spec.browser_settings, dict):
         raise ValueError("browser_settings must be an object")
     if not isinstance(spec.fixtures, dict):
@@ -356,6 +362,8 @@ def create_spec(
     auth_password_env: str = "RETRACE_TESTER_AUTH_PASSWORD",
     auth_jwt_env: str = "RETRACE_TESTER_AUTH_JWT",
     auth_headers_env: str = "RETRACE_TESTER_AUTH_HEADERS",
+    auth_profile: str = "",
+    auth_setup_steps: Optional[list[dict[str, Any]]] = None,
     execution_engine: str = "harness",
     exact_steps: Optional[list[dict[str, Any]]] = None,
     exploratory_goals: Optional[list[str]] = None,
@@ -391,6 +399,8 @@ def create_spec(
         auth_headers_env=(
             auth_headers_env.strip() or "RETRACE_TESTER_AUTH_HEADERS"
         ),
+        auth_profile=auth_profile.strip(),
+        auth_setup_steps=auth_setup_steps or [],
         created_at=created_at,
         updated_at=created_at,
         execution_engine=(execution_engine.strip().lower() or "harness"),
@@ -480,6 +490,7 @@ def _auth_context_from_env(spec: TesterSpec) -> dict[str, str]:
     return {
         "required": "true" if spec.auth_required else "false",
         "mode": spec.auth_mode,
+        "profile": spec.auth_profile,
         "login_url": spec.auth_login_url,
         "username": spec.auth_username,
         "password": os.environ.get(spec.auth_password_env, "").strip(),
@@ -513,18 +524,49 @@ def _compose_task_prompt(
     mode_name = (auth_context.get("mode") or "none").strip().lower()
     lines = [base, "", "Authentication context:"]
     if mode_name == "form":
+        if auth_context.get("profile"):
+            lines.append(f"- profile: {auth_context.get('profile', '')}")
         lines.append(f"- login_url: {auth_context.get('login_url', '')}")
         lines.append(f"- username: {auth_context.get('username', '')}")
         lines.append("- password: use provided runtime secret")
     elif mode_name == "jwt":
+        if auth_context.get("profile"):
+            lines.append(f"- profile: {auth_context.get('profile', '')}")
         lines.append("- auth type: bearer token")
         lines.append("- jwt: use provided runtime token")
     elif mode_name == "headers":
+        if auth_context.get("profile"):
+            lines.append(f"- profile: {auth_context.get('profile', '')}")
         lines.append("- auth type: custom headers")
         lines.append("- headers_json: use provided runtime JSON headers")
     else:
         lines.append("- auth required but mode unspecified; discover login path first")
     return "\n".join(lines)
+
+
+def _native_auth_headers(auth_context: dict[str, str]) -> tuple[dict[str, str], str]:
+    if str(auth_context.get("required", "")).lower() not in {"1", "true", "yes", "on"}:
+        return {}, ""
+    mode = str(auth_context.get("mode") or "none").strip().lower()
+    if mode == "jwt":
+        token = str(auth_context.get("jwt") or "").strip()
+        if not token:
+            return {}, "auth failure: missing JWT token env var"
+        return {"Authorization": f"Bearer {token}"}, ""
+    if mode == "headers":
+        raw = str(auth_context.get("headers_json") or "").strip()
+        if not raw:
+            return {}, "auth failure: missing auth headers env var"
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:
+            return {}, f"auth failure: invalid auth headers JSON: {exc}"
+        if not isinstance(parsed, dict):
+            return {}, "auth failure: auth headers must be a JSON object"
+        return {str(k): str(v) for k, v in parsed.items()}, ""
+    if mode == "form":
+        return {}, "auth failure: native execution does not support form auth"
+    return {}, "auth failure: auth mode is required"
 
 
 def _join_url(base_url: str, path: str) -> str:
@@ -1407,6 +1449,15 @@ def _write_suite_proposal_and_drafts(
             harness_command=spec.harness_command or DEFAULT_HARNESS_COMMAND,
             mode="describe",
             execution_engine="native",
+            auth_required=spec.auth_required,
+            auth_mode=spec.auth_mode,
+            auth_login_url=spec.auth_login_url,
+            auth_username=spec.auth_username,
+            auth_password_env=spec.auth_password_env,
+            auth_jwt_env=spec.auth_jwt_env,
+            auth_headers_env=spec.auth_headers_env,
+            auth_profile=spec.auth_profile,
+            auth_setup_steps=list(spec.auth_setup_steps or []),
             exact_steps=exact_steps,
             assertions=[
                 {
@@ -1557,6 +1608,7 @@ def _run_native_spec(
     app_url: str,
     run_dir: Path,
     log_path: Path,
+    auth_context: Optional[dict[str, str]] = None,
     attempt: int = 0,
 ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]], str]:
     artifacts_dir = run_dir / "artifacts"
@@ -1569,8 +1621,11 @@ def _run_native_spec(
     cache_events: list[TesterStepCacheEvent] = []
     cache_dir = run_dir.parent.parent / "cache" / "native-steps"
     script_scope: dict[str, Any] = {"vars": {}, "env": dict(spec.env_overrides or {})}
+    request_headers, auth_error = _native_auth_headers(auth_context or {})
+    if auth_error:
+        return 1, artifacts, assertion_results, auth_error
 
-    steps = spec.exact_steps or [
+    steps = [*spec.auth_setup_steps, *(spec.exact_steps or [])] or [
         {"id": "default-get", "action": "get", "url": app_url}
     ]
     if _should_use_playwright(spec, steps):
@@ -1663,7 +1718,7 @@ def _run_native_spec(
                             )
                         )
                     try:
-                        last_response = client.get(request_url)
+                        last_response = client.get(request_url, headers=request_headers)
                         if use_cached_url and not _cached_step_has_effect(
                             response=last_response,
                             step=step,
@@ -1689,7 +1744,7 @@ def _run_native_spec(
                                 ),
                             )
                         )
-                        last_response = client.get(resolved_url)
+                        last_response = client.get(resolved_url, headers=request_headers)
                     if spec.step_cache_enabled and last_response.status_code < 500:
                         effective_url = str(last_response.url)
                         _save_step_cache(
@@ -2486,6 +2541,7 @@ def run_spec(
                     app_url=app_url,
                     run_dir=run_dir,
                     log_path=harness_log_path,
+                    auth_context=auth_context,
                     attempt=attempt,
                 )
                 if last_exit == 0:

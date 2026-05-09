@@ -2760,6 +2760,96 @@ def ui_command(
             if path == "/api/tester/specs":
                 body = self._read_json_body()
                 settings = current_settings()
+                profile_name = str(body.get("auth_profile", "")).strip()
+                profile: dict[str, Any] = {}
+                if profile_name:
+                    tester_cfg = _read_config(config_path).get("tester") or {}
+                    profiles = tester_cfg.get("auth_profiles") or {}
+                    if not isinstance(profiles, dict) or profile_name not in profiles:
+                        self._json(
+                            {"ok": False, "error": f"unknown auth profile: {profile_name}"},
+                            status=400,
+                        )
+                        return
+                    profile_raw = profiles.get(profile_name) or {}
+                    if not isinstance(profile_raw, dict):
+                        self._json(
+                            {
+                                "ok": False,
+                                "error": f"auth profile must be an object: {profile_name}",
+                            },
+                            status=400,
+                        )
+                        return
+                    profile = dict(profile_raw)
+                    forbidden = {"password", "jwt", "token", "headers", "headers_json"}
+                    leaked: list[str] = []
+
+                    def scan_secret_keys(value: Any, path_s: str = "") -> None:
+                        if isinstance(value, dict):
+                            for key, nested in value.items():
+                                key_s = str(key)
+                                child_path = f"{path_s}.{key_s}" if path_s else key_s
+                                if key_s in forbidden:
+                                    leaked.append(child_path)
+                                scan_secret_keys(nested, child_path)
+                        elif isinstance(value, list):
+                            for idx, item in enumerate(value):
+                                scan_secret_keys(item, f"{path_s}[{idx}]")
+
+                    scan_secret_keys(profile)
+                    if leaked:
+                        self._json(
+                            {
+                                "ok": False,
+                                "error": (
+                                    "auth profile must reference env vars, not "
+                                    "secret values: "
+                                    + ", ".join(sorted(leaked))
+                                ),
+                            },
+                            status=400,
+                        )
+                        return
+                auth_setup_steps = body.get("auth_setup_steps")
+                if auth_setup_steps is None and profile:
+                    auth_setup_steps = profile.get(
+                        "auth_setup_steps", profile.get("setup_steps", [])
+                    )
+                if auth_setup_steps is None:
+                    auth_setup_steps = []
+                if not isinstance(auth_setup_steps, list):
+                    self._json(
+                        {"ok": False, "error": "auth_setup_steps must be a list"},
+                        status=400,
+                    )
+                    return
+                if not all(isinstance(step, dict) for step in auth_setup_steps):
+                    self._json(
+                        {
+                            "ok": False,
+                            "error": "auth_setup_steps entries must be objects",
+                        },
+                        status=400,
+                    )
+                    return
+                auth_required = bool(settings["tester_auth_required"])
+                auth_mode = str(settings["tester_auth_mode"] or "none")
+                auth_login_url = str(settings["tester_auth_login_url"] or "")
+                auth_username = str(settings["tester_auth_username"] or "")
+                auth_password_env = "RETRACE_TESTER_AUTH_PASSWORD"
+                auth_jwt_env = "RETRACE_TESTER_AUTH_JWT"
+                auth_headers_env = "RETRACE_TESTER_AUTH_HEADERS"
+                if profile:
+                    auth_required = True
+                    auth_mode = str(profile.get("mode") or auth_mode)
+                    auth_login_url = str(profile.get("login_url") or auth_login_url)
+                    auth_username = str(profile.get("username") or auth_username)
+                    auth_password_env = str(
+                        profile.get("password_env") or auth_password_env
+                    )
+                    auth_jwt_env = str(profile.get("jwt_env") or auth_jwt_env)
+                    auth_headers_env = str(profile.get("headers_env") or auth_headers_env)
                 try:
                     spec = create_spec(
                         specs_dir=specs_dir_for_data_dir(data_dir),
@@ -2772,10 +2862,15 @@ def ui_command(
                         harness_command=str(body.get("harness_command", "")).strip()
                         or settings["tester_harness_command"],
                         mode=str(body.get("mode", "")).strip() or "describe",
-                        auth_required=bool(settings["tester_auth_required"]),
-                        auth_mode=str(settings["tester_auth_mode"] or "none"),
-                        auth_login_url=str(settings["tester_auth_login_url"] or ""),
-                        auth_username=str(settings["tester_auth_username"] or ""),
+                        auth_required=auth_required,
+                        auth_mode=auth_mode,
+                        auth_login_url=auth_login_url,
+                        auth_username=auth_username,
+                        auth_password_env=auth_password_env,
+                        auth_jwt_env=auth_jwt_env,
+                        auth_headers_env=auth_headers_env,
+                        auth_profile=profile_name,
+                        auth_setup_steps=[dict(step) for step in auth_setup_steps],
                     )
                 except Exception as exc:
                     self._json({"ok": False, "error": str(exc)}, status=400)

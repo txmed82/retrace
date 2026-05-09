@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -81,6 +81,21 @@ class NotificationConfig(BaseModel):
         return bool(self.webhook_url.strip() or self.slack_webhook_url.strip())
 
 
+class TesterAuthProfileConfig(BaseModel):
+    mode: Literal["form", "jwt", "headers"] = "headers"
+    login_url: str = ""
+    username: str = ""
+    password_env: str = "RETRACE_TESTER_AUTH_PASSWORD"
+    jwt_env: str = "RETRACE_TESTER_AUTH_JWT"
+    headers_env: str = "RETRACE_TESTER_AUTH_HEADERS"
+    auth_setup_steps: list[dict[str, Any]] = Field(default_factory=list)
+    browser_settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class TesterConfig(BaseModel):
+    auth_profiles: dict[str, TesterAuthProfileConfig] = Field(default_factory=dict)
+
+
 class RetraceConfig(BaseModel):
     posthog: PostHogConfig
     llm: LLMConfig
@@ -90,6 +105,7 @@ class RetraceConfig(BaseModel):
     linear: LinearConfig = Field(default_factory=LinearConfig)
     github_sink: GitHubSinkConfig = Field(default_factory=GitHubSinkConfig)
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
+    tester: TesterConfig = Field(default_factory=TesterConfig)
 
 
 def load_config(path: Path) -> RetraceConfig:

@@ -17,6 +17,17 @@ from retrace.tester import (
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        if self.path == "/private":
+            if self.headers.get("Authorization") == "Bearer test-token":
+                body = b"<html><body>Private area</body></html>"
+                self.send_response(200)
+            else:
+                body = b"unauthorized"
+                self.send_response(401)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/final")
@@ -644,7 +655,7 @@ def test_native_step_cache_does_not_emit_cold_bypass_event(tmp_path: Path) -> No
     assert not any(item["status"] == "bypass" for item in cache_events)
 
 
-def test_native_auth_required_specs_fail_fast(tmp_path: Path) -> None:
+def test_native_form_auth_specs_fail_fast(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="native execution"):
         create_spec(
             specs_dir=specs_dir_for_data_dir(tmp_path),
@@ -655,9 +666,75 @@ def test_native_auth_required_specs_fail_fast(tmp_path: Path) -> None:
             harness_command="",
             execution_engine="native",
             auth_required=True,
-            auth_mode="jwt",
+            auth_mode="form",
             exact_steps=[{"id": "home", "action": "get", "path": "/"}],
         )
+
+
+def test_native_jwt_auth_profile_uses_env_without_persisting_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, app_url = _server_url()
+    monkeypatch.setenv("RETRACE_TEST_JWT", "test-token")
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Private area",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            auth_required=True,
+            auth_mode="jwt",
+            auth_profile="local-jwt",
+            auth_jwt_env="RETRACE_TEST_JWT",
+            exact_steps=[{"id": "private", "action": "get", "path": "/private"}],
+            assertions=[{"id": "status", "type": "status_code", "expected": 200}],
+        )
+
+        result = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    spec_path = specs_dir_for_data_dir(tmp_path) / f"{spec.spec_id}.json"
+    persisted = spec_path.read_text()
+    assert result.ok is True
+    assert "local-jwt" in persisted
+    assert "RETRACE_TEST_JWT" in persisted
+    assert "test-token" not in persisted
+
+
+def test_native_missing_jwt_auth_is_classified_distinctly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("RETRACE_MISSING_TEST_JWT", raising=False)
+    server, app_url = _server_url()
+    try:
+        spec = create_spec(
+            specs_dir=specs_dir_for_data_dir(tmp_path),
+            name="Private area missing auth",
+            prompt="",
+            app_url=app_url,
+            start_command="",
+            harness_command="",
+            execution_engine="native",
+            auth_required=True,
+            auth_mode="jwt",
+            auth_profile="local-jwt",
+            auth_jwt_env="RETRACE_MISSING_TEST_JWT",
+            exact_steps=[{"id": "private", "action": "get", "path": "/private"}],
+            assertions=[{"id": "status", "type": "status_code", "expected": 200}],
+        )
+
+        result = run_spec(spec=spec, runs_dir=runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result.ok is False
+    assert result.failure_classification == "auth_failure"
 
 
 def test_harness_retry_terminates_timed_out_process(
