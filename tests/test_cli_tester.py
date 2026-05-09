@@ -1,8 +1,12 @@
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from click.testing import CliRunner
 
 from retrace.cli import main
+from retrace.tester import set_explore_factories
 
 
 _CONFIG_YAML = """posthog:
@@ -22,6 +26,61 @@ detectors:
 cluster:
   min_size: 1
 """
+
+
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"<html>ok</html>")
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def _server_url() -> tuple[ThreadingHTTPServer, str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    return server, f"http://{host}:{port}"
+
+
+class _ExploreDriver:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self.url = ""
+
+    def navigate(self, url: str) -> None:
+        self.url = url
+
+    def click(self, selector: str) -> None:
+        return
+
+    def type(self, selector: str, text: str) -> None:
+        return
+
+    def press(self, key: str, selector: str = "") -> None:
+        return
+
+    def wait_for(self, selector: str, timeout_ms: int = 5000) -> None:
+        return
+
+    def screenshot(self, path: Path) -> None:
+        path.write_bytes(b"png")
+
+    def snapshot(self) -> dict:
+        return {"url": self.url, "title": "Demo", "text": "Signup Checkout"}
+
+    def close(self) -> None:
+        return
+
+
+class _ExploreLLM:
+    def chat_json(self, *, system: str, user: str) -> dict:
+        return {
+            "tool": "finish",
+            "args": {"status": "success", "summary": "Primary flows discovered"},
+        }
 
 
 def test_tester_create_list_and_run(tmp_path: Path, monkeypatch) -> None:
@@ -73,6 +132,76 @@ def test_tester_create_suite_defaults_to_explore_mode(
     listed = runner.invoke(main, ["tester", "list"])
     assert listed.exit_code == 0, listed.output
     assert "\texplore_suite\t" in listed.output
+
+
+def test_create_suite_run_generates_accepts_and_runs_draft_specs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    server, app_url = _server_url()
+    try:
+        (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
+        monkeypatch.chdir(tmp_path)
+        set_explore_factories(
+            driver_factory=lambda **kwargs: _ExploreDriver(),
+            llm_factory=lambda: _ExploreLLM(),
+        )
+        runner = CliRunner()
+
+        create = runner.invoke(
+            main,
+            [
+                "tester",
+                "create-suite",
+                "--app-url",
+                app_url,
+                "--goal",
+                "Signup flow",
+                "--goal",
+                "Checkout payment",
+            ],
+        )
+        assert create.exit_code == 0, create.output
+        suite_spec_id = create.output.strip().split(": ")[1]
+
+        ran_suite = runner.invoke(main, ["tester", "run", suite_spec_id])
+        assert ran_suite.exit_code == 0, ran_suite.output
+        suite_payload = json.loads(ran_suite.output)
+        run_id = suite_payload["run_id"]
+        assert any(
+            artifact["artifact_type"] == "suite_proposal"
+            for artifact in suite_payload["artifacts"]
+        )
+
+        specs_dir = tmp_path / "data" / "ui-tests" / "specs"
+        draft_specs = [
+            json.loads(path.read_text())
+            for path in specs_dir.glob("*.json")
+            if json.loads(path.read_text()).get("fixtures", {}).get("draft_status")
+            == "draft"
+        ]
+        assert len(draft_specs) == 2
+        assert {spec["fixtures"]["criticality"] for spec in draft_specs} == {"high"}
+        assert all(
+            spec["fixtures"]["source_exploration_run"] == run_id
+            for spec in draft_specs
+        )
+        assert all(spec["fixtures"]["draft_reason"] for spec in draft_specs)
+
+        draft_id = draft_specs[0]["spec_id"]
+        accepted = runner.invoke(
+            main,
+            ["tester", "accept-draft", draft_id, "--name", "Accepted draft"],
+        )
+        assert accepted.exit_code == 0, accepted.output
+        assert '"draft_status": "accepted"' in accepted.output
+
+        ran_draft = runner.invoke(main, ["tester", "run", draft_id, "--retries", "0"])
+        assert ran_draft.exit_code == 0, ran_draft.output
+        assert '"execution_engine": "native"' in ran_draft.output
+    finally:
+        set_explore_factories(driver_factory=None, llm_factory=None)
+        server.shutdown()
+        server.server_close()
 
 
 def test_tester_run_retries_and_marks_flaky(tmp_path: Path, monkeypatch) -> None:
