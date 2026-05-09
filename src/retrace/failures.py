@@ -32,6 +32,7 @@ _STATUS_MAP = {
     "unresolved": "triaged",
     "ticket_created": "in_progress",
     "resolved": "resolved",
+    "verified": "resolved",
     "regressed": "regressed",
     "ignored": "ignored",
 }

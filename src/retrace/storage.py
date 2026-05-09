@@ -881,7 +881,8 @@ class ReplayIssueUpsertResult:
     @property
     def regressed(self) -> bool:
         return (
-            self.previous_status == "resolved" and self.current_status == "regressed"
+            self.previous_status in {"resolved", "verified"}
+            and self.current_status == "regressed"
         )
 
 
@@ -4321,7 +4322,7 @@ class Storage:
                 VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, environment_id, fingerprint) DO UPDATE SET
                     status = CASE
-                        WHEN replay_issues.status = 'resolved' THEN 'regressed'
+                        WHEN replay_issues.status IN ('resolved', 'verified') THEN 'regressed'
                         WHEN replay_issues.status = 'new' THEN 'ongoing'
                         WHEN replay_issues.status = 'unresolved' THEN 'ongoing'
                         WHEN replay_issues.status = 'ongoing' THEN 'ongoing'
@@ -4380,7 +4381,7 @@ class Storage:
                     first_seen_ms = MIN(replay_issues.first_seen_ms, excluded.first_seen_ms),
                     last_seen_ms = MAX(replay_issues.last_seen_ms, excluded.last_seen_ms),
                     resolved_at = CASE
-                        WHEN replay_issues.status = 'resolved' THEN NULL
+                        WHEN replay_issues.status IN ('resolved', 'verified') THEN NULL
                         ELSE replay_issues.resolved_at
                     END,
                     updated_at = excluded.updated_at
@@ -4666,6 +4667,7 @@ class Storage:
                   AND external_ticket_id IS NOT NULL
                   AND external_ticket_id != ''
                   AND status != 'resolved'
+                  AND status != 'verified'
                   AND status != 'ignored'
                 ORDER BY updated_at DESC
                 LIMIT ?
@@ -4686,6 +4688,7 @@ class Storage:
             "unresolved",
             "ticket_created",
             "resolved",
+            "verified",
             "ongoing",
             "regressed",
             "ignored",
@@ -4693,7 +4696,7 @@ class Storage:
         if status not in allowed:
             raise ValueError(f"invalid replay issue status: {status}")
         now = datetime.now(timezone.utc).isoformat()
-        resolved_at = now if status == "resolved" else None
+        resolved_at = now if status in {"resolved", "verified"} else None
         external_state = "created" if status == "ticket_created" else ""
         with self._conn() as conn:
             cur = conn.execute(
@@ -4703,7 +4706,10 @@ class Storage:
                     external_ticket_state = COALESCE(NULLIF(?, ''), external_ticket_state),
                     external_ticket_id = COALESCE(NULLIF(?, ''), external_ticket_id),
                     external_ticket_url = COALESCE(NULLIF(?, ''), external_ticket_url),
-                    resolved_at = CASE WHEN ? = 'resolved' THEN ? ELSE NULL END,
+                    resolved_at = CASE
+                        WHEN ? IN ('resolved', 'verified') THEN ?
+                        ELSE NULL
+                    END,
                     updated_at = ?
                 WHERE id = ?
                 """,
