@@ -340,7 +340,7 @@ def _handler(
         def _handle_sentry_compat_ingest(self, path: str, query: str) -> None:
             suffix = path.removeprefix("/api/sentry/").strip("/")
             parts = [part for part in suffix.split("/") if part]
-            if len(parts) < 2:
+            if len(parts) != 2:
                 _json_response(self, 404, {"error": "not_found"})
                 return
             project_id = parts[0].strip()

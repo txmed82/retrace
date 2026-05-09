@@ -415,6 +415,32 @@ def test_sentry_endpoint_rejects_project_mismatch(tmp_path: Path) -> None:
     assert payload["error"] == "forbidden"
 
 
+def test_sentry_endpoint_rejects_extra_path_segments(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Browser",
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/sentry/{workspace.project_id}/store/extra?sentry_key={sdk.key}",
+            body=json.dumps({"event_id": "evt-extra-path"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 404
+    assert payload["error"] == "not_found"
+
+
 def test_monitoring_webhook_endpoint_rejects_empty_payload(tmp_path: Path) -> None:
     store, workspace = _store(tmp_path)
     service = create_service_token(
