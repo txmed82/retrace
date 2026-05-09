@@ -191,6 +191,27 @@ def test_github_client_upserts_existing_issue_comment() -> None:
         )
         requests.append((request.method, str(request.url), payload))
         if request.method == "GET":
+            assert request.url.params.get("page") in (None, "2")
+            if request.url.params.get("page") != "2":
+                return httpx.Response(
+                    200,
+                    headers={
+                        "Link": (
+                            '<https://api.github.com/repos/acme/web/issues/12/'
+                            'comments?page=2>; rel="next"'
+                        )
+                    },
+                    json=[
+                        {
+                            "id": 54,
+                            "body": "unrelated",
+                            "html_url": (
+                                "https://github.com/acme/web/pull/12"
+                                "#issuecomment-54"
+                            ),
+                        }
+                    ],
+                )
             return httpx.Response(
                 200,
                 json=[
@@ -223,9 +244,11 @@ def test_github_client_upserts_existing_issue_comment() -> None:
     assert result["id"] == 55
     assert requests[0][0] == "GET"
     assert requests[0][1].endswith("/repos/acme/web/issues/12/comments")
-    assert requests[1][0] == "PATCH"
-    assert requests[1][1].endswith("/repos/acme/web/issues/comments/55")
-    assert requests[1][2] == {"body": "<!-- retrace-pr-review-summary --> new"}
+    assert requests[1][0] == "GET"
+    assert requests[1][1].endswith("/repos/acme/web/issues/12/comments?page=2")
+    assert requests[2][0] == "PATCH"
+    assert requests[2][1].endswith("/repos/acme/web/issues/comments/55")
+    assert requests[2][2] == {"body": "<!-- retrace-pr-review-summary --> new"}
 
 
 def test_github_client_creates_pull_request_review_comments() -> None:

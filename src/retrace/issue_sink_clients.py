@@ -59,6 +59,41 @@ def _request_with_retry(
     raise RuntimeError("unreachable retry loop")
 
 
+def _request_json_list_pages(
+    client: httpx.Client,
+    initial_url: str,
+    *,
+    headers: dict[str, str],
+    context: str,
+) -> list[dict[str, Any]]:
+    url = initial_url
+    results: list[dict[str, Any]] = []
+    while url:
+        resp = _request_with_retry(client, "GET", url, headers=headers)
+        if resp.status_code >= 400:
+            raise IssueSinkError(
+                f"GitHub API HTTP {resp.status_code}: {_truncate(resp.text)}"
+            )
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise IssueSinkError(f"GitHub API returned non-JSON: {exc}") from exc
+        if not isinstance(data, list):
+            raise IssueSinkError(f"{context} response was not a list: {data}")
+        results.extend(item for item in data if isinstance(item, dict))
+        url = _next_link_url(resp.headers.get("Link", ""))
+    return results
+
+
+def _next_link_url(link_header: str) -> str:
+    for part in link_header.split(","):
+        url_part, _, rel_part = part.partition(";")
+        if 'rel="next"' not in rel_part:
+            continue
+        return url_part.strip().removeprefix("<").removesuffix(">")
+    return ""
+
+
 class LinearClient:
     """Minimal Linear GraphQL client for creating and transitioning issues."""
 
@@ -349,23 +384,12 @@ class GitHubClient:
     def list_issue_comments(self, *, repo: str, number: int) -> list[dict[str, Any]]:
         owner, name = _parse_repo(repo)
         url = f"{self.base_url}/repos/{owner}/{name}/issues/{int(number)}/comments"
-        resp = _request_with_retry(
+        return _request_json_list_pages(
             self._client,
-            "GET",
             url,
             headers=self._headers(),
+            context="GitHub list-comments",
         )
-        if resp.status_code >= 400:
-            raise IssueSinkError(
-                f"GitHub API HTTP {resp.status_code}: {_truncate(resp.text)}"
-            )
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            raise IssueSinkError(f"GitHub API returned non-JSON: {exc}") from exc
-        if not isinstance(data, list):
-            raise IssueSinkError(f"GitHub list-comments response was not a list: {data}")
-        return [item for item in data if isinstance(item, dict)]
 
     def create_issue_comment(
         self,
@@ -441,25 +465,12 @@ class GitHubClient:
     ) -> list[dict[str, Any]]:
         owner, name = _parse_repo(repo)
         url = f"{self.base_url}/repos/{owner}/{name}/pulls/{int(number)}/comments"
-        resp = _request_with_retry(
+        return _request_json_list_pages(
             self._client,
-            "GET",
             url,
             headers=self._headers(),
+            context="GitHub review-comments",
         )
-        if resp.status_code >= 400:
-            raise IssueSinkError(
-                f"GitHub API HTTP {resp.status_code}: {_truncate(resp.text)}"
-            )
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            raise IssueSinkError(f"GitHub API returned non-JSON: {exc}") from exc
-        if not isinstance(data, list):
-            raise IssueSinkError(
-                f"GitHub review-comments response was not a list: {data}"
-            )
-        return [item for item in data if isinstance(item, dict)]
 
     def create_pull_request_review(
         self,
