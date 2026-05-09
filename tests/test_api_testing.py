@@ -11,12 +11,22 @@ from retrace.api_testing import (
     create_api_spec,
     list_api_specs,
     load_api_spec,
+    persist_api_failure,
     run_api_spec,
 )
+from retrace.storage import Storage
 
 
 class _APIHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        if self.path.startswith("/api/checkout/42"):
+            body = b'{"error":"checkout exploded"}'
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path.startswith("/api/private"):
             if self.headers.get("Authorization") != "Bearer test-token":
                 body = b'{"error":"unauthorized"}'
@@ -208,3 +218,68 @@ def test_api_spec_reports_failed_json_assertion(tmp_path: Path) -> None:
         item["assertion_id"] == "bad" and item["ok"] is False
         for item in result.assertion_results
     )
+
+
+def test_failed_api_run_creates_failure_evidence_and_repair_task(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "server/routes").mkdir(parents=True)
+    (repo / "server/routes/checkout.ts").write_text(
+        "router.get('/api/checkout/:cartId', checkoutHandler);"
+    )
+    server, base_url, thread = _server_url()
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Checkout API",
+            method="GET",
+            url=f"{base_url}/api/checkout/42",
+            expected_status=200,
+        )
+        run = run_api_spec(
+            spec=spec,
+            runs_dir=api_runs_dir_for_data_dir(tmp_path),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert run.ok is False
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Default")
+
+    persisted = persist_api_failure(
+        store=store,
+        spec=spec,
+        result=run,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        repo_path=repo,
+    )
+
+    failure = store.get_failure(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        failure_id=persisted.failure_id,
+    )
+    assert failure is not None
+    assert failure.source_type == "test_run"
+    assert failure.source_external_id.startswith("api:")
+    assert failure.linked_repair_task_id == persisted.repair_task_id
+    evidence = store.list_failure_evidence(failure_id=persisted.failure_id)
+    assert {item.evidence_type for item in evidence} >= {
+        "api_request",
+        "api_response",
+        "test_transcript",
+    }
+    repair = store.get_repair_task(persisted.repair_task_id)
+    assert repair is not None
+    assert repair.likely_files == ["server/routes/checkout.ts"]
+    assert repair.validation_commands == [f"retrace tester api-run {spec.spec_id}"]
+    prompt = Path(persisted.prompt_path).read_text()
+    assert f"URL: `{base_url}/api/checkout/42`" in prompt
+    assert "Expected status: `200`" in prompt
+    assert "Actual status: `500`" in prompt

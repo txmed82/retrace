@@ -319,6 +319,7 @@ retrace tester api-create \
 
 retrace tester api-list
 retrace tester api-run <api_spec_id>
+retrace tester api-run <api_spec_id> --repo-path ./my-app
 retrace tester api-from-replay-issue <bug_public_id>
 retrace tester api-import-openapi ./openapi.yaml --base-url http://127.0.0.1:3000
 ```
@@ -332,6 +333,9 @@ network signal and links it to the source failure as coverage.
 `api-import-openapi` imports OpenAPI JSON/YAML into contract-derived smoke specs,
 with optional `--path-filter` and `--method` selection and response schema
 assertions generated from the contract.
+Failed `api-run` executions are persisted as canonical failures with request and
+response evidence, a repair prompt containing the exact API reproduction, and
+route-matched likely files when `--repo-path` is provided.
 
 ## First-Party Replay API
 

@@ -212,6 +212,18 @@ def _score_file(
             score += route_bonus
             hits.append(f"api_route:{route}")
         route_parts = [p for p in route_l.split("/") if p and p != "api"]
+        stable_route_parts = [
+            part
+            for part in route_parts
+            if not part.isdigit()
+            and not part.startswith(":")
+            and not (part.startswith("[") and part.endswith("]"))
+        ]
+        if server_route_file and stable_route_parts:
+            stable_hits = sum(1 for part in stable_route_parts if part in text_l)
+            if stable_hits == len(stable_route_parts):
+                score += 10.0
+                hits.append(f"api_route_pattern:{route}")
         if server_route_file:
             overlap = sum(1 for part in route_parts if part in rel_l)
             if overlap:
