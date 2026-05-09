@@ -41,22 +41,6 @@ def _rollup_severity(values: list[str]) -> str:
     return highest
 
 
-def _trace_matches_failure(
-    failure: "FailureRow",
-    *,
-    trace_id: str,
-    span_id: str = "",
-) -> bool:
-    metadata = dict(failure.metadata or {})
-    trace_ids = _string_values(metadata.get("trace_ids"))
-    span_ids = _string_values(metadata.get("span_ids"))
-    if trace_id.strip() and trace_id.strip() not in trace_ids:
-        return False
-    if span_id.strip() and span_ids and span_id.strip() not in span_ids:
-        return False
-    return True
-
-
 def _string_values(value: object) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
@@ -400,6 +384,23 @@ CREATE TABLE IF NOT EXISTS otel_events (
 
 CREATE INDEX IF NOT EXISTS idx_otel_events_trace
 ON otel_events(project_id, environment_id, trace_id, occurred_at_ms);
+
+CREATE INDEX IF NOT EXISTS idx_otel_events_signal
+ON otel_events(project_id, environment_id, signal_type, occurred_at_ms);
+
+CREATE TABLE IF NOT EXISTS failure_trace_map (
+    failure_id TEXT NOT NULL,
+    trace_id TEXT NOT NULL DEFAULT '',
+    span_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(failure_id, trace_id, span_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_failure_trace_map_trace
+ON failure_trace_map(trace_id, span_id, failure_id);
+
+CREATE INDEX IF NOT EXISTS idx_failure_trace_map_span
+ON failure_trace_map(span_id, failure_id);
 
 CREATE TABLE IF NOT EXISTS failure_test_links (
     id TEXT PRIMARY KEY,
@@ -1077,6 +1078,7 @@ class Storage:
                 conn.execute(
                     "ALTER TABLE repair_tasks ADD COLUMN environment_id TEXT NOT NULL DEFAULT ''"
                 )
+            self._backfill_failure_trace_map(conn)
             rows = conn.execute(
                 """
                 SELECT id, project_id, environment_id, stable_id
@@ -1613,6 +1615,11 @@ class Storage:
         ).fetchone()
         assert row is not None
         persisted_failure_id = str(row["id"])
+        self._replace_failure_trace_map(
+            conn,
+            failure_id=persisted_failure_id,
+            metadata=failure.metadata,
+        )
         self._refresh_incidents_for_failure(conn, failure_id=persisted_failure_id)
         return persisted_failure_id
 
@@ -2233,6 +2240,42 @@ class Storage:
                 incident_id=str(row["incident_id"]),
             )
 
+    def _replace_failure_trace_map(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        failure_id: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        conn.execute("DELETE FROM failure_trace_map WHERE failure_id = ?", (failure_id,))
+        trace_ids = _string_values(metadata.get("trace_ids"))
+        span_ids = _string_values(metadata.get("span_ids")) or [""]
+        for trace_id in trace_ids:
+            for span_id in span_ids:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO failure_trace_map
+                    (failure_id, trace_id, span_id)
+                    VALUES (?, ?, ?)
+                    """,
+                    (failure_id, trace_id, span_id),
+                )
+
+    def _backfill_failure_trace_map(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id, metadata_json
+            FROM failures
+            WHERE id NOT IN (SELECT DISTINCT failure_id FROM failure_trace_map)
+            """
+        ).fetchall()
+        for row in rows:
+            self._replace_failure_trace_map(
+                conn,
+                failure_id=str(row["id"]),
+                metadata=self._safe_json_obj(row["metadata_json"]),
+            )
+
     def record_deploy_marker(
         self,
         *,
@@ -2489,31 +2532,27 @@ class Storage:
         if not trace_id.strip() and not span_id.strip():
             return []
         params: list[object] = [project_id, environment_id]
-        where = "project_id = ? AND environment_id = ?"
+        where = "f.project_id = ? AND f.environment_id = ?"
         if trace_id.strip():
-            where += " AND metadata_json LIKE ?"
-            params.append(f"%{trace_id.strip()}%")
+            where += " AND ftm.trace_id = ?"
+            params.append(trace_id.strip())
         if span_id.strip():
-            where += " AND metadata_json LIKE ?"
-            params.append(f"%{span_id.strip()}%")
+            where += " AND (ftm.span_id = '' OR ftm.span_id = ?)"
+            params.append(span_id.strip())
         params.append(max(1, min(int(limit), 5000)))
         with self._conn() as conn:
             rows = conn.execute(
                 f"""
-                SELECT *
-                FROM failures
+                SELECT DISTINCT f.*
+                FROM failure_trace_map ftm
+                JOIN failures f ON f.id = ftm.failure_id
                 WHERE {where}
-                ORDER BY updated_at DESC, public_id
+                ORDER BY f.updated_at DESC, f.public_id
                 LIMIT ?
                 """,
                 params,
             ).fetchall()
-        failures = [self._failure_from_row(row) for row in rows]
-        return [
-            failure
-            for failure in failures
-            if _trace_matches_failure(failure, trace_id=trace_id, span_id=span_id)
-        ]
+        return [self._failure_from_row(row) for row in rows]
 
     def list_otel_events(
         self,
