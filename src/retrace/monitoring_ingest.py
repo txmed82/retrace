@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from retrace.deploys import correlate_failure_to_deploy
 from retrace.evidence import EvidenceItem, evidence_dedupe_key
 from retrace.failures import canonical_failure_from_monitor_incident
 from retrace.incidents import group_failure_into_incident
@@ -74,6 +75,7 @@ def ingest_monitoring_webhook(
         summary=alert.summary,
         severity=alert.severity,
         fingerprint=alert.fingerprint,
+        occurred_at_ms=alert.occurred_at_ms,
         metadata=alert.metadata,
     )
     failure_id = store.upsert_failure(failure)
@@ -98,6 +100,7 @@ def ingest_monitoring_webhook(
         ),
     )
     evidence_id = store.append_failure_evidence(evidence)
+    correlate_failure_to_deploy(store=store, failure_id=failure_id)
     incident = group_failure_into_incident(store=store, failure_id=failure_id)
     return MonitoringIngestResult(
         provider=alert.provider,

@@ -341,6 +341,25 @@ ON incident_failures(failure_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_failures_one_incident_per_failure
 ON incident_failures(failure_id);
 
+CREATE TABLE IF NOT EXISTS deploy_markers (
+    id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    branch TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT '',
+    deployed_at_ms INTEGER NOT NULL DEFAULT 0,
+    changed_files_json TEXT NOT NULL DEFAULT '[]',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, sha)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deploy_markers_scope_time
+ON deploy_markers(project_id, environment_id, deployed_at_ms DESC);
+
 CREATE TABLE IF NOT EXISTS failure_test_links (
     id TEXT PRIMARY KEY,
     failure_id TEXT NOT NULL,
@@ -660,6 +679,22 @@ class IncidentRow:
     failure_count: int
     evidence_count: int
     repair_task_id: str
+    metadata: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
+class DeployMarkerRow:
+    id: str
+    public_id: str
+    project_id: str
+    environment_id: str
+    sha: str
+    branch: str
+    author: str
+    deployed_at_ms: int
+    changed_files: list[str]
     metadata: dict[str, Any]
     created_at: datetime
     updated_at: datetime
@@ -1784,6 +1819,7 @@ class Storage:
             return str(row["id"])
 
     def link_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
+        """Strictly attach a failure to an incident without changing existing ownership."""
         with self._conn() as conn:
             incident = conn.execute(
                 """
@@ -1835,6 +1871,64 @@ class Storage:
                 """,
                 (str(incident["id"]), str(failure["id"])),
             )
+            self._refresh_incident_rollup(conn, incident_id=str(incident["id"]))
+
+    def move_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
+        """Attach a failure to this incident, replacing prior incident membership."""
+        with self._conn() as conn:
+            incident = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM incidents
+                WHERE id = ? OR public_id = ?
+                """,
+                (incident_id, incident_id),
+            ).fetchone()
+            if incident is None:
+                raise ValueError(f"unknown incident_id: {incident_id}")
+            failure = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM failures
+                WHERE id = ? OR public_id = ?
+                """,
+                (failure_id, failure_id),
+            ).fetchone()
+            if failure is None:
+                raise ValueError(f"unknown failure_id: {failure_id}")
+            if (
+                str(incident["project_id"]) != str(failure["project_id"])
+                or str(incident["environment_id"]) != str(failure["environment_id"])
+            ):
+                raise ValueError("incident and failure must belong to the same workspace")
+            old_links = conn.execute(
+                """
+                SELECT incident_id
+                FROM incident_failures
+                WHERE failure_id = ?
+                """,
+                (str(failure["id"]),),
+            ).fetchall()
+            conn.execute(
+                """
+                DELETE FROM incident_failures
+                WHERE failure_id = ?
+                """,
+                (str(failure["id"]),),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO incident_failures
+                (incident_id, failure_id)
+                VALUES (?, ?)
+                """,
+                (str(incident["id"]), str(failure["id"])),
+            )
+            for row in old_links:
+                self._refresh_incident_rollup(
+                    conn,
+                    incident_id=str(row["incident_id"]),
+                )
             self._refresh_incident_rollup(conn, incident_id=str(incident["id"]))
 
     def get_incident(self, incident_id: str) -> Optional[IncidentRow]:
@@ -2081,6 +2175,195 @@ class Storage:
                 conn,
                 incident_id=str(row["incident_id"]),
             )
+
+    def record_deploy_marker(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        sha: str,
+        branch: str = "",
+        author: str = "",
+        deployed_at_ms: int = 0,
+        changed_files: Optional[list[str]] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> str:
+        clean_sha = sha.strip()
+        if not clean_sha:
+            raise ValueError("sha is required")
+        now = datetime.now(timezone.utc).isoformat()
+        deploy_id = self._id("dep")
+        public_id = self._public_id("dep", project_id, environment_id, clean_sha)
+        changed_files_was_omitted = changed_files is None
+        metadata_was_omitted = metadata is None
+        clean_changed_files = self._merge_string_lists(changed_files or [])
+        try:
+            metadata_json = json.dumps(metadata or {}, sort_keys=True)
+            changed_files_json = json.dumps(clean_changed_files, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("deploy marker metadata must be JSON-serializable") from exc
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO deploy_markers
+                (id, public_id, project_id, environment_id, sha, branch, author,
+                 deployed_at_ms, changed_files_json, metadata_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, environment_id, sha) DO UPDATE SET
+                    branch = excluded.branch,
+                    author = excluded.author,
+                    deployed_at_ms = excluded.deployed_at_ms,
+                    changed_files_json = CASE
+                        WHEN ? THEN deploy_markers.changed_files_json
+                        ELSE excluded.changed_files_json
+                    END,
+                    metadata_json = CASE
+                        WHEN ? THEN deploy_markers.metadata_json
+                        ELSE excluded.metadata_json
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    deploy_id,
+                    public_id,
+                    project_id,
+                    environment_id,
+                    clean_sha,
+                    branch.strip(),
+                    author.strip(),
+                    int(deployed_at_ms),
+                    changed_files_json,
+                    metadata_json,
+                    now,
+                    now,
+                    int(changed_files_was_omitted),
+                    int(metadata_was_omitted),
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT id
+                FROM deploy_markers
+                WHERE project_id = ? AND environment_id = ? AND sha = ?
+                """,
+                (project_id, environment_id, clean_sha),
+            ).fetchone()
+            assert row is not None
+            return str(row["id"])
+
+    def get_deploy_marker(self, deploy_id: str) -> Optional[DeployMarkerRow]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM deploy_markers
+                WHERE id = ? OR public_id = ? OR sha = ?
+                ORDER BY deployed_at_ms DESC
+                LIMIT 1
+                """,
+                (deploy_id, deploy_id, deploy_id),
+            ).fetchone()
+        return self._deploy_marker_from_row(row) if row is not None else None
+
+    def get_deploy_marker_by_sha(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        sha: str,
+    ) -> Optional[DeployMarkerRow]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM deploy_markers
+                WHERE project_id = ? AND environment_id = ? AND sha = ?
+                """,
+                (project_id, environment_id, sha),
+            ).fetchone()
+        return self._deploy_marker_from_row(row) if row is not None else None
+
+    def list_deploy_markers(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        limit: int = 50,
+    ) -> list[DeployMarkerRow]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM deploy_markers
+                WHERE project_id = ? AND environment_id = ?
+                ORDER BY deployed_at_ms DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (project_id, environment_id, max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [self._deploy_marker_from_row(row) for row in rows]
+
+    def nearest_deploy_marker(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        at_ms: int,
+    ) -> Optional[DeployMarkerRow]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM deploy_markers
+                WHERE project_id = ? AND environment_id = ?
+                  AND deployed_at_ms <= ?
+                ORDER BY deployed_at_ms DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (project_id, environment_id, max(0, int(at_ms))),
+            ).fetchone()
+        return self._deploy_marker_from_row(row) if row is not None else None
+
+    def update_failure_deploy(self, *, failure_id: str, deploy_sha: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE failures
+                SET related_deploy_sha = ?, updated_at = ?
+                WHERE id = ? OR public_id = ?
+                """,
+                (deploy_sha.strip(), now, failure_id, failure_id),
+            )
+            row = conn.execute(
+                """
+                SELECT id
+                FROM failures
+                WHERE id = ? OR public_id = ?
+                """,
+                (failure_id, failure_id),
+            ).fetchone()
+            if row is not None:
+                self._refresh_incidents_for_failure(
+                    conn,
+                    failure_id=str(row["id"]),
+                )
+
+    def _deploy_marker_from_row(self, row: sqlite3.Row) -> DeployMarkerRow:
+        return DeployMarkerRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            sha=str(row["sha"]),
+            branch=str(row["branch"] or ""),
+            author=str(row["author"] or ""),
+            deployed_at_ms=int(row["deployed_at_ms"] or 0),
+            changed_files=self._parse_string_list_json(row["changed_files_json"]),
+            metadata=dict(self._safe_json_obj(row["metadata_json"])),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
 
     def upsert_failure_with_evidence_and_repair_task(
         self,

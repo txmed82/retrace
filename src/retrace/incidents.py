@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from retrace.storage import EvidenceRow, FailureRow, IncidentRow, RepairTaskRow, Storage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -48,7 +51,7 @@ def group_failure_into_incident(
         severity=failure.severity,
         metadata=incident_metadata(failure),
     )
-    store.link_failure_to_incident(incident_id=incident_id, failure_id=failure.id)
+    store.move_failure_to_incident(incident_id=incident_id, failure_id=failure.id)
     incident = store.get_incident(incident_id)
     failures = store.list_incident_failures(incident_id=incident_id)
     return IncidentGroupingResult(
@@ -87,20 +90,36 @@ def get_incident_detail(
 
 def ensure_incident_repair_task(*, store: Storage, incident_id: str) -> str:
     detail = get_incident_detail(store=store, incident_id=incident_id)
-    if detail.incident.repair_task_id:
-        return detail.incident.repair_task_id
     if not detail.failures:
         raise ValueError(f"incident has no linked failures: {incident_id}")
-    representative = detail.failures[0]
+    existing_task = (
+        store.get_repair_task(detail.incident.repair_task_id)
+        if detail.incident.repair_task_id
+        else None
+    )
+    representative = next(
+        (
+            failure
+            for failure in detail.failures
+            if existing_task is not None and failure.id == existing_task.failure_id
+        ),
+        detail.failures[0],
+    )
     evidence_ids = [
         item.id for item in detail.evidence if item.failure_id == representative.id
     ]
+    changed_files = _unique_strings(
+        file
+        for failure in detail.failures
+        for file in _safe_changed_files_for_failure(store=store, failure=failure)
+    )
     repair_task_id = store.upsert_repair_task(
         failure_id=representative.id,
         title=f"Repair incident: {detail.incident.title}",
         source_type="incident",
         source_external_id=detail.incident.public_id,
         status="open",
+        likely_files=changed_files,
         risk_notes=(
             "Review all linked incident failures and monitoring evidence before "
             "applying a fix."
@@ -111,14 +130,16 @@ def ensure_incident_repair_task(*, store: Storage, incident_id: str) -> str:
             "group_key": detail.incident.group_key,
             "failure_ids": [failure.id for failure in detail.failures],
             "evidence_ids": [item.id for item in detail.evidence],
+            "deploy_changed_files": changed_files,
         },
         evidence_ids=evidence_ids,
     )
-    store.set_incident_repair_task(
-        incident_id=detail.incident.id,
-        repair_task_id=repair_task_id,
-    )
-    return repair_task_id
+    if not detail.incident.repair_task_id:
+        store.set_incident_repair_task(
+            incident_id=detail.incident.id,
+            repair_task_id=repair_task_id,
+        )
+    return detail.incident.repair_task_id or repair_task_id
 
 
 def incident_group_key(failure: FailureRow) -> str:
@@ -214,3 +235,28 @@ def _first_list_item(value: Any) -> str:
                 return text
     text = str(value or "").strip()
     return text
+
+
+def _unique_strings(values: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value or "").strip()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _safe_changed_files_for_failure(*, store: Storage, failure: FailureRow) -> list[str]:
+    from retrace.deploys import changed_files_for_failure
+
+    try:
+        return changed_files_for_failure(store=store, failure=failure)
+    except Exception:
+        logger.warning(
+            "failed to load deploy changed files for incident repair context",
+            extra={"failure_id": failure.id, "deploy_sha": failure.related_deploy_sha},
+            exc_info=True,
+        )
+        return []

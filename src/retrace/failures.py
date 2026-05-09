@@ -310,6 +310,7 @@ def canonical_failure_from_monitor_incident(
     summary: str = "",
     severity: str = "medium",
     fingerprint: str = "",
+    occurred_at_ms: int = 0,
     metadata: dict[str, Any] | None = None,
 ) -> CanonicalFailure:
     source_external_id = f"{provider}:{external_id}"
@@ -337,6 +338,8 @@ def canonical_failure_from_monitor_incident(
         severity=severity,
         confidence="high",
         status="new",
+        first_seen_ms=_safe_int(occurred_at_ms),
+        last_seen_ms=_safe_int(occurred_at_ms),
         metadata={"provider": provider, **(metadata or {})},
     )
 
