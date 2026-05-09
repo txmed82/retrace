@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -187,6 +188,7 @@ def canonical_failure_from_test_run(
             "failure_classification": failure_classification,
             "execution_engine": str(getattr(run_result, "execution_engine", "") or ""),
             "artifacts": list(getattr(run_result, "artifacts", []) or []),
+            "trace_ids": _trace_ids_from_run_artifacts(run_result),
             "assertion_results": list(
                 getattr(run_result, "assertion_results", []) or []
             ),
@@ -393,3 +395,62 @@ def _api_trace_ids_from_spec(spec: Any) -> list[str]:
         if item and item not in out:
             out.append(item)
     return out
+
+
+def _trace_ids_from_run_artifacts(run_result: Any) -> list[str]:
+    out: list[str] = []
+    for artifact in list(getattr(run_result, "artifacts", []) or []):
+        if not isinstance(artifact, dict):
+            continue
+        artifact_type = str(artifact.get("artifact_type") or "")
+        if artifact_type not in {"network_output", "browser_harness_output"}:
+            continue
+        payload = _artifact_payload(str(artifact.get("path") or ""))
+        _collect_trace_ids(payload, out)
+        if len(out) >= 10:
+            break
+    return out[:10]
+
+
+def _artifact_payload(path_value: str) -> Any:
+    if not path_value:
+        return {}
+    try:
+        path = Path(path_value)
+        if not path.exists() or path.stat().st_size > 256_000:
+            return {}
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _collect_trace_ids(value: Any, out: list[str]) -> None:
+    if len(out) >= 10:
+        return
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            key_s = str(key).casefold()
+            if key_s in {"trace_id", "traceid", "requesttraceid", "responsetraceid"}:
+                _append_trace_id(str(nested or ""), out)
+            elif key_s in {"traceparent", "requesttraceparent", "responsetraceparent"}:
+                _append_trace_id(_trace_id_from_traceparent(str(nested or "")), out)
+            _collect_trace_ids(nested, out)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_trace_ids(item, out)
+
+
+def _append_trace_id(value: str, out: list[str]) -> None:
+    trace_id = value.strip().lower()
+    if trace_id and trace_id not in out:
+        out.append(trace_id)
+
+
+def _trace_id_from_traceparent(value: str) -> str:
+    parts = value.strip().split("-")
+    if len(parts) < 4:
+        return ""
+    trace_id = parts[1].lower()
+    if len(trace_id) != 32 or any(c not in "0123456789abcdef" for c in trace_id):
+        return ""
+    return trace_id

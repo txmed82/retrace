@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -429,6 +430,70 @@ def test_test_run_failure_can_be_represented_as_canonical_failure() -> None:
     assert failure.metadata["failure_classification"] == "app_bug"
     assert failure.metadata["assertion_results"] == [
         {"assertion_id": "a1", "ok": False}
+    ]
+
+
+def test_test_run_failure_extracts_backend_trace_ids_from_network_artifacts(
+    tmp_path: Path,
+) -> None:
+    network_path = tmp_path / "network.json"
+    network_path.write_text(
+        json.dumps(
+            [
+                {
+                    "url": "https://app.example/api/checkout",
+                    "status": 500,
+                    "headers": {
+                        "Traceparent": (
+                            "00-4bf92f3577b34da6a3ce929d0e0e4736-"
+                            "00f067aa0ba902b7-01"
+                        )
+                    },
+                },
+                {
+                    "url": "https://app.example/api/cart",
+                    "Trace_ID": "trace-short-1",
+                },
+            ]
+        )
+    )
+    result = RunResult(
+        run_id="run_1",
+        spec_id="checkout-smoke",
+        ok=False,
+        exit_code=1,
+        run_dir=str(tmp_path),
+        harness_log_path=str(tmp_path / "harness.log"),
+        app_log_path=str(tmp_path / "app.log"),
+        command="browser-harness run ...",
+        final_prompt="Verify checkout",
+        attempts=1,
+        flaky=False,
+        flake_reason="",
+        status="failed",
+        failure_classification="app_bug",
+        error="Checkout failed",
+        execution_engine="harness",
+        artifacts=[
+            {
+                "artifact_id": "browser-harness-network",
+                "artifact_type": "network_output",
+                "path": str(network_path),
+            }
+        ],
+        assertion_results=[],
+    )
+
+    failure = canonical_failure_from_test_run(
+        project_id="proj_1",
+        environment_id="env_1",
+        run_result=result,
+        spec_name="Checkout smoke",
+    )
+
+    assert failure.metadata["trace_ids"] == [
+        "4bf92f3577b34da6a3ce929d0e0e4736",
+        "trace-short-1",
     ]
 
 
