@@ -34,8 +34,8 @@ def record_deploy(
         branch=branch,
         author=author,
         deployed_at_ms=deployed_at_ms or int(time() * 1000),
-        changed_files=changed_files or [],
-        metadata=metadata or {},
+        changed_files=changed_files,
+        metadata=metadata,
     )
     deploy = store.get_deploy_marker(deploy_id)
     assert deploy is not None
@@ -61,6 +61,9 @@ def correlate_failure_to_deploy(
     if deploy is None:
         return None
     store.update_failure_deploy(failure_id=failure.id, deploy_sha=deploy.sha)
+    from retrace.incidents import group_failure_into_incident
+
+    group_failure_into_incident(store=store, failure_id=failure.id)
     return DeployCorrelationResult(
         failure_id=failure.id,
         deploy_id=deploy.id,
@@ -91,18 +94,16 @@ def correlate_recent_failures_to_deploys(
 def changed_files_for_failure(*, store: Storage, failure: FailureRow) -> list[str]:
     if not failure.related_deploy_sha:
         return []
-    for deploy in store.list_deploy_markers(
+    deploy = store.get_deploy_marker_by_sha(
         project_id=failure.project_id,
         environment_id=failure.environment_id,
-        limit=100,
-    ):
-        if deploy.sha == failure.related_deploy_sha:
-            return deploy.changed_files
-    return []
+        sha=failure.related_deploy_sha,
+    )
+    return deploy.changed_files if deploy is not None else []
 
 
 def _failure_time_ms(failure: FailureRow) -> int:
-    for value in (failure.first_seen_ms, failure.last_seen_ms):
+    for value in (failure.last_seen_ms, failure.first_seen_ms):
         if int(value or 0) > 0:
             return int(value)
     return 0

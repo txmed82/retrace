@@ -1872,6 +1872,63 @@ class Storage:
             )
             self._refresh_incident_rollup(conn, incident_id=str(incident["id"]))
 
+    def move_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
+        with self._conn() as conn:
+            incident = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM incidents
+                WHERE id = ? OR public_id = ?
+                """,
+                (incident_id, incident_id),
+            ).fetchone()
+            if incident is None:
+                raise ValueError(f"unknown incident_id: {incident_id}")
+            failure = conn.execute(
+                """
+                SELECT id, project_id, environment_id
+                FROM failures
+                WHERE id = ? OR public_id = ?
+                """,
+                (failure_id, failure_id),
+            ).fetchone()
+            if failure is None:
+                raise ValueError(f"unknown failure_id: {failure_id}")
+            if (
+                str(incident["project_id"]) != str(failure["project_id"])
+                or str(incident["environment_id"]) != str(failure["environment_id"])
+            ):
+                raise ValueError("incident and failure must belong to the same workspace")
+            old_links = conn.execute(
+                """
+                SELECT incident_id
+                FROM incident_failures
+                WHERE failure_id = ?
+                """,
+                (str(failure["id"]),),
+            ).fetchall()
+            conn.execute(
+                """
+                DELETE FROM incident_failures
+                WHERE failure_id = ?
+                """,
+                (str(failure["id"]),),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO incident_failures
+                (incident_id, failure_id)
+                VALUES (?, ?)
+                """,
+                (str(incident["id"]), str(failure["id"])),
+            )
+            for row in old_links:
+                self._refresh_incident_rollup(
+                    conn,
+                    incident_id=str(row["incident_id"]),
+                )
+            self._refresh_incident_rollup(conn, incident_id=str(incident["id"]))
+
     def get_incident(self, incident_id: str) -> Optional[IncidentRow]:
         with self._conn() as conn:
             row = conn.execute(
@@ -2135,6 +2192,8 @@ class Storage:
         now = datetime.now(timezone.utc).isoformat()
         deploy_id = self._id("dep")
         public_id = self._public_id("dep", project_id, environment_id, clean_sha)
+        changed_files_was_omitted = changed_files is None
+        metadata_was_omitted = metadata is None
         clean_changed_files = self._merge_string_lists(changed_files or [])
         try:
             metadata_json = json.dumps(metadata or {}, sort_keys=True)
@@ -2152,8 +2211,14 @@ class Storage:
                     branch = excluded.branch,
                     author = excluded.author,
                     deployed_at_ms = excluded.deployed_at_ms,
-                    changed_files_json = excluded.changed_files_json,
-                    metadata_json = excluded.metadata_json,
+                    changed_files_json = CASE
+                        WHEN ? THEN deploy_markers.changed_files_json
+                        ELSE excluded.changed_files_json
+                    END,
+                    metadata_json = CASE
+                        WHEN ? THEN deploy_markers.metadata_json
+                        ELSE excluded.metadata_json
+                    END,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -2169,6 +2234,8 @@ class Storage:
                     metadata_json,
                     now,
                     now,
+                    int(changed_files_was_omitted),
+                    int(metadata_was_omitted),
                 ),
             )
             row = conn.execute(
@@ -2193,6 +2260,24 @@ class Storage:
                 LIMIT 1
                 """,
                 (deploy_id, deploy_id, deploy_id),
+            ).fetchone()
+        return self._deploy_marker_from_row(row) if row is not None else None
+
+    def get_deploy_marker_by_sha(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        sha: str,
+    ) -> Optional[DeployMarkerRow]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM deploy_markers
+                WHERE project_id = ? AND environment_id = ? AND sha = ?
+                """,
+                (project_id, environment_id, sha),
             ).fetchone()
         return self._deploy_marker_from_row(row) if row is not None else None
 

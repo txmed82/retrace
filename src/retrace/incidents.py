@@ -5,7 +5,6 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from retrace.deploys import changed_files_for_failure
 from retrace.storage import EvidenceRow, FailureRow, IncidentRow, RepairTaskRow, Storage
 
 
@@ -49,7 +48,7 @@ def group_failure_into_incident(
         severity=failure.severity,
         metadata=incident_metadata(failure),
     )
-    store.link_failure_to_incident(incident_id=incident_id, failure_id=failure.id)
+    store.move_failure_to_incident(incident_id=incident_id, failure_id=failure.id)
     incident = store.get_incident(incident_id)
     failures = store.list_incident_failures(incident_id=incident_id)
     return IncidentGroupingResult(
@@ -96,6 +95,8 @@ def ensure_incident_repair_task(*, store: Storage, incident_id: str) -> str:
     evidence_ids = [
         item.id for item in detail.evidence if item.failure_id == representative.id
     ]
+    from retrace.deploys import changed_files_for_failure
+
     changed_files = _unique_strings(
         file
         for failure in detail.failures

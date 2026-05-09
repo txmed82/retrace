@@ -407,6 +407,9 @@ def _handler(
             if length <= 0:
                 _json_response(self, 400, {"error": "invalid_payload"})
                 return
+            if length > MAX_REPLAY_BODY_BYTES:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
             body = self.rfile.read(length)
             try:
                 payload = json.loads(body.decode("utf-8") or "{}")
@@ -420,10 +423,13 @@ def _handler(
             if not sha:
                 _json_response(self, 400, {"error": "missing_sha"})
                 return
-            changed_files = payload.get("changed_files") or payload.get("changedFiles") or []
-            if not isinstance(changed_files, list):
-                _json_response(self, 400, {"error": "invalid_changed_files"})
-                return
+            changed_files = payload.get("changed_files", payload.get("changedFiles"))
+            clean_changed_files: list[str] | None = None
+            if changed_files is not None:
+                if not isinstance(changed_files, list):
+                    _json_response(self, 400, {"error": "invalid_changed_files"})
+                    return
+                clean_changed_files = [str(item) for item in changed_files]
             try:
                 deployed_at_ms = int(payload.get("deployed_at_ms") or 0)
             except (TypeError, ValueError):
@@ -438,14 +444,21 @@ def _handler(
                     branch=str(payload.get("branch") or ""),
                     author=str(payload.get("author") or ""),
                     deployed_at_ms=deployed_at_ms,
-                    changed_files=[str(item) for item in changed_files],
-                    metadata=dict(payload.get("metadata") or {}),
+                    changed_files=clean_changed_files,
+                    metadata=(
+                        dict(payload.get("metadata"))
+                        if isinstance(payload.get("metadata"), dict)
+                        else None
+                    ),
                 )
                 correlations = correlate_recent_failures_to_deploys(
                     store=store,
                     project_id=token.project_id,
                     environment_id=environment_id,
                 )
+                correlations = [
+                    item for item in correlations if item.deploy_sha == deploy.sha
+                ]
             except Exception:
                 logger.exception("Unhandled deploy ingest error")
                 _json_response(

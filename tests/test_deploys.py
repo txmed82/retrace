@@ -75,6 +75,16 @@ def test_deploy_marker_can_be_recorded(tmp_path: Path) -> None:
     assert stored.sha == "abc123"
     assert stored.changed_files == ["src/checkout.ts", "src/cart.ts"]
 
+    updated = record_deploy(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        sha="abc123",
+        branch="release",
+    )
+    assert updated.branch == "release"
+    assert updated.changed_files == ["src/checkout.ts", "src/cart.ts"]
+
 
 def test_failure_after_deploy_links_to_nearest_deploy(tmp_path: Path) -> None:
     store, workspace = _store(tmp_path)
@@ -104,6 +114,33 @@ def test_failure_after_deploy_links_to_nearest_deploy(tmp_path: Path) -> None:
     assert result.changed_files == ["src/checkout.ts"]
     assert failure is not None
     assert failure.related_deploy_sha == "new"
+
+
+def test_recurring_failure_uses_last_seen_for_deploy_correlation(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    record_deploy(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        sha="old",
+        deployed_at_ms=500,
+        changed_files=["src/old.ts"],
+    )
+    record_deploy(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        sha="new",
+        deployed_at_ms=2_000,
+        changed_files=["src/new.ts"],
+    )
+    failure_id = _failure(store, workspace, occurred_at_ms=1_000)
+    _failure(store, workspace, occurred_at_ms=2_500)
+
+    result = correlate_failure_to_deploy(store=store, failure_id=failure_id)
+
+    assert result is not None
+    assert result.deploy_sha == "new"
 
 
 def test_incident_repair_task_includes_deploy_changed_files(tmp_path: Path) -> None:
