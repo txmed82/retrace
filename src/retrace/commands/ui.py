@@ -1079,6 +1079,111 @@ def _generate_replay_issue_spec_payload(
     )
 
 
+def _issue_has_replay_regression_link(store: Storage, issue: Any) -> bool:
+    failure_id = str(issue["canonical_failure_id"] or "")
+    if not failure_id:
+        return False
+    return any(
+        link.source == "replay_issue"
+        for link in store.list_failure_test_links(failure_id=failure_id)
+    )
+
+
+def _generate_replay_issue_specs_payload(
+    *,
+    store: Storage,
+    data_dir: Path,
+    project_id: str,
+    environment_id: str,
+    issue_ids: list[str] | None = None,
+    status: str = "",
+    app_url: str = "",
+    limit: int = 25,
+    missing_only: bool = True,
+) -> tuple[dict[str, Any], int]:
+    try:
+        limit_v = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        limit_v = 25
+    clean_issue_ids = [
+        str(item).strip()
+        for item in (issue_ids or [])
+        if str(item or "").strip()
+    ][:limit_v]
+    selected: list[Any] = []
+    seen: set[str] = set()
+    if clean_issue_ids:
+        for issue_id in clean_issue_ids:
+            row = store.get_replay_issue(
+                project_id=project_id,
+                environment_id=environment_id,
+                issue_id=issue_id,
+            )
+            if row is None:
+                continue
+            public_id = str(row["public_id"])
+            if public_id in seen:
+                continue
+            seen.add(public_id)
+            selected.append(row)
+    else:
+        selected = store.list_replay_issues(
+            project_id=project_id,
+            environment_id=environment_id,
+            status=status or None,
+        )[:limit_v]
+
+    results: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    failed: list[dict[str, str]] = []
+    for issue in selected:
+        public_id = str(issue["public_id"])
+        issue_status = str(issue["status"] or "")
+        if issue_status == "ignored":
+            skipped.append({"issue_public_id": public_id, "reason": "ignored"})
+            continue
+        if missing_only and _issue_has_replay_regression_link(store, issue):
+            skipped.append(
+                {"issue_public_id": public_id, "reason": "already_covered"}
+            )
+            continue
+        try:
+            generated = generate_spec_from_replay_issue(
+                store=store,
+                specs_dir=specs_dir_for_data_dir(data_dir),
+                project_id=project_id,
+                environment_id=environment_id,
+                issue_id=public_id,
+                app_url=app_url,
+            )
+        except Exception as exc:
+            failed.append({"issue_public_id": public_id, "error": str(exc)})
+            continue
+        results.append(
+            {
+                "issue_public_id": generated.issue_public_id,
+                "replay_public_id": generated.replay_public_id,
+                "spec_id": generated.spec.spec_id,
+                "spec_name": generated.spec.name,
+                "confidence": generated.confidence,
+                "known_gaps": generated.known_gaps,
+            }
+        )
+    ok = not failed
+    return (
+        {
+            "ok": ok,
+            "requested": len(clean_issue_ids) if clean_issue_ids else len(selected),
+            "considered": len(selected),
+            "generated": len(results),
+            "skipped": skipped,
+            "failed": failed,
+            "results": results,
+        },
+        200 if ok else 207,
+    )
+
+
 def _generate_replay_issue_api_spec_payload(
     *,
     store: Storage,
@@ -2144,6 +2249,49 @@ const retrace = init({
       await refreshTesterAndReplay(issue.public_id);
     }
 
+    function selectedReplayIssueIds(){
+      const checked = [...document.querySelectorAll('[data-issue-select]:checked')].map(el => el.value).filter(Boolean);
+      if(checked.length) return checked;
+      const list = byId('replayIssueList');
+      if(!list) return [];
+      return [...list.querySelectorAll('[data-replay-issue]')]
+        .filter(row => row.style.display !== 'none')
+        .map(row => row.dataset.replayIssue)
+        .filter(Boolean);
+    }
+
+    async function generateGroupedReplayIssueSpecs(){
+      const status = byId('groupReplaySpecStatus');
+      const issueIds = selectedReplayIssueIds();
+      if(status) status.textContent = issueIds.length ? `Generating ${issueIds.length} spec(s)...` : 'Generating specs...';
+      const res = await fetch('/api/replay-issues/specs', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          issue_ids: issueIds,
+          status: byId('issueStatusFilter')?.value || '',
+          project_id: replayState.issues[0]?.project_id || '',
+          environment_id: replayState.issues[0]?.environment_id || '',
+          app_url: byId('testerSpecAppUrl')?.value || '',
+          missing_only: true,
+          limit: Math.min(issueIds.length || 25, 100),
+        }),
+      });
+      const data = await res.json();
+      const failures = (data.failed || []).map(item => `${item.issue_public_id}: ${item.error}`).join('; ');
+      if(!res.ok){
+        if(status) status.textContent = failures || data.error || 'Grouped spec generation failed';
+        await refreshTesterAndReplay(replayState.activeIssueId);
+        return;
+      }
+      if(status) {
+        status.textContent = failures
+          ? `Generated ${data.generated || 0}; skipped ${(data.skipped || []).length}; failed ${(data.failed || []).length}: ${failures}`
+          : `Generated ${data.generated || 0}; skipped ${(data.skipped || []).length}.`;
+      }
+      await refreshTesterAndReplay(replayState.activeIssueId);
+    }
+
     async function generateReplayIssueApiSpec(issue){
       if(!issue){ return; }
       const status = byId('replayApiSpecStatus');
@@ -2385,6 +2533,7 @@ const retrace = init({
         .map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
       const issueRows = issues.map(i => `
           <div class="issue-row ${replayState.activeIssueId === i.public_id ? 'active' : ''}" role="button" tabindex="0" data-issue-status="${esc(i.status)}" data-replay-issue="${esc(i.public_id)}">
+            <input type="checkbox" data-issue-select value="${esc(i.public_id)}" aria-label="Select ${esc(i.public_id)}" style="width:auto; margin-right:6px" />
             <div class="sev">${esc(i.status)} · ${esc(i.severity)} · ${esc(i.confidence || 'medium')} confidence</div>
             <div class="title">${esc(i.title || 'Untitled issue')}</div>
           <div class="empty">${esc(i.public_id)} · sessions=${esc(i.affected_count)} · users=${esc(i.affected_users || 0)} · evidence=${esc((i.timeline || []).length)} · tests=${esc((i.test_links || []).length)} · ${esc(i.analysis_status || 'fallback')}</div>
@@ -2402,6 +2551,8 @@ const retrace = init({
           <select id="issueStatusFilter" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">
             <option value="">All statuses</option>${issueOptions}
           </select>
+          <button class="btn" id="generateGroupedReplaySpecsBtn" type="button" style="margin-top:8px">Generate Tests For Group</button>
+          <div class="empty" id="groupReplaySpecStatus"></div>
         </div>
         <div id="replayIssueList">${issueRows || '<div class="empty" style="padding:12px">No replay issues yet.</div>'}</div>
       `;
@@ -2435,6 +2586,11 @@ const retrace = init({
         el.onclick = () => loadFirstPartyReplay(el.dataset.replaySession);
       });
       bindReplayIssueRows();
+      document.querySelectorAll('[data-issue-select]').forEach(el => {
+        el.addEventListener('click', ev => ev.stopPropagation());
+        el.addEventListener('keydown', ev => ev.stopPropagation());
+      });
+      byId('generateGroupedReplaySpecsBtn')?.addEventListener('click', generateGroupedReplayIssueSpecs);
       document.querySelectorAll('[data-view-jump]').forEach(el => el.addEventListener('click', () => switchView(el.dataset.viewJump)));
       byId('issueStatusFilter')?.addEventListener('change', ev => filterReplayRows('replayIssueList', 'issueStatus', ev.target.value));
       byId('sessionStatusFilter')?.addEventListener('change', ev => filterReplayRows('replaySessionList', 'sessionStatus', ev.target.value));
@@ -3448,6 +3604,27 @@ def ui_command(
                     environment_id=str(body.get("environment_id", "")).strip()
                     or workspace.environment_id,
                     app_url=str(body.get("app_url", "")).strip(),
+                )
+                self._json(payload, status=status)
+                return
+
+            if path == "/api/replay-issues/specs":
+                body = self._read_json_body()
+                workspace = store.ensure_workspace(project_name="Default")
+                raw_issue_ids = body.get("issue_ids")
+                issue_ids = raw_issue_ids if isinstance(raw_issue_ids, list) else []
+                payload, status = _generate_replay_issue_specs_payload(
+                    store=store,
+                    data_dir=data_dir,
+                    project_id=str(body.get("project_id", "")).strip()
+                    or workspace.project_id,
+                    environment_id=str(body.get("environment_id", "")).strip()
+                    or workspace.environment_id,
+                    issue_ids=[str(item) for item in issue_ids],
+                    status=str(body.get("status", "")).strip(),
+                    app_url=str(body.get("app_url", "")).strip(),
+                    limit=int(body.get("limit") or 25),
+                    missing_only=bool(body.get("missing_only", True)),
                 )
                 self._json(payload, status=status)
                 return
