@@ -8,6 +8,7 @@ from typing import Any
 
 from retrace.evidence import EvidenceItem, evidence_dedupe_key
 from retrace.failures import canonical_failure_from_monitor_incident
+from retrace.incidents import group_failure_into_incident
 from retrace.storage import Storage
 
 
@@ -32,6 +33,8 @@ class MonitoringIngestResult:
     failure_public_id: str
     created: bool
     evidence_id: str
+    incident_id: str = ""
+    incident_public_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -41,6 +44,8 @@ class MonitoringIngestResult:
             "failure_public_id": self.failure_public_id,
             "created": self.created,
             "evidence_id": self.evidence_id,
+            "incident_id": self.incident_id,
+            "incident_public_id": self.incident_public_id,
         }
 
 
@@ -93,6 +98,7 @@ def ingest_monitoring_webhook(
         ),
     )
     evidence_id = store.append_failure_evidence(evidence)
+    incident = group_failure_into_incident(store=store, failure_id=failure_id)
     return MonitoringIngestResult(
         provider=alert.provider,
         external_id=alert.external_id,
@@ -100,6 +106,8 @@ def ingest_monitoring_webhook(
         failure_public_id=str(getattr(persisted, "public_id", "") or failure.public_id),
         created=existing is None,
         evidence_id=evidence_id,
+        incident_id=incident.incident_id,
+        incident_public_id=incident.incident_public_id,
     )
 
 
