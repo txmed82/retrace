@@ -971,7 +971,7 @@ def _api_trigger_context(
         if not isinstance(event, dict):
             continue
         timestamp_ms = _status_int(event.get("timestamp_ms"))
-        if signal_timestamp_ms and abs(timestamp_ms - signal_timestamp_ms) > 10_000:
+        if signal_timestamp_ms > 0 and abs(timestamp_ms - signal_timestamp_ms) > 10_000:
             continue
         event_type = event.get("type")
         if event_type == 4:
