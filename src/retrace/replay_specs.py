@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 from retrace.api_testing import APITestSpec, create_api_spec
 from retrace.storage import Storage
@@ -160,10 +160,19 @@ def generate_api_spec_from_replay_issue(
     if not raw_url:
         raise ValueError(f"Network signal has no request_url: {issue_id}")
     url, query = _api_url_and_query(raw_url, base_url)
+    sanitized_source_url = _redacted_url(raw_url)
     headers, auth, header_notes = _safe_api_headers(details)
     body, body_notes = _safe_api_body(details)
     original_status = _status_int(details.get("status") or details.get("status_code"))
     expected_status = 200 if original_status >= 500 or original_status == 0 else original_status
+    sanitized_signal = _sanitized_network_signal(
+        signal=signal,
+        method=method,
+        url=sanitized_source_url,
+        status=original_status,
+        headers=headers,
+        body=body,
+    )
     spec = create_api_spec(
         specs_dir=specs_dir,
         name=f"{issue['public_id']} API regression",
@@ -188,7 +197,7 @@ def generate_api_spec_from_replay_issue(
             "source_network_signal": {
                 "detector": signal.get("detector"),
                 "method": method,
-                "url": raw_url,
+                "url": sanitized_source_url,
                 "status": original_status,
             },
             "fixture_notes": [
@@ -213,7 +222,7 @@ def generate_api_spec_from_replay_issue(
         spec=spec,
         issue_public_id=str(issue["public_id"]),
         replay_public_id=str(playback.session["public_id"]),
-        source_signal=dict(signal),
+        source_signal=sanitized_signal,
     )
 
 
@@ -770,19 +779,54 @@ _SENSITIVE_BODY_KEYS = {
     "secret",
     "token",
 }
+_SENSITIVE_QUERY_KEYS = {
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "authorization",
+    "jwt",
+    "password",
+    "secret",
+    "token",
+}
 
 
 def _api_url_and_query(raw_url: str, base_url: str) -> tuple[str, dict[str, Any]]:
     absolute = raw_url if raw_url.startswith(("http://", "https://")) else urljoin(base_url, raw_url)
     parsed = urlparse(absolute)
-    query = {
+    raw_query = {
         key: values[-1] if len(values) == 1 else values
         for key, values in parse_qs(parsed.query, keep_blank_values=True).items()
     }
+    query = _redact_query(raw_query)
     clean_url = urlunparse(
         (parsed.scheme, parsed.netloc, parsed.path, parsed.params, "", parsed.fragment)
     )
     return clean_url, query
+
+
+def _redacted_url(raw_url: str) -> str:
+    parsed = urlparse(raw_url)
+    raw_query = {
+        key: values[-1] if len(values) == 1 else values
+        for key, values in parse_qs(parsed.query, keep_blank_values=True).items()
+    }
+    query = urlencode(_redact_query(raw_query), doseq=True)
+    return urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment)
+    )
+
+
+def _redact_query(query: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: (
+            "[redacted-api-input]"
+            if str(key).lower() in _SENSITIVE_QUERY_KEYS
+            else value
+        )
+        for key, value in query.items()
+    }
 
 
 def _safe_api_headers(details: dict[str, Any]) -> tuple[dict[str, str], dict[str, Any], list[str]]:
@@ -822,11 +866,50 @@ def _safe_api_body(details: dict[str, Any]) -> tuple[Any, list[str]]:
     )
     if body in (None, ""):
         return None, []
+    if isinstance(body, bytes):
+        try:
+            body = body.decode("utf-8")
+        except UnicodeDecodeError:
+            return body, []
+    if isinstance(body, str):
+        try:
+            parsed_body = json.loads(body)
+        except json.JSONDecodeError:
+            return body, []
+        redacted_body = _redact_api_body(parsed_body)
+        notes = []
+        if redacted_body != parsed_body:
+            notes.append(
+                "Sensitive request body values were replaced with redacted placeholders."
+            )
+        return json.dumps(redacted_body, sort_keys=True), notes
     redacted = _redact_api_body(body)
     notes = []
     if redacted != body:
         notes.append("Sensitive request body values were replaced with redacted placeholders.")
     return redacted, notes
+
+
+def _sanitized_network_signal(
+    *,
+    signal: dict[str, Any],
+    method: str,
+    url: str,
+    status: int,
+    headers: dict[str, str],
+    body: Any,
+) -> dict[str, Any]:
+    return {
+        "detector": signal.get("detector"),
+        "timestamp_ms": signal.get("timestamp_ms"),
+        "details": {
+            "method": method,
+            "request_url": url,
+            "status": status,
+            "request_headers": headers,
+            "request_body": body,
+        },
+    }
 
 
 def _redact_api_body(value: Any) -> Any:

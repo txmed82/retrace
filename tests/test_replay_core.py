@@ -963,17 +963,16 @@ def test_generate_api_spec_from_failed_replay_network_call(tmp_path: Path) -> No
                     "timestamp_ms": 300,
                     "details": {
                         "method": "POST",
-                        "request_url": "/api/checkout?cart=abc",
+                        "request_url": "/api/checkout?cart=abc&token=secret-token",
                         "status": 500,
                         "request_headers": {
                             "content-type": "application/json",
                             "authorization": "Bearer secret-token",
                             "x-api-key": "secret-key",
                         },
-                        "request_body": {
-                            "cart_id": "abc",
-                            "token": "secret-token",
-                        },
+                        "request_body": json.dumps(
+                            {"cart_id": "abc", "token": "secret-token"}
+                        ),
                     },
                 }
             ]
@@ -993,16 +992,27 @@ def test_generate_api_spec_from_failed_replay_network_call(tmp_path: Path) -> No
     loaded = load_api_spec(tmp_path / "api-specs", spec.spec_id)
     assert loaded.method == "POST"
     assert loaded.url == "https://app.example/api/checkout"
-    assert loaded.query == {"cart": "abc"}
+    assert loaded.query == {"cart": "abc", "token": "[redacted-api-input]"}
     assert loaded.expected_status == 200
     assert loaded.headers == {"content-type": "application/json"}
     assert loaded.auth == {
         "type": "headers",
         "headers_env": "RETRACE_API_AUTH_HEADERS",
     }
-    assert loaded.body == {"cart_id": "abc", "token": "[redacted-api-input]"}
+    assert json.loads(loaded.body) == {
+        "cart_id": "abc",
+        "token": "[redacted-api-input]",
+    }
+    assert loaded.fixtures["source_network_signal"]["url"] == (
+        "/api/checkout?cart=abc&token=%5Bredacted-api-input%5D"
+    )
+    assert generated.source_signal["details"]["request_url"] == (
+        "/api/checkout?cart=abc&token=%5Bredacted-api-input%5D"
+    )
     assert "secret-token" not in persisted
     assert "secret-key" not in persisted
+    assert "secret-token" not in json.dumps(generated.source_signal)
+    assert "secret-key" not in json.dumps(generated.source_signal)
     assert loaded.fixtures["source"] == "replay_issue_api"
     assert loaded.fixtures["issue_public_id"] == created.public_id
     assert loaded.fixtures["canonical_failure_id"]
