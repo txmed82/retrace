@@ -89,10 +89,14 @@ Scanned 9 sessions.  2 flagged into 2 cluster(s).
     assert "Parsed 1 findings" in result.output
 
     out_dir = tmp_path / "reports" / "fix-prompts"
-    json_files = list(out_dir.glob("*.json"))
+    json_files = [
+        path for path in out_dir.glob("*.json") if not path.name.endswith(".artifacts.json")
+    ]
+    manifest_files = list(out_dir.glob("*.artifacts.json"))
     codex_files = list(out_dir.glob("*.codex.md"))
     claude_files = list(out_dir.glob("*.claude.md"))
     assert len(json_files) == 1
+    assert len(manifest_files) == 1
     assert len(codex_files) == 1
     assert len(claude_files) == 1
     text = json_files[0].read_text()
@@ -148,16 +152,23 @@ def test_suggest_fixes_generates_from_replay_issue(tmp_path: Path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert f"Parsed 1 findings from replay issue {issue_id}" in result.output
     out_dir = tmp_path / "reports" / "fix-prompts"
-    json_files = list(out_dir.glob("replay-*.json"))
+    json_files = [
+        path for path in out_dir.glob("replay-*.json") if not path.name.endswith(".artifacts.json")
+    ]
+    manifest_files = list(out_dir.glob("replay-*.artifacts.json"))
     codex_files = list(out_dir.glob("replay-*.codex.md"))
     claude_files = list(out_dir.glob("replay-*.claude.md"))
     assert len(json_files) == 1
+    assert len(manifest_files) == 1
     assert len(codex_files) == 1
     assert len(claude_files) == 1
     artifact = json_files[0].read_text()
     assert '"repo": "acme/widgets"' in artifact
     assert "checkout.tsx" in artifact
     assert issue_id in codex_files[0].read_text()
+    manifest = json.loads(manifest_files[0].read_text())
+    assert manifest["schema_version"] == "artifact_manifest.v1"
+    assert manifest["source_failure"] == f"replay://issue/{issue_id}"
 
     store = Storage(tmp_path / "data" / "retrace.db")
     store.init_schema()
@@ -238,10 +249,14 @@ def test_suggest_fixes_replay_issue_honors_project_environment_scope(
     assert result.exit_code == 0, result.output
     assert f"Parsed 1 findings from replay issue {issue_id}" in result.output
     out_dir = tmp_path / "reports" / "fix-prompts"
-    json_files = list(out_dir.glob("replay-*.json"))
+    json_files = [
+        path for path in out_dir.glob("replay-*.json") if not path.name.endswith(".artifacts.json")
+    ]
+    manifest_files = list(out_dir.glob("replay-*.artifacts.json"))
     codex_files = list(out_dir.glob("replay-*.codex.md"))
     claude_files = list(out_dir.glob("replay-*.claude.md"))
     assert len(json_files) == 1
+    assert len(manifest_files) == 1
     assert len(codex_files) == 1
     assert len(claude_files) == 1
     artifact = json_files[0].read_text()

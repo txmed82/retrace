@@ -412,6 +412,7 @@ def test_generate_replay_issue_fix_prompts_payload_creates_agent_prompts(
     assert "src/checkout.tsx" in task.likely_files
     out_dir = tmp_path / "reports" / "fix-prompts"
     assert (out_dir / payload["artifact_json"]).exists()
+    assert (out_dir / payload["artifact_manifest_json"]).exists()
     assert (out_dir / payload["prompt_files"]["codex"]).exists()
 
 
