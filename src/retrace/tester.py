@@ -2083,14 +2083,29 @@ def _should_use_playwright(spec: TesterSpec, steps: list[dict[str, Any]]) -> boo
         "upload",
         "drag",
         "drop",
+        "drag_and_drop",
         "select",
         "scroll",
     }
     return any(
         str(step.get("action") or step.get("type") or "").lower() in browser_actions
-        and bool(step.get("selector") or step.get("text") or step.get("key"))
+        and _browser_step_has_runtime_signal(step)
         for step in steps
     )
+
+
+def _browser_step_has_runtime_signal(step: dict[str, Any]) -> bool:
+    action = str(step.get("action") or step.get("type") or "").strip().lower()
+    if action in {"wait", "keypress", "scroll", "drag_and_drop"}:
+        return True
+    if step.get("selector") or step.get("text") or step.get("key"):
+        return True
+    target = step.get("target")
+    if isinstance(target, dict) and target.get("selector"):
+        return True
+    if step.get("to") or step.get("target_selector") or step.get("destination_selector"):
+        return True
+    return False
 
 
 def _run_playwright_spec(

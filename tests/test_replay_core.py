@@ -651,7 +651,7 @@ def test_generate_spec_from_replay_issue_preserves_public_ids(
 
     assert generated.issue_public_id == issue_public_id
     assert generated.replay_public_id.startswith("rpl_")
-    assert generated.confidence == "medium"
+    assert generated.confidence == "low"
     assert generated.known_gaps
     assert generated.spec.execution_engine == "native"
     assert generated.spec.app_url == "https://app.example"
@@ -659,6 +659,14 @@ def test_generate_spec_from_replay_issue_preserves_public_ids(
     assert generated.spec.exact_steps[1]["action"] == "click"
     assert generated.spec.fixtures["issue_public_id"] == issue_public_id
     assert generated.spec.fixtures["canonical_failure_id"]
+    quality = generated.spec.fixtures["generation"]["quality"]
+    assert quality["status"] == "needs_locator"
+    assert quality["confidence"] == "low"
+    assert quality["requires_human_edit"] is True
+    assert quality["rrweb_fallback_step_count"] == 1
+    assert quality["blocking_gaps"] == [
+        "click-1 needs a durable locator for rrweb node 9"
+    ]
     assert (tmp_path / "specs" / f"{generated.spec.spec_id}.json").exists()
     links = store.list_failure_test_links(
         failure_id=str(generated.spec.fixtures["canonical_failure_id"])
@@ -752,6 +760,13 @@ def test_generate_spec_prefers_sdk_target_selectors_over_rrweb_ids(
     assert (
         generated.spec.fixtures["generation"]["unsupported_step_warnings"] == []
     )
+    quality = generated.spec.fixtures["generation"]["quality"]
+    assert quality["status"] == "needs_test_data"
+    assert quality["confidence"] == "medium"
+    assert quality["requires_human_edit"] is True
+    assert quality["selector_backed_step_count"] == 3
+    assert quality["rrweb_fallback_step_count"] == 0
+    assert quality["editable_gaps"] == ["input-1 needs safe test data"]
     assert generated.confidence == "medium"
 
 
@@ -855,6 +870,8 @@ def test_generate_spec_keeps_rrweb_fallbacks_not_near_sdk_events(
     assert generated.known_gaps == [
         "click-2 needs a durable locator for rrweb node 77"
     ]
+    assert generated.confidence == "low"
+    assert generated.spec.fixtures["generation"]["quality"]["status"] == "needs_locator"
 
 
 def test_generate_spec_adds_signal_assertions_and_generation_notes(
@@ -933,9 +950,62 @@ def test_generate_spec_adds_signal_assertions_and_generation_notes(
         "Open https://app.example/checkout",
         'Click [data-testid="checkout-pay"]',
     ]
+    network_assertion = next(
+        item
+        for item in generation["human_readable_assertions"]
+        if item.startswith("network-failure-cleared:")
+    )
+    assert network_assertion == (
+        "network-failure-cleared: expect model consensus on "
+        "No matching failed request or visible network error remains."
+    )
     assert "Run the app at https://app.example." in generation["preconditions"]
     assert any("redacted" in note for note in generation["fixture_notes"])
     assert generation["unsupported_step_warnings"] == []
+    assert generation["quality"]["status"] == "runnable"
+    assert generation["quality"]["requires_human_edit"] is False
+
+
+def test_generate_spec_marks_no_convertible_replay_steps_blocked(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _workspace(tmp_path)
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-no-steps",
+        sequence=0,
+        events=[],
+        flush_type="final",
+    )
+    created = store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="no-convertible-steps",
+        session_ids=["sess-no-steps"],
+        signal_summary={"console_error": 1},
+        first_seen_ms=100,
+        last_seen_ms=500,
+        title="No convertible replay steps",
+        evidence={"signals": []},
+    )
+
+    generated = generate_spec_from_replay_issue(
+        store=store,
+        specs_dir=tmp_path / "specs",
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=created.public_id,
+        app_url="https://app.example",
+    )
+
+    quality = generated.spec.fixtures["generation"]["quality"]
+    assert generated.confidence == "low"
+    assert quality["status"] == "blocked"
+    assert quality["blocking_gaps"] == [
+        "Replay did not include convertible navigation, click, or input events."
+    ]
+    assert "Inspect replay coverage" in quality["recommended_next_action"]
 
 
 def test_generate_api_spec_from_failed_replay_network_call(tmp_path: Path) -> None:

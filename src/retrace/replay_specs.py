@@ -70,6 +70,7 @@ def generate_spec_from_replay_issue(
         base_url=base_url,
         representative_session_id=representative_session_id,
         exact_steps=exact_steps,
+        assertions=assertions,
         gaps=gaps,
     )
     prompt = (
@@ -112,7 +113,7 @@ def generate_spec_from_replay_issue(
         spec=spec,
         issue_public_id=str(issue["public_id"]),
         replay_public_id=str(playback.session["public_id"]),
-        confidence=_generation_confidence(exact_steps, gaps),
+        confidence=str(generation_notes["quality"]["confidence"]),
         known_gaps=gaps,
     )
 
@@ -720,6 +721,7 @@ def _generation_notes(
     base_url: str,
     representative_session_id: str,
     exact_steps: list[dict[str, Any]],
+    assertions: list[dict[str, Any]],
     gaps: list[str],
 ) -> dict[str, Any]:
     unsupported_step_warnings = [
@@ -727,8 +729,15 @@ def _generation_notes(
         for gap in gaps
         if gap.startswith("unknown-") or "unsupported rrweb event" in gap
     ]
+    quality = _generation_quality(
+        steps=exact_steps,
+        assertions=assertions,
+        gaps=gaps,
+        unsupported_step_warnings=unsupported_step_warnings,
+    )
     return {
         "human_readable_steps": _human_readable_steps(exact_steps),
+        "human_readable_assertions": _human_readable_assertions(assertions),
         "preconditions": [
             f"Run the app at {base_url}.",
             f"Replay source session: {representative_session_id}.",
@@ -739,6 +748,8 @@ def _generation_notes(
             "Selectors are generated from SDK metadata when available.",
         ],
         "unsupported_step_warnings": unsupported_step_warnings,
+        "known_gaps": list(gaps),
+        "quality": quality,
     }
 
 
@@ -767,6 +778,115 @@ def _target_label(step: dict[str, Any]) -> str:
         or target.get("rrweb_id")
         or "unknown target"
     )
+
+
+def _human_readable_assertions(assertions: list[dict[str, Any]]) -> list[str]:
+    readable: list[str] = []
+    for assertion in assertions:
+        assertion_id = str(assertion.get("id") or assertion.get("type") or "assertion")
+        kind = str(assertion.get("type") or assertion.get("assertion_type") or "")
+        if kind == "status_code":
+            readable.append(
+                f"{assertion_id}: expect HTTP status {assertion.get('expected', 200)}"
+            )
+        elif kind == "model_consensus":
+            summary = str(
+                assertion.get("expected")
+                or assertion.get("prompt")
+                or assertion.get("description")
+                or "review replay outcome"
+            ).strip()
+            readable.append(f"{assertion_id}: expect model consensus on {summary}")
+        elif kind == "selector_count":
+            readable.append(
+                f"{assertion_id}: expect {assertion.get('selector', 'selector')} count {assertion.get('expected', 0)}"
+            )
+        elif kind == "selector_visible":
+            readable.append(
+                f"{assertion_id}: expect {assertion.get('selector', 'selector')} to be visible"
+            )
+        elif kind == "text_matches":
+            readable.append(
+                f"{assertion_id}: expect page text to match {assertion.get('expected', '')}"
+            )
+        elif assertion.get("description"):
+            readable.append(f"{assertion_id}: {assertion['description']}")
+        else:
+            readable.append(f"{assertion_id}: {kind or 'assertion'}")
+    return readable
+
+
+def _generation_quality(
+    *,
+    steps: list[dict[str, Any]],
+    assertions: list[dict[str, Any]],
+    gaps: list[str],
+    unsupported_step_warnings: list[str],
+) -> dict[str, Any]:
+    selector_backed_steps = 0
+    rrweb_fallback_steps = 0
+    redacted_input_steps = 0
+    unknown_steps = 0
+    for step in steps:
+        action = str(step.get("action") or "")
+        target = step.get("target")
+        has_selector = isinstance(target, dict) and bool(target.get("selector"))
+        has_rrweb_only = (
+            isinstance(target, dict)
+            and bool(target.get("rrweb_id"))
+            and not bool(target.get("selector"))
+        )
+        if action in {"click", "type"} and has_selector:
+            selector_backed_steps += 1
+        if action in {"click", "type"} and has_rrweb_only:
+            rrweb_fallback_steps += 1
+        if action == "type" and str(step.get("text") or "") == "[redacted-replay-input]":
+            redacted_input_steps += 1
+        if action == "unknown":
+            unknown_steps += 1
+
+    no_convertible_steps_gap = (
+        "Replay did not include convertible navigation, click, or input events."
+    )
+    blocking_gaps = [
+        gap
+        for gap in gaps
+        if gap.startswith("unknown-")
+        or "unsupported rrweb event" in gap
+        or "needs a durable locator" in gap
+        or gap == no_convertible_steps_gap
+    ]
+    editable_gaps = [gap for gap in gaps if gap not in blocking_gaps]
+    if no_convertible_steps_gap in gaps or unknown_steps or unsupported_step_warnings:
+        status = "blocked"
+        confidence = "low"
+        next_action = "Inspect replay coverage and unsupported events before relying on this spec."
+    elif blocking_gaps:
+        status = "needs_locator"
+        confidence = "low"
+        next_action = "Add durable selectors for replay steps before running in CI."
+    elif editable_gaps:
+        status = "needs_test_data"
+        confidence = "medium"
+        next_action = "Replace redacted inputs with safe test data, then run the spec."
+    else:
+        status = "runnable"
+        confidence = "high"
+        next_action = "Run the generated regression spec."
+    return {
+        "status": status,
+        "confidence": confidence,
+        "requires_human_edit": status != "runnable",
+        "recommended_next_action": next_action,
+        "step_count": len(steps),
+        "assertion_count": len(assertions),
+        "selector_backed_step_count": selector_backed_steps,
+        "rrweb_fallback_step_count": rrweb_fallback_steps,
+        "redacted_input_step_count": redacted_input_steps,
+        "unknown_step_count": unknown_steps,
+        "blocking_gaps": blocking_gaps,
+        "editable_gaps": editable_gaps,
+    }
 
 
 def _json_obj(raw: Any) -> dict[str, Any]:
