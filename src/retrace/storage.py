@@ -323,6 +323,8 @@ ON failure_test_links(spec_id, updated_at);
 CREATE TABLE IF NOT EXISTS repair_tasks (
     id TEXT PRIMARY KEY,
     public_id TEXT NOT NULL,
+    project_id TEXT NOT NULL DEFAULT '',
+    environment_id TEXT NOT NULL DEFAULT '',
     failure_id TEXT NOT NULL,
     source_type TEXT NOT NULL DEFAULT '',
     source_external_id TEXT NOT NULL DEFAULT '',
@@ -337,14 +339,14 @@ CREATE TABLE IF NOT EXISTS repair_tasks (
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(failure_id)
+    UNIQUE(failure_id, project_id, environment_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_repair_tasks_status
 ON repair_tasks(status, updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_repair_tasks_source
-ON repair_tasks(source_type, source_external_id);
+ON repair_tasks(source_type, source_external_id, project_id, environment_id);
 
 CREATE TABLE IF NOT EXISTS repair_task_evidence (
     repair_task_id TEXT NOT NULL,
@@ -618,6 +620,8 @@ class FailureTestLinkRow:
 class RepairTaskRow:
     id: str
     public_id: str
+    project_id: str
+    environment_id: str
     failure_id: str
     source_type: str
     source_external_id: str
@@ -899,6 +903,18 @@ class Storage:
             if "latest_run_classification" not in cols_failure_test_links:
                 conn.execute(
                     "ALTER TABLE failure_test_links ADD COLUMN latest_run_classification TEXT NOT NULL DEFAULT ''"
+                )
+            cols_repair_tasks = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(repair_tasks)").fetchall()
+            ]
+            if "project_id" not in cols_repair_tasks:
+                conn.execute(
+                    "ALTER TABLE repair_tasks ADD COLUMN project_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "environment_id" not in cols_repair_tasks:
+                conn.execute(
+                    "ALTER TABLE repair_tasks ADD COLUMN environment_id TEXT NOT NULL DEFAULT ''"
                 )
             rows = conn.execute(
                 """
@@ -1654,20 +1670,22 @@ class Storage:
 
         with self._conn() as conn:
             failure_row = conn.execute(
-                "SELECT id FROM failures WHERE id = ?",
+                "SELECT id, project_id, environment_id FROM failures WHERE id = ?",
                 (failure_id,),
             ).fetchone()
             if failure_row is None:
                 raise ValueError(f"unknown failure_id: {failure_id}")
+            task_project_id = str(failure_row["project_id"])
+            task_environment_id = str(failure_row["environment_id"])
             conn.execute(
                 """
                 INSERT INTO repair_tasks
-                (id, public_id, failure_id, source_type, source_external_id, title,
-                 status, likely_files_json, prompt_artifacts_json,
+                (id, public_id, project_id, environment_id, failure_id, source_type,
+                 source_external_id, title, status, likely_files_json, prompt_artifacts_json,
                  validation_commands_json, branch, pr_url, risk_notes, metadata_json,
                  created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(failure_id) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(failure_id, project_id, environment_id) DO UPDATE SET
                     source_type = excluded.source_type,
                     source_external_id = excluded.source_external_id,
                     title = excluded.title,
@@ -1684,6 +1702,8 @@ class Storage:
                 (
                     task_id,
                     public_id,
+                    task_project_id,
+                    task_environment_id,
                     failure_id,
                     source_type.strip(),
                     source_external_id.strip(),
@@ -1701,8 +1721,12 @@ class Storage:
                 ),
             )
             row = conn.execute(
-                "SELECT id FROM repair_tasks WHERE failure_id = ?",
-                (failure_id,),
+                """
+                SELECT id
+                FROM repair_tasks
+                WHERE failure_id = ? AND project_id = ? AND environment_id = ?
+                """,
+                (failure_id, task_project_id, task_environment_id),
             ).fetchone()
             assert row is not None
             persisted_task_id = str(row["id"])
@@ -1771,12 +1795,20 @@ class Storage:
     def list_repair_tasks(
         self,
         *,
+        project_id: Optional[str] = None,
+        environment_id: Optional[str] = None,
         failure_id: Optional[str] = None,
         status: Optional[str] = None,
         limit: int = 100,
     ) -> list[RepairTaskRow]:
         where: list[str] = []
         params: list[object] = []
+        if project_id is not None:
+            where.append("project_id = ?")
+            params.append(project_id)
+        if environment_id is not None:
+            where.append("environment_id = ?")
+            params.append(environment_id)
         if failure_id is not None:
             where.append("failure_id = ?")
             params.append(failure_id)
@@ -2205,6 +2237,8 @@ class Storage:
         return RepairTaskRow(
             id=str(row["id"]),
             public_id=str(row["public_id"]),
+            project_id=str(row["project_id"] or ""),
+            environment_id=str(row["environment_id"] or ""),
             failure_id=str(row["failure_id"]),
             source_type=str(row["source_type"] or ""),
             source_external_id=str(row["source_external_id"] or ""),
@@ -3215,6 +3249,19 @@ class Storage:
                   AND (id = ? OR public_id = ?)
                 """,
                 (project_id, environment_id, issue_id, issue_id),
+            ).fetchone()
+
+    def find_replay_issue(self, issue_id: str) -> Optional[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT *
+                FROM replay_issues
+                WHERE id = ? OR public_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (issue_id, issue_id),
             ).fetchone()
 
     def list_replay_issue_sessions(self, issue_id: str) -> list[sqlite3.Row]:

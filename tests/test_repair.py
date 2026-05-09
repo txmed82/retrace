@@ -86,6 +86,8 @@ def test_repair_task_links_failure_and_multiple_evidence_items(tmp_path: Path) -
     task = store.get_repair_task(task_id)
     assert task is not None
     assert task.public_id.startswith("rpr_")
+    assert task.project_id == "proj_1"
+    assert task.environment_id == "env_1"
     assert task.failure_id == failure_id
     assert task.source_external_id == created.public_id
     assert task.status == "open"
