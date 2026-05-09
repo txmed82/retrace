@@ -459,6 +459,27 @@ ON repair_tasks(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_repair_tasks_source
 ON repair_tasks(source_type, source_external_id, project_id, environment_id);
 
+CREATE TABLE IF NOT EXISTS github_review_runs (
+    id TEXT PRIMARY KEY,
+    repo_full_name TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    installation_id TEXT NOT NULL DEFAULT '',
+    sender_login TEXT NOT NULL DEFAULT '',
+    comment_id TEXT NOT NULL DEFAULT '',
+    comment_url TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued',
+    trigger_phrase TEXT NOT NULL DEFAULT '@retrace review',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_github_review_runs_repo_pr
+ON github_review_runs(repo_full_name, pr_number, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_github_review_runs_status
+ON github_review_runs(status, updated_at);
+
 CREATE TABLE IF NOT EXISTS repair_task_evidence (
     repair_task_id TEXT NOT NULL,
     evidence_id TEXT NOT NULL,
@@ -802,6 +823,22 @@ class RepairTaskRow:
 
 
 @dataclass
+class GitHubReviewRunRow:
+    id: str
+    repo_full_name: str
+    pr_number: int
+    installation_id: str
+    sender_login: str
+    comment_id: str
+    comment_url: str
+    status: str
+    trigger_phrase: str
+    metadata: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
 class ReplayBatchResult:
     session_row_id: str
     batch_id: str
@@ -1114,6 +1151,18 @@ class Storage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_signal_definitions_scope
                 ON signal_definitions(project_id, environment_id, enabled)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_github_review_runs_repo_pr
+                ON github_review_runs(repo_full_name, pr_number, updated_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_github_review_runs_status
+                ON github_review_runs(status, updated_at)
                 """
             )
             self._backfill_failure_test_links(conn)
@@ -2934,6 +2983,145 @@ class Storage:
             for row in rows
         ]
 
+    def create_github_review_run(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+        installation_id: str = "",
+        sender_login: str = "",
+        comment_id: str = "",
+        comment_url: str = "",
+        status: str = "queued",
+        trigger_phrase: str = "@retrace review",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> GitHubReviewRunRow:
+        repo = repo_full_name.strip()
+        if not repo:
+            raise ValueError("repo_full_name is required")
+        if pr_number <= 0:
+            raise ValueError("pr_number must be positive")
+        run_id = self._id("ghrr")
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            metadata_json = json.dumps(metadata or {}, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("review run metadata must be JSON-serializable") from exc
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO github_review_runs
+                (id, repo_full_name, pr_number, installation_id, sender_login,
+                 comment_id, comment_url, status, trigger_phrase, metadata_json,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    repo,
+                    int(pr_number),
+                    installation_id.strip(),
+                    sender_login.strip(),
+                    comment_id.strip(),
+                    comment_url.strip(),
+                    status.strip() or "queued",
+                    trigger_phrase.strip() or "@retrace review",
+                    metadata_json,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM github_review_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        assert row is not None
+        return self._github_review_run_from_row(row)
+
+    def get_github_review_run(self, run_id: str) -> Optional[GitHubReviewRunRow]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM github_review_runs WHERE id = ?",
+                (run_id.strip(),),
+            ).fetchone()
+        return self._github_review_run_from_row(row) if row is not None else None
+
+    def list_github_review_runs(
+        self,
+        *,
+        repo_full_name: Optional[str] = None,
+        pr_number: Optional[int] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[GitHubReviewRunRow]:
+        where: list[str] = []
+        params: list[object] = []
+        if repo_full_name is not None:
+            where.append("repo_full_name = ?")
+            params.append(repo_full_name.strip())
+        if pr_number is not None:
+            where.append("pr_number = ?")
+            params.append(int(pr_number))
+        if status is not None:
+            where.append("status = ?")
+            params.append(status.strip())
+        clause = " AND ".join(where) if where else "1 = 1"
+        params.append(max(1, min(int(limit), 500)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM github_review_runs
+                WHERE {clause}
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._github_review_run_from_row(row) for row in rows]
+
+    def update_github_review_run_status(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[GitHubReviewRunRow]:
+        clean_status = status.strip()
+        if not clean_status:
+            raise ValueError("status is required")
+        now = datetime.now(timezone.utc).isoformat()
+        metadata_json = None
+        if metadata is not None:
+            try:
+                metadata_json = json.dumps(metadata, sort_keys=True)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("review run metadata must be JSON-serializable") from exc
+        with self._conn() as conn:
+            if metadata_json is None:
+                conn.execute(
+                    """
+                    UPDATE github_review_runs
+                    SET status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (clean_status, now, run_id.strip()),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE github_review_runs
+                    SET status = ?, metadata_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (clean_status, metadata_json, now, run_id.strip()),
+                )
+            row = conn.execute(
+                "SELECT * FROM github_review_runs WHERE id = ?",
+                (run_id.strip(),),
+            ).fetchone()
+        return self._github_review_run_from_row(row) if row is not None else None
+
     def upsert_failure_test_link(
         self,
         *,
@@ -3338,6 +3526,24 @@ class Storage:
             risk_notes=str(row["risk_notes"] or ""),
             metadata=dict(self._safe_json_obj(row["metadata_json"])),
             evidence_ids=evidence_ids,
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    def _github_review_run_from_row(
+        self, row: sqlite3.Row
+    ) -> GitHubReviewRunRow:
+        return GitHubReviewRunRow(
+            id=str(row["id"]),
+            repo_full_name=str(row["repo_full_name"]),
+            pr_number=int(row["pr_number"]),
+            installation_id=str(row["installation_id"] or ""),
+            sender_login=str(row["sender_login"] or ""),
+            comment_id=str(row["comment_id"] or ""),
+            comment_url=str(row["comment_url"] or ""),
+            status=str(row["status"] or "queued"),
+            trigger_phrase=str(row["trigger_phrase"] or "@retrace review"),
+            metadata=dict(self._safe_json_obj(row["metadata_json"])),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
         )

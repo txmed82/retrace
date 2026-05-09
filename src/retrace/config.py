@@ -71,6 +71,17 @@ class GitHubSinkConfig(BaseModel):
         return bool(self.api_key.strip())
 
 
+class GitHubAppConfig(BaseModel):
+    app_id: str = ""
+    webhook_secret: str = ""
+    private_key: str = ""
+    installation_id: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.app_id.strip() and self.webhook_secret.strip())
+
+
 class NotificationConfig(BaseModel):
     webhook_url: str = ""
     webhook_secret: str = ""
@@ -104,6 +115,7 @@ class RetraceConfig(BaseModel):
     cluster: ClusterConfig = Field(default_factory=ClusterConfig)
     linear: LinearConfig = Field(default_factory=LinearConfig)
     github_sink: GitHubSinkConfig = Field(default_factory=GitHubSinkConfig)
+    github_app: GitHubAppConfig = Field(default_factory=GitHubAppConfig)
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
     tester: TesterConfig = Field(default_factory=TesterConfig)
 
@@ -150,6 +162,17 @@ def load_config(path: Path) -> RetraceConfig:
     )
     if github_key_env:
         raw.setdefault("github_sink", {})["api_key"] = github_key_env
+
+    github_app_env_map = {
+        "app_id": "RETRACE_GITHUB_APP_ID",
+        "webhook_secret": "RETRACE_GITHUB_APP_WEBHOOK_SECRET",
+        "private_key": "RETRACE_GITHUB_APP_PRIVATE_KEY",
+        "installation_id": "RETRACE_GITHUB_APP_INSTALLATION_ID",
+    }
+    for key, env_name in github_app_env_map.items():
+        value = os.environ.get(env_name)
+        if value:
+            raw.setdefault("github_app", {})[key] = value
 
     webhook_url_env = os.environ.get("RETRACE_NOTIFY_WEBHOOK_URL")
     if webhook_url_env:
