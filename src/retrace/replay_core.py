@@ -209,7 +209,10 @@ def _signal_reason_codes(signals: list[Signal]) -> list[str]:
 
 
 def _confidence_rank(confidence: str) -> int:
-    return {"low": 0, "medium": 1, "high": 2}.get(str(confidence), 1)
+    return {"low": 0, "medium": 1, "high": 2}.get(
+        str(confidence).strip().lower(),
+        1,
+    )
 
 
 def _signal_confidence(signals: list[Signal]) -> str:

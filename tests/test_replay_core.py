@@ -402,6 +402,11 @@ def test_replay_signal_definition_suppression_rules_filter_known_noise(
     assert result.signals_detected == 0
     assert result.signals_inserted == 0
     assert result.issues == []
+    assert store.list_replay_signals(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-suppressed-noise",
+    ) == []
 
 
 def test_replay_core_clusters_sessions_and_regresses_resolved_issue(tmp_path: Path) -> None:
