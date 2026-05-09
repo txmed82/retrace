@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import click
 
 from retrace.config import load_config
+from retrace.github_app import GitHubWebhookError, handle_github_webhook
 from retrace.issue_sink_clients import GitHubClient, IssueSinkError, LinearClient
 from retrace.issue_sinks import build_issue_card, compact_issue_card, promote_replay_issue
 from retrace.notification_sinks import (
@@ -62,7 +63,10 @@ def _cors_headers(handler: BaseHTTPRequestHandler) -> None:
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.send_header(
         "Access-Control-Allow-Headers",
-        "authorization, content-encoding, content-type, x-retrace-key",
+        (
+            "authorization, content-encoding, content-type, x-github-delivery, "
+            "x-github-event, x-hub-signature-256, x-retrace-key"
+        ),
     )
     handler.send_header("Access-Control-Max-Age", "86400")
 
@@ -171,6 +175,7 @@ def _handler(
     store: Storage,
     *,
     enricher: CorrelationEnricher | None = None,
+    github_webhook_secret: str = "",
 ) -> type[BaseHTTPRequestHandler]:
     class RetraceAPIHandler(BaseHTTPRequestHandler):
         server_version = "retrace-api/0.1"
@@ -235,6 +240,7 @@ def _handler(
                 and parsed.path != "/api/deploys"
                 and not parsed.path.startswith("/api/otel/")
                 and not parsed.path.startswith("/api/monitoring/webhook")
+                and parsed.path != "/api/github/webhook"
             ):
                 _json_response(self, 404, {"error": "not_found"})
                 return
@@ -262,6 +268,9 @@ def _handler(
                 "/api/monitoring/webhook/"
             ):
                 self._handle_monitoring_webhook(parsed.path, parsed.query)
+                return
+            if parsed.path == "/api/github/webhook":
+                self._handle_github_webhook()
                 return
             if parsed.path != "/api/sdk/replay":
                 _json_response(self, 404, {"error": "not_found"})
@@ -392,6 +401,56 @@ def _handler(
                 )
                 return
             _json_response(self, 202, result.to_dict())
+
+        def _handle_github_webhook(self) -> None:
+            if not github_webhook_secret.strip():
+                _json_response(
+                    self,
+                    503,
+                    {
+                        "error": "github_app_not_configured",
+                        "message": "GitHub App webhook secret is not configured.",
+                    },
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length <= 0:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            if length > MAX_REPLAY_BODY_BYTES:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            body = self.rfile.read(length)
+            try:
+                result = handle_github_webhook(
+                    store=store,
+                    body=body,
+                    headers={k: v for k, v in self.headers.items()},
+                    webhook_secret=github_webhook_secret,
+                )
+            except GitHubWebhookError as exc:
+                _json_response(
+                    self,
+                    exc.status,
+                    {"error": exc.code, "message": exc.message},
+                )
+                return
+            except Exception:
+                logger.exception("Unhandled GitHub webhook error")
+                _json_response(
+                    self,
+                    500,
+                    {
+                        "error": "internal_error",
+                        "message": "An internal server error occurred.",
+                    },
+                )
+                return
+            _json_response(self, 202 if result.accepted else 200, result.to_dict())
 
         def _handle_record_deploy(self, query: str) -> None:
             token = _require_service_token(
@@ -827,10 +886,16 @@ def api_serve(config_path: Path, host: str, port: int) -> None:
     store = Storage(cfg.run.data_dir / "retrace.db")
     store.init_schema()
     httpd = ThreadingHTTPServer(
-        (host, port), _handler(store, enricher=_build_enricher(cfg, store))
+        (host, port),
+        _handler(
+            store,
+            enricher=_build_enricher(cfg, store),
+            github_webhook_secret=cfg.github_app.webhook_secret,
+        ),
     )
     click.echo(f"Retrace API running at http://{host}:{port}")
     click.echo("Replay ingest endpoint: POST /api/sdk/replay")
+    click.echo("GitHub App webhook endpoint: POST /api/github/webhook")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
