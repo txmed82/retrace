@@ -43,6 +43,7 @@ def _payload(*, comment_body: str = "@retrace review") -> dict[str, object]:
             "id": 987,
             "node_id": "IC_kwDO",
             "body": comment_body,
+            "author_association": "MEMBER",
             "html_url": "https://github.com/acme/web/pull/42#issuecomment-987",
         },
     }
@@ -153,6 +154,54 @@ def test_github_webhook_ignores_issue_comments_that_are_not_prs(tmp_path: Path) 
     assert result.accepted is False
     assert result.reason == "not_pull_request"
     assert store.list_github_review_runs() == []
+
+
+def test_github_webhook_ignores_untrusted_commenters(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    secret = "webhook-secret"
+    payload = _payload()
+    comment = dict(payload["comment"])  # type: ignore[arg-type]
+    comment["author_association"] = "NONE"
+    payload["comment"] = comment
+    body = json.dumps(payload).encode("utf-8")
+
+    result = handle_github_webhook(
+        store=store,
+        body=body,
+        headers=_headers(secret, body),
+        webhook_secret=secret,
+    )
+
+    assert result.accepted is False
+    assert result.reason == "untrusted_commenter"
+    assert store.list_github_review_runs() == []
+
+
+def test_github_webhook_redelivery_is_idempotent_by_comment(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    secret = "webhook-secret"
+    body = json.dumps(_payload()).encode("utf-8")
+    headers = _headers(secret, body)
+
+    first = handle_github_webhook(
+        store=store,
+        body=body,
+        headers=headers,
+        webhook_secret=secret,
+    )
+    second = handle_github_webhook(
+        store=store,
+        body=body,
+        headers=headers,
+        webhook_secret=secret,
+    )
+
+    assert first.accepted is True
+    assert second.accepted is True
+    assert first.review_run is not None
+    assert second.review_run is not None
+    assert second.review_run.id == first.review_run.id
+    assert len(store.list_github_review_runs(repo_full_name="acme/web", pr_number=42)) == 1
 
 
 def test_github_webhook_endpoint_rejects_invalid_signature(tmp_path: Path) -> None:

@@ -11,6 +11,9 @@ from retrace.storage import GitHubReviewRunRow, Storage
 
 
 REVIEW_TRIGGER_RE = re.compile(r"(?<![\w-])@retrace\s+review(?![\w-])", re.IGNORECASE)
+TRUSTED_COMMENT_AUTHOR_ASSOCIATIONS = frozenset(
+    {"COLLABORATOR", "MEMBER", "OWNER"}
+)
 
 
 class GitHubWebhookError(ValueError):
@@ -143,6 +146,14 @@ def handle_github_webhook(
         raise GitHubWebhookError("invalid_pr_number", "issue.number is invalid.") from exc
     if pr_number <= 0:
         raise GitHubWebhookError("invalid_pr_number", "issue.number is required.")
+    author_association = str(comment.get("author_association") or "").strip().upper()
+    if author_association not in TRUSTED_COMMENT_AUTHOR_ASSOCIATIONS:
+        return GitHubWebhookResult(
+            accepted=False,
+            event=event,
+            action=action,
+            reason="untrusted_commenter",
+        )
     sender = payload.get("sender")
     installation = payload.get("installation")
     review_run = store.create_github_review_run(

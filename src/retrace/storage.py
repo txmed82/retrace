@@ -480,6 +480,10 @@ ON github_review_runs(repo_full_name, pr_number, updated_at);
 CREATE INDEX IF NOT EXISTS idx_github_review_runs_status
 ON github_review_runs(status, updated_at);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_github_review_runs_comment
+ON github_review_runs(repo_full_name, pr_number, comment_id)
+WHERE comment_id != '';
+
 CREATE TABLE IF NOT EXISTS repair_task_evidence (
     repair_task_id TEXT NOT NULL,
     evidence_id TEXT NOT NULL,
@@ -1163,6 +1167,13 @@ class Storage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_github_review_runs_status
                 ON github_review_runs(status, updated_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_github_review_runs_comment
+                ON github_review_runs(repo_full_name, pr_number, comment_id)
+                WHERE comment_id != ''
                 """
             )
             self._backfill_failure_test_links(conn)
@@ -3007,10 +3018,11 @@ class Storage:
             metadata_json = json.dumps(metadata or {}, sort_keys=True)
         except (TypeError, ValueError) as exc:
             raise ValueError("review run metadata must be JSON-serializable") from exc
+        clean_comment_id = comment_id.strip()
         with self._conn() as conn:
             conn.execute(
                 """
-                INSERT INTO github_review_runs
+                INSERT OR IGNORE INTO github_review_runs
                 (id, repo_full_name, pr_number, installation_id, sender_login,
                  comment_id, comment_url, status, trigger_phrase, metadata_json,
                  created_at, updated_at)
@@ -3022,7 +3034,7 @@ class Storage:
                     int(pr_number),
                     installation_id.strip(),
                     sender_login.strip(),
-                    comment_id.strip(),
+                    clean_comment_id,
                     comment_url.strip(),
                     status.strip() or "queued",
                     trigger_phrase.strip() or "@retrace review",
@@ -3031,10 +3043,20 @@ class Storage:
                     now,
                 ),
             )
-            row = conn.execute(
-                "SELECT * FROM github_review_runs WHERE id = ?",
-                (run_id,),
-            ).fetchone()
+            if clean_comment_id:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM github_review_runs
+                    WHERE repo_full_name = ? AND pr_number = ? AND comment_id = ?
+                    """,
+                    (repo, int(pr_number), clean_comment_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM github_review_runs WHERE id = ?",
+                    (run_id,),
+                ).fetchone()
         assert row is not None
         return self._github_review_run_from_row(row)
 
