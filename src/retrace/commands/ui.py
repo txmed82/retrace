@@ -933,6 +933,7 @@ def _generate_replay_issue_fix_prompts_payload(
             "prompts": artifact.prompts if artifact else {},
             "prompt_files": artifact.prompt_files if artifact else {},
             "artifact_json": artifact.artifact_json if artifact else "",
+            "artifact_manifest_json": artifact.artifact_manifest_json if artifact else "",
             "repair_task_id": artifact.repair_task_id if artifact else "",
         },
         200,

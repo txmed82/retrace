@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
 import re
 import shlex
@@ -17,6 +18,7 @@ from typing import Any, Callable, Optional
 
 import httpx
 
+from retrace.artifacts import tester_artifact_manifest_items, write_artifact_manifest
 from retrace.llm.client import build_llm_http_request, extract_llm_text_content
 from retrace.script_steps import (
     render_template,
@@ -41,6 +43,7 @@ FAILURE_CLASSIFICATIONS = {
     "selector_drift",
     "unknown",
 }
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -2423,6 +2426,24 @@ def run_spec(
         if app_proc and app_proc.poll() is None:
             app_proc.terminate()
 
+    try:
+        manifest_items = tester_artifact_manifest_items(
+            result.artifacts,
+            source_run=result.run_id,
+        )
+        manifest_artifact = write_artifact_manifest(
+            manifest_path=run_dir / "artifacts" / "artifact-manifest.json",
+            artifacts=manifest_items,
+            source_run=result.run_id,
+            metadata={"spec_id": spec.spec_id, "execution_engine": execution_engine},
+        )
+        result.artifacts = [*result.artifacts, manifest_artifact]
+    except Exception as exc:
+        logger.warning(
+            "failed to write tester artifact manifest for run %s: %s",
+            result.run_id,
+            exc,
+        )
     meta_path.write_text(json.dumps(asdict(result), indent=2) + "\n")
     return result
 

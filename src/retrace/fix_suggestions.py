@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from retrace.artifacts import artifact_manifest_item, write_artifact_manifest
 from retrace.matching import CodeCandidate, score_repo_for_finding
 from retrace.prompts import build_claude_code_prompt, build_codex_prompt
 from retrace.repair import repair_task_from_fix_suggestion
@@ -25,6 +26,7 @@ class FixSuggestionArtifact:
     prompts: dict[str, str]
     prompt_files: dict[str, str]
     artifact_json: str
+    artifact_manifest_json: str = ""
     repair_task_id: str = ""
 
 
@@ -198,6 +200,41 @@ def generate_fix_suggestions(
         (out_dir / prompt_files["claude_code"]).write_text(
             prompts["claude_code"] + "\n", encoding="utf-8"
         )
+        manifest_items = [
+            artifact_manifest_item(
+                artifact_id=f"{base}-manifest-json",
+                artifact_type="repair_manifest",
+                path=out_dir / artifact_json,
+                label="Repair prompt manifest",
+                source_failure=report_key,
+                metadata={"finding_id": finding_id, "repo": repo.repo_full_name},
+            ),
+            artifact_manifest_item(
+                artifact_id=f"{base}-codex-prompt",
+                artifact_type="repair_prompt",
+                path=out_dir / prompt_files["codex"],
+                label="Codex repair prompt",
+                source_failure=report_key,
+                metadata={"agent_target": "codex", "repo": repo.repo_full_name},
+                mime_type="text/markdown",
+            ),
+            artifact_manifest_item(
+                artifact_id=f"{base}-claude-prompt",
+                artifact_type="repair_prompt",
+                path=out_dir / prompt_files["claude_code"],
+                label="Claude Code repair prompt",
+                source_failure=report_key,
+                metadata={"agent_target": "claude_code", "repo": repo.repo_full_name},
+                mime_type="text/markdown",
+            ),
+        ]
+        artifact_manifest_json = f"{base}.artifacts.json"
+        write_artifact_manifest(
+            manifest_path=out_dir / artifact_manifest_json,
+            artifacts=manifest_items,
+            source_failure=report_key,
+            metadata={"finding_id": finding_id, "repo": repo.repo_full_name},
+        )
         try:
             repair_task_id = _upsert_replay_issue_repair_task(
                 store=store,
@@ -225,6 +262,7 @@ def generate_fix_suggestions(
                 prompts=prompts,
                 prompt_files=prompt_files,
                 artifact_json=artifact_json,
+                artifact_manifest_json=artifact_manifest_json,
                 repair_task_id=repair_task_id,
             )
         )

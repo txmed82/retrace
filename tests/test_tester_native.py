@@ -296,8 +296,13 @@ def test_native_runner_writes_run_json_and_artifacts(tmp_path: Path) -> None:
     assert len(run_json["assertion_results"]) == 2
     assert all(item["ok"] for item in run_json["assertion_results"])
     assert any(item["artifact_type"] == "assertion_results" for item in result.artifacts)
+    assert any(item["artifact_type"] == "artifact_manifest" for item in result.artifacts)
     assert (run_dir / "artifacts" / "native-summary.json").exists()
     assert (run_dir / "artifacts" / "assertions.json").exists()
+    manifest = json.loads((run_dir / "artifacts" / "artifact-manifest.json").read_text())
+    assert manifest["schema_version"] == "artifact_manifest.v1"
+    assert manifest["source_run"] == result.run_id
+    assert any(item["artifact_type"] == "assertion_results" for item in manifest["artifacts"])
 
 
 def test_native_runner_records_consensus_and_step_cache(tmp_path: Path) -> None:
