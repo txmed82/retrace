@@ -186,6 +186,7 @@ def test_create_suite_run_generates_accepts_and_runs_draft_specs(
             for spec in draft_specs
         )
         assert all(spec["fixtures"]["draft_reason"] for spec in draft_specs)
+        assert all("source_auth" in spec["fixtures"] for spec in draft_specs)
 
         draft_id = draft_specs[0]["spec_id"]
         accepted = runner.invoke(
@@ -194,6 +195,9 @@ def test_create_suite_run_generates_accepts_and_runs_draft_specs(
         )
         assert accepted.exit_code == 0, accepted.output
         assert '"draft_status": "accepted"' in accepted.output
+        accepted_again = runner.invoke(main, ["tester", "accept-draft", draft_id])
+        assert accepted_again.exit_code != 0
+        assert "not an unaccepted draft" in accepted_again.output
 
         ran_draft = runner.invoke(main, ["tester", "run", draft_id, "--retries", "0"])
         assert ran_draft.exit_code == 0, ran_draft.output

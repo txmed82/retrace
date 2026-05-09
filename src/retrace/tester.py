@@ -1403,7 +1403,7 @@ def _write_suite_proposal_and_drafts(
             name=f"{goal[:72]} regression",
             prompt=goal,
             app_url=app_url,
-            start_command="",
+            start_command=spec.start_command or "",
             harness_command=spec.harness_command or DEFAULT_HARNESS_COMMAND,
             mode="describe",
             execution_engine="native",
@@ -1416,7 +1416,8 @@ def _write_suite_proposal_and_drafts(
                     "source": "suite_proposal",
                 }
             ],
-            browser_settings={"runtime": "http"},
+            env_overrides=dict(spec.env_overrides or {}),
+            browser_settings={**dict(spec.browser_settings or {}), "runtime": "http"},
             fixtures={
                 "draft_status": "draft",
                 "draft_reason": reason,
@@ -1425,6 +1426,15 @@ def _write_suite_proposal_and_drafts(
                 "source_explore_spec_id": spec.spec_id,
                 "criticality": criticality,
                 "rank": rank,
+                "source_auth": {
+                    "auth_required": spec.auth_required,
+                    "auth_mode": spec.auth_mode,
+                    "auth_login_url": spec.auth_login_url,
+                    "auth_username": spec.auth_username,
+                    "auth_password_env": spec.auth_password_env,
+                    "auth_jwt_env": spec.auth_jwt_env,
+                    "auth_headers_env": spec.auth_headers_env,
+                },
             },
         )
         proposals.append(
@@ -1504,14 +1514,15 @@ def _exact_steps_from_exploration(
                 }
             )
         elif tool == "wait_for" and args.get("selector"):
-            exact_steps.append(
-                {
-                    "id": step_id,
-                    "action": "wait",
-                    "selector": str(args["selector"]),
-                    "timeout_ms": int(args.get("timeout_ms") or 5000),
-                }
-            )
+            wait_step = {
+                "id": step_id,
+                "action": "wait_for",
+                "selector": str(args["selector"]),
+                "timeout_ms": int(args.get("timeout_ms") or 5000),
+            }
+            if args.get("state"):
+                wait_step["state"] = str(args["state"])
+            exact_steps.append(wait_step)
     if not exact_steps:
         exact_steps.append({"id": "page-load", "action": "navigate", "url": app_url})
     return exact_steps

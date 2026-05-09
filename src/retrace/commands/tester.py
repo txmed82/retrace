@@ -247,13 +247,16 @@ def tester_accept_draft(
     cfg = load_config(config_path)
     specs_dir = specs_dir_for_data_dir(cfg.run.data_dir)
     spec = load_spec(specs_dir, spec_id)
+    if dict(spec.fixtures or {}).get("draft_status") != "draft":
+        raise click.ClickException("Spec is not an unaccepted draft.")
     if name.strip():
         spec.name = name.strip()
     if prompt.strip():
         spec.prompt = prompt.strip()
     spec.fixtures = dict(spec.fixtures or {})
     spec.fixtures["draft_status"] = "accepted"
-    spec.fixtures["accepted_at"] = now_iso()
+    if not spec.fixtures.get("accepted_at"):
+        spec.fixtures["accepted_at"] = now_iso()
     save_spec(specs_dir, spec)
     click.echo(
         json.dumps(
