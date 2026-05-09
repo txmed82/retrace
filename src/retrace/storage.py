@@ -1692,6 +1692,7 @@ class Storage:
                 risk_notes=str(repair_task.get("risk_notes") or ""),
                 metadata=dict(repair_task.get("metadata") or {}),
                 evidence_ids=evidence_ids,
+                replace_supporting=False,
             )
             return persisted_failure_id, evidence_ids, repair_task_id
 
@@ -1769,6 +1770,7 @@ class Storage:
         now: str = "",
         task_id: str = "",
         public_id: str = "",
+        replace_supporting: bool = True,
     ) -> str:
         failure_id = failure_id.strip()
         if not failure_id:
@@ -1846,13 +1848,14 @@ class Storage:
         ).fetchone()
         assert row is not None
         persisted_task_id = str(row["id"])
-        conn.execute(
-            """
-            DELETE FROM repair_task_evidence
-            WHERE repair_task_id = ? AND role = 'supporting'
-            """,
-            (persisted_task_id,),
-        )
+        if replace_supporting:
+            conn.execute(
+                """
+                DELETE FROM repair_task_evidence
+                WHERE repair_task_id = ? AND role = 'supporting'
+                """,
+                (persisted_task_id,),
+            )
         for evidence_id in clean_evidence_ids:
             evidence_row = conn.execute(
                 """
