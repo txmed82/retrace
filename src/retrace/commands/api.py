@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,10 @@ import click
 
 from retrace.config import load_config
 from retrace.github_app import GitHubWebhookError, handle_github_webhook
+from retrace.ingester import PostHogIngester
 from retrace.issue_sink_clients import GitHubClient, IssueSinkError, LinearClient
 from retrace.issue_sinks import build_issue_card, compact_issue_card, promote_replay_issue
+from retrace.llm.client import LLMClient
 from retrace.notification_sinks import (
     NotificationEvent,
     NotificationPayload,
@@ -42,6 +45,12 @@ from retrace.storage import Storage
 
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_llm_client(cfg: Any, *, enabled: bool) -> LLMClient | None:
+    if not enabled:
+        return None
+    return LLMClient(cfg.llm)
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -913,16 +922,28 @@ def api_serve(config_path: Path, host: str, port: int) -> None:
     show_default=True,
 )
 @click.option("--limit", default=25, show_default=True, type=int)
-def api_process_replays(config_path: Path, limit: int) -> None:
+@click.option(
+    "--ai/--no-ai",
+    default=False,
+    show_default=True,
+    help="Run configured LLM analysis for detector-backed replay issues.",
+)
+def api_process_replays(config_path: Path, limit: int, ai: bool) -> None:
     """Process queued final replay batches into signals and issues."""
     cfg = load_config(config_path)
     store = Storage(cfg.run.data_dir / "retrace.db")
     store.init_schema()
-    result = process_queued_replay_jobs(
-        store=store,
-        limit=limit,
-        enricher=_build_enricher(cfg, store),
-    )
+    llm_client = _maybe_llm_client(cfg, enabled=ai)
+    try:
+        result = process_queued_replay_jobs(
+            store=store,
+            limit=limit,
+            enricher=_build_enricher(cfg, store),
+            llm_client=llm_client,
+        )
+    finally:
+        if llm_client is not None:
+            llm_client.close()
     if (
         result.issues_inserted or result.issues_regressed
     ) and cfg.notifications.enabled:
@@ -971,6 +992,96 @@ def api_process_replays(config_path: Path, limit: int) -> None:
                 "jobs_failed": result.jobs_failed,
                 "sessions_processed": result.sessions_processed,
                 "issues_created_or_updated": result.issues_created_or_updated,
+                "ai_analysis": bool(ai),
+            },
+            indent=2,
+        )
+    )
+
+
+@api_group.command("import-posthog-replays")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--since-hours", default=24, show_default=True, type=int)
+@click.option("--max-sessions", default=50, show_default=True, type=int)
+@click.option("--project-name", default="Default", show_default=True)
+@click.option("--environment-name", default="production", show_default=True)
+@click.option(
+    "--process/--no-process",
+    "process_now",
+    default=True,
+    show_default=True,
+    help="Process imported replay finalize jobs immediately.",
+)
+@click.option(
+    "--ai/--no-ai",
+    default=False,
+    show_default=True,
+    help="Use configured LLM analysis while processing imported replays.",
+)
+def api_import_posthog_replays(
+    config_path: Path,
+    since_hours: int,
+    max_sessions: int,
+    project_name: str,
+    environment_name: str,
+    process_now: bool,
+    ai: bool,
+) -> None:
+    """Import PostHog session recordings into replay issues."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(
+        project_name=project_name,
+        environment_name=environment_name,
+    )
+    ingester = PostHogIngester(cfg.posthog, store, data_dir=cfg.run.data_dir)
+    since = datetime.now(timezone.utc) - timedelta(hours=max(1, since_hours))
+    imported = ingester.import_since_as_replays(
+        since,
+        max(1, max_sessions),
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+    processed_payload: dict[str, Any] = {}
+    if process_now:
+        llm_client = _maybe_llm_client(cfg, enabled=ai)
+        try:
+            processed = process_queued_replay_jobs(
+                store=store,
+                limit=max(1, max_sessions),
+                project_id=workspace.project_id,
+                enricher=_build_enricher(cfg, store),
+                llm_client=llm_client,
+            )
+        finally:
+            if llm_client is not None:
+                llm_client.close()
+        processed_payload = {
+            "jobs_seen": processed.jobs_seen,
+            "jobs_processed": processed.jobs_processed,
+            "jobs_failed": processed.jobs_failed,
+            "sessions_processed": processed.sessions_processed,
+            "issues_created_or_updated": processed.issues_created_or_updated,
+            "issues_inserted": processed.issues_inserted,
+            "issues_regressed": processed.issues_regressed,
+        }
+    click.echo(
+        json.dumps(
+            {
+                "imported_sessions": imported.session_ids,
+                "skipped_sessions": imported.skipped_session_ids,
+                "processing_job_ids": imported.processing_job_ids,
+                "project_id": workspace.project_id,
+                "environment_id": workspace.environment_id,
+                "processed": processed_payload,
+                "ai_analysis": bool(ai and process_now),
             },
             indent=2,
         )

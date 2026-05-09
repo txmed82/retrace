@@ -5,6 +5,7 @@ import logging
 import os
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,14 @@ from retrace.storage import SessionMeta, Storage
 
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PostHogReplayImportResult:
+    session_ids: list[str]
+    replay_session_ids: list[str]
+    processing_job_ids: list[str]
+    skipped_session_ids: list[str]
 
 
 class PostHogIngester:
@@ -135,6 +144,39 @@ class PostHogIngester:
                     snapshots.append(item)
         return snapshots
 
+    def _persist_legacy_session(
+        self,
+        *,
+        recording: dict[str, Any],
+        session_id: str,
+        snapshots: list[dict[str, Any]],
+    ) -> None:
+        self._atomic_write_json(self.sessions_dir / f"{session_id}.json", snapshots)
+        duration_seconds = recording.get("recording_duration") or 0
+        meta = SessionMeta(
+            id=session_id,
+            project_id=self.cfg.project_id,
+            started_at=datetime.fromisoformat(
+                str(recording["start_time"]).replace("Z", "+00:00")
+            ),
+            duration_ms=int(float(duration_seconds) * 1000),
+            distinct_id=recording.get("distinct_id"),
+            event_count=int(recording.get("event_count") or recording.get("click_count") or 0),
+        )
+        self.store.upsert_session(meta)
+
+    def _replay_metadata(self, recording: dict[str, Any]) -> dict[str, object]:
+        return {
+            "source": "posthog",
+            "posthog_project_id": self.cfg.project_id,
+            "posthog_recording_id": str(recording.get("id") or ""),
+            "posthog_host": self.cfg.host.rstrip("/"),
+            "recording_duration": recording.get("recording_duration") or 0,
+            "click_count": recording.get("click_count") or 0,
+            "event_count": recording.get("event_count") or 0,
+            "start_time": str(recording.get("start_time") or ""),
+        }
+
     def fetch_since(self, since: datetime, max_sessions: int) -> list[str]:
         host = self.cfg.host.rstrip("/")
         qs = urlencode({"date_from": since.isoformat(), "limit": max_sessions})
@@ -155,29 +197,87 @@ class PostHogIngester:
                     sid = r["id"]
                     try:
                         snapshots = self._fetch_snapshots(client, sid)
-                        self._atomic_write_json(
-                            self.sessions_dir / f"{sid}.json", snapshots
+                        self._persist_legacy_session(
+                            recording=r,
+                            session_id=sid,
+                            snapshots=snapshots,
                         )
-                        duration_seconds = r.get("recording_duration") or 0
-                        meta = SessionMeta(
-                            id=sid,
-                            project_id=self.cfg.project_id,
-                            started_at=datetime.fromisoformat(
-                                str(r["start_time"]).replace("Z", "+00:00")
-                            ),
-                            duration_ms=int(float(duration_seconds) * 1000),
-                            distinct_id=r.get("distinct_id"),
-                            event_count=int(
-                                r.get("event_count") or r.get("click_count") or 0
-                            ),
-                        )
-                        self.store.upsert_session(meta)
                         ids.append(sid)
                     except Exception as exc:
                         log.warning("failed to ingest session %s: %s", sid, exc)
                         continue
                 next_url = body.get("next")
         return ids
+
+    def import_since_as_replays(
+        self,
+        since: datetime,
+        max_sessions: int,
+        *,
+        project_id: str,
+        environment_id: str,
+    ) -> PostHogReplayImportResult:
+        """Import PostHog session recordings into first-party replay storage.
+
+        This keeps the historical raw PostHog session cache for compatibility,
+        then writes the same snapshots as a final replay batch so the normal
+        replay issue grouping, UI, and regression-test generation paths apply.
+        """
+        host = self.cfg.host.rstrip("/")
+        qs = urlencode({"date_from": since.isoformat(), "limit": max_sessions})
+        next_url: str | None = (
+            f"{host}/api/projects/{self.cfg.project_id}/session_recordings?{qs}"
+        )
+        imported: list[str] = []
+        replay_sessions: list[str] = []
+        job_ids: list[str] = []
+        skipped: list[str] = []
+        with httpx.Client(
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+        ) as client:
+            while next_url and len(imported) < max_sessions:
+                list_resp = self._get_with_retry(client, next_url)
+                body = list_resp.json()
+                recordings = body.get("results", [])
+                for recording in recordings:
+                    if len(imported) >= max_sessions:
+                        break
+                    sid = str(recording.get("id") or "").strip()
+                    if not sid:
+                        continue
+                    try:
+                        snapshots = self._fetch_snapshots(client, sid)
+                        self._persist_legacy_session(
+                            recording=recording,
+                            session_id=sid,
+                            snapshots=snapshots,
+                        )
+                        distinct_id = str(recording.get("distinct_id") or "")
+                        result = self.store.insert_replay_batch(
+                            project_id=project_id,
+                            environment_id=environment_id,
+                            session_id=sid,
+                            sequence=0,
+                            events=snapshots,
+                            flush_type="final",
+                            distinct_id=distinct_id,
+                            metadata=self._replay_metadata(recording),
+                        )
+                        imported.append(sid)
+                        replay_sessions.append(result.session_row_id)
+                        if result.processing_job_id:
+                            job_ids.append(result.processing_job_id)
+                    except Exception as exc:
+                        skipped.append(sid)
+                        log.warning("failed to import PostHog replay %s: %s", sid, exc)
+                        continue
+                next_url = body.get("next")
+        return PostHogReplayImportResult(
+            session_ids=imported,
+            replay_session_ids=replay_sessions,
+            processing_job_ids=job_ids,
+            skipped_session_ids=skipped,
+        )
 
     def load_events(self, session_id: str) -> list[dict[str, Any]]:
         path = self.sessions_dir / f"{session_id}.json"

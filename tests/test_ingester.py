@@ -7,6 +7,7 @@ from pytest_httpx import HTTPXMock
 
 from retrace.config import PostHogConfig
 from retrace.ingester import PostHogIngester
+from retrace.replay_core import process_queued_replay_jobs
 from retrace.storage import Storage
 
 
@@ -333,3 +334,80 @@ def test_fetch_sessions_supports_posthog_blob_v2_sources(
     assert len(events) == 2
     assert events[0]["type"] == 4
     assert events[1]["type"] == 6
+
+
+def test_import_since_as_replays_feeds_replay_issue_pipeline(
+    httpx_mock: HTTPXMock, tmp_path: Path, cfg: PostHogConfig
+):
+    since = datetime(2026, 4, 19, 10, 0, tzinfo=timezone.utc)
+    httpx_mock.add_response(
+        method="GET",
+        url=(
+            "https://us.i.posthog.com/api/projects/42/session_recordings"
+            "?date_from=2026-04-19T10%3A00%3A00%2B00%3A00&limit=50"
+        ),
+        json={
+            "results": [
+                {
+                    "id": "sess-posthog-error",
+                    "start_time": "2026-04-19T11:00:00+00:00",
+                    "recording_duration": 12,
+                    "distinct_id": "user-posthog",
+                    "event_count": 2,
+                }
+            ],
+            "next": None,
+        },
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=(
+            "https://us.i.posthog.com/api/projects/42/session_recordings"
+            "/sess-posthog-error/snapshots"
+        ),
+        json={
+            "snapshots": [
+                {"type": 4, "timestamp": 0, "data": {"href": "https://app.test/checkout"}},
+                {
+                    "type": 6,
+                    "timestamp": 100,
+                    "data": {
+                        "plugin": "retrace/exception@1",
+                        "payload": {
+                            "message": "Checkout crashed",
+                            "stack": "Error: Checkout crashed\n    at checkout.ts:10",
+                        },
+                    },
+                },
+            ]
+        },
+    )
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Default")
+    ingester = PostHogIngester(cfg, store, data_dir=tmp_path / "data")
+
+    imported = ingester.import_since_as_replays(
+        since,
+        max_sessions=50,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+    processed = process_queued_replay_jobs(store=store, limit=10)
+
+    assert imported.session_ids == ["sess-posthog-error"]
+    assert len(imported.processing_job_ids) == 1
+    assert processed.sessions_processed == 1
+    issues = store.list_replay_issues(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+    assert len(issues) == 1
+    assert issues[0]["affected_users"] == 1
+    playback = store.get_replay_playback(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-posthog-error",
+    )
+    assert playback is not None
+    assert playback.session["distinct_id"] == "user-posthog"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import re
 from urllib.parse import urlsplit, urlunsplit
 
 from retrace.detectors.base import Signal
@@ -22,14 +23,62 @@ def _primary_message(signals: list[Signal]) -> str:
     return ""
 
 
+def _trim(value: object, limit: int = 200) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text[:limit]
+
+
+def _top_stack_frame(stack: object) -> str:
+    if not isinstance(stack, str):
+        return ""
+    for line in stack.splitlines():
+        clean = line.strip()
+        if clean and not clean.lower().startswith(("error", "typeerror", "referenceerror")):
+            return _trim(clean)
+    return ""
+
+
+def _signal_fingerprint_part(signal: Signal) -> str:
+    details = signal.details or {}
+    if signal.detector in {"network_4xx", "network_5xx"}:
+        return "|".join(
+            [
+                _trim(details.get("method") or "GET", 20).upper(),
+                _normalize_url(str(details.get("request_url") or "")),
+                _trim(details.get("status"), 20),
+            ]
+        )
+    if signal.detector == "console_error":
+        return "|".join(
+            [
+                _primary_message([signal]),
+                _top_stack_frame(details.get("stack")),
+            ]
+        )
+    if signal.detector in {"rage_click", "dead_click"}:
+        return "|".join(
+            [
+                _trim(details.get("target_test_id") or details.get("target_id"), 120),
+                _trim(
+                    details.get("target_label")
+                    or details.get("aria_label")
+                    or details.get("label"),
+                    120,
+                ),
+            ]
+        )
+    return _primary_message([signal])
+
+
 def _fingerprint(signals: list[Signal]) -> tuple[str, str, str]:
     detectors = tuple(sorted({s.detector for s in signals}))
     urls = tuple(sorted({_normalize_url(s.url) for s in signals if s.url}))
     primary_url = urls[0] if urls else ""
+    parts = sorted({_signal_fingerprint_part(s) for s in signals if _signal_fingerprint_part(s)})
     return (
         ",".join(detectors),
         primary_url,
-        _primary_message(signals),
+        "|".join(parts) or _primary_message(signals),
     )
 
 

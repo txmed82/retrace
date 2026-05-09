@@ -70,3 +70,53 @@ def test_cluster_respects_min_size():
     }
     assert cluster_sessions(sig, min_size=2) == []
     assert len(cluster_sessions(sig, min_size=1)) == 1
+
+
+def test_cluster_splits_same_route_by_failed_request():
+    sig_a = [
+        Signal(
+            session_id="a",
+            detector="network_5xx",
+            timestamp_ms=0,
+            url="https://x/checkout",
+            details={"method": "POST", "request_url": "/api/pay", "status": 500},
+        )
+    ]
+    sig_b = [
+        Signal(
+            session_id="b",
+            detector="network_5xx",
+            timestamp_ms=0,
+            url="https://x/checkout",
+            details={"method": "POST", "request_url": "/api/cart", "status": 500},
+        )
+    ]
+
+    clusters = cluster_sessions({"a": sig_a, "b": sig_b}, min_size=1)
+
+    assert len(clusters) == 2
+
+
+def test_cluster_splits_console_errors_by_top_stack_frame():
+    sig_a = [
+        Signal(
+            session_id="a",
+            detector="console_error",
+            timestamp_ms=0,
+            url="https://x/checkout",
+            details={"message": "Cannot read total", "stack": "TypeError\n at total.ts:10"},
+        )
+    ]
+    sig_b = [
+        Signal(
+            session_id="b",
+            detector="console_error",
+            timestamp_ms=0,
+            url="https://x/checkout",
+            details={"message": "Cannot read total", "stack": "TypeError\n at tax.ts:20"},
+        )
+    ]
+
+    clusters = cluster_sessions({"a": sig_a, "b": sig_b}, min_size=1)
+
+    assert len(clusters) == 2
