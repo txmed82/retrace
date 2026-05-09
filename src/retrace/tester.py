@@ -551,22 +551,22 @@ def _native_auth_headers(auth_context: dict[str, str]) -> tuple[dict[str, str], 
     if mode == "jwt":
         token = str(auth_context.get("jwt") or "").strip()
         if not token:
-            return {}, "auth_failure: missing JWT token env var"
+            return {}, "auth failure: missing JWT token env var"
         return {"Authorization": f"Bearer {token}"}, ""
     if mode == "headers":
         raw = str(auth_context.get("headers_json") or "").strip()
         if not raw:
-            return {}, "auth_failure: missing auth headers env var"
+            return {}, "auth failure: missing auth headers env var"
         try:
             parsed = json.loads(raw)
         except Exception as exc:
-            return {}, f"auth_failure: invalid auth headers JSON: {exc}"
+            return {}, f"auth failure: invalid auth headers JSON: {exc}"
         if not isinstance(parsed, dict):
-            return {}, "auth_failure: auth headers must be a JSON object"
+            return {}, "auth failure: auth headers must be a JSON object"
         return {str(k): str(v) for k, v in parsed.items()}, ""
     if mode == "form":
-        return {}, "auth_failure: native execution does not support form auth"
-    return {}, "auth_failure: auth mode is required"
+        return {}, "auth failure: native execution does not support form auth"
+    return {}, "auth failure: auth mode is required"
 
 
 def _join_url(base_url: str, path: str) -> str:
@@ -1449,6 +1449,15 @@ def _write_suite_proposal_and_drafts(
             harness_command=spec.harness_command or DEFAULT_HARNESS_COMMAND,
             mode="describe",
             execution_engine="native",
+            auth_required=spec.auth_required,
+            auth_mode=spec.auth_mode,
+            auth_login_url=spec.auth_login_url,
+            auth_username=spec.auth_username,
+            auth_password_env=spec.auth_password_env,
+            auth_jwt_env=spec.auth_jwt_env,
+            auth_headers_env=spec.auth_headers_env,
+            auth_profile=spec.auth_profile,
+            auth_setup_steps=list(spec.auth_setup_steps or []),
             exact_steps=exact_steps,
             assertions=[
                 {
@@ -1614,7 +1623,7 @@ def _run_native_spec(
     script_scope: dict[str, Any] = {"vars": {}, "env": dict(spec.env_overrides or {})}
     request_headers, auth_error = _native_auth_headers(auth_context or {})
     if auth_error:
-        error = auth_error
+        return 1, artifacts, assertion_results, auth_error
 
     steps = [*spec.auth_setup_steps, *(spec.exact_steps or [])] or [
         {"id": "default-get", "action": "get", "url": app_url}

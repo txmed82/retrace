@@ -55,11 +55,25 @@ def _auth_profile(defaults: dict[str, Any], name: str) -> dict[str, Any]:
     if not isinstance(profile, dict):
         raise click.ClickException(f"auth profile must be an object: {name}")
     forbidden = {"password", "jwt", "token", "headers", "headers_json"}
-    leaked = sorted(forbidden & set(profile))
+    leaked: list[str] = []
+
+    def scan_secret_keys(value: Any, path: str = "") -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                key_s = str(key)
+                child_path = f"{path}.{key_s}" if path else key_s
+                if key_s in forbidden:
+                    leaked.append(child_path)
+                scan_secret_keys(nested, child_path)
+        elif isinstance(value, list):
+            for idx, item in enumerate(value):
+                scan_secret_keys(item, f"{path}[{idx}]")
+
+    scan_secret_keys(profile)
     if leaked:
         raise click.ClickException(
             "auth profile must reference env vars, not secret values: "
-            + ", ".join(leaked)
+            + ", ".join(sorted(leaked))
         )
     return profile
 

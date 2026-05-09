@@ -190,8 +190,23 @@ def test_create_suite_run_generates_accepts_and_runs_draft_specs(
 ) -> None:
     server, server_thread, app_url = _server_url()
     try:
-        (tmp_path / "config.yaml").write_text(_CONFIG_YAML)
+        (tmp_path / "config.yaml").write_text(
+            _CONFIG_YAML
+            + """
+tester:
+  auth_profiles:
+    local-jwt:
+      mode: jwt
+      jwt_env: RETRACE_LOCAL_JWT
+      auth_setup_steps:
+        - id: auth-marker
+          action: script
+          set:
+            auth_profile: "'local-jwt'"
+"""
+        )
         monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("RETRACE_LOCAL_JWT", "test-token")
         set_explore_factories(
             driver_factory=lambda **kwargs: _ExploreDriver(),
             llm_factory=lambda: _ExploreLLM(),
@@ -205,6 +220,8 @@ def test_create_suite_run_generates_accepts_and_runs_draft_specs(
                 "create-suite",
                 "--app-url",
                 app_url,
+                "--auth-profile",
+                "local-jwt",
                 "--goal",
                 "Signup flow",
                 "--goal",
@@ -238,6 +255,11 @@ def test_create_suite_run_generates_accepts_and_runs_draft_specs(
         )
         assert all(spec["fixtures"]["draft_reason"] for spec in draft_specs)
         assert all("source_auth" in spec["fixtures"] for spec in draft_specs)
+        assert all(spec["auth_profile"] == "local-jwt" for spec in draft_specs)
+        assert all(
+            spec["auth_setup_steps"][0]["id"] == "auth-marker"
+            for spec in draft_specs
+        )
 
         draft_id = draft_specs[0]["spec_id"]
         accepted = runner.invoke(

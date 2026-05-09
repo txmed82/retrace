@@ -706,7 +706,10 @@ def test_native_jwt_auth_profile_uses_env_without_persisting_secret(
     assert "test-token" not in persisted
 
 
-def test_native_missing_jwt_auth_is_classified_distinctly(tmp_path: Path) -> None:
+def test_native_missing_jwt_auth_is_classified_distinctly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("RETRACE_MISSING_TEST_JWT", raising=False)
     server, app_url = _server_url()
     try:
         spec = create_spec(
