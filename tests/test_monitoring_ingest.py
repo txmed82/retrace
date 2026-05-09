@@ -9,7 +9,8 @@ from threading import Thread
 
 from retrace.commands.api import _handler
 from retrace.monitoring_ingest import ingest_monitoring_webhook
-from retrace.sdk_keys import create_service_token
+from retrace.sdk_keys import create_sdk_key, create_service_token
+from retrace.sentry_compat import parse_sentry_envelope
 from retrace.storage import Storage, WorkspaceIds
 
 
@@ -105,6 +106,72 @@ def test_sentry_webhook_creates_and_dedupes_failure(tmp_path: Path) -> None:
     assert evidence[0].payload["top_stack_frame"] == "src/checkout.ts:submit:42"
 
 
+def test_raw_sentry_sdk_events_group_into_one_incident(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    base_event = {
+        "title": "TypeError: checkout failed",
+        "level": "error",
+        "transaction": "/checkout",
+        "exception": {
+            "values": [
+                {
+                    "type": "TypeError",
+                    "value": "Cannot read properties of undefined",
+                    "stacktrace": {
+                        "frames": [
+                            {
+                                "filename": "src/checkout.ts",
+                                "function": "submit",
+                                "lineno": 42,
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
+    }
+
+    first = ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={"event": {"event_id": "evt-sdk-1", **base_event}},
+    )
+    second = ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={"event": {"event_id": "evt-sdk-2", **base_event}},
+    )
+
+    failures = store.list_failures(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        source_type="monitor_incident",
+    )
+    assert len(failures) == 2
+    assert first.failure_id != second.failure_id
+    assert first.incident_id == second.incident_id
+    assert failures[0].metadata["grouping_fingerprint"]
+    assert failures[0].metadata["top_stack_frame"] == "src/checkout.ts:submit:42"
+
+
+def test_sentry_envelope_parser_accepts_length_delimited_event() -> None:
+    event = {"event_id": "evt-envelope-1", "level": "error", "message": "boom"}
+    event_bytes = json.dumps(event, separators=(",", ":")).encode("utf-8")
+    body = b"\n".join(
+        [
+            b'{"dsn":"https://rtpk_example@retrace.local/123"}',
+            json.dumps({"type": "event", "length": len(event_bytes)}).encode("utf-8"),
+            event_bytes,
+        ]
+    )
+
+    assert parse_sentry_envelope(body) == [event]
+
+
 def test_posthog_exception_webhook_creates_and_dedupes_failure(tmp_path: Path) -> None:
     store, workspace = _store(tmp_path)
     payload = {
@@ -193,6 +260,185 @@ def test_monitoring_webhook_endpoint_ingests_sentry_payload(tmp_path: Path) -> N
     )
     assert failure is not None
     assert failure.severity == "critical"
+
+
+def test_sentry_store_endpoint_ingests_sdk_event_with_query_key(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Browser",
+    )
+    body = json.dumps(
+        {
+            "event_id": "evt-store-1",
+            "title": "ReferenceError in settings",
+            "level": "error",
+            "timestamp": "2026-05-09T06:00:00Z",
+            "contexts": {"trace": {"trace_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+        }
+    ).encode("utf-8")
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/sentry/{workspace.project_id}/store/?sentry_key={sdk.key}",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 202
+    assert payload["accepted"] is True
+    assert payload["event_count"] == 1
+    assert payload["results"][0]["external_id"] == "evt-store-1"
+    failure = store.find_failure_by_source(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        source_type="monitor_incident",
+        source_external_id="sentry:evt-store-1",
+    )
+    assert failure is not None
+    assert failure.metadata["trace_ids"] == ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+
+
+def test_sentry_envelope_endpoint_accepts_x_sentry_auth(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Browser",
+    )
+    event = {
+        "event_id": "evt-envelope-api-1",
+        "title": "TypeError in profile",
+        "level": "fatal",
+    }
+    body = (
+        b'{"sent_at":"2026-05-09T06:00:00Z"}\n'
+        b'{"type":"event"}\n'
+        + json.dumps(event).encode("utf-8")
+        + b"\n"
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/sentry/{workspace.project_id}/envelope/",
+            body=body,
+            headers={
+                "Content-Type": "application/x-sentry-envelope",
+                "X-Sentry-Auth": f"Sentry sentry_version=7,sentry_key={sdk.key}",
+            },
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 202
+    assert payload["event_count"] == 1
+    assert payload["results"][0]["external_id"] == "evt-envelope-api-1"
+
+
+def test_sentry_envelope_endpoint_accepts_dsn_key_fallback(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Browser",
+    )
+    event = {
+        "event_id": "evt-envelope-dsn-1",
+        "title": "TypeError in billing",
+        "level": "error",
+    }
+    body = (
+        json.dumps({"dsn": f"https://{sdk.key}@retrace.local/{workspace.project_id}"}).encode(
+            "utf-8"
+        )
+        + b"\n"
+        + b'{"type":"event"}\n'
+        + json.dumps(event).encode("utf-8")
+        + b"\n"
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/sentry/{workspace.project_id}/envelope/",
+            body=body,
+            headers={"Content-Type": "application/x-sentry-envelope"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 202
+    assert payload["event_count"] == 1
+    assert payload["results"][0]["external_id"] == "evt-envelope-dsn-1"
+
+
+def test_sentry_endpoint_rejects_project_mismatch(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Browser",
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/sentry/not-{workspace.project_id}/store/?sentry_key={sdk.key}",
+            body=json.dumps({"event_id": "evt-nope"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 403
+    assert payload["error"] == "forbidden"
+
+
+def test_sentry_endpoint_rejects_extra_path_segments(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Browser",
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/sentry/{workspace.project_id}/store/extra?sentry_key={sdk.key}",
+            body=json.dumps({"event_id": "evt-extra-path"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 404
+    assert payload["error"] == "not_found"
 
 
 def test_monitoring_webhook_endpoint_rejects_empty_payload(tmp_path: Path) -> None:
