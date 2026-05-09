@@ -45,6 +45,7 @@ def test_sentry_webhook_creates_and_dedupes_failure(tmp_path: Path) -> None:
                 "event_id": "evt-1",
                 "title": "TypeError: failed checkout",
                 "level": "error",
+                "timestamp": "2026-05-09T05:00:00Z",
                 "culprit": "checkout.submit",
                 "fingerprint": ["checkout", "type-error"],
                 "contexts": {"trace": {"trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}},
@@ -99,6 +100,8 @@ def test_sentry_webhook_creates_and_dedupes_failure(tmp_path: Path) -> None:
     assert failures[0].metadata["trace_ids"] == ["4bf92f3577b34da6a3ce929d0e0e4736"]
     evidence = store.list_failure_evidence(failure_id=first.failure_id)
     assert len(evidence) == 1
+    assert evidence[0].redaction_state == "sensitive"
+    assert evidence[0].occurred_at_ms == 1_778_302_800_000
     assert evidence[0].payload["top_stack_frame"] == "src/checkout.ts:submit:42"
 
 
@@ -190,3 +193,32 @@ def test_monitoring_webhook_endpoint_ingests_sentry_payload(tmp_path: Path) -> N
     )
     assert failure is not None
     assert failure.severity == "critical"
+
+
+def test_monitoring_webhook_endpoint_rejects_empty_payload(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Ingest",
+        scopes=["monitoring:write"],
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/monitoring/webhook/sentry?environment_id={workspace.environment_id}",
+            body=json.dumps({}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 400
+    assert payload["error"] == "invalid_payload"

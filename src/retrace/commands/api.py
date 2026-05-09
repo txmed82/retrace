@@ -349,13 +349,16 @@ def _handler(
                     },
                 )
                 return
-            body = self.rfile.read(length) if length else b"{}"
+            if length == 0:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            body = self.rfile.read(length)
             try:
                 payload = json.loads(body.decode("utf-8") or "{}")
             except json.JSONDecodeError:
                 _json_response(self, 400, {"error": "invalid_json"})
                 return
-            if not isinstance(payload, dict):
+            if not isinstance(payload, dict) or not payload:
                 _json_response(self, 400, {"error": "invalid_payload"})
                 return
             try:

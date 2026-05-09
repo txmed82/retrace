@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from retrace.evidence import EvidenceItem, evidence_dedupe_key
@@ -81,7 +82,7 @@ def ingest_monitoring_webhook(
         evidence_type="monitoring_alert",
         occurred_at_ms=alert.occurred_at_ms,
         source=source_external_id,
-        redaction_state="redacted",
+        redaction_state="sensitive",
         payload=alert.evidence,
         dedupe_key=evidence_dedupe_key(
             failure_id=failure_id,
@@ -316,9 +317,31 @@ def _timestamp_ms(payload: dict[str, Any]) -> int:
         value = payload.get(key)
         if value is None:
             continue
-        if isinstance(value, int | float):
-            return int(value if value > 10_000_000_000 else value * 1000)
+        parsed = _parse_timestamp_ms(value)
+        if parsed:
+            return parsed
     return 0
+
+
+def _parse_timestamp_ms(value: Any) -> int:
+    if isinstance(value, int | float):
+        return int(value if value > 10_000_000_000 else value * 1000)
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        numeric = float(text)
+    except ValueError:
+        numeric = 0
+    if numeric:
+        return int(numeric if numeric > 10_000_000_000 else numeric * 1000)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
 
 
 def _first_exception(event: dict[str, Any]) -> dict[str, Any]:

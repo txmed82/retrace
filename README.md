@@ -378,7 +378,7 @@ Available read/process endpoints:
 - `POST /api/replays/process`
 
 Monitoring webhook ingest also uses service tokens. Create a token with
-`monitoring:write` or `admin`, then point Sentry or PostHog exception webhooks at:
+`monitoring:write`, `ingest`, or `admin`, then point Sentry or PostHog exception webhooks at:
 
 - `POST /api/monitoring/webhook/sentry?environment_id=...`
 - `POST /api/monitoring/webhook/posthog?environment_id=...`
