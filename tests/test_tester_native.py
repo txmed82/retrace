@@ -396,6 +396,29 @@ def test_auto_engine_policy_routes_exploration_and_open_prompts(
     assert select_execution_engine(visual).execution_engine == "visual"
 
 
+def test_auto_engine_policy_keeps_authenticated_exploration_on_harness(
+    tmp_path: Path,
+) -> None:
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Auto auth explore",
+        prompt="",
+        app_url="http://127.0.0.1:3000",
+        start_command="",
+        harness_command="echo {app_url_q} {prompt_q} {run_dir_q}",
+        execution_engine="auto",
+        exploratory_goals=["Explore authenticated checkout"],
+        auth_required=True,
+        auth_mode="jwt",
+        auth_jwt_env="RETRACE_TEST_JWT",
+    )
+
+    selection = select_execution_engine(spec)
+
+    assert selection.execution_engine == "harness"
+    assert "credential-aware" in selection.reason
+
+
 def test_auto_engine_policy_explains_api_only_specs(tmp_path: Path) -> None:
     spec = create_spec(
         specs_dir=specs_dir_for_data_dir(tmp_path),

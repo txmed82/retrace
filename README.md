@@ -262,6 +262,8 @@ logs explain the choice:
   to the visual engine.
 - Open-ended prompts without deterministic steps or exploratory goals use
   Browser Harness.
+- Authenticated exploratory specs also use Browser Harness because that runner
+  receives the auth context.
 - Explicit `harness`, `native`, `explore`, or `visual` engine settings are
   honored and still explain the selected runtime.
 

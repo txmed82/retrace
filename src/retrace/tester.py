@@ -259,6 +259,10 @@ def _apply_spec_defaults(data: dict[str, Any]) -> None:
     data["execution_engine"] = engine
 
 
+def _auth_needed_for_engine(spec: TesterSpec) -> bool:
+    return bool(spec.auth_required or spec.auth_profile or spec.auth_setup_steps)
+
+
 def validate_spec(spec: TesterSpec) -> None:
     if spec.schema_version != SPEC_SCHEMA_VERSION:
         raise ValueError(
@@ -282,9 +286,18 @@ def validate_spec(spec: TesterSpec) -> None:
         and bool(spec.exploratory_goals)
         and not (spec.exact_steps or spec.assertions)
     )
-    needs_harness_command = spec.execution_engine == "harness" or (
+    auto_explore_needs_harness_auth = (
         spec.execution_engine == "auto"
-        and not (spec.exact_steps or spec.assertions or spec.exploratory_goals)
+        and bool(spec.exploratory_goals)
+        and _auth_needed_for_engine(spec)
+    )
+    needs_harness_command = (
+        spec.execution_engine == "harness"
+        or auto_explore_needs_harness_auth
+        or (
+            spec.execution_engine == "auto"
+            and not (spec.exact_steps or spec.assertions or spec.exploratory_goals)
+        )
     )
     native_selected = spec.execution_engine == "native" or (
         spec.execution_engine == "auto" and bool(spec.exact_steps or spec.assertions)
@@ -492,6 +505,14 @@ def select_execution_engine(spec: TesterSpec) -> EngineSelection:
             reason=(
                 "auto selected native because deterministic steps/assertions are "
                 f"present; {runtime} runtime selected by steps"
+            ),
+        )
+    if spec.exploratory_goals and _auth_needed_for_engine(spec):
+        return EngineSelection(
+            execution_engine="harness",
+            reason=(
+                "auto selected Browser Harness because exploratory auth setup "
+                "requires credential-aware execution"
             ),
         )
     if spec.exploratory_goals:
