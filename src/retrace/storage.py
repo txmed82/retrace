@@ -2148,6 +2148,33 @@ class Storage:
             ).fetchall()
         return [self._failure_from_row(row) for row in rows]
 
+    def list_incident_failures_for_incidents(
+        self,
+        *,
+        incident_ids: list[str],
+    ) -> dict[str, list[FailureRow]]:
+        clean_ids = [str(item).strip() for item in incident_ids if str(item).strip()]
+        if not clean_ids:
+            return {}
+        placeholders = ",".join("?" for _ in clean_ids)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT inf.incident_id AS linked_incident_id, f.*
+                FROM incident_failures inf
+                JOIN failures f ON f.id = inf.failure_id
+                WHERE inf.incident_id IN ({placeholders})
+                ORDER BY f.updated_at DESC, f.public_id
+                """,
+                clean_ids,
+            ).fetchall()
+        grouped: dict[str, list[FailureRow]] = {incident_id: [] for incident_id in clean_ids}
+        for row in rows:
+            grouped.setdefault(str(row["linked_incident_id"]), []).append(
+                self._failure_from_row(row)
+            )
+        return grouped
+
     def list_incident_evidence(
         self,
         *,
