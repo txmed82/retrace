@@ -74,9 +74,9 @@ function messageFromError(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "object" && error !== null && "message" in error) {
     const message = (error as { message?: unknown }).message;
-    return typeof message === "string" ? message : String(message || "");
+    return typeof message === "string" ? message : String(message ?? "");
   }
-  return String(error || "");
+  return String(error ?? "");
 }
 
 function ensureGlobalPattern(pattern: RegExp): RegExp {
@@ -269,8 +269,8 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
         message: redactText(event.message || messageFromError(event.error)),
         stack: redactText(stackFromError(event.error)),
         source: redactText(event.filename || ""),
-        line: event.lineno || undefined,
-        column: event.colno || undefined,
+        line: event.lineno ?? undefined,
+        column: event.colno ?? undefined,
         url: redactText(globalThis.location?.href || ""),
         sessionId,
         trace: traceContext(),

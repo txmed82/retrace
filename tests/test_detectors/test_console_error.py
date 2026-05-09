@@ -19,6 +19,31 @@ def test_console_error_detects_error_level():
     assert "TypeError" in s.details["message"]
 
 
+def test_console_error_prefers_redacted_payload_url():
+    from retrace.detectors.console_error import detector
+
+    events = [
+        meta(ts=1000, href="https://example.com/page?token=raw-secret"),
+        {
+            "type": 6,
+            "timestamp": 2000,
+            "data": {
+                "plugin": "retrace/console@1",
+                "payload": {
+                    "level": "error",
+                    "payload": ["boom"],
+                    "url": "https://example.com/page?token=redacted-secret",
+                },
+            },
+        },
+    ]
+
+    signals = detector.detect("sess-1", events)
+
+    assert len(signals) == 1
+    assert signals[0].url == "https://example.com/page?[redacted]"
+
+
 def test_console_error_ignores_non_error_levels():
     from retrace.detectors.console_error import detector
 

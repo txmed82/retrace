@@ -73,12 +73,13 @@ class ConsoleErrorDetector:
                 continue
             msg_parts = payload.get("payload") or []
             message = _redact(" ".join(str(p) for p in msg_parts))
+            event_url = _redact(str(payload.get("url") or url))
             out.append(
                 Signal(
                     session_id=session_id,
                     detector=self.name,
                     timestamp_ms=event_timestamp_ms(e),
-                    url=url,
+                    url=event_url,
                     details={"message": message, "level": level},
                     confidence="medium",
                     reason_codes=("console_error.error_level",),
