@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import subprocess
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from retrace.matching.routes import RouteDefinition, load_route_manifest, route_matches
+from retrace.matching.sourcemaps import load_source_maps, map_stack_paths
 
 
 _TEXT_EXTS = {
@@ -68,6 +72,7 @@ class CodeCandidate:
     score: float
     rationale: str
     symbol: str | None = None
+    owners: list[str] = field(default_factory=list)
 
 
 def _tokenize(text: str) -> list[str]:
@@ -122,6 +127,17 @@ def _api_routes(evidence_text: str) -> list[str]:
         if route not in routes:
             routes.append(route)
     return routes[:10]
+
+
+def _api_methods(evidence_text: str) -> dict[str, str]:
+    methods: dict[str, str] = {}
+    for match in re.finditer(
+        r"\b(GET|POST|PUT|PATCH|DELETE)\b\s+(/api/[A-Za-z0-9_./:-]+)",
+        evidence_text,
+        re.IGNORECASE,
+    ):
+        methods[match.group(2).rstrip(".,);")] = match.group(1).upper()
+    return methods
 
 
 def _is_dynamic_route_segment(segment: str) -> bool:
@@ -183,7 +199,10 @@ def _score_file(
     *,
     stack_paths: list[str],
     api_routes: list[str],
-) -> tuple[float, str]:
+    api_methods: dict[str, str],
+    route_manifest: list[RouteDefinition],
+    churn_scores: dict[str, float],
+) -> tuple[float, str, str | None]:
     rel = file_path.relative_to(repo_path).as_posix()
     score = 0.0
     hits: list[str] = []
@@ -192,7 +211,7 @@ def _score_file(
     for stack_path in stack_paths:
         stack_l = stack_path.lower()
         if rel_l == stack_l or rel_l.endswith("/" + stack_l):
-            score += 35.0
+            score += 45.0
             hits.append(f"stack_frame:{stack_path}")
         elif file_path.name.lower() == Path(stack_path).name.lower():
             score += 12.0
@@ -214,7 +233,7 @@ def _score_file(
     try:
         text = file_path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
-        return 0.0, ""
+        return 0.0, "", None
     text_l = text.lower()
     server_route_file = rel_l.startswith(
         (
@@ -229,6 +248,11 @@ def _score_file(
     )
     for route in api_routes:
         route_l = route.lower()
+        method = api_methods.get(route, "")
+        for definition in route_manifest:
+            if definition.file_path == rel and route_matches(definition, route, method):
+                score += 28.0
+                hits.append(f"route_manifest:{route}")
         if route_l in text_l:
             route_bonus = 14.0 if server_route_file else 5.0
             score += route_bonus
@@ -277,7 +301,89 @@ def _score_file(
             score -= 1.5
     if "admin" not in terms and "admin" in rel_l:
         score -= 4.0
-    return score, ", ".join(hits[:6])
+    if rel in churn_scores:
+        score += churn_scores[rel]
+        hits.append("recent_churn")
+    return score, ", ".join(hits[:8]), _best_symbol(text, terms, api_routes)
+
+
+def _best_symbol(text: str, terms: list[str], api_routes: list[str]) -> str | None:
+    symbols = _extract_symbols(text)
+    if not symbols:
+        return None
+    haystack = " ".join([*terms, *api_routes]).lower()
+    for symbol in symbols:
+        if symbol.lower() in haystack:
+            return symbol
+    return symbols[0]
+
+
+def _extract_symbols(text: str) -> list[str]:
+    symbols: list[str] = []
+    patterns = [
+        r"\bexport\s+default\s+function\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+        r"\bexport\s+(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+        r"\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+        r"\bclass\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+        r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            value = match.group(1)
+            if value not in symbols:
+                symbols.append(value)
+    return symbols[:8]
+
+
+def _load_codeowners(repo_path: Path) -> list[tuple[str, list[str]]]:
+    for rel in ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"):
+        path = repo_path / rel
+        if not path.exists():
+            continue
+        owners: list[tuple[str, list[str]]] = []
+        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                owners.append((parts[0], parts[1:]))
+        return owners
+    return []
+
+
+def _owners_for_path(rel: str, rules: list[tuple[str, list[str]]]) -> list[str]:
+    matched: list[str] = []
+    for pattern, owners in rules:
+        clean = pattern.lstrip("/")
+        if clean == "*" or rel == clean or rel.startswith(clean.rstrip("/") + "/"):
+            matched = owners
+        elif clean.startswith("*.") and rel.endswith(clean[1:]):
+            matched = owners
+        elif clean.endswith("*") and rel.startswith(clean[:-1]):
+            matched = owners
+    return matched
+
+
+def _recent_churn_scores(repo_path: Path) -> dict[str, float]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "log", "--since=90 days ago", "--name-only", "--format="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return {}
+    if result.returncode != 0:
+        return {}
+    counts: dict[str, int] = {}
+    for raw in result.stdout.splitlines():
+        rel = raw.strip()
+        if rel:
+            counts[rel] = counts.get(rel, 0) + 1
+    return {rel: min(3.0, 0.4 * count) for rel, count in counts.items()}
 
 
 def score_repo_for_finding(
@@ -290,23 +396,39 @@ def score_repo_for_finding(
 ) -> list[CodeCandidate]:
     terms = _keywords(title, category, evidence_text)
     stack_paths = _stack_frame_paths(evidence_text)
+    source_maps = load_source_maps(repo_path)
+    mapped_stack_paths = map_stack_paths(evidence_text, source_maps=source_maps)
+    stack_paths = [*stack_paths, *mapped_stack_paths]
     api_routes = _api_routes(evidence_text)
+    api_methods = _api_methods(evidence_text)
+    route_manifest = load_route_manifest(repo_path)
+    codeowners = _load_codeowners(repo_path)
+    churn_scores = _recent_churn_scores(repo_path)
     scored: list[CodeCandidate] = []
     for p in _iter_source_files(repo_path):
-        s, rationale = _score_file(
+        s, rationale, symbol = _score_file(
             repo_path,
             p,
             terms,
             stack_paths=stack_paths,
             api_routes=api_routes,
+            api_methods=api_methods,
+            route_manifest=route_manifest,
+            churn_scores=churn_scores,
         )
         if s <= 0:
             continue
+        rel = p.relative_to(repo_path).as_posix()
+        owners = _owners_for_path(rel, codeowners)
+        if owners:
+            rationale = f"{rationale}, codeowners:{' '.join(owners)}" if rationale else f"codeowners:{' '.join(owners)}"
         scored.append(
             CodeCandidate(
-                file_path=p.relative_to(repo_path).as_posix(),
+                file_path=rel,
                 score=round(s, 2),
                 rationale=rationale or "keyword overlap",
+                symbol=symbol,
+                owners=owners,
             )
         )
     scored.sort(key=lambda c: (-c.score, c.file_path))
