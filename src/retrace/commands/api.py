@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from threading import Lock
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -306,6 +307,7 @@ def _dispatch_app_error_notifications(
     sinks: Iterable[Any],
     store: Storage,
     results: Iterable[Any],
+    lock: Lock | None = None,
 ) -> None:
     sink_list = list(sinks)
     if not sink_list:
@@ -315,7 +317,21 @@ def _dispatch_app_error_notifications(
             continue
         payload = _app_error_notification_payload(store=store, result=result)
         if payload is not None:
-            dispatch_notification(sink_list, payload)
+            try:
+                if lock is None:
+                    dispatch_notification(sink_list, payload)
+                else:
+                    with lock:
+                        dispatch_notification(sink_list, payload)
+            except Exception:
+                logger.warning(
+                    "failed to dispatch app_error notification",
+                    extra={
+                        "failure_id": str(getattr(result, "failure_id", "") or ""),
+                        "incident_id": str(getattr(result, "incident_id", "") or ""),
+                    },
+                    exc_info=True,
+                )
 
 
 def _build_enricher(cfg: Any, store: Storage) -> CorrelationEnricher | None:
@@ -371,6 +387,8 @@ def _handler(
     github_webhook_secret: str = "",
     notification_sinks: Iterable[Any] = (),
 ) -> type[BaseHTTPRequestHandler]:
+    notification_lock = Lock()
+
     class RetraceAPIHandler(BaseHTTPRequestHandler):
         server_version = "retrace-api/0.1"
 
@@ -564,6 +582,7 @@ def _handler(
                     sinks=notification_sinks,
                     store=store,
                     results=result.results,
+                    lock=notification_lock,
                 )
             except SentryCompatIngestError as exc:
                 _json_response(
@@ -659,6 +678,7 @@ def _handler(
                     sinks=notification_sinks,
                     store=store,
                     results=[result],
+                    lock=notification_lock,
                 )
             except Exception:
                 logger.exception("Unhandled monitoring webhook ingest error")
