@@ -377,6 +377,16 @@ Available read/process endpoints:
 - `GET /api/metrics`
 - `POST /api/replays/process`
 
+Monitoring webhook ingest also uses service tokens. Create a token with
+`monitoring:write`, `ingest`, or `admin`, then point Sentry or PostHog exception webhooks at:
+
+- `POST /api/monitoring/webhook/sentry?environment_id=...`
+- `POST /api/monitoring/webhook/posthog?environment_id=...`
+
+Retrace normalizes those alerts into canonical `monitor_incident` failures and
+dedupes repeated alerts by provider external ID, so existing error-monitoring
+alerts can feed the same evidence and repair workflow as replay and API failures.
+
 Process queued final replay batches locally:
 
 ```bash

@@ -23,6 +23,7 @@ from retrace.notification_sinks import (
 )
 from retrace.observability import collect_local_observability, record_api_request
 from retrace.enrichment import CorrelationEnricher
+from retrace.monitoring_ingest import ingest_monitoring_webhook
 from retrace.replay_api import (
     MAX_REPLAY_BODY_BYTES,
     ReplayIngestError,
@@ -227,7 +228,9 @@ def _handler(
 
         def do_OPTIONS(self) -> None:  # noqa: N802
             parsed = urlsplit(self.path)
-            if parsed.path != "/api/sdk/replay":
+            if parsed.path != "/api/sdk/replay" and not parsed.path.startswith(
+                "/api/monitoring/webhook"
+            ):
                 _json_response(self, 404, {"error": "not_found"})
                 return
             self._retrace_response_status = 204
@@ -243,6 +246,11 @@ def _handler(
             parsed = urlsplit(self.path)
             if parsed.path == "/api/replays/process":
                 self._handle_process_replays()
+                return
+            if parsed.path == "/api/monitoring/webhook" or parsed.path.startswith(
+                "/api/monitoring/webhook/"
+            ):
+                self._handle_monitoring_webhook(parsed.path, parsed.query)
                 return
             if parsed.path != "/api/sdk/replay":
                 _json_response(self, 404, {"error": "not_found"})
@@ -290,6 +298,89 @@ def _handler(
                         "message": "An internal server error occurred.",
                     },
                 )
+
+        def _handle_monitoring_webhook(self, path: str, query: str) -> None:
+            token = _require_service_token(
+                self, store, scopes={"monitoring:write", "ingest", "admin"}
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            provider = str(params.get("provider") or "").strip().lower()
+            suffix = path.removeprefix("/api/monitoring/webhook").strip("/")
+            if suffix:
+                provider = suffix.split("/", 1)[0].strip().lower()
+            if not provider:
+                _json_response(
+                    self,
+                    400,
+                    {
+                        "error": "missing_provider",
+                        "message": "provider is required in the path or query string.",
+                    },
+                )
+                return
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(
+                    self,
+                    400,
+                    {
+                        "error": "missing_environment_id",
+                        "message": "environment_id is required.",
+                    },
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length < 0:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length > MAX_REPLAY_BODY_BYTES:
+                _json_response(
+                    self,
+                    413,
+                    {
+                        "error": "body_too_large",
+                        "message": "Webhook payload is too large.",
+                    },
+                )
+                return
+            if length == 0:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            body = self.rfile.read(length)
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                _json_response(self, 400, {"error": "invalid_json"})
+                return
+            if not isinstance(payload, dict) or not payload:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            try:
+                result = ingest_monitoring_webhook(
+                    store=store,
+                    project_id=token.project_id,
+                    environment_id=environment_id,
+                    provider=provider,
+                    payload=payload,
+                )
+            except Exception:
+                logger.exception("Unhandled monitoring webhook ingest error")
+                _json_response(
+                    self,
+                    500,
+                    {
+                        "error": "internal_error",
+                        "message": "An internal server error occurred.",
+                    },
+                )
+                return
+            _json_response(self, 202, result.to_dict())
 
         def _handle_list_replays(self, query: str) -> None:
             token = _require_service_token(
