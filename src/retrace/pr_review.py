@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import shlex
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from retrace.matching.routes import RouteDefinition, load_route_manifest
 from retrace.storage import FailureRow, FailureTestLinkRow, Storage
@@ -28,6 +29,7 @@ class DiffHunk:
     new_start: int
     new_count: int
     added_lines: list[str] = field(default_factory=list)
+    added_line_numbers: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -111,6 +113,65 @@ class PRReviewAnalysis:
         }
 
 
+@dataclass(frozen=True)
+class PRInlineComment:
+    path: str
+    line: int
+    body: str
+    side: str = "RIGHT"
+    suggestion_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PRReviewCommentPlan:
+    summary_body: str
+    inline_comments: list[PRInlineComment]
+    summary_marker: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "summary_body": self.summary_body,
+            "inline_comments": [item.to_dict() for item in self.inline_comments],
+            "summary_marker": self.summary_marker,
+        }
+
+
+class PRReviewPublisher(Protocol):
+    def upsert_issue_comment(
+        self,
+        *,
+        repo: str,
+        number: int,
+        marker: str,
+        body: str,
+    ) -> dict[str, Any]: ...
+
+    def list_pull_request_review_comments(
+        self,
+        *,
+        repo: str,
+        number: int,
+    ) -> list[dict[str, Any]]: ...
+
+    def create_pull_request_review(
+        self,
+        *,
+        repo: str,
+        number: int,
+        commit_id: str,
+        body: str,
+        comments: list[dict[str, Any]],
+    ) -> dict[str, Any]: ...
+
+
+SUMMARY_MARKER = "<!-- retrace-pr-review-summary -->"
+INLINE_MARKER_PREFIX = "<!-- retrace-pr-review-inline:"
+INLINE_MARKER_SUFFIX = "-->"
+
+
 def analyze_pr_diff(
     *,
     diff_text: str,
@@ -157,11 +218,13 @@ def parse_unified_diff(diff_text: str) -> list[ChangedFile]:
     current_path = ""
     current_hunks: list[DiffHunk] = []
     current_added: list[str] = []
+    current_added_line_numbers: list[int] = []
     current_start = 0
     current_count = 0
+    current_new_line = 0
 
     def flush_hunk() -> None:
-        nonlocal current_added, current_start, current_count
+        nonlocal current_added, current_added_line_numbers, current_start, current_count
         if current_path and current_start:
             current_hunks.append(
                 DiffHunk(
@@ -169,9 +232,11 @@ def parse_unified_diff(diff_text: str) -> list[ChangedFile]:
                     new_start=current_start,
                     new_count=current_count,
                     added_lines=list(current_added),
+                    added_line_numbers=list(current_added_line_numbers),
                 )
             )
         current_added = []
+        current_added_line_numbers = []
         current_start = 0
         current_count = 0
 
@@ -193,11 +258,92 @@ def parse_unified_diff(diff_text: str) -> list[ChangedFile]:
             flush_hunk()
             current_start = int(hunk_match.group("new_start"))
             current_count = int(hunk_match.group("new_count") or "1")
+            current_new_line = current_start
             continue
         if raw_line.startswith("+") and not raw_line.startswith("+++"):
             current_added.append(raw_line[1:])
+            current_added_line_numbers.append(current_new_line)
+            current_new_line += 1
+            continue
+        if raw_line.startswith("-") and not raw_line.startswith("---"):
+            continue
+        if current_start and not raw_line.startswith("\\"):
+            current_new_line += 1
     flush_file()
     return files
+
+
+def build_pr_review_comment_plan(
+    analysis: PRReviewAnalysis,
+) -> PRReviewCommentPlan:
+    inline_comments: list[PRInlineComment] = []
+    for missing in analysis.missing_tests:
+        inline = _missing_test_inline_comment(analysis.changed_files, missing)
+        if inline:
+            inline_comments.append(inline)
+    for failure in analysis.prior_failures:
+        inline = _prior_failure_inline_comment(
+            analysis.changed_files,
+            failure,
+            analysis.existing_tests,
+        )
+        if inline:
+            inline_comments.append(inline)
+    return PRReviewCommentPlan(
+        summary_body=_summary_comment_body(analysis),
+        inline_comments=inline_comments,
+        summary_marker=SUMMARY_MARKER,
+    )
+
+
+def publish_pr_review_comments(
+    *,
+    client: PRReviewPublisher,
+    repo: str,
+    pr_number: int,
+    commit_id: str,
+    analysis: PRReviewAnalysis,
+) -> dict[str, int]:
+    plan = build_pr_review_comment_plan(analysis)
+    client.upsert_issue_comment(
+        repo=repo,
+        number=pr_number,
+        marker=plan.summary_marker,
+        body=plan.summary_body,
+    )
+    existing_bodies = [
+        str(comment.get("body") or "")
+        for comment in client.list_pull_request_review_comments(
+            repo=repo,
+            number=pr_number,
+        )
+    ]
+    new_inline = [
+        comment
+        for comment in plan.inline_comments
+        if not any(_inline_marker(comment.suggestion_id) in body for body in existing_bodies)
+    ]
+    if new_inline:
+        client.create_pull_request_review(
+            repo=repo,
+            number=pr_number,
+            commit_id=commit_id,
+            body="Retrace QA suggestions for this diff.",
+            comments=[
+                {
+                    "path": comment.path,
+                    "line": comment.line,
+                    "side": comment.side,
+                    "body": comment.body,
+                }
+                for comment in new_inline
+            ],
+        )
+    return {
+        "summary_comments": 1,
+        "inline_comments": len(new_inline),
+        "skipped_inline_comments": len(plan.inline_comments) - len(new_inline),
+    }
 
 
 def infer_affected_flows(
@@ -456,6 +602,137 @@ def _existing_test_recommendation(
         failure_public_id=failure.public_id,
         command=command,
     )
+
+
+def _summary_comment_body(analysis: PRReviewAnalysis) -> str:
+    lines = [
+        SUMMARY_MARKER,
+        "## Retrace QA review",
+        "",
+        f"- Changed files: {len(analysis.changed_files)}",
+        f"- Affected flows: {len(analysis.affected_flows)}",
+        f"- Prior failures linked: {len(analysis.prior_failures)}",
+        f"- Existing Retrace specs: {len(analysis.existing_tests)}",
+        f"- Missing test suggestions: {len(analysis.missing_tests)}",
+    ]
+    if analysis.affected_flows:
+        lines.extend(["", "### Affected flows"])
+        for flow in analysis.affected_flows[:10]:
+            lines.append(f"- `{flow.kind}` `{flow.name}` via `{', '.join(flow.files)}`")
+    if analysis.prior_failures:
+        lines.extend(["", "### Prior failures"])
+        for failure in analysis.prior_failures[:10]:
+            matches = ", ".join(failure.matched_files + failure.matched_flows)
+            lines.append(
+                f"- `{failure.public_id}` {failure.title} "
+                f"({failure.severity}, {failure.status}) matched {matches}"
+            )
+    if analysis.existing_tests:
+        lines.extend(["", "### Run existing specs"])
+        for test in analysis.existing_tests[:10]:
+            lines.append(f"- `{test.command}` for `{test.spec_name}`")
+    if analysis.missing_tests:
+        lines.extend(["", "### Generate missing specs"])
+        for missing in analysis.missing_tests[:10]:
+            lines.append(f"- `{missing.command}` for `{missing.flow}`")
+    lines.extend(
+        [
+            "",
+            "React with thumbs up to accept a suggestion or confused to dismiss it.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _missing_test_inline_comment(
+    changed_files: list[ChangedFile],
+    missing: MissingTestRecommendation,
+) -> PRInlineComment | None:
+    path, line = _first_comment_position(changed_files, missing.files)
+    if not path or line <= 0:
+        return None
+    suggestion_id = _suggestion_id("missing", missing.kind, missing.flow, path, line)
+    body = "\n".join(
+        [
+            _inline_marker(suggestion_id),
+            f"Retrace did not find linked coverage for `{missing.flow}`.",
+            "",
+            f"Suggested command: `{missing.command}`",
+            "",
+            "React with thumbs up to accept or confused to dismiss this suggestion.",
+        ]
+    )
+    return PRInlineComment(
+        path=path,
+        line=line,
+        body=body,
+        suggestion_id=suggestion_id,
+    )
+
+
+def _prior_failure_inline_comment(
+    changed_files: list[ChangedFile],
+    failure: PriorFailureReference,
+    existing_tests: list[ExistingTestRecommendation],
+) -> PRInlineComment | None:
+    path, line = _first_comment_position(changed_files, failure.matched_files)
+    if not path or line <= 0:
+        return None
+    related_commands = [
+        test.command
+        for test in existing_tests
+        if test.failure_public_id == failure.public_id
+    ]
+    suggestion_id = _suggestion_id("failure", failure.public_id, path, line)
+    lines = [
+        _inline_marker(suggestion_id),
+        f"Retrace linked this change to prior failure `{failure.public_id}`: "
+        f"{failure.title}",
+    ]
+    if related_commands:
+        lines.extend(["", "Run the linked spec before merging:"])
+        lines.extend(f"- `{command}`" for command in related_commands[:5])
+    lines.extend(
+        [
+            "",
+            "React with thumbs up to accept or confused to dismiss this suggestion.",
+        ]
+    )
+    return PRInlineComment(
+        path=path,
+        line=line,
+        body="\n".join(lines),
+        suggestion_id=suggestion_id,
+    )
+
+
+def _first_comment_position(
+    changed_files: list[ChangedFile],
+    candidate_paths: list[str],
+) -> tuple[str, int]:
+    candidates = [path for path in candidate_paths if path]
+    if not candidates and changed_files:
+        candidates = [changed_files[0].path]
+    changed_by_path = {changed.path: changed for changed in changed_files}
+    for path in candidates:
+        changed = changed_by_path.get(path)
+        if not changed:
+            continue
+        for hunk in changed.hunks:
+            if hunk.added_line_numbers:
+                return path, hunk.added_line_numbers[0]
+        if changed.hunks:
+            return path, changed.hunks[0].new_start
+    return "", 0
+
+
+def _suggestion_id(*parts: object) -> str:
+    raw = "\0".join(str(part) for part in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _inline_marker(suggestion_id: str) -> str:
+    return f"{INLINE_MARKER_PREFIX}{suggestion_id}{INLINE_MARKER_SUFFIX}"
 
 
 def _append_flow(

@@ -28,6 +28,13 @@ class CreatedPullRequest:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class CreatedIssueComment:
+    external_id: str
+    external_url: str
+    raw: dict[str, Any]
+
+
 def _request_with_retry(
     client: httpx.Client,
     method: str,
@@ -50,6 +57,41 @@ def _request_with_retry(
             sleep_s = min(8.0, 0.5 * (2**attempt))
         time.sleep(sleep_s)
     raise RuntimeError("unreachable retry loop")
+
+
+def _request_json_list_pages(
+    client: httpx.Client,
+    initial_url: str,
+    *,
+    headers: dict[str, str],
+    context: str,
+) -> list[dict[str, Any]]:
+    url = initial_url
+    results: list[dict[str, Any]] = []
+    while url:
+        resp = _request_with_retry(client, "GET", url, headers=headers)
+        if resp.status_code >= 400:
+            raise IssueSinkError(
+                f"GitHub API HTTP {resp.status_code}: {_truncate(resp.text)}"
+            )
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise IssueSinkError(f"GitHub API returned non-JSON: {exc}") from exc
+        if not isinstance(data, list):
+            raise IssueSinkError(f"{context} response was not a list: {data}")
+        results.extend(item for item in data if isinstance(item, dict))
+        url = _next_link_url(resp.headers.get("Link", ""))
+    return results
+
+
+def _next_link_url(link_header: str) -> str:
+    for part in link_header.split(","):
+        url_part, _, rel_part = part.partition(";")
+        if 'rel="next"' not in rel_part:
+            continue
+        return url_part.strip().removeprefix("<").removesuffix(">")
+    return ""
 
 
 class LinearClient:
@@ -339,6 +381,129 @@ class GitHubClient:
             raw=data,
         )
 
+    def list_issue_comments(self, *, repo: str, number: int) -> list[dict[str, Any]]:
+        owner, name = _parse_repo(repo)
+        url = f"{self.base_url}/repos/{owner}/{name}/issues/{int(number)}/comments"
+        return _request_json_list_pages(
+            self._client,
+            url,
+            headers=self._headers(),
+            context="GitHub list-comments",
+        )
+
+    def create_issue_comment(
+        self,
+        *,
+        repo: str,
+        number: int,
+        body: str,
+    ) -> CreatedIssueComment:
+        owner, name = _parse_repo(repo)
+        url = f"{self.base_url}/repos/{owner}/{name}/issues/{int(number)}/comments"
+        resp = _request_with_retry(
+            self._client,
+            "POST",
+            url,
+            headers=self._headers(),
+            json={"body": body},
+        )
+        if resp.status_code >= 400:
+            raise IssueSinkError(
+                f"GitHub API HTTP {resp.status_code}: {_truncate(resp.text)}"
+            )
+        data = _json_object(resp, "GitHub create-comment response")
+        return _created_issue_comment(data)
+
+    def update_issue_comment(
+        self,
+        *,
+        repo: str,
+        comment_id: int,
+        body: str,
+    ) -> CreatedIssueComment:
+        owner, name = _parse_repo(repo)
+        url = f"{self.base_url}/repos/{owner}/{name}/issues/comments/{int(comment_id)}"
+        resp = _request_with_retry(
+            self._client,
+            "PATCH",
+            url,
+            headers=self._headers(),
+            json={"body": body},
+        )
+        if resp.status_code >= 400:
+            raise IssueSinkError(
+                f"GitHub API HTTP {resp.status_code}: {_truncate(resp.text)}"
+            )
+        data = _json_object(resp, "GitHub update-comment response")
+        return _created_issue_comment(data)
+
+    def upsert_issue_comment(
+        self,
+        *,
+        repo: str,
+        number: int,
+        marker: str,
+        body: str,
+    ) -> dict[str, Any]:
+        if not marker.strip():
+            raise ValueError("marker is required")
+        if marker not in body:
+            body = f"{marker}\n{body}"
+        for comment in self.list_issue_comments(repo=repo, number=number):
+            if marker in str(comment.get("body") or ""):
+                comment_id = int(comment["id"])
+                return self.update_issue_comment(
+                    repo=repo,
+                    comment_id=comment_id,
+                    body=body,
+                ).raw
+        return self.create_issue_comment(repo=repo, number=number, body=body).raw
+
+    def list_pull_request_review_comments(
+        self,
+        *,
+        repo: str,
+        number: int,
+    ) -> list[dict[str, Any]]:
+        owner, name = _parse_repo(repo)
+        url = f"{self.base_url}/repos/{owner}/{name}/pulls/{int(number)}/comments"
+        return _request_json_list_pages(
+            self._client,
+            url,
+            headers=self._headers(),
+            context="GitHub review-comments",
+        )
+
+    def create_pull_request_review(
+        self,
+        *,
+        repo: str,
+        number: int,
+        commit_id: str,
+        body: str,
+        comments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        owner, name = _parse_repo(repo)
+        url = f"{self.base_url}/repos/{owner}/{name}/pulls/{int(number)}/reviews"
+        payload = {
+            "commit_id": commit_id,
+            "body": body,
+            "event": "COMMENT",
+            "comments": comments,
+        }
+        resp = _request_with_retry(
+            self._client,
+            "POST",
+            url,
+            headers=self._headers(),
+            json=payload,
+        )
+        if resp.status_code >= 400:
+            raise IssueSinkError(
+                f"GitHub API HTTP {resp.status_code}: {_truncate(resp.text)}"
+            )
+        return _json_object(resp, "GitHub create-review response")
+
     def get_issue_state(self, *, repo: str, number: int) -> dict[str, Any]:
         owner, name = _parse_repo(repo)
         url = f"{self.base_url}/repos/{owner}/{name}/issues/{int(number)}"
@@ -394,6 +559,28 @@ def _parse_repo(repo: str) -> tuple[str, str]:
     if not owner or not name:
         raise ValueError(f"GitHub repo must be in 'owner/name' format: {repo!r}")
     return owner, name
+
+
+def _json_object(resp: httpx.Response, context: str) -> dict[str, Any]:
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise IssueSinkError(f"GitHub API returned non-JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise IssueSinkError(f"{context} was not an object: {data}")
+    return data
+
+
+def _created_issue_comment(data: dict[str, Any]) -> CreatedIssueComment:
+    comment_id = data.get("id")
+    html_url = str(data.get("html_url") or "")
+    if comment_id is None or not html_url:
+        raise IssueSinkError(f"GitHub comment response missing fields: {data}")
+    return CreatedIssueComment(
+        external_id=str(comment_id),
+        external_url=html_url,
+        raw=data,
+    )
 
 
 def _truncate(text: str, limit: int = 500) -> str:

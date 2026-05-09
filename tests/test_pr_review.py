@@ -3,7 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from retrace.failures import CanonicalFailure, stable_failure_public_id
-from retrace.pr_review import analyze_pr_diff, parse_unified_diff
+from retrace.pr_review import (
+    analyze_pr_diff,
+    build_pr_review_comment_plan,
+    parse_unified_diff,
+    publish_pr_review_comments,
+)
 from retrace.storage import Storage
 
 
@@ -59,6 +64,7 @@ def test_parse_unified_diff_extracts_changed_files_and_added_lines() -> None:
     assert changed[0].hunks[0].added_lines == [
         'export default function Page() { return <main /> }'
     ]
+    assert changed[0].hunks[0].added_line_numbers == [2]
 
 
 def test_pr_review_lists_affected_api_flow_and_missing_api_test() -> None:
@@ -167,3 +173,119 @@ def test_pr_review_suggests_ui_exploration_for_component_change() -> None:
     assert analysis.missing_tests[0].command == (
         "retrace tester explore --task 'Checkout Button'"
     )
+
+
+def test_pr_review_builds_summary_and_inline_missing_test_comment() -> None:
+    diff = """diff --git a/src/app/api/checkout/route.ts b/src/app/api/checkout/route.ts
+--- a/src/app/api/checkout/route.ts
++++ b/src/app/api/checkout/route.ts
+@@ -10,3 +10,5 @@
+ export async function GET() {
++export async function POST() {
++  return Response.json({ ok: true })
+ }
+"""
+
+    analysis = analyze_pr_diff(diff_text=diff)
+    plan = build_pr_review_comment_plan(analysis)
+
+    assert "<!-- retrace-pr-review-summary -->" in plan.summary_body
+    assert "retrace tester api-create --name /api/checkout" in plan.summary_body
+    assert len(plan.inline_comments) == 1
+    assert plan.inline_comments[0].path == "src/app/api/checkout/route.ts"
+    assert plan.inline_comments[0].line == 11
+    assert "retrace tester api-create --name /api/checkout" in (
+        plan.inline_comments[0].body
+    )
+    assert "<!-- retrace-pr-review-inline:" in plan.inline_comments[0].body
+
+
+def test_publish_pr_review_comments_is_idempotent() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.issue_comments: list[dict[str, object]] = []
+            self.review_comments: list[dict[str, object]] = []
+            self.reviews: list[dict[str, object]] = []
+
+        def upsert_issue_comment(
+            self,
+            *,
+            repo: str,
+            number: int,
+            marker: str,
+            body: str,
+        ) -> dict[str, object]:
+            existing = next(
+                (
+                    comment
+                    for comment in self.issue_comments
+                    if marker in str(comment["body"])
+                ),
+                None,
+            )
+            if existing:
+                existing["body"] = body
+                return existing
+            comment = {"id": len(self.issue_comments) + 1, "body": body}
+            self.issue_comments.append(comment)
+            return comment
+
+        def list_pull_request_review_comments(
+            self,
+            *,
+            repo: str,
+            number: int,
+        ) -> list[dict[str, object]]:
+            return list(self.review_comments)
+
+        def create_pull_request_review(
+            self,
+            *,
+            repo: str,
+            number: int,
+            commit_id: str,
+            body: str,
+            comments: list[dict[str, object]],
+        ) -> dict[str, object]:
+            self.reviews.append({"body": body, "comments": comments})
+            self.review_comments.extend(comments)
+            return {"id": len(self.reviews)}
+
+    diff = """diff --git a/src/app/api/checkout/route.ts b/src/app/api/checkout/route.ts
+--- a/src/app/api/checkout/route.ts
++++ b/src/app/api/checkout/route.ts
+@@ -1,3 +1,5 @@
++export async function POST() {
++  return Response.json({ ok: true })
++}
+"""
+    client = FakeClient()
+    analysis = analyze_pr_diff(diff_text=diff)
+
+    first = publish_pr_review_comments(
+        client=client,
+        repo="acme/web",
+        pr_number=12,
+        commit_id="abc123",
+        analysis=analysis,
+    )
+    second = publish_pr_review_comments(
+        client=client,
+        repo="acme/web",
+        pr_number=12,
+        commit_id="abc123",
+        analysis=analysis,
+    )
+
+    assert first == {
+        "summary_comments": 1,
+        "inline_comments": 1,
+        "skipped_inline_comments": 0,
+    }
+    assert second == {
+        "summary_comments": 1,
+        "inline_comments": 0,
+        "skipped_inline_comments": 1,
+    }
+    assert len(client.issue_comments) == 1
+    assert len(client.reviews) == 1
