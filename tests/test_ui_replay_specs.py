@@ -405,6 +405,11 @@ def test_generate_replay_issue_fix_prompts_payload_creates_agent_prompts(
     assert payload["candidates"][0]["file_path"] == "src/checkout.tsx"
     assert issue_public_id in payload["prompts"]["codex"]
     assert "src/checkout.tsx" in payload["prompts"]["claude_code"]
+    assert payload["repair_task_id"].startswith("rpr_")
+    task = store.get_repair_task(payload["repair_task_id"])
+    assert task is not None
+    assert task.source_external_id == issue_public_id
+    assert "src/checkout.tsx" in task.likely_files
     out_dir = tmp_path / "reports" / "fix-prompts"
     assert (out_dir / payload["artifact_json"]).exists()
     assert (out_dir / payload["prompt_files"]["codex"]).exists()

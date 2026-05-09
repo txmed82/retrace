@@ -319,6 +319,43 @@ ON failure_test_links(issue_public_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_failure_test_links_spec
 ON failure_test_links(spec_id, updated_at);
 
+CREATE TABLE IF NOT EXISTS repair_tasks (
+    id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL,
+    failure_id TEXT NOT NULL,
+    source_type TEXT NOT NULL DEFAULT '',
+    source_external_id TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    likely_files_json TEXT NOT NULL DEFAULT '[]',
+    prompt_artifacts_json TEXT NOT NULL DEFAULT '[]',
+    validation_commands_json TEXT NOT NULL DEFAULT '[]',
+    branch TEXT NOT NULL DEFAULT '',
+    pr_url TEXT NOT NULL DEFAULT '',
+    risk_notes TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(failure_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_repair_tasks_status
+ON repair_tasks(status, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_repair_tasks_source
+ON repair_tasks(source_type, source_external_id);
+
+CREATE TABLE IF NOT EXISTS repair_task_evidence (
+    repair_task_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'supporting',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(repair_task_id, evidence_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_repair_task_evidence_task
+ON repair_task_evidence(repair_task_id, created_at);
+
 CREATE TABLE IF NOT EXISTS replay_issues (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -572,6 +609,27 @@ class FailureTestLinkRow:
     latest_run_classification: str
     latest_run_ok: Optional[bool]
     latest_run_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
+class RepairTaskRow:
+    id: str
+    public_id: str
+    failure_id: str
+    source_type: str
+    source_external_id: str
+    title: str
+    status: str
+    likely_files: list[str]
+    prompt_artifacts: list[dict[str, Any]]
+    validation_commands: list[str]
+    branch: str
+    pr_url: str
+    risk_notes: str
+    metadata: dict[str, Any]
+    evidence_ids: list[str]
     created_at: datetime
     updated_at: datetime
 
@@ -1327,7 +1385,10 @@ class Storage:
                 related_deploy_sha = excluded.related_deploy_sha,
                 related_pr_number = excluded.related_pr_number,
                 linked_tests_json = excluded.linked_tests_json,
-                linked_repair_task_id = excluded.linked_repair_task_id,
+                linked_repair_task_id = CASE
+                    WHEN excluded.linked_repair_task_id != '' THEN excluded.linked_repair_task_id
+                    ELSE failures.linked_repair_task_id
+                END,
                 linked_external_thread_id = excluded.linked_external_thread_id,
                 metadata_json = excluded.metadata_json,
                 updated_at = excluded.updated_at
@@ -1391,6 +1452,25 @@ class Storage:
                   AND (id = ? OR public_id = ?)
                 """,
                 (project_id, environment_id, failure_id, failure_id),
+            ).fetchone()
+        return self._failure_from_row(row) if row is not None else None
+
+    def find_failure_by_source(
+        self,
+        *,
+        source_type: str,
+        source_external_id: str,
+    ) -> Optional[FailureRow]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM failures
+                WHERE source_type = ? AND source_external_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (source_type, source_external_id),
             ).fetchone()
         return self._failure_from_row(row) if row is not None else None
 
@@ -1534,6 +1614,187 @@ class Storage:
                 params,
             ).fetchall()
         return [self._evidence_from_row(row) for row in rows]
+
+    def upsert_repair_task(
+        self,
+        *,
+        failure_id: str,
+        title: str,
+        source_type: str = "",
+        source_external_id: str = "",
+        status: str = "open",
+        likely_files: Optional[list[str]] = None,
+        prompt_artifacts: Optional[list[dict[str, Any]]] = None,
+        validation_commands: Optional[list[str]] = None,
+        branch: str = "",
+        pr_url: str = "",
+        risk_notes: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+        evidence_ids: Optional[list[str]] = None,
+    ) -> str:
+        failure_id = failure_id.strip()
+        if not failure_id:
+            raise ValueError("failure_id is required")
+        now = datetime.now(timezone.utc).isoformat()
+        task_id = self._id("rpr")
+        public_id = self._public_id("rpr", failure_id)
+        clean_likely_files = self._merge_string_lists(likely_files or [])
+        clean_validation = self._merge_string_lists(validation_commands or [])
+        clean_evidence_ids = self._merge_string_lists(evidence_ids or [])
+        try:
+            prompt_json = json.dumps(prompt_artifacts or [], sort_keys=True)
+            metadata_json = json.dumps(metadata or {}, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("repair task metadata must be JSON-serializable") from exc
+
+        with self._conn() as conn:
+            failure_row = conn.execute(
+                "SELECT id FROM failures WHERE id = ?",
+                (failure_id,),
+            ).fetchone()
+            if failure_row is None:
+                raise ValueError(f"unknown failure_id: {failure_id}")
+            conn.execute(
+                """
+                INSERT INTO repair_tasks
+                (id, public_id, failure_id, source_type, source_external_id, title,
+                 status, likely_files_json, prompt_artifacts_json,
+                 validation_commands_json, branch, pr_url, risk_notes, metadata_json,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(failure_id) DO UPDATE SET
+                    source_type = excluded.source_type,
+                    source_external_id = excluded.source_external_id,
+                    title = excluded.title,
+                    status = excluded.status,
+                    likely_files_json = excluded.likely_files_json,
+                    prompt_artifacts_json = excluded.prompt_artifacts_json,
+                    validation_commands_json = excluded.validation_commands_json,
+                    branch = excluded.branch,
+                    pr_url = excluded.pr_url,
+                    risk_notes = excluded.risk_notes,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task_id,
+                    public_id,
+                    failure_id,
+                    source_type.strip(),
+                    source_external_id.strip(),
+                    title.strip() or "Repair task",
+                    status.strip() or "open",
+                    json.dumps(clean_likely_files, sort_keys=True),
+                    prompt_json,
+                    json.dumps(clean_validation, sort_keys=True),
+                    branch.strip(),
+                    pr_url.strip(),
+                    risk_notes.strip(),
+                    metadata_json,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM repair_tasks WHERE failure_id = ?",
+                (failure_id,),
+            ).fetchone()
+            assert row is not None
+            persisted_task_id = str(row["id"])
+            for evidence_id in clean_evidence_ids:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO repair_task_evidence
+                    (repair_task_id, evidence_id, role)
+                    VALUES (?, ?, 'supporting')
+                    """,
+                    (persisted_task_id, evidence_id),
+                )
+            conn.execute(
+                """
+                UPDATE failures
+                SET linked_repair_task_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (persisted_task_id, now, failure_id),
+            )
+        return persisted_task_id
+
+    def get_repair_task(self, repair_task_id: str) -> Optional[RepairTaskRow]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM repair_tasks
+                WHERE id = ? OR public_id = ?
+                """,
+                (repair_task_id, repair_task_id),
+            ).fetchone()
+            if row is None:
+                return None
+            evidence_rows = conn.execute(
+                """
+                SELECT evidence_id
+                FROM repair_task_evidence
+                WHERE repair_task_id = ?
+                ORDER BY created_at, evidence_id
+                """,
+                (str(row["id"]),),
+            ).fetchall()
+        return self._repair_task_from_row(
+            row,
+            evidence_ids=[str(item["evidence_id"]) for item in evidence_rows],
+        )
+
+    def list_repair_tasks(
+        self,
+        *,
+        failure_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[RepairTaskRow]:
+        where: list[str] = []
+        params: list[object] = []
+        if failure_id is not None:
+            where.append("failure_id = ?")
+            params.append(failure_id)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        clause = " AND ".join(where) if where else "1 = 1"
+        params.append(max(1, min(int(limit), 500)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM repair_tasks
+                WHERE {clause}
+                ORDER BY updated_at DESC, public_id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            evidence_by_task: dict[str, list[str]] = {}
+            for row in rows:
+                evidence_rows = conn.execute(
+                    """
+                    SELECT evidence_id
+                    FROM repair_task_evidence
+                    WHERE repair_task_id = ?
+                    ORDER BY created_at, evidence_id
+                    """,
+                    (str(row["id"]),),
+                ).fetchall()
+                evidence_by_task[str(row["id"])] = [
+                    str(item["evidence_id"]) for item in evidence_rows
+                ]
+        return [
+            self._repair_task_from_row(
+                row,
+                evidence_ids=evidence_by_task.get(str(row["id"]), []),
+            )
+            for row in rows
+        ]
 
     def upsert_failure_test_link(
         self,
@@ -1913,6 +2174,34 @@ class Storage:
             updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
         )
 
+    def _repair_task_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        evidence_ids: list[str],
+    ) -> RepairTaskRow:
+        return RepairTaskRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            failure_id=str(row["failure_id"]),
+            source_type=str(row["source_type"] or ""),
+            source_external_id=str(row["source_external_id"] or ""),
+            title=str(row["title"] or ""),
+            status=str(row["status"] or "open"),
+            likely_files=self._parse_string_list_json(row["likely_files_json"]),
+            prompt_artifacts=self._parse_dict_list_json(row["prompt_artifacts_json"]),
+            validation_commands=self._parse_string_list_json(
+                row["validation_commands_json"]
+            ),
+            branch=str(row["branch"] or ""),
+            pr_url=str(row["pr_url"] or ""),
+            risk_notes=str(row["risk_notes"] or ""),
+            metadata=dict(self._safe_json_obj(row["metadata_json"])),
+            evidence_ids=evidence_ids,
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
     def _backfill_replay_issue_evidence(
         self,
         conn: sqlite3.Connection,
@@ -1941,6 +2230,16 @@ class Storage:
             dedupe_key=str(row["dedupe_key"] or ""),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
         )
+
+    @staticmethod
+    def _parse_dict_list_json(raw: object) -> list[dict[str, Any]]:
+        try:
+            parsed = json.loads(str(raw or "[]"))
+        except Exception:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [item for item in parsed if isinstance(item, dict)]
 
     def get_sdk_key_by_hash(self, key_hash: str) -> Optional[SDKKeyRow]:
         with self._conn() as conn:
