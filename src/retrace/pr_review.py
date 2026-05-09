@@ -346,6 +346,17 @@ def publish_pr_review_comments(
     }
 
 
+def recommended_sandbox_commands(
+    analysis: PRReviewAnalysis,
+    *,
+    include_missing_test_generation: bool = False,
+) -> list[str]:
+    commands = [test.command for test in analysis.existing_tests]
+    if include_missing_test_generation:
+        commands.extend(test.command for test in analysis.missing_tests)
+    return _unique(commands)
+
+
 def infer_affected_flows(
     *,
     changed_files: list[ChangedFile],

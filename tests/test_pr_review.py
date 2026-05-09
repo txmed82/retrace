@@ -8,6 +8,7 @@ from retrace.pr_review import (
     build_pr_review_comment_plan,
     parse_unified_diff,
     publish_pr_review_comments,
+    recommended_sandbox_commands,
 )
 from retrace.storage import Storage
 
@@ -289,3 +290,45 @@ def test_publish_pr_review_comments_is_idempotent() -> None:
     }
     assert len(client.issue_comments) == 1
     assert len(client.reviews) == 1
+
+
+def test_recommended_sandbox_commands_prefers_existing_specs(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    workspace = store.ensure_workspace(
+        org_name="Acme",
+        project_name="Web",
+        environment_name="production",
+    )
+    failure_id = store.upsert_failure(
+        _failure(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+        )
+    )
+    store.upsert_failure_test_link(
+        failure_id=failure_id,
+        spec_id="api checkout",
+        spec_name="POST /api/checkout contract",
+        spec_path="api-tests/specs/api_checkout.json",
+        source="api_run",
+    )
+    diff = """diff --git a/src/app/api/checkout/route.ts b/src/app/api/checkout/route.ts
+--- a/src/app/api/checkout/route.ts
++++ b/src/app/api/checkout/route.ts
+@@ -1,3 +1,5 @@
++export async function POST() {
++  return Response.json({ ok: true })
++}
+"""
+    analysis = analyze_pr_diff(
+        diff_text=diff,
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+
+    assert recommended_sandbox_commands(analysis) == [
+        "retrace tester api-run 'api checkout'"
+    ]
