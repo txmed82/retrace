@@ -20,6 +20,7 @@ from retrace.api_testing import (
 from retrace.config import load_config
 from retrace.evidence import EvidenceItem, evidence_dedupe_key
 from retrace.failures import canonical_failure_from_harness_run
+from retrace.openapi_import import import_openapi_specs
 from retrace.replay_specs import (
     generate_api_spec_from_replay_issue,
     generate_spec_from_replay_issue,
@@ -597,6 +598,54 @@ def tester_api_run(config_path: Path, spec_id: str) -> None:
     click.echo(json.dumps(result.__dict__, indent=2))
     if not result.ok:
         raise click.ClickException("API test run failed.")
+
+
+@tester_group.command("api-import-openapi")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--base-url", required=True, help="Base URL for generated runnable specs.")
+@click.option(
+    "--path-filter",
+    default="",
+    help="Regex filter for OpenAPI paths.",
+)
+@click.option(
+    "--method",
+    "method_filter",
+    default="",
+    help="HTTP method filter, for example GET or POST.",
+)
+@click.argument("openapi_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def tester_api_import_openapi(
+    config_path: Path,
+    base_url: str,
+    path_filter: str,
+    method_filter: str,
+    openapi_path: Path,
+) -> None:
+    cfg = load_config(config_path)
+    result = import_openapi_specs(
+        openapi_path=openapi_path,
+        specs_dir=api_specs_dir_for_data_dir(cfg.run.data_dir),
+        base_url=base_url,
+        path_filter=path_filter,
+        method_filter=method_filter,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "created": [spec.spec_id for spec in result.specs],
+                "created_count": len(result.specs),
+                "skipped": result.skipped,
+            },
+            indent=2,
+        )
+    )
 
 
 @tester_group.command("show")
