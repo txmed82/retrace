@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -307,7 +308,7 @@ def recommend_missing_tests(
                     flow=flow.name,
                     files=flow.files,
                     reason="changed API flow has no linked Retrace spec",
-                    command=f"retrace tester api-create --name {flow.name}",
+                    command=f"retrace tester api-create --name {shlex.quote(flow.name)}",
                 )
             )
         elif flow.kind == "ui":
@@ -317,7 +318,7 @@ def recommend_missing_tests(
                     flow=flow.name,
                     files=flow.files,
                     reason="changed UI route has no linked Retrace spec",
-                    command=f"retrace tester create --name {flow.name}",
+                    command=f"retrace tester create --name {shlex.quote(flow.name)}",
                 )
             )
         elif flow.kind == "component":
@@ -327,7 +328,7 @@ def recommend_missing_tests(
                     flow=flow.name,
                     files=flow.files,
                     reason="changed shared component may affect multiple UI flows",
-                    command=f"retrace tester explore --task {flow.name}",
+                    command=f"retrace tester explore --task {shlex.quote(flow.name)}",
                 )
             )
     return missing
@@ -442,9 +443,9 @@ def _existing_test_recommendation(
     failure: PriorFailureReference,
 ) -> ExistingTestRecommendation:
     command = (
-        f"retrace tester api-run {link.spec_id}"
+        f"retrace tester api-run {shlex.quote(link.spec_id)}"
         if "api" in (link.spec_path + link.spec_id).lower()
-        else f"retrace tester run {link.spec_id}"
+        else f"retrace tester run {shlex.quote(link.spec_id)}"
     )
     return ExistingTestRecommendation(
         spec_id=link.spec_id,

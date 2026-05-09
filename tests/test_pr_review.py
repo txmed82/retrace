@@ -94,7 +94,7 @@ def test_pr_review_links_prior_failure_and_recommends_existing_spec(tmp_path: Pa
     )
     store.upsert_failure_test_link(
         failure_id=failure_id,
-        spec_id="api_checkout",
+        spec_id="api checkout",
         spec_name="POST /api/checkout contract",
         spec_path="api-tests/specs/api_checkout.json",
         source="api_run",
@@ -119,8 +119,8 @@ def test_pr_review_links_prior_failure_and_recommends_existing_spec(tmp_path: Pa
     assert analysis.prior_failures[0].matched_files == [
         "src/app/api/checkout/route.ts"
     ]
-    assert analysis.existing_tests[0].spec_id == "api_checkout"
-    assert analysis.existing_tests[0].command == "retrace tester api-run api_checkout"
+    assert analysis.existing_tests[0].spec_id == "api checkout"
+    assert analysis.existing_tests[0].command == "retrace tester api-run 'api checkout'"
     assert analysis.missing_tests == []
 
 
@@ -152,9 +152,9 @@ def test_pr_review_uses_route_manifest_for_affected_flow(tmp_path: Path) -> None
 
 
 def test_pr_review_suggests_ui_exploration_for_component_change() -> None:
-    diff = """diff --git a/src/components/CheckoutButton.tsx b/src/components/CheckoutButton.tsx
---- a/src/components/CheckoutButton.tsx
-+++ b/src/components/CheckoutButton.tsx
+    diff = """diff --git a/src/components/Checkout Button.tsx b/src/components/Checkout Button.tsx
+--- a/src/components/Checkout Button.tsx
++++ b/src/components/Checkout Button.tsx
 @@ -1 +1,2 @@
 +export function CheckoutButton() { return <button /> }
 """
@@ -162,5 +162,8 @@ def test_pr_review_suggests_ui_exploration_for_component_change() -> None:
     analysis = analyze_pr_diff(diff_text=diff)
 
     assert analysis.affected_flows[0].kind == "component"
-    assert analysis.affected_flows[0].name == "CheckoutButton"
+    assert analysis.affected_flows[0].name == "Checkout Button"
     assert analysis.missing_tests[0].kind == "ui"
+    assert analysis.missing_tests[0].command == (
+        "retrace tester explore --task 'Checkout Button'"
+    )
