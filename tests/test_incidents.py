@@ -154,3 +154,37 @@ def test_monitoring_webhook_ingest_links_failure_to_incident(tmp_path: Path) -> 
     assert result.incident_public_id.startswith("inc_")
     assert detail.incident.failure_count == 1
     assert detail.failures[0].id == result.failure_id
+
+
+def test_incident_public_id_is_scoped_by_project_and_environment(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    first = store.ensure_workspace(
+        org_name="Acme",
+        project_name="Web",
+        environment_name="production",
+    )
+    second = store.ensure_workspace(
+        org_name="Acme",
+        project_name="API",
+        environment_name="production",
+    )
+
+    first_incident_id = store.upsert_incident(
+        project_id=first.project_id,
+        environment_id=first.environment_id,
+        group_key="same-group",
+        title="Same group",
+    )
+    second_incident_id = store.upsert_incident(
+        project_id=second.project_id,
+        environment_id=second.environment_id,
+        group_key="same-group",
+        title="Same group",
+    )
+
+    first_incident = store.get_incident(first_incident_id)
+    second_incident = store.get_incident(second_incident_id)
+    assert first_incident is not None
+    assert second_incident is not None
+    assert first_incident.public_id != second_incident.public_id

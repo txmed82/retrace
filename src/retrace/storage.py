@@ -1727,7 +1727,7 @@ class Storage:
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
         incident_id = self._id("inc")
-        public_id = self._public_id("inc", group_key)
+        public_id = self._public_id("inc", project_id, environment_id, group_key)
         try:
             metadata_json = json.dumps(metadata or {}, sort_keys=True)
         except (TypeError, ValueError) as exc:
