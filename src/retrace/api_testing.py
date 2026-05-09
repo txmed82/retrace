@@ -510,8 +510,8 @@ def _api_failure_evidence_items(*, result: APITestRunResult) -> list[EvidenceIte
             "artifact_id": str(artifact.get("artifact_id") or ""),
             "artifact_type": artifact_type,
             "label": str(artifact.get("label") or ""),
-            "metadata": dict(artifact.get("metadata") or {}),
-            "artifact": _artifact_payload(artifact_path),
+            "metadata": scrub_pii_from_blob(dict(artifact.get("metadata") or {})),
+            "artifact": scrub_pii_from_blob(_artifact_payload(artifact_path)),
         }
         items.append(
             EvidenceItem(
@@ -562,12 +562,63 @@ def _api_failure_evidence_text(spec: APITestSpec, result: APITestRunResult) -> s
             "body": _redact_json(spec.body),
             "command": f"retrace tester api-run {spec.spec_id}",
         },
-        "request": request,
-        "response": response,
-        "assertion_results": result.assertion_results,
+        "request": scrub_pii_from_blob(request),
+        "response": scrub_pii_from_blob(response),
+        "assertion_results": scrub_pii_from_blob(result.assertion_results),
         "error": result.error,
     }
-    return json.dumps(payload, indent=2, sort_keys=True)
+    return json.dumps(scrub_pii_from_blob(payload), indent=2, sort_keys=True)
+
+
+def scrub_pii_from_blob(blob: Any) -> Any:
+    pii_keys = {
+        "address",
+        "email",
+        "first_name",
+        "fullname",
+        "last_name",
+        "name",
+        "phone",
+        "postal_code",
+        "ssn",
+        "street",
+        "zip",
+    }
+    if isinstance(blob, dict):
+        return {
+            str(key): "[redacted]"
+            if str(key).lower() in pii_keys
+            else scrub_pii_from_blob(value)
+            for key, value in blob.items()
+        }
+    if isinstance(blob, list):
+        return [scrub_pii_from_blob(item) for item in blob]
+    if isinstance(blob, str):
+        return _scrub_pii_text(blob)
+    return blob
+
+
+def _scrub_pii_text(value: str) -> str:
+    value = re.sub(
+        r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        "[redacted-email]",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b",
+        "[redacted-phone]",
+        value,
+    )
+    value = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "[redacted-ssn]", value)
+    value = re.sub(
+        r"\b\d{1,6}\s+[A-Za-z0-9.'-]+(?:\s+[A-Za-z0-9.'-]+){0,4}\s+"
+        r"(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Ln|Lane)\b",
+        "[redacted-address]",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return value
 
 
 def _write_api_repair_prompt(

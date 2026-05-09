@@ -249,13 +249,26 @@ def canonical_failure_from_api_run(
     run_id = str(getattr(run_result, "run_id", "") or "")
     source_external_id = f"api:{run_id or fingerprint[:16]}"
     ok = bool(getattr(run_result, "ok", False))
-    summary = (
-        f"{method} {url} expected status {expected_status}, got {status_code}."
-        if status_code
-        else f"{method} {url} failed before receiving a response."
-    )
-    if error:
-        summary = f"{summary} Error: {error}"
+    failed_assertions = [
+        str(item.get("message") or item.get("assertion_id") or "")
+        for item in assertion_results
+        if isinstance(item, dict) and not bool(item.get("ok"))
+    ]
+    if status_code and status_code != expected_status:
+        summary = f"{method} {url} expected status {expected_status}, got {status_code}."
+        if error:
+            summary = f"{summary} Error: {error}"
+    elif status_code:
+        assertion_summary = error or "; ".join(item for item in failed_assertions if item)
+        summary = (
+            f"{method} {url} assertion failed: {assertion_summary}"
+            if assertion_summary
+            else f"{method} {url} failed after receiving status {status_code}."
+        )
+    else:
+        summary = f"{method} {url} failed before receiving a response."
+        if error:
+            summary = f"{summary} Error: {error}"
     return CanonicalFailure(
         public_id=stable_failure_public_id(
             project_id, environment_id, "test_run", source_external_id

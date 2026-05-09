@@ -124,6 +124,28 @@ def _api_routes(evidence_text: str) -> list[str]:
     return routes[:10]
 
 
+def _is_dynamic_route_segment(segment: str) -> bool:
+    value = segment.strip().lower()
+    if not value:
+        return True
+    if value.isdigit() or value.startswith(":"):
+        return True
+    if value.startswith("[") and value.endswith("]"):
+        return True
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        value,
+    ):
+        return True
+    if re.fullmatch(r"[a-z]{2,8}_[a-z0-9]{6,}", value):
+        return True
+    if re.fullmatch(r"[0-9a-f]{12,}", value):
+        return True
+    if re.fullmatch(r"(?=.*[a-z])(?=.*\d)[a-z0-9_-]{10,}", value):
+        return True
+    return bool(re.fullmatch(r"[a-z]{1,4}\d{2,}", value))
+
+
 def _iter_source_files(repo_path: Path) -> list[Path]:
     files: list[Path] = []
     allow_prefixes = ("client/", "server/", "shared/", "src/")
@@ -215,9 +237,7 @@ def _score_file(
         stable_route_parts = [
             part
             for part in route_parts
-            if not part.isdigit()
-            and not part.startswith(":")
-            and not (part.startswith("[") and part.endswith("]"))
+            if not _is_dynamic_route_segment(part)
         ]
         if server_route_file and stable_route_parts:
             stable_hits = sum(1 for part in stable_route_parts if part in text_l)
