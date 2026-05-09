@@ -10,6 +10,7 @@ from retrace.commands.ui import (
     _generate_replay_issue_api_spec_payload,
     _generate_replay_issue_fix_prompts_payload,
     _INDEX_HTML,
+    _replay_api_calls,
     _replay_api_check,
     _generate_replay_issue_spec_payload,
     _run_replay_issue_api_spec_payload,
@@ -123,6 +124,29 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "safeHashUrl(issue.share_url, '#issue=')" in _INDEX_HTML
     assert "#issue=${encodeURIComponent(issue.public_id)}" in _INDEX_HTML
     assert "#replay=${encodeURIComponent(replayId)}" in _INDEX_HTML
+
+
+def test_replay_api_calls_redacts_sensitive_query_values() -> None:
+    calls = _replay_api_calls(
+        {
+            "signals": [
+                {
+                    "detector": "network_5xx",
+                    "timestamp_ms": 120,
+                    "details": {
+                        "method": "GET",
+                        "request_url": "https://app.example/api/me?token=secret&tab=profile",
+                        "status": 500,
+                    },
+                }
+            ]
+        }
+    )
+
+    assert calls[0]["url"] == (
+        "https://app.example/api/me?token=%5Bredacted-api-input%5D&tab=profile"
+    )
+    assert "secret" not in calls[0]["url"]
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(
@@ -427,7 +451,7 @@ def test_generate_and_run_replay_issue_api_spec_payload_updates_coverage(
         spec_id = payload["spec"]["spec_id"]
         assert payload["spec"]["method"] == "POST"
         assert payload["spec"]["url"] == f"{base_url}/api/checkout"
-        assert payload["spec"]["expected_status"] == 200
+        assert payload["spec"]["expected_status"] == 500
         assert (
             api_specs_dir_for_data_dir(tmp_path) / f"{spec_id}.json"
         ).exists()

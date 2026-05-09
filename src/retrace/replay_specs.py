@@ -164,7 +164,8 @@ def generate_api_spec_from_replay_issue(
     headers, auth, header_notes = _safe_api_headers(details)
     body, body_notes = _safe_api_body(details)
     original_status = _status_int(details.get("status") or details.get("status_code"))
-    expected_status = 200 if original_status >= 400 or original_status == 0 else original_status
+    is_recovery_regression = original_status >= 400 or original_status == 0
+    expected_status = original_status
     trigger_context = _api_trigger_context(
         evidence=evidence,
         signal_timestamp_ms=_status_int(signal.get("timestamp_ms")),
@@ -207,7 +208,8 @@ def generate_api_spec_from_replay_issue(
             },
             "api_regression": {
                 "original_status": original_status,
-                "expected_status": expected_status,
+                "forbidden_status": original_status if is_recovery_regression else None,
+                "status_assertion": "not_equal" if is_recovery_regression else "exact",
                 "trigger_context": trigger_context,
                 "trace_ids": trace_ids,
                 "assertion_strategy": (
@@ -977,7 +979,7 @@ def _api_trigger_context(
                 {
                     "kind": "navigation",
                     "timestamp_ms": timestamp_ms,
-                    "href": str(event.get("href") or ""),
+                    "href": _redacted_url(str(event.get("href") or "")),
                 }
             )
         elif event_type == 3 and event.get("source") == 2:

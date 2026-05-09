@@ -37,6 +37,7 @@ from retrace.llm.client import LLMClient
 from retrace.llm.client import build_llm_http_request
 from retrace.reports.parser import parse_report_findings
 from retrace.replay_specs import (
+    _redacted_url,
     generate_api_spec_from_replay_issue,
     generate_spec_from_replay_issue,
 )
@@ -863,12 +864,13 @@ def _replay_api_calls(evidence: dict[str, Any]) -> list[dict[str, Any]]:
         if detector not in {"network_4xx", "network_5xx"}:
             continue
         details = signal.get("details") if isinstance(signal.get("details"), dict) else {}
+        raw_url = str(details.get("request_url") or details.get("url") or "")
         calls.append(
             {
                 "detector": detector,
                 "timestamp_ms": int(signal.get("timestamp_ms") or 0),
                 "method": str(details.get("method") or details.get("request_method") or "GET").upper(),
-                "url": str(details.get("request_url") or details.get("url") or ""),
+                "url": _redacted_url(raw_url),
                 "status": details.get("status") or details.get("status_code") or "",
                 "confidence": str(signal.get("confidence") or ""),
                 "reason_codes": signal.get("reason_codes") if isinstance(signal.get("reason_codes"), list) else [],

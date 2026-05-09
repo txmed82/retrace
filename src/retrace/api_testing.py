@@ -766,16 +766,38 @@ def _evaluate_api_assertions(
     elapsed_ms: int,
     status_code: int,
 ) -> list[APIAssertionResult]:
-    results = [
-        APIAssertionResult(
-            assertion_id="expected-status",
-            assertion_type="status_code",
-            ok=status_code == spec.expected_status,
-            expected=spec.expected_status,
-            actual=status_code,
-            message=f"Expected status {spec.expected_status}, got {status_code}.",
+    api_regression = (
+        spec.fixtures.get("api_regression")
+        if isinstance(spec.fixtures.get("api_regression"), dict)
+        else {}
+    )
+    if api_regression.get("status_assertion") == "not_equal":
+        forbidden_status = int(api_regression.get("forbidden_status") or spec.expected_status)
+        message = (
+            f"Expected status to differ from captured failure {forbidden_status}, "
+            f"got {status_code}."
         )
-    ]
+        results = [
+            APIAssertionResult(
+                assertion_id="forbidden-status",
+                assertion_type="status_code",
+                ok=status_code != forbidden_status,
+                expected=f"!={forbidden_status}",
+                actual=status_code,
+                message=message,
+            )
+        ]
+    else:
+        results = [
+            APIAssertionResult(
+                assertion_id="expected-status",
+                assertion_type="status_code",
+                ok=status_code == spec.expected_status,
+                expected=spec.expected_status,
+                actual=status_code,
+                message=f"Expected status {spec.expected_status}, got {status_code}.",
+            )
+        ]
     if spec.latency_ms > 0:
         results.append(
             APIAssertionResult(
