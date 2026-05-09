@@ -63,25 +63,33 @@ def _persist_harness_failure(
         run_result=result,
         spec_name=spec_name,
     )
-    failure_id = store.upsert_failure(failure)
-    evidence_ids: list[str] = []
-    for item in _harness_evidence_items(failure_id=failure_id, result=result):
-        evidence_ids.append(store.append_failure_evidence(item))
-    repair_task_id = store.upsert_repair_task(
-        failure_id=failure_id,
-        title=f"Repair harness failure: {spec_name or result.spec_id}",
-        source_type="test_run",
-        source_external_id=failure.source_external_id,
-        status="open",
-        prompt_artifacts=list(getattr(result, "artifacts", []) or []),
-        validation_commands=[f"retrace tester run {result.spec_id} --retries 0"],
-        risk_notes="Review harness artifacts before applying a repair.",
-        metadata={
+    failure_id, _evidence_ids, repair_task_id = (
+        store.upsert_failure_with_evidence_and_repair_task(
+            failure=failure,
+            evidence_items=_harness_evidence_items(failure_id="", result=result),
+            repair_task={
+                "title": f"Repair harness failure: {spec_name or result.spec_id}",
+                "source_type": "test_run",
+                "source_external_id": failure.source_external_id,
+                "status": "open",
+                "prompt_artifacts": list(getattr(result, "artifacts", []) or []),
+                "validation_commands": [
+                    f"retrace tester run {result.spec_id} --retries 0"
+                ],
+                "risk_notes": "Review harness artifacts before applying a repair.",
+                "metadata": {
             "run_id": result.run_id,
             "spec_id": result.spec_id,
             "failure_classification": result.failure_classification,
-        },
-        evidence_ids=evidence_ids,
+                },
+            },
+        )
+    )
+    store.upsert_failure_test_link(
+        failure_id=failure_id,
+        spec_id=result.spec_id,
+        spec_name=spec_name,
+        source="test_run",
     )
     return {"failure_id": failure_id, "repair_task_id": repair_task_id}
 
@@ -574,6 +582,13 @@ def tester_run(
                 result=result,
                 spec_name=spec.name,
             )
+            link_id = _single_failure_test_link_id(store, result.spec_id)
+            if link_id:
+                store.update_failure_test_link_run(
+                    spec_id=result.spec_id,
+                    run_result=result,
+                    link_id=link_id,
+                )
     except Exception as exc:
         click.echo(
             f"warning: failed to persist tester failure metadata: {exc}",

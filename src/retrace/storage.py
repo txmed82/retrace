@@ -12,6 +12,7 @@ from typing import Any, Optional, Protocol
 from retrace.evidence import (
     PROMPT_SAFE_REDACTION_STATES,
     EvidenceItem,
+    evidence_dedupe_key,
     evidence_items_from_replay_issue,
 )
 from retrace.failures import CanonicalFailure, canonical_failure_from_replay_issue
@@ -1635,6 +1636,65 @@ class Storage:
             ).fetchall()
         return [self._evidence_from_row(row) for row in rows]
 
+    def upsert_failure_with_evidence_and_repair_task(
+        self,
+        *,
+        failure: CanonicalFailure,
+        evidence_items: list[EvidenceItem],
+        repair_task: dict[str, Any],
+    ) -> tuple[str, list[str], str]:
+        now = datetime.now(timezone.utc).isoformat()
+        failure_id = self._id("flr")
+        with self._conn() as conn:
+            persisted_failure_id = self._upsert_failure(
+                conn,
+                failure=failure,
+                now=now,
+                failure_id=failure_id,
+            )
+            normalized_evidence = [
+                EvidenceItem(
+                    failure_id=persisted_failure_id,
+                    evidence_type=item.evidence_type,
+                    occurred_at_ms=item.occurred_at_ms,
+                    source=item.source,
+                    redaction_state=item.redaction_state,
+                    payload=item.payload,
+                    artifact_path=item.artifact_path,
+                    dedupe_key=evidence_dedupe_key(
+                        failure_id=persisted_failure_id,
+                        evidence_type=item.evidence_type,
+                        source=item.source,
+                        occurred_at_ms=item.occurred_at_ms,
+                        payload=item.payload,
+                    ),
+                )
+                for item in evidence_items
+            ]
+            evidence_ids = [
+                self._append_failure_evidence(conn, evidence=item)
+                for item in normalized_evidence
+            ]
+            repair_task_id = self._upsert_repair_task_in_conn(
+                conn,
+                failure_id=persisted_failure_id,
+                title=str(repair_task.get("title") or ""),
+                source_type=str(repair_task.get("source_type") or ""),
+                source_external_id=str(repair_task.get("source_external_id") or ""),
+                status=str(repair_task.get("status") or "open"),
+                likely_files=list(repair_task.get("likely_files") or []),
+                prompt_artifacts=list(repair_task.get("prompt_artifacts") or []),
+                validation_commands=list(
+                    repair_task.get("validation_commands") or []
+                ),
+                branch=str(repair_task.get("branch") or ""),
+                pr_url=str(repair_task.get("pr_url") or ""),
+                risk_notes=str(repair_task.get("risk_notes") or ""),
+                metadata=dict(repair_task.get("metadata") or {}),
+                evidence_ids=evidence_ids,
+            )
+            return persisted_failure_id, evidence_ids, repair_task_id
+
     def upsert_repair_task(
         self,
         *,
@@ -1669,101 +1729,157 @@ class Storage:
             raise ValueError("repair task metadata must be JSON-serializable") from exc
 
         with self._conn() as conn:
-            failure_row = conn.execute(
-                "SELECT id, project_id, environment_id FROM failures WHERE id = ?",
-                (failure_id,),
+            return self._upsert_repair_task_in_conn(
+                conn,
+                failure_id=failure_id,
+                title=title,
+                source_type=source_type,
+                source_external_id=source_external_id,
+                status=normalized_status,
+                likely_files=clean_likely_files,
+                prompt_artifacts=json.loads(prompt_json),
+                validation_commands=clean_validation,
+                branch=branch,
+                pr_url=pr_url,
+                risk_notes=risk_notes,
+                metadata=json.loads(metadata_json),
+                evidence_ids=clean_evidence_ids,
+                now=now,
+                task_id=task_id,
+                public_id=public_id,
+            )
+
+    def _upsert_repair_task_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        failure_id: str,
+        title: str,
+        source_type: str = "",
+        source_external_id: str = "",
+        status: str = "open",
+        likely_files: Optional[list[str]] = None,
+        prompt_artifacts: Optional[list[dict[str, Any]]] = None,
+        validation_commands: Optional[list[str]] = None,
+        branch: str = "",
+        pr_url: str = "",
+        risk_notes: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+        evidence_ids: Optional[list[str]] = None,
+        now: str = "",
+        task_id: str = "",
+        public_id: str = "",
+    ) -> str:
+        failure_id = failure_id.strip()
+        if not failure_id:
+            raise ValueError("failure_id is required")
+        now = now or datetime.now(timezone.utc).isoformat()
+        task_id = task_id or self._id("rpr")
+        public_id = public_id or self._public_id("rpr", failure_id)
+        normalized_status = normalize_repair_task_status(status)
+        clean_likely_files = self._merge_string_lists(likely_files or [])
+        clean_validation = self._merge_string_lists(validation_commands or [])
+        clean_evidence_ids = self._merge_string_lists(evidence_ids or [])
+        try:
+            prompt_json = json.dumps(prompt_artifacts or [], sort_keys=True)
+            metadata_json = json.dumps(metadata or {}, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("repair task metadata must be JSON-serializable") from exc
+        failure_row = conn.execute(
+            "SELECT id, project_id, environment_id FROM failures WHERE id = ?",
+            (failure_id,),
+        ).fetchone()
+        if failure_row is None:
+            raise ValueError(f"unknown failure_id: {failure_id}")
+        task_project_id = str(failure_row["project_id"])
+        task_environment_id = str(failure_row["environment_id"])
+        conn.execute(
+            """
+            INSERT INTO repair_tasks
+            (id, public_id, project_id, environment_id, failure_id, source_type,
+             source_external_id, title, status, likely_files_json, prompt_artifacts_json,
+             validation_commands_json, branch, pr_url, risk_notes, metadata_json,
+             created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(failure_id, project_id, environment_id) DO UPDATE SET
+                source_type = excluded.source_type,
+                source_external_id = excluded.source_external_id,
+                title = excluded.title,
+                status = excluded.status,
+                likely_files_json = excluded.likely_files_json,
+                prompt_artifacts_json = excluded.prompt_artifacts_json,
+                validation_commands_json = excluded.validation_commands_json,
+                branch = excluded.branch,
+                pr_url = excluded.pr_url,
+                risk_notes = excluded.risk_notes,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                task_id,
+                public_id,
+                task_project_id,
+                task_environment_id,
+                failure_id,
+                source_type.strip(),
+                source_external_id.strip(),
+                title.strip() or "Repair task",
+                normalized_status,
+                json.dumps(clean_likely_files, sort_keys=True),
+                prompt_json,
+                json.dumps(clean_validation, sort_keys=True),
+                branch.strip(),
+                pr_url.strip(),
+                risk_notes.strip(),
+                metadata_json,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            """
+            SELECT id
+            FROM repair_tasks
+            WHERE failure_id = ? AND project_id = ? AND environment_id = ?
+            """,
+            (failure_id, task_project_id, task_environment_id),
+        ).fetchone()
+        assert row is not None
+        persisted_task_id = str(row["id"])
+        conn.execute(
+            """
+            DELETE FROM repair_task_evidence
+            WHERE repair_task_id = ? AND role = 'supporting'
+            """,
+            (persisted_task_id,),
+        )
+        for evidence_id in clean_evidence_ids:
+            evidence_row = conn.execute(
+                """
+                SELECT 1
+                FROM failure_evidence
+                WHERE id = ? AND failure_id = ?
+                """,
+                (evidence_id, failure_id),
             ).fetchone()
-            if failure_row is None:
-                raise ValueError(f"unknown failure_id: {failure_id}")
-            task_project_id = str(failure_row["project_id"])
-            task_environment_id = str(failure_row["environment_id"])
+            if evidence_row is None:
+                continue
             conn.execute(
                 """
-                INSERT INTO repair_tasks
-                (id, public_id, project_id, environment_id, failure_id, source_type,
-                 source_external_id, title, status, likely_files_json, prompt_artifacts_json,
-                 validation_commands_json, branch, pr_url, risk_notes, metadata_json,
-                 created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(failure_id, project_id, environment_id) DO UPDATE SET
-                    source_type = excluded.source_type,
-                    source_external_id = excluded.source_external_id,
-                    title = excluded.title,
-                    status = excluded.status,
-                    likely_files_json = excluded.likely_files_json,
-                    prompt_artifacts_json = excluded.prompt_artifacts_json,
-                    validation_commands_json = excluded.validation_commands_json,
-                    branch = excluded.branch,
-                    pr_url = excluded.pr_url,
-                    risk_notes = excluded.risk_notes,
-                    metadata_json = excluded.metadata_json,
-                    updated_at = excluded.updated_at
+                INSERT OR IGNORE INTO repair_task_evidence
+                (repair_task_id, evidence_id, role)
+                VALUES (?, ?, 'supporting')
                 """,
-                (
-                    task_id,
-                    public_id,
-                    task_project_id,
-                    task_environment_id,
-                    failure_id,
-                    source_type.strip(),
-                    source_external_id.strip(),
-                    title.strip() or "Repair task",
-                    normalized_status,
-                    json.dumps(clean_likely_files, sort_keys=True),
-                    prompt_json,
-                    json.dumps(clean_validation, sort_keys=True),
-                    branch.strip(),
-                    pr_url.strip(),
-                    risk_notes.strip(),
-                    metadata_json,
-                    now,
-                    now,
-                ),
+                (persisted_task_id, evidence_id),
             )
-            row = conn.execute(
-                """
-                SELECT id
-                FROM repair_tasks
-                WHERE failure_id = ? AND project_id = ? AND environment_id = ?
-                """,
-                (failure_id, task_project_id, task_environment_id),
-            ).fetchone()
-            assert row is not None
-            persisted_task_id = str(row["id"])
-            conn.execute(
-                """
-                DELETE FROM repair_task_evidence
-                WHERE repair_task_id = ? AND role = 'supporting'
-                """,
-                (persisted_task_id,),
-            )
-            for evidence_id in clean_evidence_ids:
-                evidence_row = conn.execute(
-                    """
-                    SELECT 1
-                    FROM failure_evidence
-                    WHERE id = ? AND failure_id = ?
-                    """,
-                    (evidence_id, failure_id),
-                ).fetchone()
-                if evidence_row is None:
-                    continue
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO repair_task_evidence
-                    (repair_task_id, evidence_id, role)
-                    VALUES (?, ?, 'supporting')
-                    """,
-                    (persisted_task_id, evidence_id),
-                )
-            conn.execute(
-                """
-                UPDATE failures
-                SET linked_repair_task_id = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (persisted_task_id, now, failure_id),
-            )
+        conn.execute(
+            """
+            UPDATE failures
+            SET linked_repair_task_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (persisted_task_id, now, failure_id),
+        )
         return persisted_task_id
 
     def get_repair_task(self, repair_task_id: str) -> Optional[RepairTaskRow]:

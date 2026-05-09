@@ -289,6 +289,7 @@ def test_failed_harness_run_persists_failure_evidence_and_repair(
     assert second.exit_code != 0
     second_payload = json.loads(second.output.split("\nError:", 1)[0])
     assert second_payload["canonical_failure_id"] == first_payload["canonical_failure_id"]
+    assert second_payload["repair_task_id"] == first_payload["repair_task_id"]
 
     store = Storage(tmp_path / "data" / "retrace.db")
     store.init_schema()
@@ -305,6 +306,8 @@ def test_failed_harness_run_persists_failure_evidence_and_repair(
     repair = store.get_repair_task(first_payload["repair_task_id"])
     assert repair is not None
     assert repair.evidence_ids
+    links = store.list_failure_test_links(failure_id=failures[0].id)
+    assert links[0].latest_run_id == second_payload["run_id"]
 
 
 def test_tester_enqueue_and_worker_runs_queued_spec(
