@@ -29,6 +29,8 @@ FAILURE_TEST_COVERAGE_STATES = (
 GITHUB_REVIEW_RUN_STATUSES = ("queued", "running", "succeeded", "failed", "canceled")
 
 _SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+INGEST_RATE_LIMIT_RETENTION_SECONDS = 48 * 60 * 60
+INGEST_RATE_LIMIT_MAX_IDENTITIES_PER_BUCKET = 10000
 
 
 def _rollup_severity(values: list[str]) -> str:
@@ -2957,15 +2959,12 @@ class Storage:
                 [clean_project, clean_environment, clean_bucket, clean_identity]
             ).encode("utf-8")
         ).hexdigest()
-        row_id = self._public_id(
-            "rlim",
-            clean_project,
-            clean_environment,
-            clean_bucket,
-            identity_hash,
-            str(clean_window_seconds),
-        )
+        row_id = self._id("rlim")
         now = datetime.now(timezone.utc).isoformat()
+        cutoff = datetime.fromtimestamp(
+            (current_ms / 1000) - INGEST_RATE_LIMIT_RETENTION_SECONDS,
+            tz=timezone.utc,
+        ).isoformat()
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -3041,6 +3040,36 @@ class Storage:
                     )
                     if cursor.rowcount <= 0:
                         count = clean_limit + 1
+            conn.execute(
+                """
+                DELETE FROM ingest_rate_limits
+                WHERE project_id = ?
+                  AND environment_id = ?
+                  AND bucket = ?
+                  AND updated_at < ?
+                """,
+                (clean_project, clean_environment, clean_bucket, cutoff),
+            )
+            conn.execute(
+                """
+                DELETE FROM ingest_rate_limits
+                WHERE id IN (
+                    SELECT id
+                    FROM ingest_rate_limits
+                    WHERE project_id = ?
+                      AND environment_id = ?
+                      AND bucket = ?
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (
+                    clean_project,
+                    clean_environment,
+                    clean_bucket,
+                    INGEST_RATE_LIMIT_MAX_IDENTITIES_PER_BUCKET,
+                ),
+            )
             allowed = count <= clean_limit
             remaining = max(0, clean_limit - count)
         return RateLimitDecision(
