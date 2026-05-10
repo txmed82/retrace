@@ -382,16 +382,6 @@ CREATE TABLE IF NOT EXISTS app_error_alert_rules (
 CREATE INDEX IF NOT EXISTS idx_app_error_alert_rules_scope
 ON app_error_alert_rules(project_id, environment_id, enabled, updated_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_app_error_alert_rules_eval
-ON app_error_alert_rules(
-    project_id,
-    environment_id,
-    enabled,
-    precedence DESC,
-    created_at ASC,
-    id ASC
-);
-
 CREATE TABLE IF NOT EXISTS deploy_markers (
     id TEXT PRIMARY KEY,
     public_id TEXT NOT NULL,
@@ -1223,6 +1213,19 @@ class Storage:
                 conn.execute(
                     "ALTER TABLE app_error_alert_rules ADD COLUMN precedence INTEGER NOT NULL DEFAULT 0"
                 )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_app_error_alert_rules_eval
+                ON app_error_alert_rules(
+                    project_id,
+                    environment_id,
+                    enabled,
+                    precedence DESC,
+                    created_at ASC,
+                    id ASC
+                )
+                """
+            )
             self._backfill_failure_trace_map(conn)
             rows = conn.execute(
                 """
