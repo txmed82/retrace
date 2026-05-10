@@ -50,6 +50,7 @@ def group_failure_into_incident(
         summary=incident_summary(failure),
         severity=failure.severity,
         metadata=incident_metadata(failure),
+        reopen_resolved=True,
     )
     store.move_failure_to_incident(incident_id=incident_id, failure_id=failure.id)
     incident = store.get_incident(incident_id)

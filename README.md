@@ -447,6 +447,20 @@ Example:
 Matching rule metadata is written onto the canonical failure and incident
 response as `alert_state` and `alert_rule_name`.
 
+App-error incidents have an explicit lifecycle. Use a service token with
+`app_errors:write` or `admin` to resolve, ignore, reopen, triage, or mark an
+incident investigating:
+
+- `POST /api/app-errors/{incident_public_id}/lifecycle?environment_id=...`
+
+Send JSON with either `action` (`resolve`, `ignore`, `reopen`, `triage`, or
+`investigate`) or explicit `status` (`open`, `triaged`, `investigating`,
+`resolved`, or `ignored`). Optional `reason`, `actor_type`, `actor_id`, and
+object `metadata` are recorded in an append-only lifecycle history. The
+transition updates linked monitoring failure statuses so retention, lists, and
+repair workflows agree with the incident state. New matching failures reopen a
+resolved or ignored incident and add a system lifecycle event.
+
 App-error retention pruning is available for hosted or self-hosted cleanup jobs:
 
 - `POST /api/app-errors/prune?environment_id=...`

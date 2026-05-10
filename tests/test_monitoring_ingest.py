@@ -1339,6 +1339,117 @@ def test_app_error_incident_api_detail_controls_sensitive_evidence(
     assert weak_payload["error"] == "forbidden"
 
 
+def test_app_error_incident_lifecycle_resolves_and_reopens_on_regression(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Incident manager",
+        scopes=["app_errors:read", "app_errors:write"],
+    )
+    event = {
+        "event_id": "evt-lifecycle-1",
+        "title": "Checkout submit failed",
+        "level": "error",
+        "transaction": "/checkout",
+        "exception": {
+            "values": [
+                {
+                    "type": "TypeError",
+                    "value": "Cannot read cart total",
+                    "stacktrace": {
+                        "frames": [
+                            {
+                                "filename": "src/checkout.ts",
+                                "function": "submit",
+                                "lineno": 42,
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
+    }
+    result = ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={"event": event},
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            (
+                f"/api/app-errors/{result.incident_public_id}/lifecycle"
+                f"?environment_id={workspace.environment_id}"
+            ),
+            body=json.dumps(
+                {
+                    "action": "resolve",
+                    "reason": "fixed in deploy 2026.05.10",
+                    "metadata": {"deploy_sha": "abc123"},
+                }
+            ).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        resolve_response = conn.getresponse()
+        resolved_payload = json.loads(resolve_response.read().decode("utf-8"))
+        conn.request(
+            "GET",
+            f"/api/app-errors?environment_id={workspace.environment_id}&status=resolved",
+            headers={"Authorization": f"Bearer {service.token}"},
+        )
+        list_response = conn.getresponse()
+        listed_payload = json.loads(list_response.read().decode("utf-8"))
+        conn.close()
+
+    assert resolve_response.status == 202
+    assert resolved_payload["incident"]["status"] == "resolved"
+    assert resolved_payload["failures"][0]["status"] == "resolved"
+    assert resolved_payload["lifecycle_events"][0]["from_status"] == "open"
+    assert resolved_payload["lifecycle_events"][0]["to_status"] == "resolved"
+    assert resolved_payload["lifecycle_events"][0]["reason"] == "fixed in deploy 2026.05.10"
+    assert listed_payload["incidents"][0]["public_id"] == result.incident_public_id
+
+    regressed = {**event, "event_id": "evt-lifecycle-2"}
+    ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={"event": regressed},
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "GET",
+            f"/api/app-errors/{result.incident_public_id}?environment_id={workspace.environment_id}",
+            headers={"Authorization": f"Bearer {service.token}"},
+        )
+        detail_response = conn.getresponse()
+        detail_payload = json.loads(detail_response.read().decode("utf-8"))
+        conn.close()
+
+    assert list_response.status == 200
+    assert detail_response.status == 200
+    assert detail_payload["incident"]["status"] == "open"
+    assert detail_payload["incident"]["failure_count"] == 2
+    assert detail_payload["lifecycle_events"][0]["from_status"] == "resolved"
+    assert detail_payload["lifecycle_events"][0]["to_status"] == "open"
+    assert detail_payload["lifecycle_events"][0]["metadata"]["trigger"] == "ingest_regression"
+
+
 def test_app_error_prune_endpoint_deletes_old_resolved_monitoring_data(
     tmp_path: Path,
 ) -> None:

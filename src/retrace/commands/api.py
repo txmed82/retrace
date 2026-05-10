@@ -368,6 +368,20 @@ def _evidence_api_dict(evidence: Any) -> dict[str, Any]:
     }
 
 
+def _incident_lifecycle_event_api_dict(event: Any) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "incident_id": event.incident_id,
+        "from_status": event.from_status,
+        "to_status": event.to_status,
+        "actor_type": event.actor_type,
+        "actor_id": event.actor_id,
+        "reason": event.reason,
+        "metadata": dict(event.metadata or {}),
+        "created_at": _dt_api(event.created_at),
+    }
+
+
 def _repair_task_api_dict(task: Any) -> dict[str, Any]:
     return {
         "id": task.id,
@@ -639,6 +653,11 @@ def _handler(
                 and parsed.path != "/api/deploys"
                 and parsed.path != "/api/source-maps"
                 and parsed.path != "/api/app-error-alert-rules"
+                and parsed.path != "/api/app-errors/prune"
+                and not (
+                    parsed.path.startswith("/api/app-errors/")
+                    and parsed.path.endswith("/lifecycle")
+                )
                 and not parsed.path.startswith("/api/otel/")
                 and not parsed.path.startswith("/api/sentry/")
                 and _sentry_ingest_path_parts(parsed.path) is None
@@ -672,6 +691,14 @@ def _handler(
                 return
             if parsed.path == "/api/app-errors/prune":
                 self._handle_prune_app_errors(parsed.query)
+                return
+            if parsed.path.startswith("/api/app-errors/") and parsed.path.endswith(
+                "/lifecycle"
+            ):
+                incident_id = parsed.path.removeprefix("/api/app-errors/")[
+                    : -len("/lifecycle")
+                ].strip("/")
+                self._handle_app_error_incident_lifecycle(incident_id, parsed.query)
                 return
             if parsed.path in {"/api/otel/v1/logs", "/api/otel/v1/traces"}:
                 self._handle_otel_ingest(parsed.path, parsed.query)
@@ -1641,6 +1668,112 @@ def _handler(
                 return
             _json_response(self, 202, {"retention": _retention_result_api_dict(result)})
 
+        def _handle_app_error_incident_lifecycle(
+            self, incident_id: str, query: str
+        ) -> None:
+            token = _require_service_token(
+                self,
+                store,
+                scopes={"app_errors:write", "admin"},
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            incident_id = incident_id.strip()
+            if not incident_id:
+                _json_response(self, 404, {"error": "not_found"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length <= 0:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            if length > 64 * 1024:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                _json_response(self, 400, {"error": "invalid_json"})
+                return
+            if not isinstance(payload, dict):
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            action = str(payload.get("action") or "").strip().lower()
+            status = str(payload.get("status") or "").strip().lower()
+            action_statuses = {
+                "resolve": "resolved",
+                "resolved": "resolved",
+                "ignore": "ignored",
+                "ignored": "ignored",
+                "reopen": "open",
+                "open": "open",
+                "triage": "triaged",
+                "triaged": "triaged",
+                "investigate": "investigating",
+                "investigating": "investigating",
+            }
+            if action and not status:
+                status = action_statuses.get(action, "")
+            if not status:
+                _json_response(self, 400, {"error": "missing_status"})
+                return
+            metadata = payload.get("metadata")
+            if metadata is not None and not isinstance(metadata, dict):
+                _json_response(self, 400, {"error": "invalid_metadata"})
+                return
+            try:
+                incident = store.transition_app_error_incident(
+                    project_id=token.project_id,
+                    environment_id=environment_id,
+                    incident_id=incident_id,
+                    status=status,
+                    actor_type=str(payload.get("actor_type") or "service_token"),
+                    actor_id=str(payload.get("actor_id") or token.name or token.id),
+                    reason=str(payload.get("reason") or ""),
+                    metadata=dict(metadata or {}),
+                )
+            except ValueError as exc:
+                message = str(exc)
+                if "unknown incident_id" in message:
+                    _json_response(self, 404, {"error": "not_found"})
+                    return
+                _json_response(
+                    self,
+                    400,
+                    {"error": "invalid_lifecycle_transition", "message": message},
+                )
+                return
+            failures = store.list_incident_failures(incident_id=incident.id)
+            events = store.list_incident_lifecycle_events(incident_id=incident.id)
+            _json_response(
+                self,
+                202,
+                {
+                    "project_id": token.project_id,
+                    "environment_id": environment_id,
+                    "incident": _incident_api_dict(
+                        store=store,
+                        incident=incident,
+                        failures=failures,
+                    ),
+                    "failures": [
+                        _failure_api_dict(failure, include_metadata=False)
+                        for failure in failures
+                    ],
+                    "lifecycle_events": [
+                        _incident_lifecycle_event_api_dict(event) for event in events
+                    ],
+                },
+            )
+
         def _handle_get_app_error_incident(self, incident_id: str, query: str) -> None:
             token = _require_service_token(
                 self,
@@ -1704,6 +1837,12 @@ def _handler(
                     ],
                     "evidence": [
                         _evidence_api_dict(evidence) for evidence in detail.evidence
+                    ],
+                    "lifecycle_events": [
+                        _incident_lifecycle_event_api_dict(event)
+                        for event in store.list_incident_lifecycle_events(
+                            incident_id=detail.incident.id
+                        )
                     ],
                     "repair_task": (
                         _repair_task_api_dict(detail.repair_task)
