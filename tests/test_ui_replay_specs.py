@@ -13,6 +13,7 @@ from retrace.commands.ui import (
     _generate_replay_issue_api_spec_payload,
     _generate_replay_issue_fix_prompts_payload,
     _generate_replay_issue_specs_payload,
+    _hosted_onboarding_readiness_payload,
     _INDEX_HTML,
     _issue_workflow_payload,
     _replay_api_calls,
@@ -134,6 +135,8 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "/api/api-suite/run" in _INDEX_HTML
     assert "runManagedApiSuite" in _INDEX_HTML
     assert "apiSuiteRunMatrix" in _INDEX_HTML
+    assert "/api/onboarding/readiness" in _INDEX_HTML
+    assert "Hosted Readiness" in _INDEX_HTML
     assert "Generated Draft Review" in _INDEX_HTML
     assert "/api/tester/draft" in _INDEX_HTML
     assert "saveDraftSpec" in _INDEX_HTML
@@ -471,6 +474,108 @@ def test_create_sdk_key_payload_creates_browser_ingest_key(
     assert row.id == payload["id"]
     assert row.project_id == payload["project_id"]
     assert row.environment_id == payload["environment_id"]
+
+
+def test_hosted_onboarding_readiness_tracks_core_loop_setup(tmp_path: Path) -> None:
+    store, workspace = _workspace(tmp_path)
+    _create_sdk_key_payload(
+        store=store,
+        project_name="Web",
+        environment_name="production",
+        name="Browser SDK",
+    )
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-onboarding",
+        sequence=0,
+        events=[{"type": 4, "timestamp": 100, "data": {"href": "https://app.test"}}],
+        flush_type="final",
+    )
+    issue = store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="onboarding-error",
+        session_ids=["sess-onboarding"],
+        signal_summary={"console_error": 1},
+        first_seen_ms=100,
+        last_seen_ms=200,
+        title="Onboarding smoke issue",
+        evidence={"signals": []},
+    )
+    ui_spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Onboarding UI regression",
+        prompt="Open app",
+        app_url="https://app.test",
+        start_command="",
+        harness_command=DEFAULT_HARNESS_COMMAND,
+        fixtures={"issue_public_id": issue.public_id, "draft_status": "accepted"},
+    )
+    api_spec = create_api_spec(
+        specs_dir=api_specs_dir_for_data_dir(tmp_path),
+        name="Onboarding API",
+        method="GET",
+        url="https://app.test/api/health",
+    )
+    create_api_suite(
+        suites_dir=tmp_path / "api-tests" / "suites",
+        name="Onboarding API suite",
+        source="manual",
+        spec_ids=[api_spec.spec_id],
+    )
+    row = store.get_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=issue.public_id,
+    )
+    assert row is not None
+    store.upsert_failure_test_link(
+        failure_id=str(row["canonical_failure_id"]),
+        issue_id=str(row["id"]),
+        issue_public_id=issue.public_id,
+        spec_id=ui_spec.spec_id,
+        spec_name=ui_spec.name,
+        spec_path=f"ui-tests/specs/{ui_spec.spec_id}.json",
+        source="replay_issue",
+    )
+    store.upsert_source_map(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        release="sha",
+        dist="",
+        artifact_url="https://cdn.example/app.js",
+        source_map={"version": 3, "sources": ["src/app.ts"], "names": [], "mappings": "AAAA"},
+    )
+    store.upsert_app_error_alert_rule(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Critical errors",
+        min_severity="high",
+    )
+    store.upsert_repair_task(
+        failure_id=str(row["canonical_failure_id"]),
+        title="Repair onboarding smoke issue",
+        source_type="replay_issue",
+        source_external_id=issue.public_id,
+        status="open",
+    )
+
+    payload = _hosted_onboarding_readiness_payload(
+        store=store,
+        data_dir=tmp_path,
+        settings={"tester_app_url": "https://app.test"},
+        checks={"replay_api": {"reachable": True, "detail": "OK (200)"}},
+    )
+
+    assert payload["ready"] is True
+    assert payload["complete"] == payload["total"]
+    assert payload["counts"]["sdk_keys"] == 1
+    assert payload["counts"]["ui_specs"] == 1
+    assert payload["counts"]["api_suites"] == 1
+    assert payload["counts"]["source_maps"] == 1
+    assert payload["counts"]["alert_rules"] == 1
+    assert {step["id"]: step["status"] for step in payload["steps"]}["repair_loop"] == "complete"
 
 
 def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> None:

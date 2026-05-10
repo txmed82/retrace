@@ -3283,6 +3283,30 @@ class Storage:
             ).fetchall()
         return [self._source_map_from_row(row) for row in rows]
 
+    def list_recent_source_maps(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        limit: int = 100,
+    ) -> list[SourceMapRow]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM source_maps
+                WHERE project_id = ? AND environment_id = ?
+                ORDER BY uploaded_at DESC
+                LIMIT ?
+                """,
+                (
+                    project_id,
+                    environment_id,
+                    max(1, min(int(limit), 500)),
+                ),
+            ).fetchall()
+        return [self._source_map_from_row(row) for row in rows]
+
     def _validate_source_map_payload(self, source_map: dict[str, Any]) -> None:
         if source_map.get("version") != 3:
             raise ValueError("source_map must be a supported Source Map v3 object")
@@ -4904,6 +4928,54 @@ class Storage:
             last_used_at=self._dt(r["last_used_at"]),
             created_at=self._dt(r["created_at"]) or datetime.now(timezone.utc),
         )
+
+    def list_sdk_keys(
+        self,
+        *,
+        project_id: str = "",
+        environment_id: str = "",
+        include_revoked: bool = False,
+        limit: int = 100,
+    ) -> list[SDKKeyRow]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if environment_id:
+            clauses.append("environment_id = ?")
+            params.append(environment_id)
+        if not include_revoked:
+            clauses.append("revoked_at IS NULL")
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, min(int(limit), 500)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, project_id, environment_id, name, prefix, key_hash, last4,
+                       revoked_at, last_used_at, created_at
+                FROM sdk_keys
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [
+            SDKKeyRow(
+                id=str(r["id"]),
+                project_id=str(r["project_id"]),
+                environment_id=str(r["environment_id"]),
+                name=str(r["name"]),
+                prefix=str(r["prefix"]),
+                key_hash=str(r["key_hash"]),
+                last4=str(r["last4"]),
+                revoked_at=self._dt(r["revoked_at"]),
+                last_used_at=self._dt(r["last_used_at"]),
+                created_at=self._dt(r["created_at"]) or datetime.now(timezone.utc),
+            )
+            for r in rows
+        ]
 
     def touch_sdk_key(self, key_id: str) -> None:
         with self._conn() as conn:
