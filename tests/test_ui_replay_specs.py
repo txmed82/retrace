@@ -8,6 +8,7 @@ from unittest.mock import patch
 from retrace.commands.ui import (
     _api_suites_payload,
     _create_sdk_key_payload,
+    _edit_ui_draft_payload,
     _generate_replay_issue_api_spec_payload,
     _generate_replay_issue_fix_prompts_payload,
     _generate_replay_issue_specs_payload,
@@ -122,6 +123,10 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "generate_api_regression" in _INDEX_HTML
     assert "/api/api-suites" in _INDEX_HTML
     assert "API Suites" in _INDEX_HTML
+    assert "Generated Draft Review" in _INDEX_HTML
+    assert "/api/tester/draft" in _INDEX_HTML
+    assert "saveDraftSpec" in _INDEX_HTML
+    assert "runAcceptedDraftSpec" in _INDEX_HTML
     assert _INDEX_HTML.index("await refreshTesterAndReplay(issue.public_id);") < (
         _INDEX_HTML.index("renderReplayFixSuggestions(data);")
     )
@@ -244,6 +249,85 @@ def test_api_suites_payload_summarizes_import_quality(tmp_path: Path) -> None:
     assert payload["suites"][0]["operation_count"] == 1
     assert payload["suites"][0]["quality_warning_count"] == 1
     assert payload["suites"][0]["auth_profile"] == "local-jwt"
+
+
+def test_edit_ui_draft_payload_persists_reviewed_steps_and_accepts(
+    tmp_path: Path,
+) -> None:
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Generated checkout draft",
+        prompt="Explore checkout",
+        app_url="https://app.example",
+        start_command="",
+        harness_command=DEFAULT_HARNESS_COMMAND,
+        execution_engine="native",
+        exact_steps=[{"id": "old", "action": "navigate", "url": "https://app.example"}],
+        assertions=[{"id": "old-status", "type": "status_code", "expected": 200}],
+        fixtures={
+            "draft_status": "draft",
+            "generation": {"review": {"summary": "Needs stable checkout path"}},
+        },
+    )
+
+    payload, status = _edit_ui_draft_payload(
+        data_dir=tmp_path,
+        spec_id=spec.spec_id,
+        name="Accepted checkout draft",
+        prompt="Run checkout smoke",
+        steps=[
+            {
+                "id": "checkout",
+                "action": "navigate",
+                "url": "https://app.example/checkout",
+            }
+        ],
+        assertions=[
+            {"id": "checkout-loads", "type": "status_code", "expected": 200}
+        ],
+        review_note="Made deterministic before accepting.",
+        accept=True,
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["draft_status"] == "accepted"
+    assert payload["changed_fields"] == [
+        "assertions",
+        "draft_status",
+        "exact_steps",
+        "name",
+        "prompt",
+        "review_notes",
+    ]
+    saved = payload["spec"]
+    assert saved["name"] == "Accepted checkout draft"
+    assert saved["exact_steps"][0]["id"] == "checkout"
+    assert saved["assertions"][0]["id"] == "checkout-loads"
+    assert saved["fixtures"]["review_notes"] == ["Made deterministic before accepting."]
+    assert saved["fixtures"]["last_review_edit"]["fields"] == payload["changed_fields"]
+
+
+def test_edit_ui_draft_payload_rejects_invalid_json_shape(tmp_path: Path) -> None:
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Generated draft",
+        prompt="Explore",
+        app_url="https://app.example",
+        start_command="",
+        harness_command=DEFAULT_HARNESS_COMMAND,
+        fixtures={"draft_status": "draft"},
+    )
+
+    payload, status = _edit_ui_draft_payload(
+        data_dir=tmp_path,
+        spec_id=spec.spec_id,
+        steps={"id": "not-a-list"},
+    )
+
+    assert status == 400
+    assert payload["ok"] is False
+    assert "steps must be a JSON list of objects" in payload["error"]
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(
