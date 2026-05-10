@@ -370,6 +370,11 @@ def test_sentry_source_map_miss_records_artifact_diagnostics(tmp_path: Path) -> 
     assert evidence[0].payload["stack_frames"][0]["source_map_reason"] == (
         "no_matching_artifact"
     )
+    evidence_frame = evidence[0].payload["stack_frames"][0]
+    assert evidence_frame["source_map_diagnostic"]["candidate_artifacts"] == [
+        "https://cdn.example.com/assets/other.min.js"
+    ]
+    assert "token=secret" not in json.dumps(evidence_frame["source_map_diagnostic"])
 
 
 def test_source_map_api_endpoint_accepts_upload(tmp_path: Path) -> None:
