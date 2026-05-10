@@ -123,6 +123,7 @@ def tester_review_spec(config_path: Path, kind: str, spec_id: str) -> None:
     else:
         spec = load_spec(specs_dir_for_data_dir(cfg.run.data_dir), spec_id)
         generation = spec.fixtures.get("generation", {})
+        review = generation.get("review", {})
         payload = {
             "kind": "ui",
             "spec_id": spec.spec_id,
@@ -131,13 +132,52 @@ def tester_review_spec(config_path: Path, kind: str, spec_id: str) -> None:
             "auth_profile": spec.auth_profile,
             "execution_engine": spec.execution_engine,
             "quality": generation.get("quality", {}),
-            "review": generation.get("review", {}),
+            "review": review,
+            "review_summary": _ui_review_summary(spec=spec, review=review),
             "steps": spec.exact_steps,
             "assertions": spec.assertions,
             "known_gaps": generation.get("known_gaps", []),
             "api_regression_candidate": generation.get("api_regression_candidate", {}),
         }
     click.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _ui_review_summary(*, spec: Any, review: Any) -> dict[str, Any]:
+    review_steps = review.get("steps", []) if isinstance(review, dict) else []
+    review_assertions = review.get("assertions", []) if isinstance(review, dict) else []
+    needs_locator = [
+        str(item.get("id") or "")
+        for item in review_steps
+        if isinstance(item, dict) and item.get("needs_locator")
+    ]
+    needs_test_data = [
+        str(item.get("id") or "")
+        for item in review_steps
+        if isinstance(item, dict) and item.get("needs_test_data")
+    ]
+    needs_assertion_review = [
+        str(item.get("id") or "")
+        for item in review_assertions
+        if isinstance(item, dict) and item.get("needs_review")
+    ]
+    blocking_items = [
+        *[f"step:{item}:locator" for item in needs_locator if item],
+        *[f"step:{item}:test_data" for item in needs_test_data if item],
+        *[f"assertion:{item}:review" for item in needs_assertion_review if item],
+    ]
+    draft_status = str(dict(spec.fixtures or {}).get("draft_status") or "")
+    return {
+        "draft_status": draft_status,
+        "step_count": len(spec.exact_steps or []),
+        "assertion_count": len(spec.assertions or []),
+        "blocking_items": blocking_items,
+        "recommended_command": (
+            f"retrace tester edit-draft {spec.spec_id} --steps-file steps.json "
+            "--assertions-file assertions.json --accept"
+            if draft_status == "draft"
+            else ""
+        ),
+    }
 
 
 def _route_path_for_review(url: str) -> str:
@@ -155,6 +195,19 @@ def _json_option(value: str, *, label: str, default: Any) -> Any:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         raise click.ClickException(f"{label} must be valid JSON: {exc}") from exc
+
+
+def _json_file(path: Path, *, label: str) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"{label} must contain valid JSON: {exc}") from exc
+
+
+def _json_object_list(value: Any, *, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise click.ClickException(f"{label} must be a JSON list of objects")
+    return [dict(item) for item in value]
 
 
 def _auth_profile(defaults: dict[str, Any], name: str) -> dict[str, Any]:
@@ -559,6 +612,112 @@ def tester_accept_draft(
                 "spec_id": spec.spec_id,
                 "draft_status": spec.fixtures["draft_status"],
                 "source_exploration_run": spec.fixtures.get("source_exploration_run", ""),
+            },
+            indent=2,
+        )
+    )
+
+
+@tester_group.command("edit-draft")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.argument("spec_id")
+@click.option("--name", default="", help="Optional edited spec name.")
+@click.option("--prompt", default="", help="Optional edited spec prompt.")
+@click.option("--app-url", default="", help="Optional edited app URL.")
+@click.option(
+    "--steps-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="JSON file containing edited exact_steps.",
+)
+@click.option(
+    "--assertions-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="JSON file containing edited assertions.",
+)
+@click.option(
+    "--review-note",
+    "review_notes",
+    multiple=True,
+    help="Reviewer note to persist on the draft.",
+)
+@click.option("--accept", is_flag=True, default=False, help="Accept the draft after editing.")
+def tester_edit_draft(
+    config_path: Path,
+    spec_id: str,
+    name: str,
+    prompt: str,
+    app_url: str,
+    steps_file: Optional[Path],
+    assertions_file: Optional[Path],
+    review_notes: tuple[str, ...],
+    accept: bool,
+) -> None:
+    """Edit generated UI draft steps/assertions before acceptance."""
+    cfg = load_config(config_path)
+    specs_dir = specs_dir_for_data_dir(cfg.run.data_dir)
+    spec = load_spec(specs_dir, spec_id)
+    if dict(spec.fixtures or {}).get("draft_status") != "draft":
+        raise click.ClickException("Spec is not an unaccepted draft.")
+    if name.strip():
+        spec.name = name.strip()
+    if prompt.strip():
+        spec.prompt = prompt.strip()
+    if app_url.strip():
+        spec.app_url = app_url.strip()
+    changed_fields: list[str] = []
+    if steps_file is not None:
+        spec.exact_steps = _json_object_list(
+            _json_file(steps_file, label="steps-file"),
+            label="steps-file",
+        )
+        changed_fields.append("exact_steps")
+    if assertions_file is not None:
+        spec.assertions = _json_object_list(
+            _json_file(assertions_file, label="assertions-file"),
+            label="assertions-file",
+        )
+        changed_fields.append("assertions")
+    spec.fixtures = dict(spec.fixtures or {})
+    notes = [
+        str(item).strip()
+        for item in list(spec.fixtures.get("review_notes", []) or [])
+        if str(item).strip()
+    ]
+    notes.extend(str(item).strip() for item in review_notes if str(item).strip())
+    if notes:
+        spec.fixtures["review_notes"] = notes
+        changed_fields.append("review_notes")
+    spec.fixtures["reviewed_at"] = now_iso()
+    if changed_fields:
+        spec.fixtures["last_review_edit"] = {
+            "edited_at": now_iso(),
+            "fields": sorted(set(changed_fields)),
+        }
+    if accept:
+        spec.fixtures["draft_status"] = "accepted"
+        spec.fixtures.setdefault("accepted_at", now_iso())
+    spec.updated_at = now_iso()
+    validate_spec(spec)
+    save_spec(specs_dir, spec)
+    click.echo(
+        json.dumps(
+            {
+                "ok": True,
+                "spec_id": spec.spec_id,
+                "draft_status": spec.fixtures.get("draft_status", ""),
+                "accepted": bool(accept),
+                "changed_fields": sorted(set(changed_fields)),
+                "step_count": len(spec.exact_steps or []),
+                "assertion_count": len(spec.assertions or []),
+                "review_notes": spec.fixtures.get("review_notes", []),
             },
             indent=2,
         )
