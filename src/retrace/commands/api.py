@@ -63,6 +63,14 @@ INGEST_RATE_LIMITS: dict[str, tuple[int, int]] = {
     "monitoring": (300, 60),
     "source_maps": (30, 60),
 }
+HOSTED_ONBOARDING_SCOPES = (
+    "ingest",
+    "source_maps:write",
+    "app_errors:read",
+    "app_errors:write",
+    "issues:read",
+    "replay:read",
+)
 
 
 def _maybe_llm_client(cfg: Any, *, enabled: bool) -> LLMClient | None:
@@ -403,6 +411,122 @@ def _repair_task_api_dict(task: Any) -> dict[str, Any]:
     }
 
 
+def _hosted_onboarding_manifest(
+    *,
+    base_url: str,
+    project_id: str,
+    environment_id: str,
+    sdk_key: str,
+    service_token: str,
+    service_token_scopes: Iterable[str],
+    release: str = "$GITHUB_SHA",
+    artifact_url: str = "https://cdn.example.com/assets/app.min.js",
+) -> dict[str, Any]:
+    clean_base_url = base_url.rstrip("/") or "http://127.0.0.1:8788"
+    clean_release = release.strip() or "$GITHUB_SHA"
+    clean_artifact_url = artifact_url.strip() or "https://cdn.example.com/assets/app.min.js"
+    sentry_dsn = build_sentry_dsn(
+        public_key=sdk_key,
+        base_url=clean_base_url,
+        project_id=project_id,
+    )
+    monitoring_webhook = (
+        f"{clean_base_url}/api/monitoring/webhook/sentry?environment_id={environment_id}"
+    )
+    source_map_endpoint = f"{clean_base_url}/api/source-maps?environment_id={environment_id}"
+    app_errors_endpoint = f"{clean_base_url}/api/app-errors?environment_id={environment_id}"
+    alert_rules_endpoint = (
+        f"{clean_base_url}/api/app-error-alert-rules?environment_id={environment_id}"
+    )
+    prune_endpoint = f"{clean_base_url}/api/app-errors/prune?environment_id={environment_id}"
+    return {
+        "workspace": {
+            "project_id": project_id,
+            "environment_id": environment_id,
+            "api_base_url": clean_base_url,
+        },
+        "credentials": {
+            "browser_sdk_key": sdk_key,
+            "service_token": service_token,
+            "service_token_scopes": [str(scope) for scope in service_token_scopes],
+            "sentry_dsn": sentry_dsn,
+        },
+        "endpoints": {
+            "replay_ingest": f"{clean_base_url}/api/sdk/replay",
+            "sentry_store": f"{clean_base_url}/api/sentry/{project_id}/store/",
+            "sentry_envelope": f"{clean_base_url}/api/sentry/{project_id}/envelope/",
+            "monitoring_webhook": monitoring_webhook,
+            "source_maps": source_map_endpoint,
+            "app_errors": app_errors_endpoint,
+            "app_error_alert_rules": alert_rules_endpoint,
+            "app_error_retention_prune": prune_endpoint,
+        },
+        "snippets": {
+            "browser_sdk_install": "npm install @retrace/browser",
+            "browser_sdk_init": (
+                "import { initRetrace } from '@retrace/browser';\n\n"
+                "initRetrace({\n"
+                f"  apiBaseUrl: '{clean_base_url}',\n"
+                f"  key: '{sdk_key}',\n"
+                "  captureConsole: true,\n"
+                "  captureNetwork: true,\n"
+                "  captureClicks: true,\n"
+                "});"
+            ),
+            "sentry_js_init": (
+                "import * as Sentry from '@sentry/browser';\n\n"
+                "Sentry.init({\n"
+                f"  dsn: '{sentry_dsn}',\n"
+                f"  release: '{clean_release}',\n"
+                "});"
+            ),
+            "monitoring_webhook_curl": (
+                "curl -X POST "
+                f"'{monitoring_webhook}' "
+                f"-H 'Authorization: Bearer {service_token}' "
+                "-H 'Content-Type: application/json' "
+                "-d '{\"event\":{\"event_id\":\"smoke-1\",\"title\":\"Smoke error\",\"level\":\"error\"}}'"
+            ),
+            "source_map_upload_curl": (
+                "curl -X POST "
+                f"'{source_map_endpoint}' "
+                f"-H 'Authorization: Bearer {service_token}' "
+                "-H 'Content-Type: application/json' "
+                f"-d '{{\"release\":\"{clean_release}\",\"artifact_url\":\"{clean_artifact_url}\",\"source_map\":{{\"version\":3,\"sources\":[\"src/app.ts\"],\"names\":[],\"mappings\":\"AAAA\"}}}}'"
+            ),
+            "alert_rule_curl": (
+                "curl -X POST "
+                f"'{alert_rules_endpoint}' "
+                f"-H 'Authorization: Bearer {service_token}' "
+                "-H 'Content-Type: application/json' "
+                "-d '{\"name\":\"Critical production errors\",\"action\":\"alert\",\"min_severity\":\"high\"}'"
+            ),
+            "resolve_incident_curl": (
+                "curl -X POST "
+                f"'{clean_base_url}/api/app-errors/<incident_public_id>/lifecycle?environment_id={environment_id}' "
+                f"-H 'Authorization: Bearer {service_token}' "
+                "-H 'Content-Type: application/json' "
+                "-d '{\"action\":\"resolve\",\"reason\":\"fixed and verified\"}'"
+            ),
+            "retention_cron": (
+                "curl -X POST "
+                f"'{prune_endpoint}' "
+                f"-H 'Authorization: Bearer {service_token}' "
+                "-H 'Content-Type: application/json' "
+                "-d '{\"failure_retention_days\":90,\"evidence_retention_days\":90,\"source_map_retention_days\":30,\"rate_limit_retention_hours\":48}'"
+            ),
+        },
+        "checklist": [
+            "Start the API with `retrace api serve --host 0.0.0.0 --port 8788` behind TLS.",
+            "Install the browser SDK or point Sentry-compatible clients at the DSN.",
+            "Upload source maps from CI for each release before or during deploy.",
+            "Create at least one alert rule for high-severity production errors.",
+            "Send the monitoring smoke webhook and confirm it appears in `GET /api/app-errors`.",
+            "Schedule the retention prune request daily for hosted cleanup.",
+        ],
+    }
+
+
 def _alert_rule_api_dict(rule: Any) -> dict[str, Any]:
     return {
         "id": rule.id,
@@ -652,6 +776,7 @@ def _handler(
                 parsed.path != "/api/sdk/replay"
                 and parsed.path != "/api/deploys"
                 and parsed.path != "/api/source-maps"
+                and parsed.path != "/api/onboarding/hosted"
                 and parsed.path != "/api/app-error-alert-rules"
                 and parsed.path != "/api/app-errors/prune"
                 and not (
@@ -691,6 +816,9 @@ def _handler(
                 return
             if parsed.path == "/api/app-errors/prune":
                 self._handle_prune_app_errors(parsed.query)
+                return
+            if parsed.path == "/api/onboarding/hosted":
+                self._handle_hosted_onboarding(parsed.query)
                 return
             if parsed.path.startswith("/api/app-errors/") and parsed.path.endswith(
                 "/lifecycle"
@@ -1599,6 +1727,78 @@ def _handler(
                 {"rule": _alert_rule_api_dict(rule) if rule is not None else {"id": rule_id}},
             )
 
+        def _handle_hosted_onboarding(self, query: str) -> None:
+            token = _require_service_token(
+                self,
+                store,
+                scopes={"admin"},
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length < 0:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length > 64 * 1024:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            payload: dict[str, Any] = {}
+            if length:
+                try:
+                    decoded = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    _json_response(self, 400, {"error": "invalid_json"})
+                    return
+                if not isinstance(decoded, dict):
+                    _json_response(self, 400, {"error": "invalid_payload"})
+                    return
+                payload = decoded
+            raw_scopes = payload.get("service_token_scopes")
+            if raw_scopes is None:
+                service_token_scopes = list(HOSTED_ONBOARDING_SCOPES)
+            elif isinstance(raw_scopes, list) and all(
+                isinstance(item, str) and item.strip() for item in raw_scopes
+            ):
+                service_token_scopes = [str(item).strip() for item in raw_scopes]
+            else:
+                _json_response(self, 400, {"error": "invalid_service_token_scopes"})
+                return
+            sdk = create_sdk_key(
+                store,
+                project_id=token.project_id,
+                environment_id=environment_id,
+                name=str(payload.get("sdk_key_name") or "Hosted browser SDK"),
+            )
+            service = create_service_token(
+                store,
+                project_id=token.project_id,
+                name=str(payload.get("service_token_name") or "Hosted onboarding"),
+                scopes=service_token_scopes,
+            )
+            manifest = _hosted_onboarding_manifest(
+                base_url=str(payload.get("api_base_url") or "http://127.0.0.1:8788"),
+                project_id=token.project_id,
+                environment_id=environment_id,
+                sdk_key=sdk.key,
+                service_token=service.token,
+                service_token_scopes=service.scopes,
+                release=str(payload.get("release") or "$GITHUB_SHA"),
+                artifact_url=str(
+                    payload.get("artifact_url")
+                    or "https://cdn.example.com/assets/app.min.js"
+                ),
+            )
+            _json_response(self, 201, {"onboarding": manifest})
+
         def _handle_prune_app_errors(self, query: str) -> None:
             token = _require_service_token(
                 self,
@@ -1960,6 +2160,80 @@ def api_create_service_token(
                 "project_id": workspace.project_id,
                 "token": created.token,
                 "scopes": created.scopes,
+            },
+            indent=2,
+        )
+    )
+
+
+@api_group.command("onboard-hosted")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--org", default="Local", show_default=True)
+@click.option("--project", "project_name", default="Default", show_default=True)
+@click.option("--environment", default="production", show_default=True)
+@click.option("--api-base-url", default="http://127.0.0.1:8788", show_default=True)
+@click.option("--sdk-key-name", default="Hosted browser SDK", show_default=True)
+@click.option("--service-token-name", default="Hosted onboarding", show_default=True)
+@click.option("--service-token-scope", "scopes", multiple=True)
+@click.option("--release", default="$GITHUB_SHA", show_default=True)
+@click.option(
+    "--artifact-url",
+    default="https://cdn.example.com/assets/app.min.js",
+    show_default=True,
+)
+def api_onboard_hosted(
+    config_path: Path,
+    org: str,
+    project_name: str,
+    environment: str,
+    api_base_url: str,
+    sdk_key_name: str,
+    service_token_name: str,
+    scopes: tuple[str, ...],
+    release: str,
+    artifact_url: str,
+) -> None:
+    """Create hosted/self-host onboarding credentials and integration snippets."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(
+        org_name=org,
+        project_name=project_name,
+        environment_name=environment,
+    )
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name=sdk_key_name,
+    )
+    service_scopes = list(scopes) if scopes else list(HOSTED_ONBOARDING_SCOPES)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name=service_token_name,
+        scopes=service_scopes,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "onboarding": _hosted_onboarding_manifest(
+                    base_url=api_base_url,
+                    project_id=workspace.project_id,
+                    environment_id=workspace.environment_id,
+                    sdk_key=sdk.key,
+                    service_token=service.token,
+                    service_token_scopes=service.scopes,
+                    release=release,
+                    artifact_url=artifact_url,
+                )
             },
             indent=2,
         )

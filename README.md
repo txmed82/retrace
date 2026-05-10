@@ -99,6 +99,23 @@ from-replay-issue <issue_public_id>` only when you want to generate another spec
 from the same issue. Pass `--no-generate-fix-prompts` if you only want replay
 and regression-test seed data.
 
+For hosted or shared self-host installs, generate a complete browser/app-error
+onboarding manifest:
+
+```bash
+retrace api onboard-hosted \
+  --api-base-url https://retrace.example.com \
+  --project Web \
+  --environment production
+```
+
+The manifest creates a browser SDK key, a scoped service token, a Sentry DSN,
+and copyable setup snippets for browser replay capture, Sentry-compatible error
+ingest, monitoring webhooks, source-map uploads, alert rules, incident
+lifecycle actions, and retention cleanup. Hosted control planes can also create
+the same one-time manifest with `POST /api/onboarding/hosted?environment_id=...`
+using an `admin` service token.
+
 ## Local UI (Onboarding + Replay + Prompts)
 
 ```bash
