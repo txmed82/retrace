@@ -20,6 +20,7 @@ from retrace.commands.ui import (
     _generate_replay_issue_spec_payload,
     _run_replay_issue_api_spec_payload,
     _run_api_spec_payload,
+    _run_api_suite_payload,
     _to_replay_dashboard_payload,
     _transition_replay_issue_payload,
     _verify_resolved_issues_payload,
@@ -130,6 +131,9 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "UI Spec Inventory" in _INDEX_HTML
     assert "API Spec Inventory" in _INDEX_HTML
     assert "runManagedApiSpec" in _INDEX_HTML
+    assert "/api/api-suite/run" in _INDEX_HTML
+    assert "runManagedApiSuite" in _INDEX_HTML
+    assert "apiSuiteRunMatrix" in _INDEX_HTML
     assert "Generated Draft Review" in _INDEX_HTML
     assert "/api/tester/draft" in _INDEX_HTML
     assert "saveDraftSpec" in _INDEX_HTML
@@ -310,6 +314,54 @@ def test_run_api_spec_payload_runs_saved_api_spec(tmp_path: Path) -> None:
     assert payload["ok"] is True
     assert payload["result"]["spec_id"] == spec.spec_id
     assert payload["result"]["status"] == "passed"
+
+
+def test_run_api_suite_payload_returns_pass_fail_matrix(tmp_path: Path) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HealthHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        passing = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Health API",
+            method="GET",
+            url=f"http://{host}:{port}/healthz",
+            expected_status=200,
+        )
+        failing = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Missing API",
+            method="GET",
+            url=f"http://{host}:{port}/missing",
+            expected_status=200,
+        )
+        suite = create_api_suite(
+            suites_dir=tmp_path / "api-tests" / "suites",
+            name="Smoke Suite",
+            source="manual",
+            spec_ids=[passing.spec_id, failing.spec_id],
+        )
+        payload, status = _run_api_suite_payload(
+            data_dir=tmp_path,
+            suite_id=suite.suite_id,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 400
+    assert payload["ok"] is False
+    assert payload["total"] == 2
+    assert payload["passed"] == 1
+    assert payload["failed"] == 1
+    assert [item["spec_id"] for item in payload["results"]] == [
+        passing.spec_id,
+        failing.spec_id,
+    ]
+    assert payload["results"][0]["ok"] is True
+    assert payload["results"][1]["ok"] is False
 
 
 def test_edit_ui_draft_payload_persists_reviewed_steps_and_accepts(

@@ -19,7 +19,7 @@ import click
 import httpx
 import yaml
 
-from retrace.api_suites import api_suites_dir_for_data_dir, list_api_suites
+from retrace.api_suites import api_suites_dir_for_data_dir, list_api_suites, load_api_suite
 from retrace.api_testing import (
     api_runs_dir_for_data_dir,
     api_specs_dir_for_data_dir,
@@ -1746,6 +1746,66 @@ def _run_api_spec_payload(*, data_dir: Path, spec_id: str) -> tuple[dict[str, An
     return {"ok": result.ok, "result": result.__dict__}, 200 if result.ok else 400
 
 
+def _run_api_suite_payload(*, data_dir: Path, suite_id: str) -> tuple[dict[str, Any], int]:
+    clean_suite_id = suite_id.strip()
+    if not clean_suite_id:
+        return {"ok": False, "error": "suite_id is required"}, 400
+    try:
+        suite = load_api_suite(api_suites_dir_for_data_dir(data_dir), clean_suite_id)
+    except Exception:
+        return {"ok": False, "error": f"API suite not found: {clean_suite_id}"}, 404
+    results: list[dict[str, Any]] = []
+    for spec_id in suite.spec_ids:
+        try:
+            spec = load_api_spec(api_specs_dir_for_data_dir(data_dir), spec_id)
+            result = run_api_spec(
+                spec=spec,
+                runs_dir=api_runs_dir_for_data_dir(data_dir),
+            )
+            results.append(
+                {
+                    "spec_id": spec.spec_id,
+                    "name": spec.name,
+                    "method": spec.method,
+                    "url": spec.url,
+                    "ok": result.ok,
+                    "status": result.status,
+                    "status_code": result.status_code,
+                    "elapsed_ms": result.elapsed_ms,
+                    "run_id": result.run_id,
+                    "failure_classification": result.failure_classification,
+                    "error": result.error,
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "spec_id": str(spec_id),
+                    "name": "",
+                    "method": "",
+                    "url": "",
+                    "ok": False,
+                    "status": "failed",
+                    "status_code": 0,
+                    "elapsed_ms": 0,
+                    "run_id": "",
+                    "failure_classification": "suite_error",
+                    "error": str(exc),
+                }
+            )
+    passed = sum(1 for item in results if bool(item.get("ok")))
+    failed = len(results) - passed
+    return {
+        "ok": failed == 0,
+        "suite_id": suite.suite_id,
+        "name": suite.name,
+        "total": len(results),
+        "passed": passed,
+        "failed": failed,
+        "results": results,
+    }, 200 if failed == 0 else 400
+
+
 def _json_object_list_payload(value: Any, *, label: str) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
         raise ValueError(f"{label} must be a JSON list of objects")
@@ -2783,7 +2843,7 @@ const retrace = init({
         const operations = (s.operations || []).slice(0, 5).map(op => `<li><code>${esc(op.method)}</code> ${esc(op.path || op.url || '')}${op.operation_id ? ` · ${esc(op.operation_id)}` : ''}</li>`).join('');
         return `
           <div class="suite-row">
-            <div><strong>${esc(s.name || s.suite_id)}</strong> <code>${esc(s.suite_id)}</code></div>
+            <div><button class="btn" type="button" data-run-api-suite="${esc(s.suite_id)}">Run Suite</button> <strong>${esc(s.name || s.suite_id)}</strong> <code>${esc(s.suite_id)}</code></div>
             <div class="empty">source=<code>${esc(s.source)}</code> · specs=<code>${esc(s.spec_count)}</code> · operations=<code>${esc(s.operation_count)}</code> · skipped=<code>${esc(s.skipped_count)}</code> · warnings=<code class="${warnings ? 'bad' : 'ok'}">${esc(warnings)}</code></div>
             <div class="empty">coverage=<code>${esc(summary.coverage_percent ?? 0)}%</code>${s.auth_profile ? ` · auth=<code>${esc(s.auth_profile)}</code>` : ''}${s.env_profile ? ` · env=<code>${esc(s.env_profile)}</code>` : ''}</div>
             ${operations ? `<ul>${operations}</ul>` : ''}
@@ -2870,6 +2930,8 @@ const retrace = init({
         <div style="height:12px"></div>
         <div class="card">
           <h3>API Suites</h3>
+          <div class="empty" id="apiSuiteRunStatus"></div>
+          <div id="apiSuiteRunMatrix"></div>
           ${suiteRows || '<div class="empty">No API suites yet. Import an OpenAPI document with <code>retrace tester api-import-openapi</code>.</div>'}
         </div>
       `;
@@ -2887,6 +2949,9 @@ const retrace = init({
       });
       document.querySelectorAll('[data-run-api-management-spec]').forEach(el => {
         el.addEventListener('click', () => runManagedApiSpec(el.dataset.runApiManagementSpec));
+      });
+      document.querySelectorAll('[data-run-api-suite]').forEach(el => {
+        el.addEventListener('click', () => runManagedApiSuite(el.dataset.runApiSuite));
       });
       if(draftSpecs.length){
         window.retraceDraftSpecs = draftSpecs;
@@ -2915,6 +2980,32 @@ const retrace = init({
       }
       if(status) status.textContent = `API passed: ${data.result.run_id}`;
       await loadTesterPanel();
+    }
+
+    async function runManagedApiSuite(suiteId){
+      const status = byId('apiSuiteRunStatus');
+      const matrix = byId('apiSuiteRunMatrix');
+      if(status) status.textContent = `Running suite ${suiteId}...`;
+      if(matrix) matrix.innerHTML = '';
+      const res = await fetch('/api/api-suite/run', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({suite_id: suiteId}),
+      });
+      const data = await res.json();
+      const rows = (data.results || []).map(item => `
+        <li>
+          <code>${esc(item.spec_id)}</code> · <span class="${item.ok ? 'ok' : 'bad'}">${esc(item.status || (item.ok ? 'passed' : 'failed'))}</span>
+          ${item.status_code ? ` · status=<code>${esc(item.status_code)}</code>` : ''}
+          ${item.run_id ? ` · run=<code>${esc(item.run_id)}</code>` : ''}
+          ${item.error ? `<br><span class="bad">${esc(item.error)}</span>` : ''}
+        </li>
+      `).join('');
+      if(status) status.textContent = `${data.name || suiteId}: ${data.passed || 0}/${data.total || 0} passed`;
+      if(matrix) matrix.innerHTML = rows ? `<ul>${rows}</ul>` : '<div class="empty">No suite results.</div>';
+      if(!res.ok || !data.ok){
+        return;
+      }
     }
 
     function selectedDraftSpec(){
@@ -4246,6 +4337,15 @@ def ui_command(
                 payload, status = _run_api_spec_payload(
                     data_dir=data_dir,
                     spec_id=str(body.get("spec_id", "")).strip(),
+                )
+                self._json(payload, status=status)
+                return
+
+            if path == "/api/api-suite/run":
+                body = self._read_json_body()
+                payload, status = _run_api_suite_payload(
+                    data_dir=data_dir,
+                    suite_id=str(body.get("suite_id", "")).strip(),
                 )
                 self._json(payload, status=status)
                 return
