@@ -178,6 +178,8 @@ def _incident_api_dict(
     transaction = ""
     release = ""
     provider = ""
+    alert_state = "active"
+    alert_rule_name = ""
     if representative is not None:
         metadata = dict(getattr(representative, "metadata", {}) or {})
         trace_value = metadata.get("trace_ids")
@@ -187,6 +189,8 @@ def _incident_api_dict(
         transaction = str(metadata.get("transaction") or metadata.get("route") or "")
         release = str(metadata.get("release") or metadata.get("deploy_sha") or "")
         provider = str(metadata.get("provider") or "")
+        alert_state = str(metadata.get("alert_state") or "active")
+        alert_rule_name = str(metadata.get("alert_rule_name") or "")
     return {
         "id": incident.id,
         "public_id": incident.public_id,
@@ -211,6 +215,8 @@ def _incident_api_dict(
         "transaction": transaction,
         "release": release,
         "provider": provider,
+        "alert_state": alert_state,
+        "alert_rule_name": alert_rule_name,
     }
 
 
@@ -286,6 +292,24 @@ def _repair_task_api_dict(task: Any) -> dict[str, Any]:
         "evidence_ids": list(task.evidence_ids or []),
         "created_at": _dt_api(task.created_at),
         "updated_at": _dt_api(task.updated_at),
+    }
+
+
+def _alert_rule_api_dict(rule: Any) -> dict[str, Any]:
+    return {
+        "id": rule.id,
+        "public_id": rule.public_id,
+        "name": rule.name,
+        "enabled": rule.enabled,
+        "action": rule.action,
+        "min_severity": rule.min_severity,
+        "provider": rule.provider,
+        "title_contains": rule.title_contains,
+        "fingerprint_contains": rule.fingerprint_contains,
+        "route_contains": rule.route_contains,
+        "metadata": dict(rule.metadata or {}),
+        "created_at": _dt_api(rule.created_at),
+        "updated_at": _dt_api(rule.updated_at),
     }
 
 
@@ -461,6 +485,9 @@ def _handler(
             if parsed.path == "/api/app-errors":
                 self._handle_list_app_error_incidents(parsed.query)
                 return
+            if parsed.path == "/api/app-error-alert-rules":
+                self._handle_list_app_error_alert_rules(parsed.query)
+                return
             if parsed.path.startswith("/api/app-errors/"):
                 incident_id = parsed.path.removeprefix("/api/app-errors/").strip("/")
                 self._handle_get_app_error_incident(incident_id, parsed.query)
@@ -476,6 +503,7 @@ def _handler(
                 parsed.path != "/api/sdk/replay"
                 and parsed.path != "/api/deploys"
                 and parsed.path != "/api/source-maps"
+                and parsed.path != "/api/app-error-alert-rules"
                 and not parsed.path.startswith("/api/otel/")
                 and not parsed.path.startswith("/api/sentry/")
                 and _sentry_ingest_path_parts(parsed.path) is None
@@ -503,6 +531,9 @@ def _handler(
                 return
             if parsed.path == "/api/source-maps":
                 self._handle_upload_source_map(parsed.query)
+                return
+            if parsed.path == "/api/app-error-alert-rules":
+                self._handle_upsert_app_error_alert_rule(parsed.query)
                 return
             if parsed.path in {"/api/otel/v1/logs", "/api/otel/v1/traces"}:
                 self._handle_otel_ingest(parsed.path, parsed.query)
@@ -1207,6 +1238,105 @@ def _handler(
                         for incident in incidents
                     ],
                 },
+            )
+
+        def _handle_list_app_error_alert_rules(self, query: str) -> None:
+            token = _require_service_token(
+                self,
+                store,
+                scopes={"app_errors:read", "issues:read", "mcp:read", "admin"},
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            rules = store.list_app_error_alert_rules(
+                project_id=token.project_id,
+                environment_id=environment_id,
+            )
+            _json_response(
+                self,
+                200,
+                {
+                    "project_id": token.project_id,
+                    "environment_id": environment_id,
+                    "rules": [_alert_rule_api_dict(rule) for rule in rules],
+                },
+            )
+
+        def _handle_upsert_app_error_alert_rule(self, query: str) -> None:
+            token = _require_service_token(
+                self,
+                store,
+                scopes={"app_errors:write", "app_errors:read", "admin"},
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length <= 0:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            if length > MAX_REPLAY_BODY_BYTES:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            body = self.rfile.read(length)
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                _json_response(self, 400, {"error": "invalid_json"})
+                return
+            if not isinstance(payload, dict) or not payload:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            try:
+                rule_id = store.upsert_app_error_alert_rule(
+                    project_id=token.project_id,
+                    environment_id=environment_id,
+                    name=str(payload.get("name") or ""),
+                    enabled=bool(payload.get("enabled", True)),
+                    action=str(payload.get("action") or "alert"),
+                    min_severity=str(payload.get("min_severity") or ""),
+                    provider=str(payload.get("provider") or ""),
+                    title_contains=str(payload.get("title_contains") or ""),
+                    fingerprint_contains=str(payload.get("fingerprint_contains") or ""),
+                    route_contains=str(payload.get("route_contains") or ""),
+                    metadata=(
+                        dict(payload.get("metadata"))
+                        if isinstance(payload.get("metadata"), dict)
+                        else None
+                    ),
+                )
+            except ValueError as exc:
+                _json_response(self, 400, {"error": "invalid_alert_rule", "message": str(exc)})
+                return
+            rule = next(
+                (
+                    item
+                    for item in store.list_app_error_alert_rules(
+                        project_id=token.project_id,
+                        environment_id=environment_id,
+                        enabled=None,
+                    )
+                    if item.id == rule_id
+                ),
+                None,
+            )
+            _json_response(
+                self,
+                202,
+                {"rule": _alert_rule_api_dict(rule) if rule is not None else {"id": rule_id}},
             )
 
         def _handle_get_app_error_incident(self, incident_id: str, query: str) -> None:

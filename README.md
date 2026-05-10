@@ -410,6 +410,17 @@ Send JSON with `release`, `artifact_url`, optional `dist`, and `source_map`.
 Sentry-compatible events map stack frames when their `release`, `dist`,
 generated filename, line, and column match an uploaded Source Map v3 artifact.
 
+App-error alert rules can mark matching incidents active or suppressed before
+they reach downstream workflows:
+
+- `GET /api/app-error-alert-rules?environment_id=...`
+- `POST /api/app-error-alert-rules?environment_id=...`
+
+Rules support `action` (`alert` or `suppress`), `min_severity`, `provider`,
+`title_contains`, `fingerprint_contains`, and `route_contains`. Matching rule
+metadata is written onto the canonical failure and incident response as
+`alert_state` and `alert_rule_name`.
+
 Deploy markers can be recorded from CI with `POST /api/deploys?environment_id=...`
 or locally with `retrace api record-deploy --sha <commit> --changed-file <path>`.
 Failures after the deploy are linked to the nearest marker, and incident repair

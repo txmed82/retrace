@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from retrace.alert_rules import evaluate_app_error_alert_rules
 from retrace.deploys import correlate_failure_to_deploy
 from retrace.evidence import EvidenceItem, evidence_dedupe_key
 from retrace.failures import canonical_failure_from_monitor_incident
@@ -65,6 +66,27 @@ def ingest_monitoring_webhook(
         store=store,
         project_id=project_id,
         environment_id=environment_id,
+    )
+    rule_decision = evaluate_app_error_alert_rules(
+        store=store,
+        project_id=project_id,
+        environment_id=environment_id,
+        alert=alert,
+    )
+    alert = MonitoringAlert(
+        provider=alert.provider,
+        external_id=alert.external_id,
+        title=alert.title,
+        summary=alert.summary,
+        severity=alert.severity,
+        fingerprint=alert.fingerprint,
+        occurred_at_ms=alert.occurred_at_ms,
+        metadata={**alert.metadata, **rule_decision.metadata()},
+        evidence={
+            **alert.evidence,
+            "alert_state": rule_decision.state,
+            "alert_rule_name": rule_decision.rule_name,
+        },
     )
     source_external_id = f"{alert.provider}:{alert.external_id}"
     existing = store.find_failure_by_source(
