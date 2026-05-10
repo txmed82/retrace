@@ -913,6 +913,11 @@ def scrub_pii_from_blob(blob: Any) -> Any:
 
 def _scrub_pii_text(value: str) -> str:
     value = re.sub(
+        r"(?i)\bBasic\s+[A-Za-z0-9._~+/=-]+\b",
+        "Basic [redacted-token]",
+        value,
+    )
+    value = re.sub(
         r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+\b",
         "Bearer [redacted-token]",
         value,
