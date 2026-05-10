@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import Thread
 
 from retrace.commands.api import _handler
+from retrace.notification_sinks import NotificationPayload
 from retrace.monitoring_ingest import ingest_monitoring_webhook
 from retrace.sdk_keys import create_sdk_key, create_service_token
 from retrace.sentry_compat import parse_sentry_envelope
@@ -25,9 +26,24 @@ def _store(tmp_path: Path) -> tuple[Storage, WorkspaceIds]:
     return store, workspace
 
 
+class _CaptureSink:
+    name = "capture"
+
+    def __init__(self) -> None:
+        self.payloads: list[NotificationPayload] = []
+
+    def send(self, payload: NotificationPayload) -> object:
+        self.payloads.append(payload)
+        return type(
+            "Result",
+            (),
+            {"ok": True, "sink": self.name, "target": "", "status_code": 200},
+        )()
+
+
 @contextmanager
-def _server(store: Storage):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(store))
+def _server(store: Storage, **handler_kwargs: object):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(store, **handler_kwargs))
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -305,6 +321,177 @@ def test_sentry_store_endpoint_ingests_sdk_event_with_query_key(tmp_path: Path) 
     )
     assert failure is not None
     assert failure.metadata["trace_ids"] == ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+
+
+def test_sentry_store_endpoint_dispatches_app_error_notification(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _store(tmp_path)
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Browser",
+    )
+    sink = _CaptureSink()
+    body = json.dumps(
+        {
+            "event_id": "evt-notify-1",
+            "title": "TypeError in billing",
+            "level": "fatal",
+            "contexts": {"trace": {"trace_id": "dddddddddddddddddddddddddddddddd"}},
+        }
+    ).encode("utf-8")
+
+    with _server(store, notification_sinks=[sink]) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/sentry/{workspace.project_id}/store/?sentry_key={sdk.key}",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/sentry/{workspace.project_id}/store/?sentry_key={sdk.key}",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        duplicate_response = conn.getresponse()
+        duplicate_payload = json.loads(duplicate_response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 202
+    assert payload["results"][0]["created"] is True
+    assert duplicate_response.status == 202
+    assert duplicate_payload["results"][0]["created"] is False
+    assert len(sink.payloads) == 1
+    notification = sink.payloads[0]
+    assert notification.event == "app_error.created"
+    assert notification.severity == "critical"
+    assert notification.public_id == payload["results"][0]["incident_public_id"]
+    assert notification.extra["failure_public_id"] == payload["results"][0]["failure_public_id"]
+    assert notification.extra["trace_ids"] == ["dddddddddddddddddddddddddddddddd"]
+
+
+def test_monitoring_webhook_dispatches_app_error_notification(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Ingest",
+        scopes=["monitoring:write"],
+    )
+    sink = _CaptureSink()
+    body = json.dumps(
+        {
+            "event": {
+                "event_id": "evt-monitoring-notify-1",
+                "title": "TypeError in checkout",
+                "level": "fatal",
+                "contexts": {"trace": {"trace_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},
+            }
+        }
+    ).encode("utf-8")
+
+    with _server(store, notification_sinks=[sink]) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/monitoring/webhook/sentry?environment_id={workspace.environment_id}",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/monitoring/webhook/sentry?environment_id={workspace.environment_id}",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        duplicate_response = conn.getresponse()
+        duplicate_payload = json.loads(duplicate_response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 202
+    assert payload["created"] is True
+    assert duplicate_response.status == 202
+    assert duplicate_payload["created"] is False
+    assert len(sink.payloads) == 1
+    notification = sink.payloads[0]
+    assert notification.event == "app_error.created"
+    assert notification.severity == "critical"
+    assert notification.public_id == payload["incident_public_id"]
+    assert notification.extra["failure_public_id"] == payload["failure_public_id"]
+    assert notification.extra["trace_ids"] == ["eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]
+
+
+def test_app_error_notification_failure_does_not_fail_ingest(tmp_path: Path) -> None:
+    class BoomSink:
+        name = "boom"
+
+        def send(self, payload: NotificationPayload) -> object:
+            raise RuntimeError("notification target down")
+
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Ingest",
+        scopes=["monitoring:write"],
+    )
+
+    with _server(store, notification_sinks=[BoomSink()]) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/monitoring/webhook/sentry?environment_id={workspace.environment_id}",
+            body=json.dumps(
+                {
+                    "event": {
+                        "event_id": "evt-notify-boom-1",
+                        "title": "TypeError in checkout",
+                        "level": "error",
+                    }
+                }
+            ).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 202
+    assert payload["created"] is True
+    assert payload["external_id"] == "evt-notify-boom-1"
+    failure = store.find_failure_by_source(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        source_type="monitor_incident",
+        source_external_id="sentry:evt-notify-boom-1",
+    )
+    assert failure is not None
 
 
 def test_sentry_envelope_endpoint_accepts_x_sentry_auth(tmp_path: Path) -> None:
