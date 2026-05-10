@@ -130,13 +130,14 @@ def diagnose_stack_frame_mapping(
     dist: str = "",
 ) -> SourceMapDiagnostic:
     clean_release = release.strip()
+    clean_dist = dist.strip()
     clean_generated = generated_file.strip()
     if not clean_release:
         return SourceMapDiagnostic(
             status="skipped",
             reason="missing_release",
             release=clean_release,
-            dist=dist.strip(),
+            dist=clean_dist,
             generated_file=clean_generated,
             line=line,
             column=max(0, column),
@@ -146,7 +147,7 @@ def diagnose_stack_frame_mapping(
             status="skipped",
             reason="invalid_stack_frame",
             release=clean_release,
-            dist=dist.strip(),
+            dist=clean_dist,
             generated_file=clean_generated,
             line=line,
             column=max(0, column),
@@ -155,15 +156,15 @@ def diagnose_stack_frame_mapping(
         project_id=project_id,
         environment_id=environment_id,
         release=clean_release,
-        dist=dist,
+        dist=clean_dist,
     )
-    candidate_artifacts = tuple(row.artifact_url for row in rows)
+    candidate_artifacts = tuple(_diagnostic_artifact_url(row.artifact_url) for row in rows)
     if not rows:
         return SourceMapDiagnostic(
             status="unmapped",
             reason="no_source_maps_for_release_dist",
             release=clean_release,
-            dist=dist.strip(),
+            dist=clean_dist,
             generated_file=clean_generated,
             line=line,
             column=max(0, column),
@@ -179,7 +180,7 @@ def diagnose_stack_frame_mapping(
             status="unmapped",
             reason="no_matching_artifact",
             release=clean_release,
-            dist=dist.strip(),
+            dist=clean_dist,
             generated_file=clean_generated,
             line=line,
             column=max(0, column),
@@ -191,21 +192,26 @@ def diagnose_stack_frame_mapping(
                 status="mapped",
                 reason="mapped",
                 release=clean_release,
-                dist=dist.strip(),
+                dist=clean_dist,
                 generated_file=clean_generated,
                 line=line,
                 column=max(0, column),
-                candidate_artifacts=tuple(item.artifact_url for item in matched_rows),
+                candidate_artifacts=tuple(
+                    _diagnostic_artifact_url(item.artifact_url)
+                    for item in matched_rows
+                ),
             )
     return SourceMapDiagnostic(
         status="unmapped",
         reason="no_mapping_for_position",
         release=clean_release,
-        dist=dist.strip(),
+        dist=clean_dist,
         generated_file=clean_generated,
         line=line,
         column=max(0, column),
-        candidate_artifacts=tuple(item.artifact_url for item in matched_rows),
+        candidate_artifacts=tuple(
+            _diagnostic_artifact_url(item.artifact_url) for item in matched_rows
+        ),
     )
 
 
@@ -335,6 +341,14 @@ def _normalize_artifact(value: str) -> str:
     while clean.startswith("./"):
         clean = clean[2:]
     return clean
+
+
+def _diagnostic_artifact_url(value: str) -> str:
+    text = str(value or "").strip()
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        return parsed._replace(query="", fragment="").geturl()
+    return text.split("?", 1)[0].split("#", 1)[0]
 
 
 def _normalize_source(source: str, *, source_root: str) -> str:
