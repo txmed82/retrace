@@ -12,6 +12,7 @@ from retrace.notification_sinks import NotificationPayload
 from retrace.monitoring_ingest import ingest_monitoring_webhook
 from retrace.sdk_keys import create_sdk_key, create_service_token
 from retrace.sentry_compat import parse_sentry_envelope
+from retrace.source_maps import upload_source_map
 from retrace.storage import Storage, WorkspaceIds
 
 
@@ -39,6 +40,33 @@ class _CaptureSink:
             (),
             {"ok": True, "sink": self.name, "target": "", "status_code": 200},
         )()
+
+
+def _vlq(values: list[int]) -> str:
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    encoded = ""
+    for value in values:
+        sign_bit = 1 if value < 0 else 0
+        raw = (abs(value) << 1) | sign_bit
+        while True:
+            digit = raw & 31
+            raw >>= 5
+            if raw:
+                digit |= 32
+            encoded += alphabet[digit]
+            if not raw:
+                break
+    return encoded
+
+
+def _source_map() -> dict[str, object]:
+    return {
+        "version": 3,
+        "file": "app.min.js",
+        "sources": ["src/checkout.ts"],
+        "names": ["submit"],
+        "mappings": _vlq([143, 0, 41, 12, 0]),
+    }
 
 
 @contextmanager
@@ -120,6 +148,103 @@ def test_sentry_webhook_creates_and_dedupes_failure(tmp_path: Path) -> None:
     assert evidence[0].redaction_state == "sensitive"
     assert evidence[0].occurred_at_ms == 1_778_302_800_000
     assert evidence[0].payload["top_stack_frame"] == "src/checkout.ts:submit:42"
+
+
+def test_sentry_ingest_applies_uploaded_source_map(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    upload_source_map(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        release="abc123",
+        artifact_url="https://cdn.example.com/assets/app.min.js",
+        source_map=_source_map(),
+    )
+
+    result = ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={
+            "event": {
+                "event_id": "evt-sourcemap-1",
+                "title": "TypeError: failed checkout",
+                "release": "abc123",
+                "exception": {
+                    "values": [
+                        {
+                            "type": "TypeError",
+                            "value": "Cannot read cart total",
+                            "stacktrace": {
+                                "frames": [
+                                    {
+                                        "filename": "https://cdn.example.com/assets/app.min.js",
+                                        "function": "n",
+                                        "lineno": 1,
+                                        "colno": 143,
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                },
+            }
+        },
+    )
+
+    failure = store.get_failure_by_id(result.failure_id)
+    evidence = store.list_failure_evidence(failure_id=result.failure_id)
+    assert failure is not None
+    assert failure.metadata["top_stack_frame"] == "src/checkout.ts:submit:42"
+    assert failure.metadata["stack_frames"][0]["source_mapped"] is True
+    assert failure.metadata["stack_frames"][0]["generated_filename"].endswith(
+        "/assets/app.min.js"
+    )
+    assert evidence[0].payload["top_stack_frame"] == "src/checkout.ts:submit:42"
+
+
+def test_source_map_api_endpoint_accepts_upload(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Source maps",
+        scopes=["source_maps:write"],
+    )
+
+    body = json.dumps(
+        {
+            "release": "abc123",
+            "artifact_url": "https://cdn.example.com/assets/app.min.js",
+            "source_map": _source_map(),
+        }
+    ).encode("utf-8")
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/source-maps?environment_id={workspace.environment_id}",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    rows = store.list_source_maps(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        release="abc123",
+    )
+    assert response.status == 202
+    assert payload["source_map"]["release"] == "abc123"
+    assert rows[0].artifact_url == "https://cdn.example.com/assets/app.min.js"
 
 
 def test_raw_sentry_sdk_events_group_into_one_incident(tmp_path: Path) -> None:

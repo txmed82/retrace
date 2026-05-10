@@ -49,6 +49,7 @@ from retrace.sentry_compat import (
     build_sentry_dsn,
     ingest_sentry_compat_request,
 )
+from retrace.source_maps import upload_source_map
 from retrace.storage import Storage
 
 
@@ -474,6 +475,7 @@ def _handler(
             if (
                 parsed.path != "/api/sdk/replay"
                 and parsed.path != "/api/deploys"
+                and parsed.path != "/api/source-maps"
                 and not parsed.path.startswith("/api/otel/")
                 and not parsed.path.startswith("/api/sentry/")
                 and _sentry_ingest_path_parts(parsed.path) is None
@@ -498,6 +500,9 @@ def _handler(
                 return
             if parsed.path == "/api/deploys":
                 self._handle_record_deploy(parsed.query)
+                return
+            if parsed.path == "/api/source-maps":
+                self._handle_upload_source_map(parsed.query)
                 return
             if parsed.path in {"/api/otel/v1/logs", "/api/otel/v1/traces"}:
                 self._handle_otel_ingest(parsed.path, parsed.query)
@@ -861,6 +866,92 @@ def _handler(
                         {"failure_id": item.failure_id, "deploy_sha": item.deploy_sha}
                         for item in correlations
                     ],
+                },
+            )
+
+        def _handle_upload_source_map(self, query: str) -> None:
+            token = _require_service_token(
+                self, store, scopes={"source_maps:write", "ingest", "admin"}
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length <= 0:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            if length > MAX_REPLAY_BODY_BYTES:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            body = self.rfile.read(length)
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                _json_response(self, 400, {"error": "invalid_json"})
+                return
+            if not isinstance(payload, dict) or not payload:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            release = str(payload.get("release") or "").strip()
+            artifact_url = str(
+                payload.get("artifact_url")
+                or payload.get("artifactUrl")
+                or payload.get("url")
+                or ""
+            ).strip()
+            source_map = payload.get("source_map") or payload.get("sourceMap")
+            if not release:
+                _json_response(self, 400, {"error": "missing_release"})
+                return
+            if not artifact_url:
+                _json_response(self, 400, {"error": "missing_artifact_url"})
+                return
+            if not isinstance(source_map, dict) or not source_map:
+                _json_response(self, 400, {"error": "invalid_source_map"})
+                return
+            try:
+                row = upload_source_map(
+                    store=store,
+                    project_id=token.project_id,
+                    environment_id=environment_id,
+                    release=release,
+                    dist=str(payload.get("dist") or ""),
+                    artifact_url=artifact_url,
+                    source_map=source_map,
+                )
+            except ValueError as exc:
+                _json_response(self, 400, {"error": "invalid_source_map", "message": str(exc)})
+                return
+            except Exception:
+                logger.exception("Unhandled source map upload error")
+                _json_response(
+                    self,
+                    500,
+                    {
+                        "error": "internal_error",
+                        "message": "An internal server error occurred.",
+                    },
+                )
+                return
+            _json_response(
+                self,
+                202,
+                {
+                    "source_map": {
+                        "id": row.id,
+                        "public_id": row.public_id,
+                        "release": row.release,
+                        "dist": row.dist,
+                        "artifact_url": row.artifact_url,
+                    }
                 },
             )
 
@@ -2093,6 +2184,67 @@ def api_record_deploy(
                     {"failure_id": item.failure_id, "deploy_sha": item.deploy_sha}
                     for item in correlations
                 ],
+            },
+            indent=2,
+        )
+    )
+
+
+@api_group.command("upload-source-map")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--project-id", default="", help="Project ID override.")
+@click.option("--environment-id", default="", help="Environment ID override.")
+@click.option("--release", required=True, help="Release or commit SHA.")
+@click.option("--dist", default="", help="Optional release distribution.")
+@click.option("--artifact-url", required=True, help="Generated JS URL or path.")
+@click.argument("source_map_path", type=click.Path(path_type=Path, exists=True))
+def api_upload_source_map(
+    config_path: Path,
+    project_id: str,
+    environment_id: str,
+    release: str,
+    dist: str,
+    artifact_url: str,
+    source_map_path: Path,
+) -> None:
+    """Upload a Source Map v3 file for app-error stack mapping."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Default")
+    pid = project_id.strip() or workspace.project_id
+    eid = environment_id.strip() or workspace.environment_id
+    try:
+        source_map = json.loads(source_map_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"invalid source map JSON: {exc}") from exc
+    if not isinstance(source_map, dict):
+        raise click.ClickException("source map must be a JSON object")
+    row = upload_source_map(
+        store=store,
+        project_id=pid,
+        environment_id=eid,
+        release=release,
+        dist=dist,
+        artifact_url=artifact_url,
+        source_map=source_map,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "source_map": {
+                    "id": row.id,
+                    "public_id": row.public_id,
+                    "release": row.release,
+                    "dist": row.dist,
+                    "artifact_url": row.artifact_url,
+                }
             },
             indent=2,
         )

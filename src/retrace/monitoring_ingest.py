@@ -10,6 +10,7 @@ from retrace.deploys import correlate_failure_to_deploy
 from retrace.evidence import EvidenceItem, evidence_dedupe_key
 from retrace.failures import canonical_failure_from_monitor_incident
 from retrace.incidents import group_failure_into_incident
+from retrace.source_maps import map_stack_frame
 from retrace.storage import Storage
 
 
@@ -58,7 +59,13 @@ def ingest_monitoring_webhook(
     provider: str,
     payload: dict[str, Any],
 ) -> MonitoringIngestResult:
-    alert = normalize_monitoring_alert(provider=provider, payload=payload)
+    alert = normalize_monitoring_alert(
+        provider=provider,
+        payload=payload,
+        store=store,
+        project_id=project_id,
+        environment_id=environment_id,
+    )
     source_external_id = f"{alert.provider}:{alert.external_id}"
     existing = store.find_failure_by_source(
         project_id=project_id,
@@ -114,16 +121,34 @@ def ingest_monitoring_webhook(
     )
 
 
-def normalize_monitoring_alert(*, provider: str, payload: dict[str, Any]) -> MonitoringAlert:
+def normalize_monitoring_alert(
+    *,
+    provider: str,
+    payload: dict[str, Any],
+    store: Storage | None = None,
+    project_id: str = "",
+    environment_id: str = "",
+) -> MonitoringAlert:
     clean_provider = str(provider or payload.get("provider") or "generic").strip().lower()
     if clean_provider == "sentry":
-        return _sentry_alert(payload)
+        return _sentry_alert(
+            payload,
+            store=store,
+            project_id=project_id,
+            environment_id=environment_id,
+        )
     if clean_provider == "posthog":
         return _posthog_alert(payload)
     return _generic_alert(clean_provider, payload)
 
 
-def _sentry_alert(payload: dict[str, Any]) -> MonitoringAlert:
+def _sentry_alert(
+    payload: dict[str, Any],
+    *,
+    store: Storage | None = None,
+    project_id: str = "",
+    environment_id: str = "",
+) -> MonitoringAlert:
     data = _dict(payload.get("data"))
     event = _dict(data.get("event")) or _dict(payload.get("event")) or payload
     issue = _dict(data.get("issue")) or _dict(payload.get("issue"))
@@ -152,7 +177,18 @@ def _sentry_alert(payload: dict[str, Any]) -> MonitoringAlert:
         if part
     ]
     level = _first_str(event, "level", default=_first_str(issue, "level", default="error"))
-    top_stack_frame = _top_stack_frame(event)
+    release = _first_str(event, "release", default="")
+    dist = _first_str(event, "dist", default=_first_str(event, "distribution", default=""))
+    stack_frames = _stack_frames(event)
+    stack_frames = _apply_source_maps(
+        stack_frames,
+        store=store,
+        project_id=project_id,
+        environment_id=environment_id,
+        release=release,
+        dist=dist,
+    )
+    top_stack_frame = _top_stack_frame_from_frames(stack_frames)
     transaction = _first_str(event, "transaction", default="")
     grouping_fingerprint = _fingerprint(
         "sentry-group",
@@ -182,8 +218,10 @@ def _sentry_alert(payload: dict[str, Any]) -> MonitoringAlert:
         "level": level,
         "trace_ids": _trace_ids_from_sentry(event),
         "top_stack_frame": top_stack_frame,
+        "stack_frames": stack_frames,
         "transaction": transaction,
-        "release": _first_str(event, "release", default=""),
+        "release": release,
+        "dist": dist,
         "environment": _first_str(event, "environment", default=""),
         "grouping_fingerprint": grouping_fingerprint,
     }
@@ -206,8 +244,10 @@ def _sentry_alert(payload: dict[str, Any]) -> MonitoringAlert:
                 "issue": _trim_dict(issue, {"id", "short_id", "title", "url", "web_url"}),
                 "trace_ids": _trace_ids_from_sentry(event),
                 "top_stack_frame": top_stack_frame,
+                "stack_frames": stack_frames,
                 "transaction": transaction,
-                "release": _first_str(event, "release", default=""),
+                "release": release,
+                "dist": dist,
             }
         ),
     )
@@ -386,9 +426,83 @@ def _first_exception(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def _top_stack_frame(event: dict[str, Any]) -> str:
+    return _top_stack_frame_from_frames(_stack_frames(event))
+
+
+def _stack_frames(event: dict[str, Any]) -> list[dict[str, Any]]:
     exception = _first_exception(event)
     frames = _dict(exception.get("stacktrace")).get("frames")
     if not isinstance(frames, list) or not frames:
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in frames:
+        frame = _dict(raw)
+        filename = _first_str(frame, "filename", "abs_path", "module", default="")
+        function = _first_str(frame, "function", default="")
+        lineno = _safe_int(frame.get("lineno"))
+        colno = _safe_int(frame.get("colno") or frame.get("column"))
+        if filename or function or lineno:
+            out.append(
+                _without_empty(
+                    {
+                        "filename": filename,
+                        "function": function,
+                        "lineno": lineno,
+                        "colno": colno,
+                    }
+                )
+            )
+    return out
+
+
+def _apply_source_maps(
+    frames: list[dict[str, Any]],
+    *,
+    store: Storage | None,
+    project_id: str,
+    environment_id: str,
+    release: str,
+    dist: str,
+) -> list[dict[str, Any]]:
+    if store is None or not release.strip():
+        return frames
+    mapped_frames: list[dict[str, Any]] = []
+    for frame in frames:
+        filename = str(frame.get("filename") or "").strip()
+        lineno = _safe_int(frame.get("lineno"))
+        colno = _safe_int(frame.get("colno"))
+        match = map_stack_frame(
+            store=store,
+            project_id=project_id,
+            environment_id=environment_id,
+            release=release,
+            dist=dist,
+            generated_file=filename,
+            line=lineno,
+            column=colno,
+        )
+        if match is None:
+            mapped_frames.append(frame)
+            continue
+        mapped_frames.append(
+            {
+                **frame,
+                "generated_filename": filename,
+                "generated_lineno": lineno,
+                "generated_colno": colno,
+                "filename": match.source,
+                "function": match.name or str(frame.get("function") or ""),
+                "lineno": match.line,
+                "colno": match.column,
+                "source_mapped": True,
+                "source_map_artifact": match.artifact_url,
+            }
+        )
+    return mapped_frames
+
+
+def _top_stack_frame_from_frames(frames: list[dict[str, Any]]) -> str:
+    if not frames:
         return ""
     frame = _dict(frames[-1])
     filename = _first_str(frame, "filename", "abs_path", "module", default="")
@@ -415,6 +529,13 @@ def _trace_ids_from_sentry(event: dict[str, Any]) -> list[str]:
             if str(item[0]) in {"trace_id", "traceId"}:
                 values.append(item[1])
     return _string_list([item for item in values if item])
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _trim_dict(payload: dict[str, Any], keys: set[str]) -> dict[str, Any]:
