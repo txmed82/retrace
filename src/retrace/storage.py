@@ -359,6 +359,26 @@ ON incident_failures(failure_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_failures_one_incident_per_failure
 ON incident_failures(failure_id);
 
+CREATE TABLE IF NOT EXISTS app_error_alert_rules (
+    id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    precedence INTEGER NOT NULL DEFAULT 0,
+    action TEXT NOT NULL DEFAULT 'alert',
+    min_severity TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    title_contains TEXT NOT NULL DEFAULT '',
+    fingerprint_contains TEXT NOT NULL DEFAULT '',
+    route_contains TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS deploy_markers (
     id TEXT PRIMARY KEY,
     public_id TEXT NOT NULL,
@@ -779,6 +799,26 @@ class IncidentRow:
 
 
 @dataclass
+class AppErrorAlertRuleRow:
+    id: str
+    public_id: str
+    project_id: str
+    environment_id: str
+    name: str
+    enabled: bool
+    precedence: int
+    action: str
+    min_severity: str
+    provider: str
+    title_contains: str
+    fingerprint_contains: str
+    route_contains: str
+    metadata: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
 class DeployMarkerRow:
     id: str
     public_id: str
@@ -1160,6 +1200,30 @@ class Storage:
                 conn.execute(
                     "ALTER TABLE repair_tasks ADD COLUMN environment_id TEXT NOT NULL DEFAULT ''"
                 )
+            cols_alert_rules = [
+                r["name"]
+                for r in conn.execute(
+                    "PRAGMA table_info(app_error_alert_rules)"
+                ).fetchall()
+            ]
+            if "precedence" not in cols_alert_rules:
+                conn.execute(
+                    "ALTER TABLE app_error_alert_rules ADD COLUMN precedence INTEGER NOT NULL DEFAULT 0"
+                )
+            conn.execute("DROP INDEX IF EXISTS idx_app_error_alert_rules_scope")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_app_error_alert_rules_eval
+                ON app_error_alert_rules(
+                    project_id,
+                    environment_id,
+                    enabled,
+                    precedence DESC,
+                    created_at ASC,
+                    id ASC
+                )
+                """
+            )
             self._backfill_failure_trace_map(conn)
             rows = conn.execute(
                 """
@@ -2300,6 +2364,145 @@ class Storage:
             failure_count=int(row["failure_count"] or 0),
             evidence_count=int(row["evidence_count"] or 0),
             repair_task_id=str(row["repair_task_id"] or ""),
+            metadata=dict(self._safe_json_obj(row["metadata_json"])),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    def upsert_app_error_alert_rule(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        name: str,
+        enabled: bool = True,
+        precedence: int = 0,
+        action: str = "alert",
+        min_severity: str = "",
+        provider: str = "",
+        title_contains: str = "",
+        fingerprint_contains: str = "",
+        route_contains: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> str:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("alert rule name is required")
+        clean_action = action.strip().lower() or "alert"
+        if clean_action not in {"alert", "suppress"}:
+            raise ValueError("alert rule action must be alert or suppress")
+        clean_severity = min_severity.strip().lower()
+        if clean_severity and clean_severity not in _SEVERITY_ORDER:
+            raise ValueError("alert rule min_severity is invalid")
+        if metadata is None:
+            clean_metadata: dict[str, Any] = {}
+        elif not isinstance(metadata, dict):
+            raise ValueError("alert rule metadata must be a JSON object")
+        else:
+            clean_metadata = metadata
+        try:
+            metadata_json = json.dumps(clean_metadata, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("alert rule metadata must be JSON-serializable") from exc
+        rule_id = self._public_id("alertrule", project_id, environment_id, clean_name)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_error_alert_rules
+                (id, public_id, project_id, environment_id, name, enabled, precedence, action,
+                 min_severity, provider, title_contains, fingerprint_contains,
+                 route_contains, metadata_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, environment_id, name) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    precedence = excluded.precedence,
+                    action = excluded.action,
+                    min_severity = excluded.min_severity,
+                    provider = excluded.provider,
+                    title_contains = excluded.title_contains,
+                    fingerprint_contains = excluded.fingerprint_contains,
+                    route_contains = excluded.route_contains,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    rule_id,
+                    rule_id,
+                    project_id,
+                    environment_id,
+                    clean_name,
+                    int(bool(enabled)),
+                    int(precedence),
+                    clean_action,
+                    clean_severity,
+                    provider.strip().lower(),
+                    title_contains.strip(),
+                    fingerprint_contains.strip(),
+                    route_contains.strip(),
+                    metadata_json,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT id
+                FROM app_error_alert_rules
+                WHERE project_id = ? AND environment_id = ? AND name = ?
+                """,
+                (project_id, environment_id, clean_name),
+            ).fetchone()
+            assert row is not None
+            return str(row["id"])
+
+    def list_app_error_alert_rules(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        enabled: Optional[bool] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[AppErrorAlertRuleRow]:
+        params: list[object] = [project_id, environment_id]
+        where = "project_id = ? AND environment_id = ?"
+        if enabled is not None:
+            where += " AND enabled = ?"
+            params.append(int(bool(enabled)))
+        params.append(max(1, min(int(limit), 500)))
+        params.append(max(0, int(offset)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM app_error_alert_rules
+                WHERE {where}
+                ORDER BY precedence DESC, created_at ASC, id ASC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
+        return [self._app_error_alert_rule_from_row(row) for row in rows]
+
+    def _app_error_alert_rule_from_row(
+        self,
+        row: sqlite3.Row,
+    ) -> AppErrorAlertRuleRow:
+        return AppErrorAlertRuleRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            name=str(row["name"]),
+            enabled=bool(row["enabled"]),
+            precedence=int(row["precedence"] or 0),
+            action=str(row["action"] or "alert"),
+            min_severity=str(row["min_severity"] or ""),
+            provider=str(row["provider"] or ""),
+            title_contains=str(row["title_contains"] or ""),
+            fingerprint_contains=str(row["fingerprint_contains"] or ""),
+            route_contains=str(row["route_contains"] or ""),
             metadata=dict(self._safe_json_obj(row["metadata_json"])),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),

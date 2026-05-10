@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from threading import Thread
 
+import pytest
+
 from retrace.commands.api import _handler
 from retrace.notification_sinks import NotificationPayload
 from retrace.monitoring_ingest import ingest_monitoring_webhook
@@ -385,6 +387,60 @@ def test_raw_sentry_sdk_events_group_into_one_incident(tmp_path: Path) -> None:
     assert first.incident_id == second.incident_id
     assert failures[0].metadata["grouping_fingerprint"]
     assert failures[0].metadata["top_stack_frame"] == "src/checkout.ts:submit:42"
+
+
+def test_app_error_alert_rule_suppresses_matching_error(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    store.upsert_app_error_alert_rule(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Ignore noisy checkout beta",
+        action="suppress",
+        provider="sentry",
+        title_contains="checkout failed",
+        min_severity="medium",
+    )
+
+    result = ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={
+            "event": {
+                "event_id": "evt-alert-rule-1",
+                "title": "TypeError: checkout failed",
+                "level": "error",
+                "exception": {
+                    "values": [
+                        {
+                            "type": "TypeError",
+                            "value": "Cannot read properties of undefined",
+                            "stacktrace": {
+                                "frames": [
+                                    {
+                                        "filename": "src/checkout.ts",
+                                        "function": "submit",
+                                        "lineno": 42,
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                },
+            }
+        },
+    )
+
+    failure = store.get_failure_by_id(result.failure_id)
+    incident = store.get_incident(result.incident_id)
+    evidence = store.list_failure_evidence(failure_id=result.failure_id)
+    assert failure is not None
+    assert incident is not None
+    assert failure.metadata["alert_state"] == "suppressed"
+    assert failure.metadata["alert_rule_name"] == "Ignore noisy checkout beta"
+    assert incident.metadata["alert_state"] == "suppressed"
+    assert evidence[0].payload["alert_state"] == "suppressed"
 
 
 def test_sentry_envelope_parser_accepts_length_delimited_event() -> None:
@@ -955,6 +1011,127 @@ def test_app_error_incident_api_lists_monitoring_incidents(tmp_path: Path) -> No
     assert incident["transaction"] == "/checkout"
     assert incident["release"] == "abc123"
     assert incident["latest_failure"]["source_external_id"] == "sentry:evt-list-2"
+
+
+def test_app_error_alert_rule_api_creates_and_lists_rules(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="App error writer",
+        scopes=["app_errors:write", "app_errors:read"],
+    )
+    body = json.dumps(
+        {
+            "name": "Critical checkout only",
+            "action": "alert",
+            "precedence": 10,
+            "min_severity": "critical",
+            "provider": "sentry",
+            "route_contains": "/checkout",
+        }
+    ).encode("utf-8")
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/app-error-alert-rules?environment_id={workspace.environment_id}",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        created = json.loads(response.read().decode("utf-8"))
+        conn.request(
+            "GET",
+            f"/api/app-error-alert-rules?environment_id={workspace.environment_id}",
+            headers={"Authorization": f"Bearer {service.token}"},
+        )
+        list_response = conn.getresponse()
+        listed = json.loads(list_response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 202
+    assert created["rule"]["name"] == "Critical checkout only"
+    assert created["rule"]["precedence"] == 10
+    assert created["rule"]["min_severity"] == "critical"
+    assert list_response.status == 200
+    assert listed["rules"][0]["route_contains"] == "/checkout"
+
+
+def test_app_error_alert_rule_rejects_non_object_metadata(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+
+    with pytest.raises(ValueError, match="metadata must be a JSON object"):
+        store.upsert_app_error_alert_rule(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            name="Bad metadata",
+            metadata=["not", "an", "object"],  # type: ignore[arg-type]
+        )
+
+
+def test_app_error_alert_rule_api_requires_write_scope(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Read only",
+        scopes=["app_errors:read"],
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/app-error-alert-rules?environment_id={workspace.environment_id}",
+            body=json.dumps({"name": "No write", "action": "suppress"}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 403
+    assert payload["error"] == "forbidden"
+
+
+def test_app_error_alert_rule_api_requires_app_error_read_scope(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    store.upsert_app_error_alert_rule(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Rule",
+    )
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Issue reader",
+        scopes=["issues:read"],
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "GET",
+            f"/api/app-error-alert-rules?environment_id={workspace.environment_id}",
+            headers={"Authorization": f"Bearer {service.token}"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 403
+    assert payload["error"] == "forbidden"
 
 
 def test_app_error_incident_api_detail_controls_sensitive_evidence(

@@ -209,6 +209,11 @@ def incident_metadata(failure: FailureRow) -> dict[str, Any]:
         "trace_ids",
         "release",
         "deploy_sha",
+        "alert_state",
+        "alert_action",
+        "alert_rule_id",
+        "alert_rule_public_id",
+        "alert_rule_name",
     }
     return {
         "source_failure_id": failure.id,
