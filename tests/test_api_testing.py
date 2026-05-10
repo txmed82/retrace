@@ -582,6 +582,7 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
     )
     log_payload = backend_log_item["untrusted_payload"]
     assert "checkout handler failed" in log_payload["lines"][0]
+    assert "INFO unrelated trace_id=abc" not in json.dumps(log_payload)
     assert "dev@example.com" not in json.dumps(log_payload)
     assert "raw-secret-token" not in json.dumps(log_payload)
     assert "raw-basic-token" not in json.dumps(log_payload)
