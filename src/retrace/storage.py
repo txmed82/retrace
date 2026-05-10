@@ -2122,6 +2122,7 @@ class Storage:
         severity: str = "medium",
         status: str = "open",
         metadata: Optional[dict[str, Any]] = None,
+        reopen_resolved: bool = False,
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
         incident_id = self._id("inc")
@@ -2151,7 +2152,8 @@ class Storage:
                     summary = excluded.summary,
                     severity = excluded.severity,
                     status = CASE
-                        WHEN incidents.status IN ('resolved', 'ignored') THEN excluded.status
+                        WHEN incidents.status IN ('resolved', 'ignored') AND ? = 1
+                            THEN excluded.status
                         ELSE incidents.status
                     END,
                     metadata_json = excluded.metadata_json,
@@ -2170,6 +2172,7 @@ class Storage:
                     metadata_json,
                     now,
                     now,
+                    1 if reopen_resolved else 0,
                 ),
             )
             row = conn.execute(
@@ -2185,6 +2188,7 @@ class Storage:
                 existing is not None
                 and str(existing["status"] or "") in {"resolved", "ignored"}
                 and clean_status == "open"
+                and reopen_resolved
             ):
                 self._append_incident_lifecycle_event(
                     conn,
@@ -2198,6 +2202,21 @@ class Storage:
                     reason="new matching app-error failure reopened the incident",
                     metadata={"trigger": "ingest_regression"},
                     created_at=now,
+                )
+                conn.execute(
+                    """
+                    UPDATE failures
+                    SET status = 'new',
+                        updated_at = ?
+                    WHERE id IN (
+                        SELECT failure_id
+                        FROM incident_failures
+                        WHERE incident_id = ?
+                    )
+                      AND source_type = 'monitor_incident'
+                      AND status IN ('resolved', 'ignored')
+                    """,
+                    (now, str(row["id"])),
                 )
             return str(row["id"])
 
@@ -2469,7 +2488,12 @@ class Storage:
         clean_actor_type = actor_type.strip()[:80] or "service_token"
         clean_actor_id = actor_id.strip()[:200]
         clean_reason = reason.strip()[:2000]
-        clean_metadata = metadata or {}
+        if metadata is None:
+            clean_metadata: dict[str, Any] = {}
+        elif isinstance(metadata, dict):
+            clean_metadata = metadata
+        else:
+            raise ValueError("lifecycle metadata must be a JSON object")
         try:
             metadata_json = json.dumps(clean_metadata, sort_keys=True)
         except (TypeError, ValueError) as exc:
@@ -2477,6 +2501,7 @@ class Storage:
         failure_status = APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS[clean_status]
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             incident = conn.execute(
                 """
                 SELECT *
