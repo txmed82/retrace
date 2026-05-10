@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from threading import Thread
 
+import pytest
+
 from retrace.commands.api import _handler
 from retrace.notification_sinks import NotificationPayload
 from retrace.monitoring_ingest import ingest_monitoring_webhook
@@ -1059,6 +1061,18 @@ def test_app_error_alert_rule_api_creates_and_lists_rules(tmp_path: Path) -> Non
     assert created["rule"]["min_severity"] == "critical"
     assert list_response.status == 200
     assert listed["rules"][0]["route_contains"] == "/checkout"
+
+
+def test_app_error_alert_rule_rejects_non_object_metadata(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+
+    with pytest.raises(ValueError, match="metadata must be a JSON object"):
+        store.upsert_app_error_alert_rule(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            name="Bad metadata",
+            metadata=["not", "an", "object"],  # type: ignore[arg-type]
+        )
 
 
 def test_app_error_alert_rule_api_requires_write_scope(tmp_path: Path) -> None:

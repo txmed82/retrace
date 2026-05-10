@@ -382,6 +382,16 @@ CREATE TABLE IF NOT EXISTS app_error_alert_rules (
 CREATE INDEX IF NOT EXISTS idx_app_error_alert_rules_scope
 ON app_error_alert_rules(project_id, environment_id, enabled, updated_at DESC);
 
+CREATE INDEX IF NOT EXISTS idx_app_error_alert_rules_eval
+ON app_error_alert_rules(
+    project_id,
+    environment_id,
+    enabled,
+    precedence DESC,
+    created_at ASC,
+    id ASC
+);
+
 CREATE TABLE IF NOT EXISTS deploy_markers (
     id TEXT PRIMARY KEY,
     public_id TEXT NOT NULL,
@@ -2383,8 +2393,14 @@ class Storage:
         clean_severity = min_severity.strip().lower()
         if clean_severity and clean_severity not in _SEVERITY_ORDER:
             raise ValueError("alert rule min_severity is invalid")
+        if metadata is None:
+            clean_metadata: dict[str, Any] = {}
+        elif not isinstance(metadata, dict):
+            raise ValueError("alert rule metadata must be a JSON object")
+        else:
+            clean_metadata = metadata
         try:
-            metadata_json = json.dumps(metadata or {}, sort_keys=True)
+            metadata_json = json.dumps(clean_metadata, sort_keys=True)
         except (TypeError, ValueError) as exc:
             raise ValueError("alert rule metadata must be JSON-serializable") from exc
         rule_id = self._public_id("alertrule", project_id, environment_id, clean_name)
