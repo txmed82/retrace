@@ -52,9 +52,12 @@ from retrace.tester import (
     list_specs,
     load_run_summaries,
     load_spec,
+    now_iso,
     run_spec,
     runs_dir_for_data_dir,
+    save_spec,
     specs_dir_for_data_dir,
+    validate_spec,
 )
 
 logger = logging.getLogger(__name__)
@@ -1700,6 +1703,97 @@ def _api_suites_payload(data_dir: Path) -> dict[str, Any]:
     return {"suites": suites}
 
 
+def _json_object_list_payload(value: Any, *, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError(f"{label} must be a JSON list of objects")
+    return [dict(item) for item in value]
+
+
+def _edit_ui_draft_payload(
+    *,
+    data_dir: Path,
+    spec_id: str,
+    name: str = "",
+    prompt: str = "",
+    app_url: str = "",
+    steps: Any = None,
+    assertions: Any = None,
+    review_note: str = "",
+    accept: bool = False,
+) -> tuple[dict[str, Any], int]:
+    clean_spec_id = spec_id.strip()
+    if not clean_spec_id:
+        return {"ok": False, "error": "spec_id is required"}, 400
+    specs_dir = specs_dir_for_data_dir(data_dir)
+    try:
+        spec = load_spec(specs_dir, clean_spec_id)
+    except Exception:
+        return {"ok": False, "error": f"spec not found: {clean_spec_id}"}, 404
+    if dict(spec.fixtures or {}).get("draft_status") != "draft":
+        return {"ok": False, "error": "Spec is not an unaccepted draft."}, 409
+
+    changed_fields: list[str] = []
+    edited_name = name.strip()
+    if edited_name and edited_name != spec.name:
+        spec.name = edited_name
+        changed_fields.append("name")
+    edited_prompt = prompt.strip()
+    if edited_prompt and edited_prompt != spec.prompt:
+        spec.prompt = edited_prompt
+        changed_fields.append("prompt")
+    edited_app_url = app_url.strip()
+    if edited_app_url and edited_app_url != spec.app_url:
+        spec.app_url = edited_app_url
+        changed_fields.append("app_url")
+    try:
+        if steps is not None:
+            spec.exact_steps = _json_object_list_payload(steps, label="steps")
+            changed_fields.append("exact_steps")
+        if assertions is not None:
+            spec.assertions = _json_object_list_payload(assertions, label="assertions")
+            changed_fields.append("assertions")
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}, 400
+
+    spec.fixtures = dict(spec.fixtures or {})
+    notes = [
+        str(item).strip()
+        for item in list(spec.fixtures.get("review_notes", []) or [])
+        if str(item).strip()
+    ]
+    clean_note = review_note.strip()
+    if clean_note:
+        notes.append(clean_note)
+        spec.fixtures["review_notes"] = notes
+        changed_fields.append("review_notes")
+    spec.fixtures["reviewed_at"] = now_iso()
+    if accept:
+        spec.fixtures["draft_status"] = "accepted"
+        spec.fixtures.setdefault("accepted_at", now_iso())
+        changed_fields.append("draft_status")
+    if changed_fields:
+        spec.fixtures["last_review_edit"] = {
+            "edited_at": now_iso(),
+            "fields": sorted(set(changed_fields)),
+        }
+    spec.updated_at = now_iso()
+    try:
+        validate_spec(spec)
+        save_spec(specs_dir, spec)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 400
+    return {
+        "ok": True,
+        "spec": spec.__dict__,
+        "draft_status": spec.fixtures.get("draft_status", ""),
+        "accepted": bool(accept),
+        "changed_fields": sorted(set(changed_fields)),
+        "step_count": len(spec.exact_steps or []),
+        "assertion_count": len(spec.assertions or []),
+        "review_notes": spec.fixtures.get("review_notes", []),
+    }, 200
+
+
 def _connect_github_repo_payload(
     *,
     store: Storage,
@@ -1832,6 +1926,7 @@ _INDEX_HTML = """<!doctype html>
     .card h3 { margin:0 0 8px 0; font-size:13px; color:#93c5fd; text-transform:uppercase; letter-spacing:.08em; }
     .lbl { font-size:12px; color:var(--muted); margin-top:8px; }
     input { width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px; }
+    textarea { width:100%; min-height:120px; resize:vertical; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
     ul { margin:0; padding-left:18px; }
     li { margin: 6px 0; font-size:13px; }
     pre { white-space:pre-wrap; font-size:12px; background:#0b1220; border:1px solid #1f2937; padding:10px; border-radius:8px; max-height:360px; overflow:auto; }
@@ -1860,6 +1955,8 @@ _INDEX_HTML = """<!doctype html>
     .recommendation-list button { margin-right:6px; margin-top:4px; }
     .suite-row { border-top:1px solid #1f2937; padding:10px 0; }
     .suite-row:first-child { border-top:0; padding-top:0; }
+    .draft-editor { margin-top:12px; }
+    .draft-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
     .ok { color:#86efac; } .bad { color:#fca5a5; }
     @media (max-width: 980px) {
       .app-shell { grid-template-columns: 1fr; height:auto; min-height:100vh; }
@@ -1867,7 +1964,7 @@ _INDEX_HTML = """<!doctype html>
       .nav-btn { display:inline-block; width:auto; margin-right:4px; }
       .rail { border-right:0; border-bottom:1px solid var(--line); max-height:42vh; }
       .main { padding:12px; }
-      .metric-grid, .detail-grid, .grid, .workflow-strip { grid-template-columns: 1fr; }
+      .metric-grid, .detail-grid, .grid, .workflow-strip, .draft-grid { grid-template-columns: 1fr; }
       .timeline-row { grid-template-columns: 1fr; }
     }
   </style>
@@ -2608,6 +2705,10 @@ const retrace = init({
       const specOptions = specs.map(s =>
         `<option value="${esc(s.spec_id)}">${esc(s.name)} (${esc(s.mode)})</option>`
       ).join('');
+      const draftSpecs = specs.filter(s => (s.fixtures || {}).draft_status === 'draft');
+      const draftOptions = draftSpecs.map(s =>
+        `<option value="${esc(s.spec_id)}">${esc(s.name)} · ${esc(s.spec_id)}</option>`
+      ).join('');
       const suiteRows = apiSuites.map(s => {
         const summary = s.import_summary || {};
         const warnings = s.quality_warning_count || 0;
@@ -2654,6 +2755,38 @@ const retrace = init({
             <div id="linkedFailureTests"><div class="empty">Loading linked failures...</div></div>
           </div>
         </div>
+        <div class="card draft-editor">
+          <h3>Generated Draft Review</h3>
+          ${draftSpecs.length ? `
+            <div class="draft-grid">
+              <div>
+                <div class="lbl">Draft Spec</div>
+                <select id="draftSpecSelect" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">${draftOptions}</select>
+                <div class="lbl">Name</div>
+                <input id="draftName" value="" />
+                <div class="lbl">Prompt</div>
+                <textarea id="draftPrompt"></textarea>
+                <div class="lbl">App URL</div>
+                <input id="draftAppUrl" value="" />
+                <div class="lbl">Review Note</div>
+                <input id="draftReviewNote" value="" placeholder="What changed or what you verified" />
+                <div style="margin-top:8px">
+                  <button class="btn" id="saveDraftSpecBtn" type="button">Save Draft</button>
+                  <button class="btn" id="acceptDraftSpecBtn" type="button">Accept Draft</button>
+                  <button class="btn" id="runAcceptedDraftBtn" type="button">Run Accepted</button>
+                  <span class="empty" id="draftEditStatus"></span>
+                </div>
+              </div>
+              <div>
+                <div class="lbl">Steps JSON</div>
+                <textarea id="draftStepsJson"></textarea>
+                <div class="lbl">Assertions JSON</div>
+                <textarea id="draftAssertionsJson"></textarea>
+                <div class="empty" id="draftReviewSummary"></div>
+              </div>
+            </div>
+          ` : '<div class="empty">No generated drafts waiting for review.</div>'}
+        </div>
         <div style="height:12px"></div>
         <div class="card">
           <h3>API Suites</h3>
@@ -2666,7 +2799,103 @@ const retrace = init({
       `;
       byId('testerCreateForm').addEventListener('submit', createTesterSpec);
       byId('runTesterBtn').addEventListener('click', runTesterSpec);
+      if(draftSpecs.length){
+        window.retraceDraftSpecs = draftSpecs;
+        byId('draftSpecSelect')?.addEventListener('change', renderSelectedDraftEditor);
+        byId('saveDraftSpecBtn')?.addEventListener('click', () => saveDraftSpec(false));
+        byId('acceptDraftSpecBtn')?.addEventListener('click', () => saveDraftSpec(true));
+        byId('runAcceptedDraftBtn')?.addEventListener('click', runAcceptedDraftSpec);
+        renderSelectedDraftEditor();
+      }
       renderLinkedFailureTests();
+    }
+
+    function selectedDraftSpec(){
+      const id = byId('draftSpecSelect')?.value || '';
+      return (window.retraceDraftSpecs || []).find(s => s.spec_id === id) || null;
+    }
+
+    function renderSelectedDraftEditor(){
+      const spec = selectedDraftSpec();
+      if(!spec){ return; }
+      byId('draftName').value = spec.name || '';
+      byId('draftPrompt').value = spec.prompt || '';
+      byId('draftAppUrl').value = spec.app_url || '';
+      byId('draftStepsJson').value = JSON.stringify(spec.exact_steps || [], null, 2);
+      byId('draftAssertionsJson').value = JSON.stringify(spec.assertions || [], null, 2);
+      const fixtures = spec.fixtures || {};
+      const generation = fixtures.generation || {};
+      const review = generation.review || {};
+      const notes = fixtures.review_notes || [];
+      byId('draftReviewSummary').innerHTML = `
+        draft=<code>${esc(fixtures.draft_status || '')}</code> · steps=<code>${esc((spec.exact_steps || []).length)}</code> · assertions=<code>${esc((spec.assertions || []).length)}</code>
+        ${review.summary ? `<br>${esc(review.summary)}` : ''}
+        ${notes.length ? `<br>Notes: ${notes.map(item => `<code>${esc(item)}</code>`).join(' ')}` : ''}
+      `;
+      byId('draftEditStatus').textContent = '';
+    }
+
+    function parseDraftJson(id, label){
+      try {
+        const value = JSON.parse(byId(id).value || '[]');
+        if(!Array.isArray(value) || value.some(item => !item || typeof item !== 'object' || Array.isArray(item))){
+          throw new Error(`${label} must be a JSON list of objects`);
+        }
+        return value;
+      } catch(err) {
+        throw new Error(`${label}: ${err.message || err}`);
+      }
+    }
+
+    async function saveDraftSpec(accept=false){
+      const spec = selectedDraftSpec();
+      const status = byId('draftEditStatus');
+      if(!spec || !status){ return; }
+      let steps, assertions;
+      try {
+        steps = parseDraftJson('draftStepsJson', 'Steps');
+        assertions = parseDraftJson('draftAssertionsJson', 'Assertions');
+      } catch(err) {
+        status.textContent = err.message || String(err);
+        return;
+      }
+      status.textContent = accept ? 'Accepting...' : 'Saving...';
+      const res = await fetch('/api/tester/draft', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          spec_id: spec.spec_id,
+          name: byId('draftName').value,
+          prompt: byId('draftPrompt').value,
+          app_url: byId('draftAppUrl').value,
+          steps,
+          assertions,
+          review_note: byId('draftReviewNote').value,
+          accept,
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        status.textContent = data.error || 'Draft update failed';
+        return;
+      }
+      status.textContent = accept
+        ? `Accepted ${data.spec.spec_id}`
+        : `Saved ${data.changed_fields.join(', ') || 'metadata'}`;
+      await loadTesterPanel();
+      if(accept){
+        const select = byId('testerSpecSelect');
+        if(select) select.value = data.spec.spec_id;
+      }
+    }
+
+    async function runAcceptedDraftSpec(){
+      const spec = selectedDraftSpec();
+      if(!spec){ return; }
+      await saveDraftSpec(true);
+      const select = byId('testerSpecSelect');
+      if(select) select.value = spec.spec_id;
+      await runTesterSpec();
     }
 
     async function processReplayJobs(){
@@ -3820,6 +4049,22 @@ def ui_command(
                     )
                 status = 200 if result.ok else 400
                 self._json({"ok": result.ok, "result": result.__dict__}, status=status)
+                return
+
+            if path == "/api/tester/draft":
+                body = self._read_json_body()
+                payload, status = _edit_ui_draft_payload(
+                    data_dir=data_dir,
+                    spec_id=str(body.get("spec_id", "")).strip(),
+                    name=str(body.get("name", "")).strip(),
+                    prompt=str(body.get("prompt", "")).strip(),
+                    app_url=str(body.get("app_url", "")).strip(),
+                    steps=body.get("steps") if "steps" in body else None,
+                    assertions=body.get("assertions") if "assertions" in body else None,
+                    review_note=str(body.get("review_note", "")).strip(),
+                    accept=bool(body.get("accept") or False),
+                )
+                self._json(payload, status=status)
                 return
 
             if path == "/api/replay-issue/spec":
