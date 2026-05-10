@@ -280,6 +280,36 @@ tester:
     assert "test-token" not in json.dumps(spec_payload)
 
 
+def test_tester_profiles_outputs_redacted_shared_profiles(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "config.yaml").write_text(
+        _CONFIG_YAML
+        + """
+tester:
+  auth_profiles:
+    api-jwt:
+      mode: jwt
+      jwt_env: RETRACE_API_JWT
+  env_profiles:
+    local-api:
+      api_base_url: http://127.0.0.1:3000
+      env_overrides:
+        FEATURE_FLAG: enabled
+"""
+    )
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["tester", "profiles"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["auth_profiles"][0]["jwt_env"] == "[secret-env]"
+    assert payload["env_profiles"][0]["api_base_url"] == "http://127.0.0.1:3000"
+    assert "RETRACE_API_JWT" not in result.output
+
+
 def test_create_suite_run_generates_accepts_and_runs_draft_specs(
     tmp_path: Path, monkeypatch
 ) -> None:

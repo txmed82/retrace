@@ -73,6 +73,13 @@ def generate_spec_from_replay_issue(
         assertions=assertions,
         gaps=gaps,
     )
+    api_candidate = _api_regression_candidate(
+        issue=issue,
+        base_url=base_url,
+    )
+    if api_candidate:
+        generation_notes["api_regression_candidate"] = api_candidate
+        generation_notes["review"]["api_regression_candidate"] = api_candidate
     prompt = (
         f"Replay-derived regression for {issue['public_id']}: "
         f"{str(issue['title'] or 'Replay issue')}"
@@ -96,6 +103,7 @@ def generate_spec_from_replay_issue(
             "replay_public_id": str(playback.session["public_id"]),
             "session_id": representative_session_id,
             "generation": generation_notes,
+            "api_regression_candidate": api_candidate,
         },
         data_extraction=[],
     )
@@ -308,6 +316,7 @@ def _steps_from_events(
                 "target": target,
                 "source": "retrace_browser_sdk",
             }
+            _annotate_generated_step(step, event=event, reason="captured SDK click")
             steps.append(step)
             if not target.get("selector"):
                 gaps.append(
@@ -324,6 +333,7 @@ def _steps_from_events(
                 "text": "[redacted-replay-input]",
                 "source": "retrace_browser_sdk",
             }
+            _annotate_generated_step(step, event=event, reason="captured SDK input")
             steps.append(step)
             if not target.get("selector"):
                 gaps.append(
@@ -337,14 +347,14 @@ def _steps_from_events(
             if _has_nearby_sdk_interaction(sdk_interactions, "click", event.get("timestamp")):
                 continue
             click_count += 1
-            steps.append(
-                {
-                    "id": f"click-{click_count}",
-                    "action": "click",
-                    "target": {"rrweb_id": data.get("id")},
-                    "source": "replay",
-                }
-            )
+            step = {
+                "id": f"click-{click_count}",
+                "action": "click",
+                "target": {"rrweb_id": data.get("id")},
+                "source": "replay",
+            }
+            _annotate_generated_step(step, event=event, reason="rrweb click fallback")
+            steps.append(step)
             gaps.append(
                 f"click-{click_count} needs a durable locator for rrweb node {data.get('id', 'unknown')}"
             )
@@ -352,15 +362,15 @@ def _steps_from_events(
             if _has_nearby_sdk_interaction(sdk_interactions, "input", event.get("timestamp")):
                 continue
             input_count += 1
-            steps.append(
-                {
-                    "id": f"input-{input_count}",
-                    "action": "type",
-                    "target": {"rrweb_id": data.get("id")},
-                    "text": "[redacted-replay-input]",
-                    "source": "replay",
-                }
-            )
+            step = {
+                "id": f"input-{input_count}",
+                "action": "type",
+                "target": {"rrweb_id": data.get("id")},
+                "text": "[redacted-replay-input]",
+                "source": "replay",
+            }
+            _annotate_generated_step(step, event=event, reason="rrweb input fallback")
+            steps.append(step)
             gaps.append(
                 f"input-{input_count} needs a durable locator and safe test data"
             )
@@ -381,6 +391,23 @@ def _steps_from_events(
         steps.append({"id": "home", "action": "get", "url": base_url})
         gaps.append("Replay did not include convertible navigation, click, or input events.")
     return steps[:20], list(dict.fromkeys(gaps))
+
+
+def _annotate_generated_step(
+    step: dict[str, Any],
+    *,
+    event: dict[str, Any],
+    reason: str,
+) -> None:
+    target = step.get("target") if isinstance(step.get("target"), dict) else {}
+    candidates = target.get("selector_candidates") if isinstance(target, dict) else []
+    step["generation"] = {
+        "source_event_type": event.get("type"),
+        "source_timestamp_ms": _event_timestamp_ms(event.get("timestamp")),
+        "reason": reason,
+        "selector_candidate_count": len(candidates) if isinstance(candidates, list) else 0,
+        "needs_review": not bool(target.get("selector")) or step.get("text") == "[redacted-replay-input]",
+    }
 
 
 def _sdk_interaction_timestamps(events: list[dict[str, Any]]) -> dict[str, list[int]]:
@@ -738,6 +765,12 @@ def _generation_notes(
     return {
         "human_readable_steps": _human_readable_steps(exact_steps),
         "human_readable_assertions": _human_readable_assertions(assertions),
+        "review": {
+            "status": "draft" if quality["requires_human_edit"] else "ready",
+            "steps": _review_steps(exact_steps),
+            "assertions": _review_assertions(assertions),
+            "recommended_next_action": quality["recommended_next_action"],
+        },
         "preconditions": [
             f"Run the app at {base_url}.",
             f"Replay source session: {representative_session_id}.",
@@ -750,6 +783,66 @@ def _generation_notes(
         "unsupported_step_warnings": unsupported_step_warnings,
         "known_gaps": list(gaps),
         "quality": quality,
+    }
+
+
+def _review_steps(exact_steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    review: list[dict[str, Any]] = []
+    for step in exact_steps:
+        target = step.get("target") if isinstance(step.get("target"), dict) else {}
+        generation = step.get("generation") if isinstance(step.get("generation"), dict) else {}
+        review.append(
+            {
+                "id": step.get("id"),
+                "action": step.get("action"),
+                "selector": target.get("selector") if isinstance(target, dict) else "",
+                "selector_candidates": target.get("selector_candidates", [])
+                if isinstance(target, dict)
+                else [],
+                "needs_test_data": step.get("text") == "[redacted-replay-input]",
+                "needs_locator": step.get("action") in {"click", "type"}
+                and not bool(target.get("selector")) if isinstance(target, dict) else False,
+                "source": step.get("source"),
+                "generation": generation,
+            }
+        )
+    return review
+
+
+def _review_assertions(assertions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": assertion.get("id") or assertion.get("type"),
+            "type": assertion.get("type"),
+            "expected": assertion.get("expected"),
+            "source": assertion.get("source"),
+            "needs_review": assertion.get("type") == "model_consensus",
+        }
+        for assertion in assertions
+    ]
+
+
+def _api_regression_candidate(*, issue: Any, base_url: str) -> dict[str, Any]:
+    evidence = _json_obj(issue["evidence_json"])
+    signal = _first_signal(_evidence_signals(evidence), {"network_4xx", "network_5xx"})
+    if signal is None:
+        return {}
+    details = _json_obj(signal.get("details"))
+    raw_url = str(details.get("request_url") or details.get("url") or "").strip()
+    if not raw_url:
+        return {}
+    method = str(details.get("method") or details.get("request_method") or "GET").upper()
+    url, query = _api_url_and_query(raw_url, base_url)
+    status = _status_int(details.get("status") or details.get("status_code"))
+    return {
+        "detector": signal.get("detector"),
+        "method": method,
+        "url": url,
+        "query": query,
+        "status": status,
+        "trace_ids": _api_trace_ids(details),
+        "create_command": f"retrace tester api-from-replay-issue {issue['public_id']}",
+        "reason": "Replay issue includes a failed network call that can become an API regression test.",
     }
 
 

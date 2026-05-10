@@ -27,6 +27,12 @@ from retrace.replay_specs import (
     generate_spec_from_replay_issue,
 )
 from retrace.storage import Storage
+from retrace.test_profiles import (
+    apply_api_profiles,
+    resolve_auth_profile,
+    resolve_env_profile,
+    validate_profiles,
+)
 from retrace.tester import (
     DEFAULT_APP_URL,
     DEFAULT_HARNESS_COMMAND,
@@ -58,6 +64,89 @@ def _tester_defaults(config_path: Path) -> dict[str, Any]:
     return (raw.get("tester") or {}) if isinstance(raw, dict) else {}
 
 
+@tester_group.command("profiles")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def tester_profiles(config_path: Path) -> None:
+    """Validate shared auth/env profiles and print a redacted preview."""
+    try:
+        payload = validate_profiles(_tester_defaults(config_path))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+@tester_group.command("review-spec")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--kind",
+    type=click.Choice(["ui", "api"], case_sensitive=False),
+    default="ui",
+    show_default=True,
+)
+@click.argument("spec_id")
+def tester_review_spec(config_path: Path, kind: str, spec_id: str) -> None:
+    """Print review/edit metadata for a generated UI or API test spec."""
+    cfg = load_config(config_path)
+    if kind.lower() == "api":
+        spec = load_api_spec(api_specs_dir_for_data_dir(cfg.run.data_dir), spec_id)
+        payload = {
+            "kind": "api",
+            "spec_id": spec.spec_id,
+            "name": spec.name,
+            "method": spec.method,
+            "url": spec.url,
+            "route_path": _route_path_for_review(spec.url),
+            "auth_profile": spec.auth_profile,
+            "env_profile": spec.env_profile,
+            "request_count": len(spec.steps) if spec.steps else 1,
+            "steps": spec.steps,
+            "assertions": {
+                "expected_status": spec.expected_status,
+                "json": spec.json_assertions,
+                "schema": spec.schema_assertions,
+            },
+            "api_regression": spec.fixtures.get("api_regression", {}),
+            "fixture_notes": spec.fixtures.get("fixture_notes", []),
+        }
+    else:
+        spec = load_spec(specs_dir_for_data_dir(cfg.run.data_dir), spec_id)
+        generation = spec.fixtures.get("generation", {})
+        payload = {
+            "kind": "ui",
+            "spec_id": spec.spec_id,
+            "name": spec.name,
+            "app_url": spec.app_url,
+            "auth_profile": spec.auth_profile,
+            "execution_engine": spec.execution_engine,
+            "quality": generation.get("quality", {}),
+            "review": generation.get("review", {}),
+            "steps": spec.exact_steps,
+            "assertions": spec.assertions,
+            "known_gaps": generation.get("known_gaps", []),
+            "api_regression_candidate": generation.get("api_regression_candidate", {}),
+        }
+    click.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _route_path_for_review(url: str) -> str:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    return parsed.path or url
+
+
 def _json_option(value: str, *, label: str, default: Any) -> Any:
     raw = value.strip()
     if not raw:
@@ -69,36 +158,14 @@ def _json_option(value: str, *, label: str, default: Any) -> Any:
 
 
 def _auth_profile(defaults: dict[str, Any], name: str) -> dict[str, Any]:
-    profiles = defaults.get("auth_profiles") or {}
     if not name:
         return {}
-    if not isinstance(profiles, dict) or name not in profiles:
-        raise click.ClickException(f"unknown auth profile: {name}")
-    profile = profiles.get(name) or {}
-    if not isinstance(profile, dict):
-        raise click.ClickException(f"auth profile must be an object: {name}")
-    forbidden = {"password", "jwt", "token", "headers", "headers_json"}
-    leaked: list[str] = []
-
-    def scan_secret_keys(value: Any, path: str = "") -> None:
-        if isinstance(value, dict):
-            for key, nested in value.items():
-                key_s = str(key)
-                child_path = f"{path}.{key_s}" if path else key_s
-                if key_s in forbidden:
-                    leaked.append(child_path)
-                scan_secret_keys(nested, child_path)
-        elif isinstance(value, list):
-            for idx, item in enumerate(value):
-                scan_secret_keys(item, f"{path}[{idx}]")
-
-    scan_secret_keys(profile)
-    if leaked:
-        raise click.ClickException(
-            "auth profile must reference env vars, not secret values: "
-            + ", ".join(sorted(leaked))
-        )
-    return profile
+    try:
+        resolve_auth_profile(defaults, name)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    profiles = defaults.get("auth_profiles") or {}
+    return dict(profiles.get(name) or {})
 
 
 def _profile_setup_steps(profile: dict[str, Any]) -> list[dict[str, Any]]:
@@ -118,18 +185,14 @@ def _profile_browser_settings(profile: dict[str, Any]) -> dict[str, Any]:
 
 
 def _env_profile(defaults: dict[str, Any], name: str) -> dict[str, Any]:
-    profiles = defaults.get("env_profiles") or {}
     if not name:
         return {}
-    if not isinstance(profiles, dict) or name not in profiles:
-        raise click.ClickException(f"unknown env profile: {name}")
-    profile = profiles.get(name) or {}
-    if not isinstance(profile, dict):
-        raise click.ClickException(f"env profile must be an object: {name}")
-    env_overrides = profile.get("env_overrides") or {}
-    if not isinstance(env_overrides, dict):
-        raise click.ClickException("env profile env_overrides must be an object")
-    return dict(profile)
+    try:
+        resolve_env_profile(defaults, name)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    profiles = defaults.get("env_profiles") or {}
+    return dict(profiles.get(name) or {})
 
 
 def _apply_api_profiles(
@@ -139,32 +202,15 @@ def _apply_api_profiles(
     auth_profile_name: str = "",
     env_profile_name: str = "",
 ) -> Any:
-    auth_name = auth_profile_name.strip() or str(getattr(spec, "auth_profile", "") or "")
-    env_name = env_profile_name.strip() or str(getattr(spec, "env_profile", "") or "")
-    if auth_name:
-        profile = _auth_profile(defaults, auth_name)
-        mode = str(profile.get("mode") or "headers").strip().lower()
-        if mode == "jwt":
-            spec.auth = {"type": "bearer", "token_env": str(profile.get("jwt_env") or "")}
-        elif mode == "headers":
-            spec.auth = {"type": "headers", "headers_env": str(profile.get("headers_env") or "")}
-        elif mode == "form":
-            raise click.ClickException("API tests do not support form auth profiles")
-        else:
-            raise click.ClickException(f"unsupported API auth profile mode: {mode}")
-        spec.auth_profile = auth_name
-    if env_name:
-        profile = _env_profile(defaults, env_name)
-        env_overrides = profile.get("env_overrides") or {}
-        spec.env_overrides = {
-            **{str(k): str(v) for k, v in dict(env_overrides).items()},
-            **{str(k): str(v) for k, v in dict(spec.env_overrides or {}).items()},
-        }
-        api_base_url = str(profile.get("api_base_url") or "").strip()
-        if api_base_url and spec.url.startswith("/"):
-            spec.url = api_base_url.rstrip("/") + "/" + spec.url.lstrip("/")
-        spec.env_profile = env_name
-    return spec
+    try:
+        return apply_api_profiles(
+            spec,
+            defaults=defaults,
+            auth_profile_name=auth_profile_name,
+            env_profile_name=env_profile_name,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _single_failure_test_link_id(store: Storage, spec_id: str) -> str:
@@ -587,20 +633,19 @@ def tester_api_create(
 ) -> None:
     cfg = load_config(config_path)
     defaults = _tester_defaults(config_path)
-    profile_auth = _auth_profile(defaults, auth_profile.strip()) if auth_profile.strip() else {}
     auth = (
         {"type": "bearer", "token_env": auth_bearer_env.strip()}
         if auth_bearer_env.strip()
         else {}
     )
-    if profile_auth and not auth:
-        mode = str(profile_auth.get("mode") or "headers").strip().lower()
-        if mode == "jwt":
-            auth = {"type": "bearer", "token_env": str(profile_auth.get("jwt_env") or "")}
-        elif mode == "headers":
-            auth = {"type": "headers", "headers_env": str(profile_auth.get("headers_env") or "")}
-        else:
-            raise click.ClickException("API specs support jwt and headers auth profiles")
+    if auth_profile.strip() and not auth:
+        try:
+            resolved_auth = resolve_auth_profile(defaults, auth_profile.strip())
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if resolved_auth.mode == "form":
+            raise click.ClickException("API specs support jwt, headers, and none auth profiles")
+        auth = dict(resolved_auth.auth)
     env_profile_data = _env_profile(defaults, env_profile.strip()) if env_profile.strip() else {}
     final_url = url
     api_base_url = str(env_profile_data.get("api_base_url") or "").strip()
