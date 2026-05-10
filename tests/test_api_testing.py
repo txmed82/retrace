@@ -186,9 +186,11 @@ def test_api_spec_runs_with_auth_assertions_and_redacted_artifacts(
         thread.join(timeout=2)
 
     assert result.ok is True
+    assert result.failure_classification == "passed"
     assert result.status_code == 200
     assert any(item["artifact_type"] == "api_request" for item in result.artifacts)
     assert any(item["artifact_type"] == "api_response" for item in result.artifacts)
+    assert any(item["artifact_type"] == "api_run_summary" for item in result.artifacts)
     request_artifact = next(
         item for item in result.artifacts if item["artifact_type"] == "api_request"
     )
@@ -229,10 +231,56 @@ def test_api_spec_reports_failed_json_assertion(tmp_path: Path) -> None:
         thread.join(timeout=2)
 
     assert result.ok is False
+    assert result.failure_classification == "assertion_failure"
     assert any(
         item["assertion_id"] == "bad" and item["ok"] is False
         for item in result.assertion_results
     )
+    summary_artifact = next(
+        item for item in result.artifacts if item["artifact_type"] == "api_run_summary"
+    )
+    summary = json.loads(Path(summary_artifact["path"]).read_text())
+    assert summary["failure_classification"] == "assertion_failure"
+    assert summary["route_path"] == "/api/health"
+
+
+def test_api_spec_expected_4xx_json_assertion_failure_is_assertion_failure(
+    tmp_path: Path,
+) -> None:
+    server, base_url, thread = _server_url()
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Expected unauthorized assertion failure",
+            method="GET",
+            url=f"{base_url}/api/private",
+            expected_status=401,
+            json_assertions=[
+                {"id": "bad-msg", "path": "$.error", "equals": "different"}
+            ],
+        )
+
+        result = run_api_spec(
+            spec=spec,
+            runs_dir=api_runs_dir_for_data_dir(tmp_path),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is False
+    assert result.failure_classification == "assertion_failure"
+    assert any(
+        item["assertion_id"] == "bad-msg" and item["ok"] is False
+        for item in result.assertion_results
+    )
+    summary_artifact = next(
+        item for item in result.artifacts if item["artifact_type"] == "api_run_summary"
+    )
+    summary = json.loads(Path(summary_artifact["path"]).read_text())
+    assert summary["failure_classification"] == "assertion_failure"
+    assert summary["route_path"] == "/api/private"
 
 
 def test_api_spec_runs_request_sequence_with_extracted_values(
@@ -312,6 +360,7 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
         thread.join(timeout=2)
 
     assert run.ok is False
+    assert run.failure_classification == "server_error"
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
     workspace = store.ensure_workspace(project_name="Default")
@@ -352,4 +401,5 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
     assert f"URL: `{base_url}/api/checkout/42`" in prompt
     assert "Expected status: `200`" in prompt
     assert "Actual status: `500`" in prompt
+    assert "Failure classification: `server_error`" in prompt
     assert "dev@example.com" not in prompt

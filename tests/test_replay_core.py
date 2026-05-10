@@ -1160,6 +1160,11 @@ def test_generate_spec_adds_signal_assertions_and_generation_notes(
     assert generation["unsupported_step_warnings"] == []
     assert generation["quality"]["status"] == "runnable"
     assert generation["quality"]["requires_human_edit"] is False
+    assert generation["review"]["status"] == "ready"
+    assert generation["review"]["steps"][1]["selector"] == '[data-testid="checkout-pay"]'
+    assert generation["api_regression_candidate"]["method"] == "POST"
+    assert generation["api_regression_candidate"]["url"] == "https://app.example/api/checkout"
+    assert generated.spec.fixtures["api_regression_candidate"]["status"] == 500
 
 
 def test_generate_spec_marks_no_convertible_replay_steps_blocked(
