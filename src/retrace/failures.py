@@ -400,7 +400,9 @@ def _api_trace_ids_from_spec(spec: Any) -> list[str]:
 
 
 def _api_trace_ids_from_spec_and_run(spec: Any, run_result: Any) -> list[str]:
-    out = _api_trace_ids_from_spec(spec)
+    out: list[str] = []
+    for value in _api_trace_ids_from_spec(spec):
+        _append_trace_id(str(value or ""), out)
     for artifact in list(getattr(run_result, "artifacts", []) or []):
         if not isinstance(artifact, dict):
             continue

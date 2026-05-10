@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from retrace import api_testing
 from retrace.api_testing import (
     api_runs_dir_for_data_dir,
     api_specs_dir_for_data_dir,
@@ -415,6 +416,15 @@ def test_api_headers_env_reports_invalid_json_cleanly(
     )
 
 
+def test_api_traceparent_rejects_malformed_extra_segments() -> None:
+    assert (
+        api_testing._trace_id_from_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra"
+        )
+        == ""
+    )
+
+
 def test_api_env_profile_applies_base_url_to_sequence_steps(tmp_path: Path) -> None:
     server, base_url, thread = _server_url()
     try:
@@ -474,6 +484,11 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
             method="GET",
             url=f"{base_url}/api/checkout/42",
             expected_status=200,
+            fixtures={
+                "api_regression": {
+                    "trace_ids": ["4BF92F3577B34DA6A3CE929D0E0E4736"]
+                }
+            },
         )
         run = run_api_spec(
             spec=spec,

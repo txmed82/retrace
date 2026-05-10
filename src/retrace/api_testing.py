@@ -938,7 +938,7 @@ def _append_trace_id(value: str, out: list[str]) -> None:
 
 def _trace_id_from_traceparent(value: str) -> str:
     parts = value.strip().split("-")
-    if len(parts) < 4:
+    if len(parts) != 4:
         return ""
     trace_id = parts[1].lower()
     if len(trace_id) != 32 or any(c not in "0123456789abcdef" for c in trace_id):
@@ -950,7 +950,7 @@ def _unique_strings(values: list[Any]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for value in values:
-        item = str(value or "").strip()
+        item = str(value or "").strip().lower()
         if item and item not in seen:
             seen.add(item)
             out.append(item)
