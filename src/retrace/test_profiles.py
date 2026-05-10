@@ -166,6 +166,8 @@ def _redacted_profile_preview(profile: dict[str, Any]) -> dict[str, Any]:
                 str(key): (
                     "[secret-env]"
                     if str(key).endswith("_env")
+                    else _redact_env_overrides(nested)
+                    if str(key) == "env_overrides"
                     else redact(nested)
                 )
                 for key, nested in value.items()
@@ -177,3 +179,9 @@ def _redacted_profile_preview(profile: dict[str, Any]) -> dict[str, Any]:
 
     # Copy through JSON to keep previews stable and serializable.
     return json.loads(json.dumps(redact(profile), sort_keys=True))
+
+
+def _redact_env_overrides(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): "[secret-env]" for key in value}
+    return "[secret-env]"

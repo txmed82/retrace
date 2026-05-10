@@ -646,11 +646,8 @@ def tester_api_create(
         if resolved_auth.mode == "form":
             raise click.ClickException("API specs support jwt, headers, and none auth profiles")
         auth = dict(resolved_auth.auth)
-    env_profile_data = _env_profile(defaults, env_profile.strip()) if env_profile.strip() else {}
-    final_url = url
-    api_base_url = str(env_profile_data.get("api_base_url") or "").strip()
-    if api_base_url and final_url.startswith("/"):
-        final_url = api_base_url.rstrip("/") + "/" + final_url.lstrip("/")
+    if env_profile.strip():
+        _env_profile(defaults, env_profile.strip())
     parsed_json_assertions = []
     for item in json_assertions:
         parsed = _json_option(item, label="json-assertion", default={})
@@ -665,7 +662,7 @@ def tester_api_create(
         specs_dir=api_specs_dir_for_data_dir(cfg.run.data_dir),
         name=name,
         method=method,
-        url=final_url,
+        url=url,
         query=_json_option(query_json, label="query-json", default={}),
         headers=_json_option(headers_json, label="headers-json", default={}),
         body=_json_option(body_json, label="body-json", default=None),

@@ -334,6 +334,8 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
             step_id = str(step.get("id") or f"request-{idx + 1}")
             method = str(step.get("method") or spec.method).upper()
             url = _render_text(str(step.get("url") or spec.url), scope)
+            status_code = 0
+            elapsed_ms = 0
             query = _render_mapping(step.get("query", spec.query), scope)
             headers = _resolve_headers(
                 spec,
@@ -517,19 +519,33 @@ def _classify_api_run(
 ) -> str:
     if ok:
         return "passed"
+    failed_assertions = [
+        item for item in assertion_results if not bool(item.get("ok"))
+    ]
+    status_assertion_failed = any(
+        str(item.get("assertion_type") or "") == "status_code"
+        for item in failed_assertions
+    )
     error_l = error.lower()
-    if "auth failure" in error_l or status_code in {401, 403}:
-        return "auth_failure"
     if "timeout" in error_l or "timed out" in error_l:
         return "timeout"
     if error and status_code == 0:
         return "network_error"
+    if status_assertion_failed:
+        if "auth failure" in error_l or status_code in {401, 403}:
+            return "auth_failure"
+        if status_code >= 500:
+            return "server_error"
+        if status_code >= 400:
+            return "client_error"
+    if failed_assertions:
+        return "assertion_failure"
+    if "auth failure" in error_l or status_code in {401, 403}:
+        return "auth_failure"
     if status_code >= 500:
         return "server_error"
     if status_code >= 400:
         return "client_error"
-    if any(not bool(item.get("ok")) for item in assertion_results):
-        return "assertion_failure"
     return "unknown"
 
 

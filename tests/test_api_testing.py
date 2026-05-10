@@ -244,6 +244,45 @@ def test_api_spec_reports_failed_json_assertion(tmp_path: Path) -> None:
     assert summary["route_path"] == "/api/health"
 
 
+def test_api_spec_expected_4xx_json_assertion_failure_is_assertion_failure(
+    tmp_path: Path,
+) -> None:
+    server, base_url, thread = _server_url()
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Expected unauthorized assertion failure",
+            method="GET",
+            url=f"{base_url}/api/private",
+            expected_status=401,
+            json_assertions=[
+                {"id": "bad-msg", "path": "$.error", "equals": "different"}
+            ],
+        )
+
+        result = run_api_spec(
+            spec=spec,
+            runs_dir=api_runs_dir_for_data_dir(tmp_path),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is False
+    assert result.failure_classification == "assertion_failure"
+    assert any(
+        item["assertion_id"] == "bad-msg" and item["ok"] is False
+        for item in result.assertion_results
+    )
+    summary_artifact = next(
+        item for item in result.artifacts if item["artifact_type"] == "api_run_summary"
+    )
+    summary = json.loads(Path(summary_artifact["path"]).read_text())
+    assert summary["failure_classification"] == "assertion_failure"
+    assert summary["route_path"] == "/api/private"
+
+
 def test_api_spec_runs_request_sequence_with_extracted_values(
     tmp_path: Path,
 ) -> None:

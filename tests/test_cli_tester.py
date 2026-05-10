@@ -277,6 +277,7 @@ tester:
     )
     assert spec_payload["auth_profile"] == "api-jwt"
     assert spec_payload["env_profile"] == "local-api"
+    assert spec_payload["url"] == "/api/private"
     assert "test-token" not in json.dumps(spec_payload)
 
 
@@ -307,7 +308,9 @@ tester:
     payload = json.loads(result.output)
     assert payload["auth_profiles"][0]["jwt_env"] == "[secret-env]"
     assert payload["env_profiles"][0]["api_base_url"] == "http://127.0.0.1:3000"
+    assert payload["env_profiles"][0]["env_overrides"]["FEATURE_FLAG"] == "[secret-env]"
     assert "RETRACE_API_JWT" not in result.output
+    assert "enabled" not in result.output
 
 
 def test_create_suite_run_generates_accepts_and_runs_draft_specs(
