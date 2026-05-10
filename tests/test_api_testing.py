@@ -558,6 +558,9 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
     assert "dev@example.com" not in evidence_text
     assert "555-123-4567" not in evidence_text
     assert "123 Main Street" not in evidence_text
+    assert "raw-secret-token" not in evidence_text
+    assert "raw-basic-token" not in evidence_text
+    assert "sk_live_secret" not in evidence_text
     repair = store.get_repair_task(persisted.repair_task_id)
     assert repair is not None
     assert repair.likely_files == ["server/routes/checkout.ts"]
