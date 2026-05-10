@@ -64,6 +64,8 @@ class PriorFailureReference:
     status: str
     matched_files: list[str]
     matched_flows: list[str]
+    repair_task_id: str = ""
+    repair_task_status: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -425,6 +427,11 @@ def link_prior_failures(
                 status=failure.status,
                 matched_files=matched_files,
                 matched_flows=matched_flows,
+                repair_task_id=failure.linked_repair_task_id,
+                repair_task_status=_repair_task_status(
+                    store,
+                    failure.linked_repair_task_id,
+                ),
             )
         )
     return references
@@ -634,9 +641,14 @@ def _summary_comment_body(analysis: PRReviewAnalysis) -> str:
         lines.extend(["", "### Prior failures"])
         for failure in analysis.prior_failures[:10]:
             matches = ", ".join(failure.matched_files + failure.matched_flows)
+            repair = (
+                f", repair `{failure.repair_task_id}` {failure.repair_task_status}"
+                if failure.repair_task_id
+                else ""
+            )
             lines.append(
                 f"- `{failure.public_id}` {failure.title} "
-                f"({failure.severity}, {failure.status}) matched {matches}"
+                f"({failure.severity}, {failure.status}{repair}) matched {matches}"
             )
     if analysis.existing_tests:
         lines.extend(["", "### Run existing specs"])
@@ -703,6 +715,14 @@ def _prior_failure_inline_comment(
     if related_commands:
         lines.extend(["", "Run the linked spec before merging:"])
         lines.extend(f"- `{command}`" for command in related_commands[:5])
+    if failure.repair_task_id:
+        lines.extend(
+            [
+                "",
+                "Verify the linked repair task after changes land:",
+                f"- `retrace repair verify --repair-task-id {shlex.quote(failure.repair_task_id)}`",
+            ]
+        )
     lines.extend(
         [
             "",
@@ -735,6 +755,13 @@ def _first_comment_position(
         if changed.hunks:
             return path, changed.hunks[0].new_start
     return "", 0
+
+
+def _repair_task_status(store: Storage, repair_task_id: str) -> str:
+    if not repair_task_id:
+        return ""
+    task = store.get_repair_task(repair_task_id)
+    return task.status if task is not None else ""
 
 
 def _suggestion_id(*parts: object) -> str:

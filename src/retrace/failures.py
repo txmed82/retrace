@@ -30,8 +30,10 @@ FailureSourceType = Literal[
 
 _STATUS_MAP = {
     "new": "new",
+    "triaged": "triaged",
     "ongoing": "triaged",
     "unresolved": "triaged",
+    "in_progress": "in_progress",
     "ticket_created": "in_progress",
     "resolved": "resolved",
     "verified": "resolved",

@@ -15,7 +15,11 @@ from retrace.evidence import (
     evidence_dedupe_key,
     evidence_items_from_replay_issue,
 )
-from retrace.failures import CanonicalFailure, canonical_failure_from_replay_issue
+from retrace.failures import (
+    CanonicalFailure,
+    canonical_failure_from_replay_issue,
+    normalize_failure_status,
+)
 from retrace.repair import normalize_repair_task_status
 
 FAILURE_TEST_COVERAGE_STATES = (
@@ -1983,6 +1987,47 @@ class Storage:
                 params,
             ).fetchall()
         return [self._failure_from_row(row) for row in rows]
+
+    def update_failure_status(
+        self,
+        *,
+        failure_id: str,
+        status: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[FailureRow]:
+        clean_id = failure_id.strip()
+        clean_status = normalize_failure_status(status)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT metadata_json FROM failures WHERE id = ? OR public_id = ?",
+                (clean_id, clean_id),
+            ).fetchone()
+            if row is None:
+                return None
+            merged_metadata = dict(self._safe_json_obj(row["metadata_json"]))
+            if metadata:
+                merged_metadata.update(metadata)
+            try:
+                metadata_json = json.dumps(merged_metadata, sort_keys=True)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("failure metadata must be JSON-serializable") from exc
+            conn.execute(
+                """
+                UPDATE failures
+                SET status = ?,
+                    metadata_json = ?,
+                    updated_at = ?
+                WHERE id = ? OR public_id = ?
+                """,
+                (clean_status, metadata_json, now, clean_id, clean_id),
+            )
+            refreshed = conn.execute(
+                "SELECT * FROM failures WHERE id = ? OR public_id = ?",
+                (clean_id, clean_id),
+            ).fetchone()
+        return self._failure_from_row(refreshed) if refreshed is not None else None
 
     def _failure_from_row(self, row: sqlite3.Row) -> FailureRow:
         return FailureRow(
@@ -4073,6 +4118,67 @@ class Storage:
             evidence_ids=[str(item["evidence_id"]) for item in evidence_rows],
         )
 
+    def update_repair_task_status(
+        self,
+        *,
+        repair_task_id: str,
+        status: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[RepairTaskRow]:
+        clean_id = repair_task_id.strip()
+        clean_status = normalize_repair_task_status(status)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT metadata_json
+                FROM repair_tasks
+                WHERE id = ? OR public_id = ?
+                """,
+                (clean_id, clean_id),
+            ).fetchone()
+            if row is None:
+                return None
+            merged_metadata = dict(self._safe_json_obj(row["metadata_json"]))
+            if metadata:
+                merged_metadata.update(metadata)
+            try:
+                metadata_json = json.dumps(merged_metadata, sort_keys=True)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("repair task metadata must be JSON-serializable") from exc
+            conn.execute(
+                """
+                UPDATE repair_tasks
+                SET status = ?,
+                    metadata_json = ?,
+                    updated_at = ?
+                WHERE id = ? OR public_id = ?
+                """,
+                (clean_status, metadata_json, now, clean_id, clean_id),
+            )
+            refreshed = conn.execute(
+                "SELECT * FROM repair_tasks WHERE id = ? OR public_id = ?",
+                (clean_id, clean_id),
+            ).fetchone()
+            evidence_rows = conn.execute(
+                """
+                SELECT evidence_id
+                FROM repair_task_evidence
+                WHERE repair_task_id = ?
+                ORDER BY created_at, evidence_id
+                """,
+                (str(refreshed["id"]) if refreshed is not None else clean_id,),
+            ).fetchall()
+        return (
+            self._repair_task_from_row(
+                refreshed,
+                evidence_ids=[str(item["evidence_id"]) for item in evidence_rows],
+            )
+            if refreshed is not None
+            else None
+        )
+
     def list_repair_tasks(
         self,
         *,
@@ -4386,6 +4492,34 @@ class Storage:
                 LIMIT ?
                 """,
                 params,
+            ).fetchall()
+        return [self._failure_test_link_from_row(row) for row in rows]
+
+    def list_all_failure_test_links(
+        self,
+        *,
+        failure_id: Optional[str] = None,
+        issue_public_id: Optional[str] = None,
+        spec_id: Optional[str] = None,
+    ) -> list[FailureTestLinkRow]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM failure_test_links
+                WHERE (? IS NULL OR failure_id = ?)
+                  AND (? IS NULL OR issue_public_id = ?)
+                  AND (? IS NULL OR spec_id = ?)
+                ORDER BY updated_at DESC, created_at DESC, id
+                """,
+                (
+                    failure_id,
+                    failure_id,
+                    issue_public_id,
+                    issue_public_id,
+                    spec_id,
+                    spec_id,
+                ),
             ).fetchall()
         return [self._failure_test_link_from_row(row) for row in rows]
 

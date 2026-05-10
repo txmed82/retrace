@@ -106,6 +106,11 @@ def test_pr_review_links_prior_failure_and_recommends_existing_spec(tmp_path: Pa
         spec_path="api-tests/specs/api_checkout.json",
         source="api_run",
     )
+    repair_task_id = store.upsert_repair_task(
+        failure_id=failure_id,
+        title="Repair checkout API",
+        status="ready_for_validation",
+    )
     diff = """diff --git a/src/app/api/checkout/route.ts b/src/app/api/checkout/route.ts
 --- a/src/app/api/checkout/route.ts
 +++ b/src/app/api/checkout/route.ts
@@ -128,6 +133,8 @@ def test_pr_review_links_prior_failure_and_recommends_existing_spec(tmp_path: Pa
     ]
     assert analysis.existing_tests[0].spec_id == "api checkout"
     assert analysis.existing_tests[0].command == "retrace tester api-run 'api checkout'"
+    assert analysis.prior_failures[0].repair_task_id == repair_task_id
+    assert analysis.prior_failures[0].repair_task_status == "ready_for_validation"
     assert analysis.missing_tests == []
 
 
@@ -199,6 +206,50 @@ def test_pr_review_builds_summary_and_inline_missing_test_comment() -> None:
         plan.inline_comments[0].body
     )
     assert "<!-- retrace-pr-review-inline:" in plan.inline_comments[0].body
+
+
+def test_pr_review_comments_include_repair_verification_command(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    workspace = store.ensure_workspace(
+        org_name="Acme",
+        project_name="Web",
+        environment_name="production",
+    )
+    failure_id = store.upsert_failure(
+        _failure(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+        )
+    )
+    repair_task_id = store.upsert_repair_task(
+        failure_id=failure_id,
+        title="Repair checkout API",
+        status="ready_for_validation",
+    )
+    diff = """diff --git a/src/app/api/checkout/route.ts b/src/app/api/checkout/route.ts
+--- a/src/app/api/checkout/route.ts
++++ b/src/app/api/checkout/route.ts
+@@ -1,3 +1,5 @@
++export async function POST() {
++  return Response.json({ ok: true })
++}
+"""
+
+    analysis = analyze_pr_diff(
+        diff_text=diff,
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+    plan = build_pr_review_comment_plan(analysis)
+
+    assert f"repair `{repair_task_id}` ready_for_validation" in plan.summary_body
+    assert (
+        f"retrace repair verify --repair-task-id {repair_task_id}"
+        in plan.inline_comments[-1].body
+    )
 
 
 def test_publish_pr_review_comments_is_idempotent() -> None:
