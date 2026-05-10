@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from retrace import api_testing
 from retrace.api_testing import (
     api_runs_dir_for_data_dir,
     api_specs_dir_for_data_dir,
@@ -14,6 +15,7 @@ from retrace.api_testing import (
     persist_api_failure,
     run_api_spec,
 )
+from retrace.repair import build_repair_bundle
 from retrace.storage import Storage
 from retrace.test_profiles import apply_api_profiles
 
@@ -27,6 +29,10 @@ class _APIHandler(BaseHTTPRequestHandler):
             )
             self.send_response(500)
             self.send_header("Content-Type", "application/json")
+            self.send_header(
+                "traceparent",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -410,6 +416,15 @@ def test_api_headers_env_reports_invalid_json_cleanly(
     )
 
 
+def test_api_traceparent_rejects_malformed_extra_segments() -> None:
+    assert (
+        api_testing._trace_id_from_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra"
+        )
+        == ""
+    )
+
+
 def test_api_env_profile_applies_base_url_to_sequence_steps(tmp_path: Path) -> None:
     server, base_url, thread = _server_url()
     try:
@@ -469,6 +484,11 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
             method="GET",
             url=f"{base_url}/api/checkout/42",
             expected_status=200,
+            fixtures={
+                "api_regression": {
+                    "trace_ids": ["4BF92F3577B34DA6A3CE929D0E0E4736"]
+                }
+            },
         )
         run = run_api_spec(
             spec=spec,
@@ -481,6 +501,14 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
 
     assert run.ok is False
     assert run.failure_classification == "server_error"
+    summary_artifact = next(
+        item for item in run.artifacts if item["artifact_type"] == "api_run_summary"
+    )
+    summary = json.loads(Path(summary_artifact["path"]).read_text())
+    assert summary["trace_ids"] == ["4bf92f3577b34da6a3ce929d0e0e4736"]
+    assert summary["requests"][0]["trace_ids"] == [
+        "4bf92f3577b34da6a3ce929d0e0e4736"
+    ]
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
     workspace = store.ensure_workspace(project_name="Default")
@@ -503,6 +531,7 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
     assert failure.source_type == "test_run"
     assert failure.source_external_id.startswith("api:")
     assert failure.linked_repair_task_id == persisted.repair_task_id
+    assert failure.metadata["trace_ids"] == ["4bf92f3577b34da6a3ce929d0e0e4736"]
     evidence = store.list_failure_evidence(failure_id=persisted.failure_id)
     assert {item.evidence_type for item in evidence} >= {
         "api_request",
@@ -523,3 +552,7 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
     assert "Actual status: `500`" in prompt
     assert "Failure classification: `server_error`" in prompt
     assert "dev@example.com" not in prompt
+    bundle = build_repair_bundle(store, persisted.failure_id)
+    assert bundle.backend_context["logs"]["trace_ids"] == [
+        "4bf92f3577b34da6a3ce929d0e0e4736"
+    ]

@@ -362,6 +362,7 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
                 "headers": _redact_headers(headers),
                 "body": _redact_json(request_body),
             }
+            request_trace_ids = _trace_ids_from_blob({"headers": headers})
             request_path = artifacts_dir / f"{step_id}-request.json"
             request_path.write_text(json.dumps(request_payload, indent=2) + "\n")
             artifacts.append(
@@ -409,6 +410,9 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
                 "headers": _redact_headers(dict(response.headers)),
                 "body": _redact_json(response_json if response_json is not None else response_body),
             }
+            trace_ids = _unique_strings(
+                [*request_trace_ids, *_trace_ids_from_blob({"headers": dict(response.headers)})]
+            )
             executed_requests.append(
                 {
                     "step_id": step_id,
@@ -417,6 +421,7 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
                     "route_path": _url_path(url),
                     "status_code": status_code,
                     "elapsed_ms": elapsed_ms,
+                    "trace_ids": trace_ids,
                 }
             )
             response_path = artifacts_dir / f"{step_id}-response.json"
@@ -593,7 +598,16 @@ def _api_run_summary(
             "requests": executed_requests,
             "assertion_count": len(assertion_results),
             "failed_assertions": failed_assertions,
-            "trace_ids": api_regression.get("trace_ids", []),
+            "trace_ids": _unique_strings(
+                [
+                    *list(api_regression.get("trace_ids", []) or []),
+                    *[
+                        trace_id
+                        for request in executed_requests
+                        for trace_id in list(request.get("trace_ids", []) or [])
+                    ],
+                ]
+            ),
             "source_issue_public_id": spec.fixtures.get("issue_public_id", ""),
         }
     )
@@ -892,6 +906,55 @@ def _artifact_by_type(result: APITestRunResult, artifact_type: str) -> Any:
 def _url_path(url: str) -> str:
     parsed = urlparse(url)
     return parsed.path or url
+
+
+def _trace_ids_from_blob(value: Any) -> list[str]:
+    out: list[str] = []
+    _collect_trace_ids(value, out)
+    return out[:10]
+
+
+def _collect_trace_ids(value: Any, out: list[str]) -> None:
+    if len(out) >= 10:
+        return
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            key_s = str(key).casefold()
+            if key_s in {"trace_id", "traceid", "requesttraceid", "responsetraceid"}:
+                _append_trace_id(str(nested or ""), out)
+            elif key_s in {"traceparent", "requesttraceparent", "responsetraceparent"}:
+                _append_trace_id(_trace_id_from_traceparent(str(nested or "")), out)
+            _collect_trace_ids(nested, out)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_trace_ids(item, out)
+
+
+def _append_trace_id(value: str, out: list[str]) -> None:
+    trace_id = value.strip().lower()
+    if trace_id and trace_id not in out:
+        out.append(trace_id)
+
+
+def _trace_id_from_traceparent(value: str) -> str:
+    parts = value.strip().split("-")
+    if len(parts) != 4:
+        return ""
+    trace_id = parts[1].lower()
+    if len(trace_id) != 32 or any(c not in "0123456789abcdef" for c in trace_id):
+        return ""
+    return trace_id
+
+
+def _unique_strings(values: list[Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value or "").strip().lower()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 
 def _request_steps(spec: APITestSpec) -> list[dict[str, Any]]:
