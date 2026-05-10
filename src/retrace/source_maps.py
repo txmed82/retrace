@@ -24,6 +24,34 @@ class SourceMapMatch:
         return ":".join(str(part) for part in (self.source, label, self.line) if part)
 
 
+@dataclass(frozen=True)
+class SourceMapDiagnostic:
+    status: str
+    reason: str
+    release: str
+    dist: str = ""
+    generated_file: str = ""
+    line: int = 0
+    column: int = 0
+    candidate_artifacts: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in {
+                "status": self.status,
+                "reason": self.reason,
+                "release": self.release,
+                "dist": self.dist,
+                "generated_file": self.generated_file,
+                "line": self.line,
+                "column": self.column,
+                "candidate_artifacts": list(self.candidate_artifacts),
+            }.items()
+            if value not in ("", 0, [])
+        }
+
+
 def upload_source_map(
     *,
     store: Storage,
@@ -88,6 +116,97 @@ def map_stack_frame(
                 name=name,
             )
     return None
+
+
+def diagnose_stack_frame_mapping(
+    *,
+    store: Storage,
+    project_id: str,
+    environment_id: str,
+    release: str,
+    generated_file: str,
+    line: int,
+    column: int = 0,
+    dist: str = "",
+) -> SourceMapDiagnostic:
+    clean_release = release.strip()
+    clean_generated = generated_file.strip()
+    if not clean_release:
+        return SourceMapDiagnostic(
+            status="skipped",
+            reason="missing_release",
+            release=clean_release,
+            dist=dist.strip(),
+            generated_file=clean_generated,
+            line=line,
+            column=max(0, column),
+        )
+    if not clean_generated or line <= 0:
+        return SourceMapDiagnostic(
+            status="skipped",
+            reason="invalid_stack_frame",
+            release=clean_release,
+            dist=dist.strip(),
+            generated_file=clean_generated,
+            line=line,
+            column=max(0, column),
+        )
+    rows = store.list_source_maps(
+        project_id=project_id,
+        environment_id=environment_id,
+        release=clean_release,
+        dist=dist,
+    )
+    candidate_artifacts = tuple(row.artifact_url for row in rows)
+    if not rows:
+        return SourceMapDiagnostic(
+            status="unmapped",
+            reason="no_source_maps_for_release_dist",
+            release=clean_release,
+            dist=dist.strip(),
+            generated_file=clean_generated,
+            line=line,
+            column=max(0, column),
+        )
+    generated_path = _normalize_artifact(clean_generated)
+    matched_rows = [
+        row
+        for row in rows
+        if _artifact_matches(generated_path, row.artifact_url, row.source_map)
+    ]
+    if not matched_rows:
+        return SourceMapDiagnostic(
+            status="unmapped",
+            reason="no_matching_artifact",
+            release=clean_release,
+            dist=dist.strip(),
+            generated_file=clean_generated,
+            line=line,
+            column=max(0, column),
+            candidate_artifacts=candidate_artifacts,
+        )
+    for row in matched_rows:
+        if _lookup_mapping(row.source_map, line=line, column=max(0, column)) is not None:
+            return SourceMapDiagnostic(
+                status="mapped",
+                reason="mapped",
+                release=clean_release,
+                dist=dist.strip(),
+                generated_file=clean_generated,
+                line=line,
+                column=max(0, column),
+                candidate_artifacts=tuple(item.artifact_url for item in matched_rows),
+            )
+    return SourceMapDiagnostic(
+        status="unmapped",
+        reason="no_mapping_for_position",
+        release=clean_release,
+        dist=dist.strip(),
+        generated_file=clean_generated,
+        line=line,
+        column=max(0, column),
+        candidate_artifacts=tuple(item.artifact_url for item in matched_rows),
+    )
 
 
 def _lookup_mapping(

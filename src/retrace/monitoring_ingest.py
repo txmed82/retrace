@@ -11,7 +11,7 @@ from retrace.deploys import correlate_failure_to_deploy
 from retrace.evidence import EvidenceItem, evidence_dedupe_key
 from retrace.failures import canonical_failure_from_monitor_incident
 from retrace.incidents import group_failure_into_incident
-from retrace.source_maps import map_stack_frame
+from retrace.source_maps import diagnose_stack_frame_mapping, map_stack_frame
 from retrace.storage import Storage
 
 
@@ -504,7 +504,24 @@ def _apply_source_maps(
             column=colno,
         )
         if match is None:
-            mapped_frames.append(frame)
+            diagnostic = diagnose_stack_frame_mapping(
+                store=store,
+                project_id=project_id,
+                environment_id=environment_id,
+                release=release,
+                dist=dist,
+                generated_file=filename,
+                line=lineno,
+                column=colno,
+            )
+            mapped_frames.append(
+                {
+                    **frame,
+                    "source_map_status": diagnostic.status,
+                    "source_map_reason": diagnostic.reason,
+                    "source_map_diagnostic": diagnostic.to_dict(),
+                }
+            )
             continue
         mapped_frames.append(
             {

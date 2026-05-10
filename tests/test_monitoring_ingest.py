@@ -257,6 +257,67 @@ def test_sentry_source_map_lookup_does_not_cross_dist(tmp_path: Path) -> None:
     assert failure is not None
     assert failure.metadata["top_stack_frame"].endswith("/assets/app.min.js:n:1")
     assert "source_mapped" not in failure.metadata["stack_frames"][0]
+    frame = failure.metadata["stack_frames"][0]
+    assert frame["source_map_status"] == "unmapped"
+    assert frame["source_map_reason"] == "no_source_maps_for_release_dist"
+    assert frame["source_map_diagnostic"]["release"] == "abc123"
+
+
+def test_sentry_source_map_miss_records_artifact_diagnostics(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    upload_source_map(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        release="abc123",
+        artifact_url="https://cdn.example.com/assets/other.min.js",
+        source_map={**_source_map(), "file": "other.min.js"},
+    )
+
+    result = ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={
+            "event": {
+                "event_id": "evt-sourcemap-miss-1",
+                "title": "TypeError: failed checkout",
+                "release": "abc123",
+                "exception": {
+                    "values": [
+                        {
+                            "type": "TypeError",
+                            "value": "Cannot read cart total",
+                            "stacktrace": {
+                                "frames": [
+                                    {
+                                        "filename": "https://cdn.example.com/assets/app.min.js",
+                                        "function": "n",
+                                        "lineno": 1,
+                                        "colno": 143,
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                },
+            }
+        },
+    )
+
+    failure = store.get_failure_by_id(result.failure_id)
+    evidence = store.list_failure_evidence(failure_id=result.failure_id)
+    assert failure is not None
+    frame = failure.metadata["stack_frames"][0]
+    assert frame["source_map_status"] == "unmapped"
+    assert frame["source_map_reason"] == "no_matching_artifact"
+    assert frame["source_map_diagnostic"]["candidate_artifacts"] == [
+        "https://cdn.example.com/assets/other.min.js"
+    ]
+    assert evidence[0].payload["stack_frames"][0]["source_map_reason"] == (
+        "no_matching_artifact"
+    )
 
 
 def test_source_map_api_endpoint_accepts_upload(tmp_path: Path) -> None:
