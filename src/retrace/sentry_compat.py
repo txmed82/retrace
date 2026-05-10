@@ -37,6 +37,15 @@ class SentryCompatIngestResponse:
         }
 
 
+def build_sentry_dsn(*, public_key: str, base_url: str, project_id: str) -> str:
+    parsed = urlparse(base_url.strip().rstrip("/") or "http://127.0.0.1:8788")
+    scheme = parsed.scheme or "http"
+    host = parsed.netloc or parsed.path
+    prefix = parsed.path.strip("/") if parsed.netloc else ""
+    path = "/".join(part for part in (prefix, project_id.strip("/")) if part)
+    return f"{scheme}://{public_key}@{host}/{path}"
+
+
 def ingest_sentry_compat_request(
     *,
     store: Storage,

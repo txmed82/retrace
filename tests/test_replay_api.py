@@ -450,6 +450,9 @@ run:
     payload = json.loads(result.output)
     assert payload["key"].startswith("rtpk_")
     assert payload["project_id"].startswith("proj_")
+    assert payload["sentry_dsn"] == (
+        f"http://{payload['key']}@127.0.0.1:8788/{payload['project_id']}"
+    )
 
 
 def test_api_rejects_oversized_content_length_before_reading(tmp_path: Path) -> None:

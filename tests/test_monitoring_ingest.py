@@ -323,6 +323,38 @@ def test_sentry_store_endpoint_ingests_sdk_event_with_query_key(tmp_path: Path) 
     assert failure.metadata["trace_ids"] == ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
 
 
+def test_standard_sentry_store_endpoint_ingests_sdk_event(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Browser",
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/{workspace.project_id}/store/?sentry_key={sdk.key}",
+            body=json.dumps(
+                {
+                    "event_id": "evt-standard-store-1",
+                    "title": "TypeError in search",
+                    "level": "error",
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 202
+    assert payload["results"][0]["external_id"] == "evt-standard-store-1"
+
+
 def test_sentry_store_endpoint_dispatches_app_error_notification(
     tmp_path: Path,
 ) -> None:
