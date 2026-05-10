@@ -495,6 +495,109 @@ run:
     )
 
 
+def test_api_onboard_hosted_outputs_manifest(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        f"""
+posthog:
+  host: https://us.i.posthog.com
+  project_id: "1"
+llm:
+  provider: openai_compatible
+  base_url: http://localhost:8080/v1
+  model: test
+run:
+  data_dir: {tmp_path / "data"}
+  output_dir: {tmp_path / "reports"}
+"""
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "api",
+            "onboard-hosted",
+            "--config",
+            str(cfg),
+            "--project",
+            "Web",
+            "--api-base-url",
+            "https://retrace.example.com",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    onboarding = payload["onboarding"]
+    credentials = onboarding["credentials"]
+    assert onboarding["workspace"]["api_base_url"] == "https://retrace.example.com"
+    assert credentials["browser_sdk_key"].startswith("rtpk_")
+    assert credentials["service_token"].startswith("rtst_")
+    assert "source_maps:write" in credentials["service_token_scopes"]
+    assert credentials["sentry_dsn"].startswith(
+        f"https://{credentials['browser_sdk_key']}@retrace.example.com/"
+    )
+    assert "/api/sdk/replay" in onboarding["endpoints"]["replay_ingest"]
+    assert "@retrace/browser" in onboarding["snippets"]["browser_sdk_install"]
+    assert "retention" in onboarding["snippets"]["retention_cron"]
+
+
+def test_hosted_onboarding_endpoint_requires_admin_and_creates_manifest(
+    tmp_path: Path,
+) -> None:
+    store, _key, workspace = _store(tmp_path)
+    weak = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Read only",
+        scopes=["app_errors:read"],
+    )
+    admin = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Admin",
+        scopes=["admin"],
+    )
+
+    with _running_replay_api_server(store) as server:
+        port = server.server_address[1]
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        body = json.dumps({"api_base_url": "https://retrace.example.com"}).encode()
+        conn.request(
+            "POST",
+            f"/api/onboarding/hosted?environment_id={workspace.environment_id}",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {weak.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        weak_response = conn.getresponse()
+        weak_payload = json.loads(weak_response.read().decode("utf-8"))
+        conn.request(
+            "POST",
+            f"/api/onboarding/hosted?environment_id={workspace.environment_id}",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {admin.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        admin_response = conn.getresponse()
+        admin_payload = json.loads(admin_response.read().decode("utf-8"))
+        conn.close()
+
+    assert weak_response.status == 403
+    assert weak_payload["error"] == "forbidden"
+    assert admin_response.status == 201
+    onboarding = admin_payload["onboarding"]
+    assert onboarding["credentials"]["browser_sdk_key"].startswith("rtpk_")
+    assert onboarding["credentials"]["service_token"].startswith("rtst_")
+    assert onboarding["endpoints"]["app_errors"].endswith(
+        f"/api/app-errors?environment_id={workspace.environment_id}"
+    )
+
+
 def test_api_rejects_oversized_content_length_before_reading(tmp_path: Path) -> None:
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
