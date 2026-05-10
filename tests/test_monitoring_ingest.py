@@ -334,6 +334,14 @@ def test_sentry_store_endpoint_dispatches_app_error_notification(
         name="Browser",
     )
     sink = _CaptureSink()
+    body = json.dumps(
+        {
+            "event_id": "evt-notify-1",
+            "title": "TypeError in billing",
+            "level": "fatal",
+            "contexts": {"trace": {"trace_id": "dddddddddddddddddddddddddddddddd"}},
+        }
+    ).encode("utf-8")
 
     with _server(store, notification_sinks=[sink]) as server:
         host, port = server.server_address
@@ -341,24 +349,28 @@ def test_sentry_store_endpoint_dispatches_app_error_notification(
         conn.request(
             "POST",
             f"/api/sentry/{workspace.project_id}/store/?sentry_key={sdk.key}",
-            body=json.dumps(
-                {
-                    "event_id": "evt-notify-1",
-                    "title": "TypeError in billing",
-                    "level": "fatal",
-                    "contexts": {
-                        "trace": {"trace_id": "dddddddddddddddddddddddddddddddd"}
-                    },
-                }
-            ).encode("utf-8"),
+            body=body,
             headers={"Content-Type": "application/json"},
         )
         response = conn.getresponse()
         payload = json.loads(response.read().decode("utf-8"))
         conn.close()
 
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/sentry/{workspace.project_id}/store/?sentry_key={sdk.key}",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        duplicate_response = conn.getresponse()
+        duplicate_payload = json.loads(duplicate_response.read().decode("utf-8"))
+        conn.close()
+
     assert response.status == 202
     assert payload["results"][0]["created"] is True
+    assert duplicate_response.status == 202
+    assert duplicate_payload["results"][0]["created"] is False
     assert len(sink.payloads) == 1
     notification = sink.payloads[0]
     assert notification.event == "app_error.created"
@@ -377,6 +389,16 @@ def test_monitoring_webhook_dispatches_app_error_notification(tmp_path: Path) ->
         scopes=["monitoring:write"],
     )
     sink = _CaptureSink()
+    body = json.dumps(
+        {
+            "event": {
+                "event_id": "evt-monitoring-notify-1",
+                "title": "TypeError in checkout",
+                "level": "fatal",
+                "contexts": {"trace": {"trace_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},
+            }
+        }
+    ).encode("utf-8")
 
     with _server(store, notification_sinks=[sink]) as server:
         host, port = server.server_address
@@ -384,18 +406,7 @@ def test_monitoring_webhook_dispatches_app_error_notification(tmp_path: Path) ->
         conn.request(
             "POST",
             f"/api/monitoring/webhook/sentry?environment_id={workspace.environment_id}",
-            body=json.dumps(
-                {
-                    "event": {
-                        "event_id": "evt-monitoring-notify-1",
-                        "title": "TypeError in checkout",
-                        "level": "fatal",
-                        "contexts": {
-                            "trace": {"trace_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
-                        },
-                    }
-                }
-            ).encode("utf-8"),
+            body=body,
             headers={
                 "Authorization": f"Bearer {service.token}",
                 "Content-Type": "application/json",
@@ -405,8 +416,24 @@ def test_monitoring_webhook_dispatches_app_error_notification(tmp_path: Path) ->
         payload = json.loads(response.read().decode("utf-8"))
         conn.close()
 
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/monitoring/webhook/sentry?environment_id={workspace.environment_id}",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        duplicate_response = conn.getresponse()
+        duplicate_payload = json.loads(duplicate_response.read().decode("utf-8"))
+        conn.close()
+
     assert response.status == 202
     assert payload["created"] is True
+    assert duplicate_response.status == 202
+    assert duplicate_payload["created"] is False
     assert len(sink.payloads) == 1
     notification = sink.payloads[0]
     assert notification.event == "app_error.created"
@@ -458,6 +485,13 @@ def test_app_error_notification_failure_does_not_fail_ingest(tmp_path: Path) -> 
     assert response.status == 202
     assert payload["created"] is True
     assert payload["external_id"] == "evt-notify-boom-1"
+    failure = store.find_failure_by_source(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        source_type="monitor_incident",
+        source_external_id="sentry:evt-notify-boom-1",
+    )
+    assert failure is not None
 
 
 def test_sentry_envelope_endpoint_accepts_x_sentry_auth(tmp_path: Path) -> None:
