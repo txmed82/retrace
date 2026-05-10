@@ -1363,7 +1363,7 @@ def test_app_error_prune_endpoint_deletes_old_resolved_monitoring_data(
             }
         },
     )
-    upload_source_map(
+    source_map_row = upload_source_map(
         store=store,
         project_id=workspace.project_id,
         environment_id=workspace.environment_id,
@@ -1381,10 +1381,27 @@ def test_app_error_prune_endpoint_deletes_old_resolved_monitoring_data(
     )
     old_created_at = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
     with sqlite3.connect(store.path) as conn:
+        rate_limit_row_id = conn.execute(
+            """
+            SELECT id
+            FROM ingest_rate_limits
+            WHERE project_id = ? AND environment_id = ? AND bucket = ?
+            """,
+            (workspace.project_id, workspace.environment_id, "sentry"),
+        ).fetchone()[0]
         conn.execute("UPDATE failures SET status = 'resolved' WHERE id = ?", (result.failure_id,))
-        conn.execute("UPDATE failure_evidence SET created_at = ?", (old_created_at,))
-        conn.execute("UPDATE source_maps SET uploaded_at = ?", (old_created_at,))
-        conn.execute("UPDATE ingest_rate_limits SET updated_at = ?", (old_created_at,))
+        conn.execute(
+            "UPDATE failure_evidence SET created_at = ? WHERE failure_id = ?",
+            (old_created_at, result.failure_id),
+        )
+        conn.execute(
+            "UPDATE source_maps SET uploaded_at = ? WHERE id = ?",
+            (old_created_at, source_map_row.id),
+        )
+        conn.execute(
+            "UPDATE ingest_rate_limits SET updated_at = ? WHERE id = ?",
+            (old_created_at, rate_limit_row_id),
+        )
 
     with _server(store) as server:
         host, port = server.server_address

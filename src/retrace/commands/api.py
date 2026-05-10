@@ -426,6 +426,28 @@ def _retention_result_api_dict(result: Any) -> dict[str, Any]:
     }
 
 
+def _optional_int(payload: dict[str, Any], key: str, default: int) -> int:
+    value = payload.get(key, None)
+    if value is None:
+        return default
+    return int(value)
+
+
+def _optional_bool(payload: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = payload.get(key, None)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ValueError(f"{key} must be a boolean")
+
+
 def _app_error_notification_payload(
     *,
     store: Storage,
@@ -1589,18 +1611,33 @@ def _handler(
                 result = store.prune_app_error_retention(
                     project_id=token.project_id,
                     environment_id=environment_id,
-                    failure_retention_days=int(payload.get("failure_retention_days") or 90),
-                    evidence_retention_days=int(payload.get("evidence_retention_days") or 90),
-                    source_map_retention_days=int(
-                        payload.get("source_map_retention_days") or 30
+                    failure_retention_days=_optional_int(
+                        payload, "failure_retention_days", 90
                     ),
-                    rate_limit_retention_hours=int(
-                        payload.get("rate_limit_retention_hours") or 48
+                    evidence_retention_days=_optional_int(
+                        payload, "evidence_retention_days", 90
                     ),
-                    dry_run=bool(payload.get("dry_run")),
+                    source_map_retention_days=_optional_int(
+                        payload, "source_map_retention_days", 30
+                    ),
+                    rate_limit_retention_hours=_optional_int(
+                        payload, "rate_limit_retention_hours", 48
+                    ),
+                    dry_run=_optional_bool(payload, "dry_run"),
                 )
             except (TypeError, ValueError) as exc:
                 _json_response(self, 400, {"error": "invalid_retention", "message": str(exc)})
+                return
+            except Exception:
+                logger.exception("Unhandled app-error retention prune error")
+                _json_response(
+                    self,
+                    500,
+                    {
+                        "error": "internal_error",
+                        "message": "An internal server error occurred.",
+                    },
+                )
                 return
             _json_response(self, 202, {"retention": _retention_result_api_dict(result)})
 

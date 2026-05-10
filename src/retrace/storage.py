@@ -3144,15 +3144,22 @@ class Storage:
                 (clean_project, clean_environment, failure_cutoff_ms),
             ).fetchall()
             failure_ids = [str(row["id"]) for row in failure_rows]
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS tmp_prune_failures (id TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM tmp_prune_failures")
+            if failure_ids:
+                conn.executemany(
+                    "INSERT INTO tmp_prune_failures (id) VALUES (?)",
+                    [(failure_id,) for failure_id in failure_ids],
+                )
             evidence_count = int(
                 conn.execute(
                     """
                     SELECT COUNT(*) AS count
                     FROM failure_evidence ev
                     JOIN failures f ON f.id = ev.failure_id
+                    JOIN tmp_prune_failures pf ON pf.id = f.id
                     WHERE f.project_id = ?
                       AND f.environment_id = ?
-                      AND f.source_type = 'monitor_incident'
                       AND ev.created_at < ?
                     """,
                     (clean_project, clean_environment, evidence_cutoff),
@@ -3180,22 +3187,22 @@ class Storage:
             )
             incident_link_count = 0
             if failure_ids:
-                placeholders = ",".join("?" for _ in failure_ids)
                 incident_link_count = int(
                     conn.execute(
-                        f"""
+                        """
                         SELECT COUNT(*) AS count
                         FROM incident_failures
-                        WHERE failure_id IN ({placeholders})
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
                         """,
-                        failure_ids,
                     ).fetchone()["count"]
                 )
             stale_incidents = conn.execute(
                 """
                 SELECT i.id
                 FROM incidents i
-                LEFT JOIN incident_failures inf ON inf.incident_id = i.id
+                LEFT JOIN incident_failures inf
+                  ON inf.incident_id = i.id
+                 AND inf.failure_id NOT IN (SELECT id FROM tmp_prune_failures)
                 WHERE i.project_id = ?
                   AND i.environment_id = ?
                   AND inf.incident_id IS NULL
@@ -3211,9 +3218,9 @@ class Storage:
                         SELECT ev.id
                         FROM failure_evidence ev
                         JOIN failures f ON f.id = ev.failure_id
+                        JOIN tmp_prune_failures pf ON pf.id = f.id
                         WHERE f.project_id = ?
                           AND f.environment_id = ?
-                          AND f.source_type = 'monitor_incident'
                           AND ev.created_at < ?
                     )
                     """,
@@ -3226,9 +3233,9 @@ class Storage:
                         SELECT ev.id
                         FROM failure_evidence ev
                         JOIN failures f ON f.id = ev.failure_id
+                        JOIN tmp_prune_failures pf ON pf.id = f.id
                         WHERE f.project_id = ?
                           AND f.environment_id = ?
-                          AND f.source_type = 'monitor_incident'
                           AND ev.created_at < ?
                     )
                     """,
@@ -3248,23 +3255,37 @@ class Storage:
                     """,
                     (clean_project, clean_environment, rate_limit_cutoff),
                 )
+                affected_incident_ids = [
+                    str(row["incident_id"])
+                    for row in conn.execute(
+                        """
+                        SELECT DISTINCT incident_id
+                        FROM incident_failures
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
+                    ).fetchall()
+                ]
                 if failure_ids:
-                    placeholders = ",".join("?" for _ in failure_ids)
                     conn.execute(
-                        f"DELETE FROM incident_failures WHERE failure_id IN ({placeholders})",
-                        failure_ids,
+                        """
+                        DELETE FROM incident_failures
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
                     )
                     conn.execute(
-                        f"DELETE FROM failure_trace_map WHERE failure_id IN ({placeholders})",
-                        failure_ids,
+                        """
+                        DELETE FROM failure_trace_map
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
                     )
                     conn.execute(
-                        f"DELETE FROM failure_test_links WHERE failure_id IN ({placeholders})",
-                        failure_ids,
+                        """
+                        DELETE FROM failure_test_links
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
                     )
                     conn.execute(
-                        f"DELETE FROM failures WHERE id IN ({placeholders})",
-                        failure_ids,
+                        "DELETE FROM failures WHERE id IN (SELECT id FROM tmp_prune_failures)"
                     )
                 stale_incidents = conn.execute(
                     """
@@ -3278,13 +3299,24 @@ class Storage:
                     (clean_project, clean_environment),
                 ).fetchall()
                 incident_count = len(stale_incidents)
+                deleted_incident_ids: set[str] = set()
                 if stale_incidents:
                     incident_ids = [str(row["id"]) for row in stale_incidents]
-                    placeholders = ",".join("?" for _ in incident_ids)
+                    deleted_incident_ids = set(incident_ids)
                     conn.execute(
-                        f"DELETE FROM incidents WHERE id IN ({placeholders})",
-                        incident_ids,
+                        "CREATE TEMP TABLE IF NOT EXISTS tmp_prune_incidents (id TEXT PRIMARY KEY)"
                     )
+                    conn.execute("DELETE FROM tmp_prune_incidents")
+                    conn.executemany(
+                        "INSERT INTO tmp_prune_incidents (id) VALUES (?)",
+                        [(incident_id,) for incident_id in incident_ids],
+                    )
+                    conn.execute(
+                        "DELETE FROM incidents WHERE id IN (SELECT id FROM tmp_prune_incidents)"
+                    )
+                for incident_id in affected_incident_ids:
+                    if incident_id not in deleted_incident_ids:
+                        self._refresh_incident_rollup(conn, incident_id=incident_id)
         return AppErrorRetentionPruneResult(
             dry_run=bool(dry_run),
             failure_retention_days=clean_failure_days,
