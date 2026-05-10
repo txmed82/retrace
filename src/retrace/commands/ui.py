@@ -916,6 +916,98 @@ def _issue_workflow_payload(issue: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _issue_evidence_stitching_payload(issue: dict[str, Any]) -> dict[str, Any]:
+    timeline = issue.get("timeline") if isinstance(issue.get("timeline"), list) else []
+    api_calls = issue.get("api_calls") if isinstance(issue.get("api_calls"), list) else []
+    test_links = issue.get("test_links") if isinstance(issue.get("test_links"), list) else []
+    repair_task = issue.get("repair_task") if isinstance(issue.get("repair_task"), dict) else None
+    api_links = [
+        link
+        for link in test_links
+        if "api" in str(link.get("source") or "").lower()
+        or "/api-tests/" in str(link.get("spec_path") or "")
+    ]
+    trace_ids: set[str] = set()
+    source_map_states: list[dict[str, Any]] = []
+    for call in api_calls:
+        trace = call.get("trace") if isinstance(call, dict) else {}
+        if isinstance(trace, dict):
+            for value in trace.values():
+                if isinstance(value, str) and value.strip():
+                    trace_ids.add(value.strip())
+                elif isinstance(value, list):
+                    trace_ids.update(str(item).strip() for item in value if str(item).strip())
+    for event in timeline:
+        payload = event.get("payload") if isinstance(event, dict) else {}
+        if not isinstance(payload, dict):
+            continue
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        for key in ("trace_id", "trace_ids"):
+            value = payload.get(key, metadata.get(key))
+            if isinstance(value, str) and value.strip():
+                trace_ids.add(value.strip())
+            elif isinstance(value, list):
+                trace_ids.update(str(item).strip() for item in value if str(item).strip())
+        evidence_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        frames = evidence_payload.get("stack_frames") if isinstance(evidence_payload, dict) else []
+        if not isinstance(frames, list):
+            frames = []
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            source_map_states.append(
+                {
+                    "filename": str(frame.get("filename") or frame.get("source") or ""),
+                    "source_mapped": bool(frame.get("source_mapped")),
+                    "reason": str(frame.get("source_map_reason") or ""),
+                    "status": str(frame.get("source_map_status") or ""),
+                }
+            )
+    stages = [
+        {
+            "id": "frontend_replay",
+            "label": "Frontend replay",
+            "status": "complete" if timeline else "missing",
+            "detail": f"{len(timeline)} timeline event(s), {len(issue.get('sessions') or [])} replay(s)",
+        },
+        {
+            "id": "network_api",
+            "label": "Network/API evidence",
+            "status": "complete" if api_calls else "missing",
+            "detail": f"{len(api_calls)} failed API call(s), {len(api_links)} linked API regression(s)",
+        },
+        {
+            "id": "backend_trace",
+            "label": "Backend trace/log bridge",
+            "status": "complete" if trace_ids else "missing",
+            "detail": f"{len(trace_ids)} trace id(s)",
+        },
+        {
+            "id": "source_maps",
+            "label": "Source map context",
+            "status": "complete"
+            if any(item.get("source_mapped") for item in source_map_states)
+            else ("partial" if source_map_states else "missing"),
+            "detail": f"{len(source_map_states)} stack frame mapping result(s)",
+        },
+        {
+            "id": "repair_context",
+            "label": "Repair context",
+            "status": "complete" if repair_task else "missing",
+            "detail": str((repair_task or {}).get("public_id") or (repair_task or {}).get("id") or ""),
+        },
+    ]
+    return {
+        "status": "complete"
+        if all(stage["status"] == "complete" for stage in stages)
+        else "partial",
+        "stages": stages,
+        "trace_ids": sorted(trace_ids),
+        "api_regression_spec_ids": [str(link.get("spec_id") or "") for link in api_links],
+        "source_map_frames": source_map_states[:10],
+    }
+
+
 def _replay_issue_payload(
     row: Any, *, sessions: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -1098,6 +1190,7 @@ def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
                 repair_tasks[0] if repair_tasks else None
             )
         payload["workflow"] = _issue_workflow_payload(payload)
+        payload["evidence_stitching"] = _issue_evidence_stitching_payload(payload)
         issues.append(payload)
     sessions = []
     for row in store.list_recent_replay_sessions(limit=50):
@@ -3494,6 +3587,31 @@ const retrace = init({
       `;
     }
 
+    function renderEvidenceStitching(issue){
+      const stitching = issue.evidence_stitching || {};
+      const stages = stitching.stages || [];
+      const stageRows = stages.map(stage => `
+        <div class="workflow-step ${stage.status === 'complete' ? 'complete' : (stage.status === 'missing' ? 'blocked' : 'current')}">
+          <strong>${esc(stage.label)}</strong>
+          <span>${esc(stage.detail || '')}</span>
+        </div>
+      `).join('');
+      const traceRows = (stitching.trace_ids || []).map(id => `<code>${esc(id)}</code>`).join(' ');
+      const apiRows = (stitching.api_regression_spec_ids || []).filter(Boolean).map(id => `<code>${esc(id)}</code>`).join(' ');
+      const frameRows = (stitching.source_map_frames || []).map(frame => `
+        <li>
+          <code>${esc(frame.filename || 'frame')}</code> · ${frame.source_mapped ? '<span class="ok">mapped</span>' : '<span class="bad">unmapped</span>'}
+          ${frame.reason ? ` · <span class="empty">${esc(frame.reason)}</span>` : ''}
+        </li>
+      `).join('');
+      return `
+        <div class="workflow-strip">${stageRows}</div>
+        <div class="empty">Trace IDs: ${traceRows || 'none captured'}</div>
+        <div class="empty">API regression specs: ${apiRows || 'none linked'}</div>
+        ${frameRows ? `<ul>${frameRows}</ul>` : '<div class="empty">No source-map frame diagnostics in this issue timeline.</div>'}
+      `;
+    }
+
     function renderIssueReadiness(issue){
       const workflow = issue.workflow || {};
       const blockers = workflow.blockers || [];
@@ -3628,6 +3746,8 @@ const retrace = init({
             </div>
             <div style="height:12px"></div>
             <div class="card">${renderIssueTimeline(issue)}</div>
+            <div style="height:12px"></div>
+            <div class="card"><h3>Evidence Stitching</h3>${renderEvidenceStitching(issue)}</div>
             <div style="height:12px"></div>
             <div class="card">
               <h3>Repair Task</h3>
