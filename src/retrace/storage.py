@@ -846,6 +846,21 @@ class RateLimitDecision:
 
 
 @dataclass
+class AppErrorRetentionPruneResult:
+    dry_run: bool
+    failure_retention_days: int
+    evidence_retention_days: int
+    source_map_retention_days: int
+    rate_limit_retention_hours: int
+    failures: int
+    evidence: int
+    incident_links: int
+    incidents: int
+    source_maps: int
+    rate_limit_rows: int
+
+
+@dataclass
 class DeployMarkerRow:
     id: str
     public_id: str
@@ -3078,6 +3093,242 @@ class Storage:
             remaining=remaining,
             reset_after_seconds=reset_after_seconds,
             window_seconds=clean_window_seconds,
+        )
+
+    def prune_app_error_retention(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        failure_retention_days: int = 90,
+        evidence_retention_days: int = 90,
+        source_map_retention_days: int = 30,
+        rate_limit_retention_hours: int = 48,
+        dry_run: bool = False,
+        now: Optional[datetime] = None,
+    ) -> AppErrorRetentionPruneResult:
+        clean_project = project_id.strip()
+        clean_environment = environment_id.strip()
+        clean_failure_days = max(1, int(failure_retention_days))
+        clean_evidence_days = max(1, int(evidence_retention_days))
+        clean_source_map_days = max(1, int(source_map_retention_days))
+        clean_rate_limit_hours = max(1, int(rate_limit_retention_hours))
+        current = now or datetime.now(timezone.utc)
+        failure_cutoff_ms = int(
+            (current.timestamp() - (clean_failure_days * 24 * 60 * 60)) * 1000
+        )
+        evidence_cutoff = datetime.fromtimestamp(
+            current.timestamp() - (clean_evidence_days * 24 * 60 * 60),
+            tz=timezone.utc,
+        ).isoformat()
+        source_map_cutoff = datetime.fromtimestamp(
+            current.timestamp() - (clean_source_map_days * 24 * 60 * 60),
+            tz=timezone.utc,
+        ).isoformat()
+        rate_limit_cutoff = datetime.fromtimestamp(
+            current.timestamp() - (clean_rate_limit_hours * 60 * 60),
+            tz=timezone.utc,
+        ).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            failure_rows = conn.execute(
+                """
+                SELECT id
+                FROM failures
+                WHERE project_id = ?
+                  AND environment_id = ?
+                  AND source_type = 'monitor_incident'
+                  AND status IN ('resolved', 'ignored', 'verified')
+                  AND COALESCE(NULLIF(last_seen_ms, 0), first_seen_ms) < ?
+                """,
+                (clean_project, clean_environment, failure_cutoff_ms),
+            ).fetchall()
+            failure_ids = [str(row["id"]) for row in failure_rows]
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS tmp_prune_failures (id TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM tmp_prune_failures")
+            if failure_ids:
+                conn.executemany(
+                    "INSERT INTO tmp_prune_failures (id) VALUES (?)",
+                    [(failure_id,) for failure_id in failure_ids],
+                )
+            evidence_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM failure_evidence ev
+                    JOIN failures f ON f.id = ev.failure_id
+                    JOIN tmp_prune_failures pf ON pf.id = f.id
+                    WHERE f.project_id = ?
+                      AND f.environment_id = ?
+                      AND ev.created_at < ?
+                    """,
+                    (clean_project, clean_environment, evidence_cutoff),
+                ).fetchone()["count"]
+            )
+            source_map_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM source_maps
+                    WHERE project_id = ? AND environment_id = ? AND uploaded_at < ?
+                    """,
+                    (clean_project, clean_environment, source_map_cutoff),
+                ).fetchone()["count"]
+            )
+            rate_limit_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM ingest_rate_limits
+                    WHERE project_id = ? AND environment_id = ? AND updated_at < ?
+                    """,
+                    (clean_project, clean_environment, rate_limit_cutoff),
+                ).fetchone()["count"]
+            )
+            incident_link_count = 0
+            if failure_ids:
+                incident_link_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM incident_failures
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """,
+                    ).fetchone()["count"]
+                )
+            stale_incidents = conn.execute(
+                """
+                SELECT i.id
+                FROM incidents i
+                LEFT JOIN incident_failures inf
+                  ON inf.incident_id = i.id
+                 AND inf.failure_id NOT IN (SELECT id FROM tmp_prune_failures)
+                WHERE i.project_id = ?
+                  AND i.environment_id = ?
+                  AND inf.incident_id IS NULL
+                """,
+                (clean_project, clean_environment),
+            ).fetchall()
+            incident_count = len(stale_incidents)
+            if not dry_run:
+                conn.execute(
+                    """
+                    DELETE FROM repair_task_evidence
+                    WHERE evidence_id IN (
+                        SELECT ev.id
+                        FROM failure_evidence ev
+                        JOIN failures f ON f.id = ev.failure_id
+                        JOIN tmp_prune_failures pf ON pf.id = f.id
+                        WHERE f.project_id = ?
+                          AND f.environment_id = ?
+                          AND ev.created_at < ?
+                    )
+                    """,
+                    (clean_project, clean_environment, evidence_cutoff),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM failure_evidence
+                    WHERE id IN (
+                        SELECT ev.id
+                        FROM failure_evidence ev
+                        JOIN failures f ON f.id = ev.failure_id
+                        JOIN tmp_prune_failures pf ON pf.id = f.id
+                        WHERE f.project_id = ?
+                          AND f.environment_id = ?
+                          AND ev.created_at < ?
+                    )
+                    """,
+                    (clean_project, clean_environment, evidence_cutoff),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM source_maps
+                    WHERE project_id = ? AND environment_id = ? AND uploaded_at < ?
+                    """,
+                    (clean_project, clean_environment, source_map_cutoff),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM ingest_rate_limits
+                    WHERE project_id = ? AND environment_id = ? AND updated_at < ?
+                    """,
+                    (clean_project, clean_environment, rate_limit_cutoff),
+                )
+                affected_incident_ids = [
+                    str(row["incident_id"])
+                    for row in conn.execute(
+                        """
+                        SELECT DISTINCT incident_id
+                        FROM incident_failures
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
+                    ).fetchall()
+                ]
+                if failure_ids:
+                    conn.execute(
+                        """
+                        DELETE FROM incident_failures
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
+                    )
+                    conn.execute(
+                        """
+                        DELETE FROM failure_trace_map
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
+                    )
+                    conn.execute(
+                        """
+                        DELETE FROM failure_test_links
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
+                    )
+                    conn.execute(
+                        "DELETE FROM failures WHERE id IN (SELECT id FROM tmp_prune_failures)"
+                    )
+                stale_incidents = conn.execute(
+                    """
+                    SELECT i.id
+                    FROM incidents i
+                    LEFT JOIN incident_failures inf ON inf.incident_id = i.id
+                    WHERE i.project_id = ?
+                      AND i.environment_id = ?
+                      AND inf.incident_id IS NULL
+                    """,
+                    (clean_project, clean_environment),
+                ).fetchall()
+                incident_count = len(stale_incidents)
+                deleted_incident_ids: set[str] = set()
+                if stale_incidents:
+                    incident_ids = [str(row["id"]) for row in stale_incidents]
+                    deleted_incident_ids = set(incident_ids)
+                    conn.execute(
+                        "CREATE TEMP TABLE IF NOT EXISTS tmp_prune_incidents (id TEXT PRIMARY KEY)"
+                    )
+                    conn.execute("DELETE FROM tmp_prune_incidents")
+                    conn.executemany(
+                        "INSERT INTO tmp_prune_incidents (id) VALUES (?)",
+                        [(incident_id,) for incident_id in incident_ids],
+                    )
+                    conn.execute(
+                        "DELETE FROM incidents WHERE id IN (SELECT id FROM tmp_prune_incidents)"
+                    )
+                for incident_id in affected_incident_ids:
+                    if incident_id not in deleted_incident_ids:
+                        self._refresh_incident_rollup(conn, incident_id=incident_id)
+        return AppErrorRetentionPruneResult(
+            dry_run=bool(dry_run),
+            failure_retention_days=clean_failure_days,
+            evidence_retention_days=clean_evidence_days,
+            source_map_retention_days=clean_source_map_days,
+            rate_limit_retention_hours=clean_rate_limit_hours,
+            failures=len(failure_ids),
+            evidence=evidence_count,
+            incident_links=incident_link_count,
+            incidents=incident_count,
+            source_maps=source_map_count,
+            rate_limit_rows=rate_limit_count,
         )
 
     def _source_map_from_row(self, row: sqlite3.Row) -> SourceMapRow:
