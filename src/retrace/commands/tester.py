@@ -200,6 +200,10 @@ def _json_option(value: str, *, label: str, default: Any) -> Any:
 def _json_file(path: Path, *, label: str) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise click.ClickException(f"{label} could not be read: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise click.ClickException(f"{label} must be UTF-8 encoded JSON: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise click.ClickException(f"{label} must contain valid JSON: {exc}") from exc
 
@@ -666,13 +670,19 @@ def tester_edit_draft(
     spec = load_spec(specs_dir, spec_id)
     if dict(spec.fixtures or {}).get("draft_status") != "draft":
         raise click.ClickException("Spec is not an unaccepted draft.")
-    if name.strip():
-        spec.name = name.strip()
-    if prompt.strip():
-        spec.prompt = prompt.strip()
-    if app_url.strip():
-        spec.app_url = app_url.strip()
     changed_fields: list[str] = []
+    edited_name = name.strip()
+    if edited_name and edited_name != spec.name:
+        spec.name = edited_name
+        changed_fields.append("name")
+    edited_prompt = prompt.strip()
+    if edited_prompt and edited_prompt != spec.prompt:
+        spec.prompt = edited_prompt
+        changed_fields.append("prompt")
+    edited_app_url = app_url.strip()
+    if edited_app_url and edited_app_url != spec.app_url:
+        spec.app_url = edited_app_url
+        changed_fields.append("app_url")
     if steps_file is not None:
         spec.exact_steps = _json_object_list(
             _json_file(steps_file, label="steps-file"),
@@ -691,19 +701,21 @@ def tester_edit_draft(
         for item in list(spec.fixtures.get("review_notes", []) or [])
         if str(item).strip()
     ]
-    notes.extend(str(item).strip() for item in review_notes if str(item).strip())
-    if notes:
+    new_notes = [str(item).strip() for item in review_notes if str(item).strip()]
+    if new_notes:
+        notes.extend(new_notes)
         spec.fixtures["review_notes"] = notes
         changed_fields.append("review_notes")
     spec.fixtures["reviewed_at"] = now_iso()
+    if accept:
+        spec.fixtures["draft_status"] = "accepted"
+        spec.fixtures.setdefault("accepted_at", now_iso())
+        changed_fields.append("draft_status")
     if changed_fields:
         spec.fixtures["last_review_edit"] = {
             "edited_at": now_iso(),
             "fields": sorted(set(changed_fields)),
         }
-    if accept:
-        spec.fixtures["draft_status"] = "accepted"
-        spec.fixtures.setdefault("accepted_at", now_iso())
     spec.updated_at = now_iso()
     validate_spec(spec)
     save_spec(specs_dir, spec)

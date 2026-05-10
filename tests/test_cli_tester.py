@@ -442,12 +442,15 @@ tester:
         assert '"exact_steps"' in accepted.output
         accepted_spec = json.loads((specs_dir / f"{draft_id}.json").read_text())
         assert accepted_spec["exact_steps"][0]["id"] == "open-signup"
+        assert accepted_spec["assertions"][0]["id"] == "page-loads"
         assert accepted_spec["fixtures"]["review_notes"] == [
             "Replaced generated journey with stable smoke path."
         ]
         assert accepted_spec["fixtures"]["last_review_edit"]["fields"] == [
             "assertions",
+            "draft_status",
             "exact_steps",
+            "name",
             "review_notes",
         ]
         accepted_again = runner.invoke(main, ["tester", "accept-draft", draft_id])
