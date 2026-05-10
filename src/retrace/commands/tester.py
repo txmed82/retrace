@@ -9,6 +9,11 @@ from typing import Any, Optional
 import click
 import yaml
 
+from retrace.api_suites import (
+    api_suites_dir_for_data_dir,
+    list_api_suites,
+    load_api_suite,
+)
 from retrace.api_testing import (
     api_runs_dir_for_data_dir,
     api_specs_dir_for_data_dir,
@@ -988,6 +993,7 @@ def tester_api_import_openapi(
     result = import_openapi_specs(
         openapi_path=openapi_path,
         specs_dir=api_specs_dir_for_data_dir(cfg.run.data_dir),
+        suites_dir=api_suites_dir_for_data_dir(cfg.run.data_dir),
         base_url=effective_base_url,
         path_filter=path_filter,
         method_filter=method_filter,
@@ -1000,10 +1006,60 @@ def tester_api_import_openapi(
                 "created": [spec.spec_id for spec in result.specs],
                 "created_count": len(result.specs),
                 "skipped": result.skipped,
+                "suite_id": result.suite.suite_id if result.suite else "",
+                "suite_path": str(
+                    api_suites_dir_for_data_dir(cfg.run.data_dir)
+                    / f"{result.suite.suite_id}.json"
+                )
+                if result.suite
+                else "",
+                "quality_report": result.quality_report or {},
             },
             indent=2,
         )
     )
+
+
+@tester_group.command("api-suite-list")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def tester_api_suite_list(config_path: Path) -> None:
+    cfg = load_config(config_path)
+    suites = list_api_suites(api_suites_dir_for_data_dir(cfg.run.data_dir))
+    if not suites:
+        click.echo("No API suites found.")
+        return
+    for suite in suites:
+        click.echo(
+            "\t".join(
+                [
+                    suite.suite_id,
+                    suite.source,
+                    str(len(suite.spec_ids)),
+                    suite.name,
+                ]
+            )
+        )
+
+
+@tester_group.command("api-suite-show")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.argument("suite_id")
+def tester_api_suite_show(config_path: Path, suite_id: str) -> None:
+    cfg = load_config(config_path)
+    suite = load_api_suite(api_suites_dir_for_data_dir(cfg.run.data_dir), suite_id)
+    click.echo(json.dumps(suite.__dict__, indent=2))
 
 
 @tester_group.command("show")

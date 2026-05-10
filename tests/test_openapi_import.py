@@ -5,6 +5,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
+from retrace.api_suites import api_suites_dir_for_data_dir, load_api_suite
 from retrace.api_testing import api_runs_dir_for_data_dir, api_specs_dir_for_data_dir, run_api_spec
 from retrace.cli import main
 from retrace.openapi_import import import_openapi_specs
@@ -121,6 +122,13 @@ paths:
     assert spec.fixtures["contract_derived"] is True
     assert spec.fixtures["source"] == "openapi_import"
     assert spec.fixtures["operation_id"] == "getUser"
+    assert spec.fixtures["summary"] == ""
+    assert result.suite is not None
+    assert result.suite.spec_ids == [spec.spec_id]
+    assert result.suite.import_summary["imported_count"] == 1
+    assert result.suite.operations[0]["operation_id"] == "getUser"
+    assert result.quality_report is not None
+    assert result.quality_report["coverage_percent"] == 100.0
     assert run.ok is True
 
 
@@ -319,8 +327,26 @@ servers:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["created_count"] == 1
+    assert payload["suite_id"].startswith("api_suite_openapi-demo-api_")
+    assert payload["quality_report"]["imported_count"] == 1
     spec_paths = list((tmp_path / "data" / "api-tests" / "specs").glob("*.json"))
     assert len(spec_paths) == 1
     spec_payload = json.loads(spec_paths[0].read_text())
     assert spec_payload["url"] == "http://api.example.test/v1/health"
     assert spec_payload["fixtures"]["contract_derived"] is True
+    suite = load_api_suite(
+        api_suites_dir_for_data_dir(tmp_path / "data"),
+        payload["suite_id"],
+    )
+    assert suite.import_summary["document_title"] == "Demo API"
+    assert suite.operations[0]["path"] == "/v1/health"
+
+    listed = CliRunner().invoke(main, ["tester", "api-suite-list"])
+    assert listed.exit_code == 0, listed.output
+    assert payload["suite_id"] in listed.output
+
+    shown = CliRunner().invoke(main, ["tester", "api-suite-show", payload["suite_id"]])
+    assert shown.exit_code == 0, shown.output
+    shown_payload = json.loads(shown.output)
+    assert shown_payload["suite_id"] == payload["suite_id"]
+    assert shown_payload["spec_ids"] == [spec_payload["spec_id"]]
