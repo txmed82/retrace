@@ -14,6 +14,7 @@ from retrace.commands.ui import (
     _generate_replay_issue_fix_prompts_payload,
     _generate_replay_issue_specs_payload,
     _hosted_onboarding_readiness_payload,
+    _issue_evidence_stitching_payload,
     _INDEX_HTML,
     _issue_workflow_payload,
     _replay_api_calls,
@@ -120,6 +121,7 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "copyEvidenceBundle" in _INDEX_HTML
     assert "timelineTypeFilter" in _INDEX_HTML
     assert "renderIssueWorkflow" in _INDEX_HTML
+    assert "renderEvidenceStitching" in _INDEX_HTML
     assert "renderIssueReadiness" in _INDEX_HTML
     assert "renderRepairTask" in _INDEX_HTML
     assert "data-workflow-action" in _INDEX_HTML
@@ -137,6 +139,7 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "apiSuiteRunMatrix" in _INDEX_HTML
     assert "/api/onboarding/readiness" in _INDEX_HTML
     assert "Hosted Readiness" in _INDEX_HTML
+    assert "Evidence Stitching" in _INDEX_HTML
     assert "Generated Draft Review" in _INDEX_HTML
     assert "/api/tester/draft" in _INDEX_HTML
     assert "saveDraftSpec" in _INDEX_HTML
@@ -229,6 +232,51 @@ def test_issue_workflow_recommends_ui_and_api_regressions() -> None:
         "generate_replay_spec",
         "generate_api_regression",
     ]
+
+
+def test_issue_evidence_stitching_links_frontend_api_trace_and_repair() -> None:
+    stitching = _issue_evidence_stitching_payload(
+        {
+            "sessions": [{"session_id": "sess-1"}],
+            "timeline": [
+                {
+                    "type": "monitoring_alert",
+                    "payload": {
+                        "metadata": {"trace_id": "abc123"},
+                        "payload": {
+                            "stack_frames": [
+                                {
+                                    "filename": "https://cdn.example/app.js",
+                                    "source_mapped": True,
+                                    "source": "src/app.ts",
+                                }
+                            ]
+                        },
+                    },
+                }
+            ],
+            "api_calls": [
+                {
+                    "method": "POST",
+                    "url": "/api/checkout",
+                    "trace": {"trace_id": "def456"},
+                }
+            ],
+            "test_links": [
+                {
+                    "spec_id": "api_checkout",
+                    "source": "replay_issue_api",
+                    "spec_path": "api-tests/specs/api_checkout.json",
+                }
+            ],
+            "repair_task": {"public_id": "repair_123"},
+        }
+    )
+
+    assert stitching["status"] == "complete"
+    assert stitching["trace_ids"] == ["abc123", "def456"]
+    assert stitching["api_regression_spec_ids"] == ["api_checkout"]
+    assert stitching["source_map_frames"][0]["source_mapped"] is True
 
 
 def test_api_suites_payload_summarizes_import_quality(tmp_path: Path) -> None:
@@ -705,6 +753,8 @@ def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> N
     ]
     assert issue["workflow"]["coverage_state"] == "covered_failing"
     assert issue["workflow"]["primary_action"] == "run_tests"
+    assert issue["evidence_stitching"]["stages"][0]["id"] == "frontend_replay"
+    assert issue["evidence_stitching"]["stages"][1]["id"] == "network_api"
     assert issue["workflow"]["stage_states"]["evidence"] == "complete"
     assert issue["workflow"]["stage_states"]["test"] == "complete"
     assert issue["workflow"]["stage_states"]["repair"] == "complete"
