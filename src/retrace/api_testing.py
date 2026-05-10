@@ -39,6 +39,7 @@ SENSITIVE_BODY_KEYS = {
     "secret",
     "token",
 }
+TRACE_ID_HEX_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 @dataclass
@@ -648,9 +649,10 @@ def persist_api_failure(
         run_result=result,
     )
     trace_ids = [
-        str(item or "").strip().lower()
+        value
         for item in list(failure.metadata.get("trace_ids", []) or [])
-        if str(item or "").strip()
+        for value in [str(item or "").strip().lower()]
+        if TRACE_ID_HEX_RE.fullmatch(value)
     ]
     evidence_items = [
         *_api_failure_evidence_items(result=result),
@@ -829,7 +831,9 @@ def _matching_log_lines(*, path: Path, trace_ids: list[str]) -> list[str]:
         raw_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
     except Exception:
         return []
-    needles = [item.casefold() for item in trace_ids if item]
+    needles = [item.casefold() for item in trace_ids if TRACE_ID_HEX_RE.fullmatch(item)]
+    if not needles:
+        return []
     matches: list[str] = []
     for line in raw_lines:
         line_l = line.casefold()
@@ -908,6 +912,21 @@ def scrub_pii_from_blob(blob: Any) -> Any:
 
 
 def _scrub_pii_text(value: str) -> str:
+    value = re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+\b",
+        "Bearer [redacted-token]",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password|session)\b\s*[:=]\s*\S+",
+        lambda match: f"{match.group(1)}=[redacted]",
+        value,
+    )
+    value = re.sub(
+        r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
+        "[redacted-jwt]",
+        value,
+    )
     value = re.sub(
         r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
         "[redacted-email]",

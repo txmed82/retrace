@@ -484,7 +484,8 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
                 "INFO unrelated trace_id=abc",
                 (
                     "ERROR trace_id=4bf92f3577b34da6a3ce929d0e0e4736 "
-                    "checkout handler failed for dev@example.com"
+                    "Authorization: Bearer raw-secret-token "
+                    "api_key=sk_live_secret checkout handler failed for dev@example.com"
                 ),
             ]
         )
@@ -574,3 +575,13 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
     log_payload = bundle.backend_context["logs"]["items"][0]["untrusted_payload"]
     assert "checkout handler failed" in log_payload["lines"][0]
     assert "dev@example.com" not in json.dumps(log_payload)
+    assert "raw-secret-token" not in json.dumps(log_payload)
+    assert "sk_live_secret" not in json.dumps(log_payload)
+    assert "Bearer [redacted-token]" in log_payload["lines"][0]
+
+
+def test_api_log_matching_rejects_short_trace_ids(tmp_path: Path) -> None:
+    log_path = tmp_path / "backend.log"
+    log_path.write_text("ERROR trace_id=abc unrelated failure\n")
+
+    assert api_testing._matching_log_lines(path=log_path, trace_ids=["abc"]) == []
