@@ -23,6 +23,7 @@ from retrace.api_suites import api_suites_dir_for_data_dir, list_api_suites
 from retrace.api_testing import (
     api_runs_dir_for_data_dir,
     api_specs_dir_for_data_dir,
+    list_api_specs,
     load_api_spec,
     run_api_spec,
 )
@@ -1703,6 +1704,48 @@ def _api_suites_payload(data_dir: Path) -> dict[str, Any]:
     return {"suites": suites}
 
 
+def _api_specs_payload(data_dir: Path) -> dict[str, Any]:
+    specs = []
+    for spec in list_api_specs(api_specs_dir_for_data_dir(data_dir)):
+        fixtures = dict(spec.fixtures or {})
+        specs.append(
+            {
+                "spec_id": spec.spec_id,
+                "name": spec.name,
+                "method": spec.method,
+                "url": spec.url,
+                "auth_profile": spec.auth_profile,
+                "env_profile": spec.env_profile,
+                "expected_status": spec.expected_status,
+                "request_count": len(spec.steps) if spec.steps else 1,
+                "json_assertion_count": len(spec.json_assertions),
+                "schema_assertion_count": len(spec.schema_assertions),
+                "source": str(fixtures.get("source") or ""),
+                "issue_public_id": str(fixtures.get("issue_public_id") or ""),
+                "operation_id": str(fixtures.get("operation_id") or ""),
+                "openapi_path": str(fixtures.get("openapi_path") or ""),
+                "created_at": spec.created_at,
+                "updated_at": spec.updated_at,
+            }
+        )
+    return {"specs": specs}
+
+
+def _run_api_spec_payload(*, data_dir: Path, spec_id: str) -> tuple[dict[str, Any], int]:
+    clean_spec_id = spec_id.strip()
+    if not clean_spec_id:
+        return {"ok": False, "error": "spec_id is required"}, 400
+    try:
+        spec = load_api_spec(api_specs_dir_for_data_dir(data_dir), clean_spec_id)
+    except Exception:
+        return {"ok": False, "error": f"API spec not found: {clean_spec_id}"}, 404
+    result = run_api_spec(
+        spec=spec,
+        runs_dir=api_runs_dir_for_data_dir(data_dir),
+    )
+    return {"ok": result.ok, "result": result.__dict__}, 200 if result.ok else 400
+
+
 def _json_object_list_payload(value: Any, *, label: str) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
         raise ValueError(f"{label} must be a JSON list of objects")
@@ -1957,6 +2000,9 @@ _INDEX_HTML = """<!doctype html>
     .suite-row:first-child { border-top:0; padding-top:0; }
     .draft-editor { margin-top:12px; }
     .draft-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .inventory-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px; }
+    .inventory-row { border-top:1px solid #1f2937; padding:9px 0; overflow-wrap:anywhere; }
+    .inventory-row:first-child { border-top:0; padding-top:0; }
     .ok { color:#86efac; } .bad { color:#fca5a5; }
     @media (max-width: 980px) {
       .app-shell { grid-template-columns: 1fr; height:auto; min-height:100vh; }
@@ -1964,7 +2010,7 @@ _INDEX_HTML = """<!doctype html>
       .nav-btn { display:inline-block; width:auto; margin-right:4px; }
       .rail { border-right:0; border-bottom:1px solid var(--line); max-height:42vh; }
       .main { padding:12px; }
-      .metric-grid, .detail-grid, .grid, .workflow-strip, .draft-grid { grid-template-columns: 1fr; }
+      .metric-grid, .detail-grid, .grid, .workflow-strip, .draft-grid, .inventory-grid { grid-template-columns: 1fr; }
       .timeline-row { grid-template-columns: 1fr; }
     }
   </style>
@@ -2689,22 +2735,44 @@ const retrace = init({
     }
 
     async function loadTesterPanel(){
-      const [specRes, runsRes, settingsRes, suitesRes] = await Promise.all([
+      const [specRes, runsRes, settingsRes, suitesRes, apiSpecRes] = await Promise.all([
         fetch('/api/tester/specs'),
         fetch('/api/tester/runs'),
         fetch('/api/settings'),
         fetch('/api/api-suites'),
+        fetch('/api/api-specs'),
       ]);
       const specData = await specRes.json();
       const runData = await runsRes.json();
       const settings = await settingsRes.json();
       const suiteData = await suitesRes.json();
+      const apiSpecData = await apiSpecRes.json();
       const specs = specData.specs || [];
       const runs = runData.runs || [];
       const apiSuites = suiteData.suites || [];
+      const apiSpecs = apiSpecData.specs || [];
       const specOptions = specs.map(s =>
         `<option value="${esc(s.spec_id)}">${esc(s.name)} (${esc(s.mode)})</option>`
       ).join('');
+      const uiSpecRows = specs.map(s => {
+        const fixtures = s.fixtures || {};
+        const status = fixtures.draft_status || 'accepted';
+        const linkedIssue = fixtures.issue_public_id || '';
+        return `
+          <div class="inventory-row">
+            <button class="btn" type="button" data-select-ui-spec="${esc(s.spec_id)}">Select</button>
+            <code>${esc(s.spec_id)}</code> · ${esc(s.name || '')}
+            <br><span class="empty">status=<code>${esc(status)}</code> · engine=<code>${esc(s.execution_engine || '')}</code> · steps=<code>${esc((s.exact_steps || []).length)}</code> · assertions=<code>${esc((s.assertions || []).length)}</code>${linkedIssue ? ` · issue=<code>${esc(linkedIssue)}</code>` : ''}</span>
+          </div>
+        `;
+      }).join('');
+      const apiSpecRows = apiSpecs.map(s => `
+        <div class="inventory-row">
+          <button class="btn" type="button" data-run-api-management-spec="${esc(s.spec_id)}">Run</button>
+          <code>${esc(s.spec_id)}</code> · <code>${esc(s.method)}</code> ${esc(s.openapi_path || s.url || '')}
+          <br><span class="empty">expected=<code>${esc(s.expected_status)}</code> · source=<code>${esc(s.source || 'manual')}</code> · requests=<code>${esc(s.request_count)}</code> · assertions=<code>${esc((s.json_assertion_count || 0) + (s.schema_assertion_count || 0))}</code>${s.issue_public_id ? ` · issue=<code>${esc(s.issue_public_id)}</code>` : ''}${s.operation_id ? ` · op=<code>${esc(s.operation_id)}</code>` : ''}</span>
+        </div>
+      `).join('');
       const draftSpecs = specs.filter(s => (s.fixtures || {}).draft_status === 'draft');
       const draftOptions = draftSpecs.map(s =>
         `<option value="${esc(s.spec_id)}">${esc(s.name)} · ${esc(s.spec_id)}</option>`
@@ -2788,6 +2856,18 @@ const retrace = init({
           ` : '<div class="empty">No generated drafts waiting for review.</div>'}
         </div>
         <div style="height:12px"></div>
+        <div class="inventory-grid">
+          <div class="card">
+            <h3>UI Spec Inventory</h3>
+            ${uiSpecRows || '<div class="empty">No UI specs yet.</div>'}
+          </div>
+          <div class="card">
+            <h3>API Spec Inventory</h3>
+            <div class="empty" id="apiManagementRunStatus"></div>
+            ${apiSpecRows || '<div class="empty">No API specs yet.</div>'}
+          </div>
+        </div>
+        <div style="height:12px"></div>
         <div class="card">
           <h3>API Suites</h3>
           ${suiteRows || '<div class="empty">No API suites yet. Import an OpenAPI document with <code>retrace tester api-import-openapi</code>.</div>'}
@@ -2799,6 +2879,15 @@ const retrace = init({
       `;
       byId('testerCreateForm').addEventListener('submit', createTesterSpec);
       byId('runTesterBtn').addEventListener('click', runTesterSpec);
+      document.querySelectorAll('[data-select-ui-spec]').forEach(el => {
+        el.addEventListener('click', () => {
+          const select = byId('testerSpecSelect');
+          if(select) select.value = el.dataset.selectUiSpec;
+        });
+      });
+      document.querySelectorAll('[data-run-api-management-spec]').forEach(el => {
+        el.addEventListener('click', () => runManagedApiSpec(el.dataset.runApiManagementSpec));
+      });
       if(draftSpecs.length){
         window.retraceDraftSpecs = draftSpecs;
         byId('draftSpecSelect')?.addEventListener('change', renderSelectedDraftEditor);
@@ -2808,6 +2897,24 @@ const retrace = init({
         renderSelectedDraftEditor();
       }
       renderLinkedFailureTests();
+    }
+
+    async function runManagedApiSpec(specId){
+      const status = byId('apiManagementRunStatus');
+      if(status) status.textContent = `Running ${specId}...`;
+      const res = await fetch('/api/api-spec/run', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({spec_id: specId}),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        const msg = data?.result?.error || data.error || 'API run failed';
+        if(status) status.textContent = `Failed: ${msg}`;
+        return;
+      }
+      if(status) status.textContent = `API passed: ${data.result.run_id}`;
+      await loadTesterPanel();
     }
 
     function selectedDraftSpec(){
@@ -3668,6 +3775,10 @@ def ui_command(
                 self._json(_api_suites_payload(data_dir))
                 return
 
+            if path == "/api/api-specs":
+                self._json(_api_specs_payload(data_dir))
+                return
+
             if path == "/api/replay-dashboard":
                 self._json(_to_replay_dashboard_payload(store))
                 return
@@ -4124,6 +4235,15 @@ def ui_command(
                 body = self._read_json_body()
                 payload, status = _run_replay_issue_api_spec_payload(
                     store=store,
+                    data_dir=data_dir,
+                    spec_id=str(body.get("spec_id", "")).strip(),
+                )
+                self._json(payload, status=status)
+                return
+
+            if path == "/api/api-spec/run":
+                body = self._read_json_body()
+                payload, status = _run_api_spec_payload(
                     data_dir=data_dir,
                     spec_id=str(body.get("spec_id", "")).strip(),
                 )
