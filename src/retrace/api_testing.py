@@ -39,6 +39,7 @@ SENSITIVE_BODY_KEYS = {
     "secret",
     "token",
 }
+TRACE_ID_HEX_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 @dataclass
@@ -621,6 +622,7 @@ def persist_api_failure(
     project_id: str,
     environment_id: str,
     repo_path: Optional[Path] = None,
+    log_paths: Optional[list[Path]] = None,
 ) -> APIFailurePersistenceResult:
     if result.ok:
         raise ValueError("only failed API runs can be persisted as failures")
@@ -646,10 +648,24 @@ def persist_api_failure(
         spec=spec,
         run_result=result,
     )
+    trace_ids = [
+        value
+        for item in list(failure.metadata.get("trace_ids", []) or [])
+        for value in [str(item or "").strip().lower()]
+        if TRACE_ID_HEX_RE.fullmatch(value)
+    ]
+    evidence_items = [
+        *_api_failure_evidence_items(result=result),
+        *_api_log_evidence_items(
+            result=result,
+            log_paths=log_paths or [],
+            trace_ids=trace_ids,
+        ),
+    ]
     persisted_failure_id, evidence_ids, repair_task_id = (
         store.upsert_failure_with_evidence_and_repair_task(
             failure=failure,
-            evidence_items=_api_failure_evidence_items(result=result),
+            evidence_items=evidence_items,
             repair_task={
                 "title": f"Repair API failure: {spec.name or spec.spec_id}",
                 "source_type": "test_run",
@@ -764,6 +780,70 @@ def _api_failure_evidence_items(*, result: APITestRunResult) -> list[EvidenceIte
     return items
 
 
+def _api_log_evidence_items(
+    *,
+    result: APITestRunResult,
+    log_paths: list[Path],
+    trace_ids: list[str],
+) -> list[EvidenceItem]:
+    if not trace_ids:
+        return []
+    items: list[EvidenceItem] = []
+    source = f"api_run:{result.run_id}"
+    for path in log_paths:
+        lines = _matching_log_lines(path=path, trace_ids=trace_ids)
+        if not lines:
+            continue
+        payload = scrub_pii_from_blob(
+            {
+                "run_id": result.run_id,
+                "spec_id": result.spec_id,
+                "path": str(path),
+                "trace_ids": trace_ids,
+                "lines": lines,
+            }
+        )
+        items.append(
+            EvidenceItem(
+                failure_id="",
+                evidence_type="backend_log",
+                occurred_at_ms=0,
+                source=source,
+                redaction_state="redacted",
+                payload=payload,
+                artifact_path=str(path),
+                dedupe_key=evidence_dedupe_key(
+                    failure_id="",
+                    evidence_type="backend_log",
+                    source=source,
+                    occurred_at_ms=0,
+                    payload=payload,
+                ),
+            )
+        )
+    return items
+
+
+def _matching_log_lines(*, path: Path, trace_ids: list[str]) -> list[str]:
+    try:
+        if not path.exists() or not path.is_file() or path.stat().st_size > 2_000_000:
+            return []
+        raw_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return []
+    needles = [item.casefold() for item in trace_ids if TRACE_ID_HEX_RE.fullmatch(item)]
+    if not needles:
+        return []
+    matches: list[str] = []
+    for line in raw_lines:
+        line_l = line.casefold()
+        if any(needle in line_l for needle in needles):
+            matches.append(line[:4000])
+        if len(matches) >= 50:
+            break
+    return matches
+
+
 def _artifact_payload(path_value: str) -> Any:
     if not path_value:
         return {}
@@ -832,6 +912,26 @@ def scrub_pii_from_blob(blob: Any) -> Any:
 
 
 def _scrub_pii_text(value: str) -> str:
+    value = re.sub(
+        r"(?i)\bBasic\s+[A-Za-z0-9._~+/=-]+\b",
+        "Basic [redacted-token]",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+\b",
+        "Bearer [redacted-token]",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password|session)\b\s*[:=]\s*\S+",
+        lambda match: f"{match.group(1)}=[redacted]",
+        value,
+    )
+    value = re.sub(
+        r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
+        "[redacted-jwt]",
+        value,
+    )
     value = re.sub(
         r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
         "[redacted-email]",

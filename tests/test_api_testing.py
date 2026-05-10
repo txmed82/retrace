@@ -477,6 +477,20 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
         "router.get('/api/checkout/:cartId', checkoutHandler);"
     )
     server, base_url, thread = _server_url()
+    log_path = tmp_path / "backend.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "INFO unrelated trace_id=abc",
+                (
+                    "ERROR trace_id=4bf92f3577b34da6a3ce929d0e0e4736 "
+                    "Authorization: Bearer raw-secret-token "
+                    "Authorization: Basic raw-basic-token "
+                    "api_key=sk_live_secret checkout handler failed for dev@example.com"
+                ),
+            ]
+        )
+    )
     try:
         spec = create_api_spec(
             specs_dir=api_specs_dir_for_data_dir(tmp_path),
@@ -520,6 +534,7 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
         project_id=workspace.project_id,
         environment_id=workspace.environment_id,
         repo_path=repo,
+        log_paths=[log_path],
     )
 
     failure = store.get_failure(
@@ -536,12 +551,16 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
     assert {item.evidence_type for item in evidence} >= {
         "api_request",
         "api_response",
+        "backend_log",
         "test_transcript",
     }
     evidence_text = json.dumps([item.payload for item in evidence])
     assert "dev@example.com" not in evidence_text
     assert "555-123-4567" not in evidence_text
     assert "123 Main Street" not in evidence_text
+    assert "raw-secret-token" not in evidence_text
+    assert "raw-basic-token" not in evidence_text
+    assert "sk_live_secret" not in evidence_text
     repair = store.get_repair_task(persisted.repair_task_id)
     assert repair is not None
     assert repair.likely_files == ["server/routes/checkout.ts"]
@@ -556,3 +575,24 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
     assert bundle.backend_context["logs"]["trace_ids"] == [
         "4bf92f3577b34da6a3ce929d0e0e4736"
     ]
+    backend_log_item = next(
+        item
+        for item in bundle.backend_context["logs"]["items"]
+        if item["type"] == "backend_log"
+    )
+    log_payload = backend_log_item["untrusted_payload"]
+    assert "checkout handler failed" in log_payload["lines"][0]
+    assert "INFO unrelated trace_id=abc" not in json.dumps(log_payload)
+    assert "dev@example.com" not in json.dumps(log_payload)
+    assert "raw-secret-token" not in json.dumps(log_payload)
+    assert "raw-basic-token" not in json.dumps(log_payload)
+    assert "sk_live_secret" not in json.dumps(log_payload)
+    assert "Basic [redacted-token]" in log_payload["lines"][0]
+    assert "Bearer [redacted-token]" in log_payload["lines"][0]
+
+
+def test_api_log_matching_rejects_short_trace_ids(tmp_path: Path) -> None:
+    log_path = tmp_path / "backend.log"
+    log_path.write_text("ERROR trace_id=abc unrelated failure\n")
+
+    assert api_testing._matching_log_lines(path=log_path, trace_ids=["abc"]) == []

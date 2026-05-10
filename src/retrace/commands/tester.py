@@ -713,6 +713,13 @@ def tester_api_list(config_path: Path) -> None:
     default=None,
     help="Local repo path for route-based repair file scoring.",
 )
+@click.option(
+    "--log-path",
+    "log_paths",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Backend log file to attach when lines match API trace IDs.",
+)
 @click.option("--auth-profile", default="", help="Auth profile override for this run.")
 @click.option("--env-profile", default="", help="Environment profile override for this run.")
 @click.argument("spec_id")
@@ -721,6 +728,7 @@ def tester_api_run(
     project_id: str,
     environment_id: str,
     repo_path: Optional[Path],
+    log_paths: tuple[Path, ...],
     auth_profile: str,
     env_profile: str,
     spec_id: str,
@@ -748,6 +756,7 @@ def tester_api_run(
                 project_id=project_id.strip() or workspace.project_id,
                 environment_id=environment_id.strip() or workspace.environment_id,
                 repo_path=repo_path,
+                log_paths=list(log_paths),
             )
             failure_metadata = {
                 "canonical_failure_id": persisted.failure_id,
