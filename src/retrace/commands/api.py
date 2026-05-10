@@ -39,6 +39,7 @@ from retrace.replay_api import (
 )
 from retrace.replay_core import process_queued_replay_jobs
 from retrace.sdk_keys import (
+    authenticate_sdk_key,
     authenticate_service_token,
     create_sdk_key,
     create_service_token,
@@ -50,10 +51,17 @@ from retrace.sentry_compat import (
     ingest_sentry_compat_request,
 )
 from retrace.source_maps import upload_source_map
-from retrace.storage import Storage
+from retrace.storage import RateLimitDecision, Storage
 
 
 logger = logging.getLogger(__name__)
+
+INGEST_RATE_LIMITS: dict[str, tuple[int, int]] = {
+    "replay": (600, 60),
+    "sentry": (600, 60),
+    "monitoring": (300, 60),
+    "source_maps": (30, 60),
+}
 
 
 def _maybe_llm_client(cfg: Any, *, enabled: bool) -> LLMClient | None:
@@ -62,7 +70,13 @@ def _maybe_llm_client(cfg: Any, *, enabled: bool) -> LLMClient | None:
     return LLMClient(cfg.llm)
 
 
-def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
+def _json_response(
+    handler: BaseHTTPRequestHandler,
+    status: int,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+) -> None:
     data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     setattr(handler, "_retrace_response_status", status)
     handler.send_response(status)
@@ -70,6 +84,8 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
     trace_id = str(getattr(handler, "_retrace_trace_id", "") or "")
     if trace_id:
         handler.send_header("X-Retrace-Trace-Id", trace_id)
+    for name, value in (headers or {}).items():
+        handler.send_header(name, value)
     _cors_headers(handler)
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
@@ -114,6 +130,90 @@ def _bearer_token(headers: Any) -> str:
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
     return ""
+
+
+def _header_value(headers: Any, name: str) -> str:
+    lname = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == lname:
+            return str(value)
+    return ""
+
+
+def _extract_replay_sdk_key(headers: Any, query: dict[str, str]) -> str:
+    direct = _header_value(headers, "x-retrace-key").strip()
+    if direct:
+        return direct
+    auth = _header_value(headers, "authorization").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return str(
+        query.get("key") or query.get("api_key") or query.get("apiKey") or ""
+    ).strip()
+
+
+def _extract_sentry_sdk_key(headers: Any, query: dict[str, str]) -> str:
+    for key in ("sentry_key", "key", "api_key", "apiKey"):
+        value = str(query.get(key) or "").strip()
+        if value:
+            return value
+    auth = _header_value(headers, "x-sentry-auth").strip()
+    if auth:
+        for part in auth.removeprefix("Sentry").split(","):
+            name, _, value = part.strip().partition("=")
+            if name.strip() == "sentry_key":
+                return value.strip()
+    return ""
+
+
+def _rate_limit_headers(decision: RateLimitDecision) -> dict[str, str]:
+    return {
+        "Retry-After": str(decision.reset_after_seconds),
+        "X-RateLimit-Limit": str(decision.limit),
+        "X-RateLimit-Remaining": str(decision.remaining),
+        "X-RateLimit-Reset": str(decision.reset_after_seconds),
+        "X-RateLimit-Window": str(decision.window_seconds),
+    }
+
+
+def _rate_limited_response(
+    handler: BaseHTTPRequestHandler,
+    *,
+    bucket: str,
+    decision: RateLimitDecision,
+) -> None:
+    _json_response(
+        handler,
+        429,
+        {
+            "error": "rate_limited",
+            "message": f"{bucket} ingest rate limit exceeded.",
+            "limit": decision.limit,
+            "remaining": decision.remaining,
+            "retry_after_seconds": decision.reset_after_seconds,
+            "window_seconds": decision.window_seconds,
+        },
+        headers=_rate_limit_headers(decision),
+    )
+
+
+def _consume_rate_limit(
+    store: Storage,
+    *,
+    project_id: str,
+    environment_id: str,
+    bucket: str,
+    identity: str,
+) -> RateLimitDecision:
+    limit, window_seconds = INGEST_RATE_LIMITS[bucket]
+    return store.consume_ingest_rate_limit(
+        project_id=project_id,
+        environment_id=environment_id,
+        bucket=bucket,
+        identity=identity,
+        limit=limit,
+        window_seconds=window_seconds,
+    )
 
 
 def _require_service_token(
@@ -574,13 +674,37 @@ def _handler(
                     },
                 )
                 return
+            replay_query = _query_dict(parsed.query)
+            sdk_key = authenticate_sdk_key(
+                store, _extract_replay_sdk_key(self.headers, replay_query)
+            )
+            if sdk_key is None:
+                _json_response(
+                    self,
+                    401,
+                    {
+                        "error": "unauthorized",
+                        "message": "Missing or invalid SDK key.",
+                    },
+                )
+                return
+            decision = _consume_rate_limit(
+                store,
+                project_id=sdk_key.project_id,
+                environment_id=sdk_key.environment_id,
+                bucket="replay",
+                identity=sdk_key.id,
+            )
+            if not decision.allowed:
+                _rate_limited_response(self, bucket="replay", decision=decision)
+                return
             try:
                 body = self.rfile.read(length)
                 result = ingest_replay_request(
                     store=store,
                     headers={k: v for k, v in self.headers.items()},
                     body=body,
-                    query=_query_dict(parsed.query),
+                    query=replay_query,
                 )
                 _json_response(self, 202, result)
             except ReplayIngestError as exc:
@@ -624,6 +748,40 @@ def _handler(
                     },
                 )
                 return
+            sentry_query = _query_dict(query)
+            raw_sentry_key = _extract_sentry_sdk_key(self.headers, sentry_query)
+            if raw_sentry_key:
+                sdk_key = authenticate_sdk_key(store, raw_sentry_key)
+                if sdk_key is None:
+                    _json_response(
+                        self,
+                        401,
+                        {
+                            "error": "unauthorized",
+                            "message": "Missing or invalid Sentry SDK key.",
+                        },
+                    )
+                    return
+                if project_id and sdk_key.project_id != project_id:
+                    _json_response(
+                        self,
+                        403,
+                        {
+                            "error": "forbidden",
+                            "message": "SDK key does not belong to this project.",
+                        },
+                    )
+                    return
+                decision = _consume_rate_limit(
+                    store,
+                    project_id=sdk_key.project_id,
+                    environment_id=sdk_key.environment_id,
+                    bucket="sentry",
+                    identity=sdk_key.id,
+                )
+                if not decision.allowed:
+                    _rate_limited_response(self, bucket="sentry", decision=decision)
+                    return
             body = self.rfile.read(length)
             try:
                 result = ingest_sentry_compat_request(
@@ -632,7 +790,7 @@ def _handler(
                     endpoint=endpoint,
                     headers={k: v for k, v in self.headers.items()},
                     body=body,
-                    query=_query_dict(query),
+                    query=sentry_query,
                 )
                 _dispatch_app_error_notifications(
                     sinks=notification_sinks,
@@ -691,6 +849,16 @@ def _handler(
                         "message": "environment_id is required.",
                     },
                 )
+                return
+            decision = _consume_rate_limit(
+                store,
+                project_id=token.project_id,
+                environment_id=environment_id,
+                bucket="monitoring",
+                identity=f"{token.id}:{provider}",
+            )
+            if not decision.allowed:
+                _rate_limited_response(self, bucket="monitoring", decision=decision)
                 return
             try:
                 length = int(self.headers.get("Content-Length") or "0")
@@ -911,6 +1079,16 @@ def _handler(
             environment_id = str(params.get("environment_id") or "").strip()
             if not environment_id:
                 _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            decision = _consume_rate_limit(
+                store,
+                project_id=token.project_id,
+                environment_id=environment_id,
+                bucket="source_maps",
+                identity=token.id,
+            )
+            if not decision.allowed:
+                _rate_limited_response(self, bucket="source_maps", decision=decision)
                 return
             try:
                 length = int(self.headers.get("Content-Length") or "0")

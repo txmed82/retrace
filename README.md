@@ -390,6 +390,14 @@ Related monitor failures are also grouped into incidents by stack frame, route,
 service, trace, deploy, and fingerprint. Each incident rolls up severity,
 affected failures, evidence, and a single repair task.
 
+Ingest endpoints use per-project, per-environment fixed-window rate limits before
+expensive parsing or persistence. Default limits are 600 replay batches/minute
+per SDK key, 600 Sentry-compatible events/minute per SDK key, 300 monitoring
+webhooks/minute per service token/provider, and 30 source-map uploads/minute per
+service token. Limited requests return `429` with `Retry-After`,
+`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and
+`X-RateLimit-Window` headers.
+
 Upload production source maps before or during deploys so minified browser
 errors resolve to original source paths in failure metadata, incident grouping,
 and repair prompts:
