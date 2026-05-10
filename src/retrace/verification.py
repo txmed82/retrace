@@ -99,7 +99,7 @@ def plan_repair_verification(
         failure_id=failure_id,
     )
     refs: list[VerificationTestRef] = []
-    for link in store.list_failure_test_links(failure_id=failure.id, limit=100):
+    for link in store.list_all_failure_test_links(failure_id=failure.id):
         kind = _linked_test_kind(data_dir=data_dir, link=link)
         if not kind:
             continue
@@ -179,13 +179,21 @@ def run_repair_verification(
                 test=test,
             )
         )
-    status = "passed" if all(item.ok for item in runs) else "failed"
+    if any(item.status == "blocked" for item in runs):
+        status = "blocked"
+        error = "One or more linked specs could not run."
+    elif any(not item.ok for item in runs):
+        status = "failed"
+        error = "One or more linked specs failed."
+    else:
+        status = "passed"
+        error = ""
     _record_verification(
         store=store,
         plan=plan,
         status=status,
         tests=runs,
-        error="" if status == "passed" else "One or more linked specs failed.",
+        error=error,
     )
     return VerificationResult(
         status=status,
@@ -193,7 +201,7 @@ def run_repair_verification(
         failure_public_id=plan.failure_public_id,
         repair_task_id=plan.repair_task_id,
         tests=runs,
-        error="" if status == "passed" else "One or more linked specs failed.",
+        error=error,
     )
 
 
@@ -317,7 +325,14 @@ def _record_verification(
                 status="ready_for_validation",
                 metadata=metadata,
             )
-    elif plan.repair_task_id:
+    else:
+        failure = store.get_failure_by_id(plan.failure_id)
+        store.update_failure_status(
+            failure_id=plan.failure_id,
+            status=str(getattr(failure, "status", "") or "triaged"),
+            metadata=metadata,
+        )
+    if status == "blocked" and plan.repair_task_id:
         store.update_repair_task_status(
             repair_task_id=plan.repair_task_id,
             status="blocked",

@@ -129,6 +129,8 @@ def test_repair_verification_blocks_without_linked_specs(tmp_path: Path) -> None
         failure_id=failure_id,
         title="Repair checkout API",
     )
+    before = store.get_failure_by_id(failure_id)
+    assert before is not None
 
     result = run_repair_verification(
         store=store,
@@ -138,10 +140,87 @@ def test_repair_verification_blocks_without_linked_specs(tmp_path: Path) -> None
     )
 
     assert result.status == "blocked"
+    failure = store.get_failure_by_id(failure_id)
+    assert failure is not None
+    assert failure.status == before.status
+    assert failure.metadata["last_verification"]["status"] == "blocked"
     task = store.get_repair_task(repair_task_id)
     assert task is not None
     assert task.status == "blocked"
     assert task.metadata["last_verification"]["error"] == "No linked Retrace specs found."
+
+
+def test_repair_verification_preserves_blocked_linked_spec(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Default")
+    failure_id = store.upsert_failure(
+        _failure(workspace.project_id, workspace.environment_id)
+    )
+    link_id = store.upsert_failure_test_link(
+        failure_id=failure_id,
+        spec_id="missing-checkout-api",
+        spec_name="Missing checkout API",
+        spec_path="api-tests/specs/missing-checkout-api.json",
+        source="manual",
+    )
+    repair_task_id = store.upsert_repair_task(
+        failure_id=failure_id,
+        title="Repair checkout API",
+        status="ready_for_validation",
+    )
+    before = store.get_failure_by_id(failure_id)
+    assert before is not None
+
+    result = run_repair_verification(
+        store=store,
+        data_dir=tmp_path,
+        cwd=tmp_path,
+        repair_task_id=repair_task_id,
+    )
+
+    assert result.status == "blocked"
+    assert result.error == "One or more linked specs could not run."
+    assert result.tests[0].coverage_link_id == link_id
+    assert result.tests[0].status == "blocked"
+    failure = store.get_failure_by_id(failure_id)
+    assert failure is not None
+    assert failure.status == before.status
+    assert failure.metadata["last_verification"]["status"] == "blocked"
+    task = store.get_repair_task(repair_task_id)
+    assert task is not None
+    assert task.status == "blocked"
+
+
+def test_repair_verification_plans_all_linked_specs(tmp_path: Path) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Default")
+    failure_id = store.upsert_failure(
+        _failure(workspace.project_id, workspace.environment_id)
+    )
+    repair_task_id = store.upsert_repair_task(
+        failure_id=failure_id,
+        title="Repair checkout API",
+        status="ready_for_validation",
+    )
+    for index in range(105):
+        spec_id = f"checkout-api-{index}"
+        store.upsert_failure_test_link(
+            failure_id=failure_id,
+            spec_id=spec_id,
+            spec_name=f"Checkout API {index}",
+            spec_path=f"api-tests/specs/{spec_id}.json",
+            source="manual",
+        )
+
+    plan = plan_repair_verification(
+        store=store,
+        data_dir=tmp_path,
+        repair_task_id=repair_task_id,
+    )
+
+    assert len(plan.tests) == 105
 
 
 def test_repair_verify_cli_prints_verification_plan(

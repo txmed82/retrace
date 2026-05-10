@@ -1999,6 +1999,7 @@ class Storage:
         clean_status = normalize_failure_status(status)
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT metadata_json FROM failures WHERE id = ? OR public_id = ?",
                 (clean_id, clean_id),
@@ -4128,6 +4129,7 @@ class Storage:
         clean_status = normalize_repair_task_status(status)
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
                 SELECT metadata_json
@@ -4488,6 +4490,37 @@ class Storage:
                 WHERE {clause}
                 ORDER BY updated_at DESC, created_at DESC, id
                 LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._failure_test_link_from_row(row) for row in rows]
+
+    def list_all_failure_test_links(
+        self,
+        *,
+        failure_id: Optional[str] = None,
+        issue_public_id: Optional[str] = None,
+        spec_id: Optional[str] = None,
+    ) -> list[FailureTestLinkRow]:
+        where: list[str] = []
+        params: list[object] = []
+        if failure_id is not None:
+            where.append("failure_id = ?")
+            params.append(failure_id)
+        if issue_public_id is not None:
+            where.append("issue_public_id = ?")
+            params.append(issue_public_id)
+        if spec_id is not None:
+            where.append("spec_id = ?")
+            params.append(spec_id)
+        clause = " AND ".join(where) if where else "1 = 1"
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM failure_test_links
+                WHERE {clause}
+                ORDER BY updated_at DESC, created_at DESC, id
                 """,
                 params,
             ).fetchall()
