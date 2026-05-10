@@ -49,6 +49,25 @@ def build_sentry_dsn(*, public_key: str, base_url: str, project_id: str) -> str:
     return f"{scheme}://{public_key}@{host}/{path}"
 
 
+def extract_sentry_ingest_key(
+    *,
+    headers: dict[str, str],
+    query: dict[str, str] | None = None,
+    body: bytes | None = None,
+    content_encoding: str = "",
+) -> str:
+    raw_key = _extract_sentry_key(headers=headers, query=query)
+    if raw_key:
+        return raw_key
+    if body is None:
+        return ""
+    try:
+        decoded = _decode_body(body, content_encoding=content_encoding)
+    except SentryCompatIngestError:
+        return ""
+    return _extract_sentry_key_from_envelope(decoded)
+
+
 def ingest_sentry_compat_request(
     *,
     store: Storage,

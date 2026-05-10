@@ -29,6 +29,8 @@ FAILURE_TEST_COVERAGE_STATES = (
 GITHUB_REVIEW_RUN_STATUSES = ("queued", "running", "succeeded", "failed", "canceled")
 
 _SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+INGEST_RATE_LIMIT_RETENTION_SECONDS = 48 * 60 * 60
+INGEST_RATE_LIMIT_MAX_IDENTITIES_PER_BUCKET = 10000
 
 
 def _rollup_severity(values: list[str]) -> str:
@@ -413,6 +415,22 @@ CREATE TABLE IF NOT EXISTS source_maps (
 
 CREATE INDEX IF NOT EXISTS idx_source_maps_scope_release
 ON source_maps(project_id, environment_id, release, dist, uploaded_at DESC);
+
+CREATE TABLE IF NOT EXISTS ingest_rate_limits (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    bucket TEXT NOT NULL,
+    identity_hash TEXT NOT NULL,
+    window_seconds INTEGER NOT NULL,
+    window_start_ms INTEGER NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, bucket, identity_hash, window_seconds)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingest_rate_limits_scope
+ON ingest_rate_limits(project_id, environment_id, bucket, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS otel_events (
     id TEXT PRIMARY KEY,
@@ -816,6 +834,15 @@ class AppErrorAlertRuleRow:
     metadata: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass
+class RateLimitDecision:
+    allowed: bool
+    limit: int
+    remaining: int
+    reset_after_seconds: int
+    window_seconds: int
 
 
 @dataclass
@@ -2899,6 +2926,159 @@ class Storage:
         file_value = source_map.get("file")
         if file_value is not None and not isinstance(file_value, str):
             raise ValueError("source_map file must be a string when provided")
+
+    def consume_ingest_rate_limit(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        bucket: str,
+        identity: str,
+        limit: int,
+        window_seconds: int,
+        now_ms: Optional[int] = None,
+    ) -> RateLimitDecision:
+        clean_project = project_id.strip()
+        clean_environment = environment_id.strip()
+        clean_bucket = bucket.strip().lower()
+        clean_identity = identity.strip() or "anonymous"
+        clean_limit = max(1, int(limit))
+        clean_window_seconds = max(1, int(window_seconds))
+        current_ms = (
+            int(now_ms)
+            if now_ms is not None
+            else int(datetime.now(timezone.utc).timestamp() * 1000)
+        )
+        window_ms = clean_window_seconds * 1000
+        window_start_ms = current_ms - (current_ms % window_ms)
+        reset_after_seconds = max(
+            1, int(((window_start_ms + window_ms) - current_ms + 999) // 1000)
+        )
+        identity_hash = hashlib.sha256(
+            "\n".join(
+                [clean_project, clean_environment, clean_bucket, clean_identity]
+            ).encode("utf-8")
+        ).hexdigest()
+        row_id = self._id("rlim")
+        now = datetime.now(timezone.utc).isoformat()
+        cutoff = datetime.fromtimestamp(
+            (current_ms / 1000) - INGEST_RATE_LIMIT_RETENTION_SECONDS,
+            tz=timezone.utc,
+        ).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT window_start_ms, count
+                FROM ingest_rate_limits
+                WHERE project_id = ?
+                  AND environment_id = ?
+                  AND bucket = ?
+                  AND identity_hash = ?
+                  AND window_seconds = ?
+                """,
+                (
+                    clean_project,
+                    clean_environment,
+                    clean_bucket,
+                    identity_hash,
+                    clean_window_seconds,
+                ),
+            ).fetchone()
+            if row is None or int(row["window_start_ms"] or 0) != window_start_ms:
+                count = 1
+                conn.execute(
+                    """
+                    INSERT INTO ingest_rate_limits
+                    (id, project_id, environment_id, bucket, identity_hash,
+                     window_seconds, window_start_ms, count, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, environment_id, bucket, identity_hash, window_seconds)
+                    DO UPDATE SET
+                        window_start_ms = excluded.window_start_ms,
+                        count = excluded.count,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        row_id,
+                        clean_project,
+                        clean_environment,
+                        clean_bucket,
+                        identity_hash,
+                        clean_window_seconds,
+                        window_start_ms,
+                        count,
+                        now,
+                    ),
+                )
+            else:
+                previous_count = int(row["count"] or 0)
+                count = previous_count + 1
+                if count <= clean_limit:
+                    cursor = conn.execute(
+                        """
+                        UPDATE ingest_rate_limits
+                        SET count = count + 1, updated_at = ?
+                        WHERE project_id = ?
+                          AND environment_id = ?
+                          AND bucket = ?
+                          AND identity_hash = ?
+                          AND window_seconds = ?
+                          AND window_start_ms = ?
+                          AND count < ?
+                        """,
+                        (
+                            now,
+                            clean_project,
+                            clean_environment,
+                            clean_bucket,
+                            identity_hash,
+                            clean_window_seconds,
+                            window_start_ms,
+                            clean_limit,
+                        ),
+                    )
+                    if cursor.rowcount <= 0:
+                        count = clean_limit + 1
+            conn.execute(
+                """
+                DELETE FROM ingest_rate_limits
+                WHERE project_id = ?
+                  AND environment_id = ?
+                  AND bucket = ?
+                  AND updated_at < ?
+                """,
+                (clean_project, clean_environment, clean_bucket, cutoff),
+            )
+            conn.execute(
+                """
+                DELETE FROM ingest_rate_limits
+                WHERE id IN (
+                    SELECT id
+                    FROM ingest_rate_limits
+                    WHERE project_id = ?
+                      AND environment_id = ?
+                      AND bucket = ?
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (
+                    clean_project,
+                    clean_environment,
+                    clean_bucket,
+                    INGEST_RATE_LIMIT_MAX_IDENTITIES_PER_BUCKET,
+                ),
+            )
+            allowed = count <= clean_limit
+            remaining = max(0, clean_limit - count)
+        return RateLimitDecision(
+            allowed=allowed,
+            limit=clean_limit,
+            remaining=remaining,
+            reset_after_seconds=reset_after_seconds,
+            window_seconds=clean_window_seconds,
+        )
 
     def _source_map_from_row(self, row: sqlite3.Row) -> SourceMapRow:
         return SourceMapRow(

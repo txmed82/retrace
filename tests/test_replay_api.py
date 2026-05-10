@@ -9,7 +9,9 @@ from pathlib import Path
 from threading import Thread
 
 from click.testing import CliRunner
+import pytest
 
+import retrace.commands.api as api_module
 from retrace.commands.api import _handler
 from retrace.cli import main
 from retrace.replay_api import (
@@ -529,6 +531,34 @@ def test_api_rejects_negative_content_length_before_reading(tmp_path: Path) -> N
             payload = json.loads(response.read())
             assert response.status == 400
             assert payload["error"] == "invalid_content_length"
+
+
+def test_api_rate_limits_replay_ingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(api_module.INGEST_RATE_LIMITS, "replay", (1, 60))
+    store, key, _workspace = _store(tmp_path)
+
+    with _running_replay_api_server(store) as server:
+        with closing(
+            HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+        ) as conn:
+            for sequence in (0, 1):
+                body = json.dumps(
+                    {
+                        "sessionId": "sess-rate",
+                        "sequence": sequence,
+                        "events": [{"type": 4, "data": {"href": "https://example.com"}}],
+                    }
+                ).encode()
+                conn.request("POST", "/api/sdk/replay", body=body, headers={"x-retrace-key": key})
+                response = conn.getresponse()
+                payload = json.loads(response.read())
+
+    assert response.status == 429
+    assert payload["error"] == "rate_limited"
+    assert response.getheader("Retry-After")
+    assert response.getheader("X-RateLimit-Remaining") == "0"
 
 
 def test_api_cors_preflight_for_replay_ingest(tmp_path: Path) -> None:

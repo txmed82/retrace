@@ -9,6 +9,7 @@ from threading import Thread
 
 import pytest
 
+import retrace.commands.api as api_module
 from retrace.commands.api import _handler
 from retrace.notification_sinks import NotificationPayload
 from retrace.monitoring_ingest import ingest_monitoring_webhook
@@ -299,6 +300,47 @@ def test_source_map_api_endpoint_accepts_upload(tmp_path: Path) -> None:
     assert rows[0].artifact_url == "https://cdn.example.com/assets/app.min.js"
 
 
+def test_source_map_api_endpoint_rate_limits_uploads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(api_module.INGEST_RATE_LIMITS, "source_maps", (1, 60))
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Source maps",
+        scopes=["source_maps:write"],
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        for artifact in ("app-a.min.js", "app-b.min.js"):
+            conn.request(
+                "POST",
+                f"/api/source-maps?environment_id={workspace.environment_id}",
+                body=json.dumps(
+                    {
+                        "release": "abc123",
+                        "artifact_url": f"https://cdn.example.com/assets/{artifact}",
+                        "source_map": _source_map(),
+                    }
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {service.token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 429
+    assert payload["error"] == "rate_limited"
+    assert payload["limit"] == 1
+    assert response.getheader("Retry-After")
+
+
 def test_source_map_api_endpoint_rejects_unsupported_map(tmp_path: Path) -> None:
     store, workspace = _store(tmp_path)
     service = create_service_token(
@@ -545,6 +587,44 @@ def test_monitoring_webhook_endpoint_ingests_sentry_payload(tmp_path: Path) -> N
     )
     assert failure is not None
     assert failure.severity == "critical"
+
+
+def test_monitoring_webhook_endpoint_rate_limits_by_token_environment_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(api_module.INGEST_RATE_LIMITS, "monitoring", (1, 60))
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Ingest",
+        scopes=["monitoring:write"],
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        for event_id in ("evt-rate-1", "evt-rate-2"):
+            conn.request(
+                "POST",
+                f"/api/monitoring/webhook/sentry?environment_id={workspace.environment_id}",
+                body=json.dumps({"event": {"event_id": event_id, "title": "Boom"}}).encode(
+                    "utf-8"
+                ),
+                headers={
+                    "Authorization": f"Bearer {service.token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 429
+    assert payload["error"] == "rate_limited"
+    assert payload["limit"] == 1
+    assert response.getheader("Retry-After")
+    assert response.getheader("X-RateLimit-Remaining") == "0"
 
 
 def test_sentry_store_endpoint_ingests_sdk_event_with_query_key(tmp_path: Path) -> None:
@@ -884,6 +964,49 @@ def test_sentry_envelope_endpoint_accepts_dsn_key_fallback(tmp_path: Path) -> No
     assert response.status == 202
     assert payload["event_count"] == 1
     assert payload["results"][0]["external_id"] == "evt-envelope-dsn-1"
+
+
+def test_sentry_envelope_endpoint_rate_limits_dsn_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(api_module.INGEST_RATE_LIMITS, "sentry", (1, 60))
+    store, workspace = _store(tmp_path)
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Browser",
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        for event_id in ("evt-envelope-rate-1", "evt-envelope-rate-2"):
+            body = (
+                json.dumps(
+                    {"dsn": f"https://{sdk.key}@retrace.local/{workspace.project_id}"}
+                ).encode("utf-8")
+                + b"\n"
+                + b'{"type":"event"}\n'
+                + json.dumps({"event_id": event_id, "title": "TypeError"}).encode(
+                    "utf-8"
+                )
+                + b"\n"
+            )
+            conn.request(
+                "POST",
+                f"/api/sentry/{workspace.project_id}/envelope/",
+                body=body,
+                headers={"Content-Type": "application/x-sentry-envelope"},
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 429
+    assert payload["error"] == "rate_limited"
+    assert payload["limit"] == 1
+    assert response.getheader("Retry-After")
 
 
 def test_sentry_endpoint_rejects_project_mismatch(tmp_path: Path) -> None:
