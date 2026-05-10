@@ -381,6 +381,35 @@ def test_api_env_profile_supplies_runtime_headers_without_persisting_secret(
     assert request_payload["headers"]["Authorization"] == "[redacted]"
 
 
+def test_api_headers_env_reports_invalid_json_cleanly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    server, base_url, thread = _server_url()
+    monkeypatch.setenv("RETRACE_PROFILE_HEADERS", "not-json")
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Invalid env headers API",
+            method="GET",
+            url=f"{base_url}/api/private",
+            headers_env="RETRACE_PROFILE_HEADERS",
+            expected_status=200,
+        )
+
+        result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is False
+    assert result.failure_classification == "network_error"
+    assert (
+        result.error
+        == "auth failure: headers env var RETRACE_PROFILE_HEADERS must be valid JSON"
+    )
+
+
 def test_api_env_profile_applies_base_url_to_sequence_steps(tmp_path: Path) -> None:
     server, base_url, thread = _server_url()
     try:

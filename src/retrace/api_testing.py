@@ -1002,7 +1002,12 @@ def _resolve_headers(
         raw_headers = env_values.get(headers_env, "").strip()
         if not raw_headers:
             raise RuntimeError(f"auth failure: missing headers env var {headers_env}")
-        parsed_headers = json.loads(raw_headers)
+        try:
+            parsed_headers = json.loads(raw_headers)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"auth failure: headers env var {headers_env} must be valid JSON"
+            ) from exc
         if not isinstance(parsed_headers, dict):
             raise RuntimeError("auth failure: headers env var must be a JSON object")
         headers.update({str(k): str(v) for k, v in parsed_headers.items()})
