@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shlex
+from typing import Any
 
 import click
 
@@ -9,11 +11,144 @@ from retrace.config import load_config
 from retrace.repair import build_repair_bundle
 from retrace.repair_runner import RepairRunnerConfig, run_repair
 from retrace.storage import Storage
+from retrace.verification import plan_repair_verification, run_repair_verification
 
 
 @click.group("repair")
 def repair_group() -> None:
     """Build repair bundles and run local repair agents."""
+
+
+def _store_and_config(config_path: Path) -> tuple[Any, Storage]:
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    return cfg, store
+
+
+@repair_group.command("list")
+@click.option("--status", default="", help="Filter by repair task status.")
+@click.option("--failure-id", default="", help="Filter by failure row ID.")
+@click.option("--limit", default=25, show_default=True, type=int)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    default=False,
+    help="Print machine-readable JSON.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def repair_list_command(
+    *,
+    status: str,
+    failure_id: str,
+    limit: int,
+    json_output: bool,
+    config_path: Path,
+) -> None:
+    _cfg, store = _store_and_config(config_path)
+    tasks = store.list_repair_tasks(
+        failure_id=failure_id.strip() or None,
+        status=status.strip() or None,
+        limit=limit,
+    )
+    payload = [_repair_task_payload(task) for task in tasks]
+    if json_output:
+        click.echo(json.dumps({"repair_tasks": payload}, indent=2, sort_keys=True))
+        return
+    if not tasks:
+        click.echo("No repair tasks found.")
+        return
+    for task in payload:
+        click.echo(
+            f"{task['id']}\t{task['status']}\t{task['failure_id']}\t{task['title']}"
+        )
+
+
+@repair_group.command("show")
+@click.argument("repair_task_id")
+@click.option("--include-sensitive", is_flag=True, default=False)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def repair_show_command(
+    *,
+    repair_task_id: str,
+    include_sensitive: bool,
+    config_path: Path,
+) -> None:
+    _cfg, store = _store_and_config(config_path)
+    task = store.get_repair_task(repair_task_id)
+    if task is None:
+        raise click.ClickException(f"Repair task not found: {repair_task_id}")
+    bundle = build_repair_bundle(
+        store,
+        task.failure_id,
+        include_sensitive=include_sensitive,
+    )
+    plan = plan_repair_verification(
+        store=store,
+        data_dir=_cfg.run.data_dir,
+        repair_task_id=task.id,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "repair_task": _repair_task_payload(task),
+                "bundle": bundle.__dict__,
+                "verification_plan": plan.to_dict(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@repair_group.command("verify")
+@click.option("--repair-task-id", default="", help="Repair task ID or public ID.")
+@click.option("--failure-id", default="", help="Failure row ID or public ID.")
+@click.option("--dry-run", is_flag=True, default=False)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def repair_verify_command(
+    *,
+    repair_task_id: str,
+    failure_id: str,
+    dry_run: bool,
+    config_path: Path,
+) -> None:
+    if not repair_task_id.strip() and not failure_id.strip():
+        raise click.ClickException("Provide --repair-task-id or --failure-id.")
+    cfg, store = _store_and_config(config_path)
+    try:
+        result = run_repair_verification(
+            store=store,
+            data_dir=cfg.run.data_dir,
+            cwd=config_path.parent,
+            repair_task_id=repair_task_id,
+            failure_id=failure_id,
+            dry_run=dry_run,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    if result.status in {"failed", "blocked"} and not dry_run:
+        raise click.ClickException(f"verification {result.status}")
 
 
 @repair_group.command("run")
@@ -102,3 +237,22 @@ def repair_run_command(
         click.echo(f"draft_pr_url={result.draft_pr_url}")
     if result.error:
         raise click.ClickException(result.error)
+
+
+def _repair_task_payload(task: Any) -> dict[str, Any]:
+    return {
+        "id": task.id,
+        "public_id": task.public_id,
+        "failure_id": task.failure_id,
+        "source_type": task.source_type,
+        "source_external_id": task.source_external_id,
+        "title": task.title,
+        "status": task.status,
+        "likely_files": list(task.likely_files or []),
+        "validation_commands": list(task.validation_commands or []),
+        "branch": task.branch,
+        "pr_url": task.pr_url,
+        "risk_notes": task.risk_notes,
+        "metadata": dict(task.metadata or {}),
+        "evidence_ids": list(task.evidence_ids or []),
+    }
