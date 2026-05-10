@@ -176,6 +176,55 @@ def test_openapi_import_resolves_json_refs_and_filters_methods(tmp_path: Path) -
     assert result.specs[0].fixtures["contract_derived"] is True
 
 
+def test_openapi_import_generates_request_body_from_schema(tmp_path: Path) -> None:
+    openapi_path = tmp_path / "openapi.yaml"
+    openapi_path.write_text(
+        """
+openapi: 3.0.3
+info:
+  title: Demo API
+  version: "1.0"
+paths:
+  /v1/orders:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sku, quantity]
+              properties:
+                sku:
+                  type: string
+                  example: sku_123
+                quantity:
+                  type: integer
+                  default: 2
+                note:
+                  type: string
+      responses:
+        "201":
+          description: Created
+"""
+    )
+
+    result = import_openapi_specs(
+        openapi_path=openapi_path,
+        specs_dir=api_specs_dir_for_data_dir(tmp_path),
+        base_url="http://api.example.test",
+        method_filter="POST",
+    )
+
+    assert len(result.specs) == 1
+    spec = result.specs[0]
+    assert spec.method == "POST"
+    assert spec.url == "http://api.example.test/v1/orders"
+    assert spec.headers == {"Content-Type": "application/json"}
+    assert spec.body == {"sku": "sku_123", "quantity": 2}
+    assert spec.expected_status == 201
+
+
 def test_openapi_import_attaches_shared_auth_and_env_profiles(tmp_path: Path) -> None:
     openapi_path = tmp_path / "openapi.yaml"
     openapi_path.write_text(

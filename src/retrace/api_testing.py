@@ -69,6 +69,7 @@ class APITestSpec:
     url: str
     query: dict[str, Any] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
+    headers_env: str = ""
     body: Any = None
     auth: dict[str, Any] = field(default_factory=dict)
     auth_profile: str = ""
@@ -141,6 +142,7 @@ def _coerce_spec(data: dict[str, Any]) -> APITestSpec:
     data.setdefault("schema_version", API_SPEC_SCHEMA_VERSION)
     data.setdefault("query", {})
     data.setdefault("headers", {})
+    data.setdefault("headers_env", "")
     data.setdefault("auth", {})
     data.setdefault("auth_profile", "")
     data.setdefault("env_profile", "")
@@ -230,6 +232,7 @@ def create_api_spec(
     url: str,
     query: Optional[dict[str, Any]] = None,
     headers: Optional[dict[str, str]] = None,
+    headers_env: str = "",
     body: Any = None,
     auth: Optional[dict[str, Any]] = None,
     auth_profile: str = "",
@@ -254,6 +257,7 @@ def create_api_spec(
         url=url.strip(),
         query=dict(query or {}),
         headers={str(k): str(v) for k, v in dict(headers or {}).items()},
+        headers_env=headers_env.strip(),
         body=body,
         auth=dict(auth or {}),
         auth_profile=auth_profile.strip(),
@@ -339,6 +343,7 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
             query = _render_mapping(step.get("query", spec.query), scope)
             headers = _resolve_headers(
                 spec,
+                step_headers_env=step.get("headers_env"),
                 step_auth=step.get("auth"),
                 env=effective_env,
             )
@@ -925,6 +930,7 @@ def _step_spec(
         url=url,
         query=query,
         headers=dict(step.get("headers") or {}),
+        headers_env=str(step.get("headers_env") or spec.headers_env or ""),
         body=step.get("body", spec.body),
         auth=dict(step.get("auth") or spec.auth),
         auth_profile=spec.auth_profile,
@@ -985,11 +991,26 @@ def _apply_extractors(raw_extractors: Any, scope: dict[str, Any]) -> None:
 def _resolve_headers(
     spec: APITestSpec,
     *,
+    step_headers_env: Any = None,
     step_auth: Any = None,
     env: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
     headers = {str(k): str(v) for k, v in spec.headers.items()}
     env_values = env if env is not None else dict(os.environ)
+    headers_env = str(step_headers_env or spec.headers_env or "").strip()
+    if headers_env:
+        raw_headers = env_values.get(headers_env, "").strip()
+        if not raw_headers:
+            raise RuntimeError(f"auth failure: missing headers env var {headers_env}")
+        try:
+            parsed_headers = json.loads(raw_headers)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"auth failure: headers env var {headers_env} must be valid JSON"
+            ) from exc
+        if not isinstance(parsed_headers, dict):
+            raise RuntimeError("auth failure: headers env var must be a JSON object")
+        headers.update({str(k): str(v) for k, v in parsed_headers.items()})
     auth = step_auth if isinstance(step_auth, dict) else spec.auth
     auth_type = str(auth.get("type") or "none").strip().lower()
     if auth_type in {"", "none"}:

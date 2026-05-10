@@ -23,6 +23,7 @@ class ResolvedEnvProfile:
     name: str
     api_base_url: str = ""
     app_url: str = ""
+    headers_env: str = ""
     env_overrides: dict[str, str] = field(default_factory=dict)
     redacted_preview: dict[str, Any] = field(default_factory=dict)
 
@@ -94,6 +95,7 @@ def resolve_env_profile(defaults: dict[str, Any], name: str) -> ResolvedEnvProfi
         name=clean_name,
         api_base_url=str(profile.get("api_base_url") or "").strip(),
         app_url=str(profile.get("app_url") or "").strip(),
+        headers_env=str(profile.get("headers_env") or "").strip(),
         env_overrides={str(k): str(v) for k, v in dict(env_overrides).items()},
         redacted_preview=_redacted_profile_preview(profile),
     )
@@ -138,10 +140,25 @@ def apply_api_profiles(
             **env_profile.env_overrides,
             **{str(k): str(v) for k, v in dict(spec.env_overrides or {}).items()},
         }
-        if env_profile.api_base_url and str(spec.url).startswith("/"):
-            spec.url = env_profile.api_base_url.rstrip("/") + "/" + str(spec.url).lstrip("/")
+        if env_profile.headers_env:
+            spec.headers_env = env_profile.headers_env
+        if env_profile.api_base_url:
+            spec.url = _with_api_base_url(env_profile.api_base_url, str(spec.url))
+            steps = []
+            for step in list(getattr(spec, "steps", []) or []):
+                item = dict(step)
+                if item.get("url"):
+                    item["url"] = _with_api_base_url(env_profile.api_base_url, str(item["url"]))
+                steps.append(item)
+            spec.steps = steps
         spec.env_profile = env_name
     return spec
+
+
+def _with_api_base_url(base_url: str, url: str) -> str:
+    if not base_url.strip() or not url.startswith("/"):
+        return url
+    return base_url.rstrip("/") + "/" + url.lstrip("/")
 
 
 def _secret_key_paths(value: Any, path: str = "") -> list[str]:

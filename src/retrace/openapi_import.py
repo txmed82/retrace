@@ -111,6 +111,7 @@ def _operation_to_spec(
     request_path = _render_path(raw_path, operation_parameters)
     query = _query_defaults(operation_parameters)
     status, response_schema = _response_contract(document, operation)
+    body, content_type = _request_body_example(document, operation)
     operation_id = str(operation.get("operationId") or "").strip()
     summary = str(operation.get("summary") or "").strip()
     name = summary or operation_id or f"{method} {raw_path}"
@@ -120,6 +121,8 @@ def _operation_to_spec(
         method=method,
         url=_join_url(base_url, request_path),
         query=query,
+        headers={"Content-Type": content_type} if body is not None and content_type else {},
+        body=body,
         auth_profile=auth_profile,
         env_profile=env_profile,
         env_overrides=env_overrides or {},
@@ -135,6 +138,37 @@ def _operation_to_spec(
             "selected_response_status": str(status),
         },
     )
+
+
+def _request_body_example(
+    document: dict[str, Any],
+    operation: dict[str, Any],
+) -> tuple[Any, str]:
+    request_body = _resolve_ref(document, operation.get("requestBody"))
+    if not isinstance(request_body, dict):
+        return None, ""
+    content = request_body.get("content") or {}
+    if not isinstance(content, dict) or not content:
+        return None, ""
+    content_type = (
+        "application/json"
+        if "application/json" in content
+        else str(next(iter(content.keys())))
+    )
+    media = content.get(content_type)
+    if not isinstance(media, dict):
+        return None, content_type
+    if "example" in media:
+        return media["example"], content_type
+    examples = media.get("examples")
+    if isinstance(examples, dict) and examples:
+        first = next(iter(examples.values()))
+        if isinstance(first, dict) and "value" in first:
+            return first["value"], content_type
+    schema = _resolve_schema_refs(document, media.get("schema"), keep_examples=True)
+    if isinstance(schema, dict):
+        return _schema_example(schema), content_type
+    return None, content_type
 
 
 def _parameters(document: dict[str, Any], value: Any) -> list[dict[str, Any]]:
@@ -237,16 +271,28 @@ def _resolve_ref(document: dict[str, Any], value: Any) -> Any:
     return value
 
 
-def _resolve_schema_refs(document: dict[str, Any], value: Any) -> Any:
+def _resolve_schema_refs(
+    document: dict[str, Any],
+    value: Any,
+    *,
+    keep_examples: bool = False,
+) -> Any:
     resolved = copy.deepcopy(_resolve_ref(document, value))
     if isinstance(resolved, dict):
         return {
-            key: _resolve_schema_refs(document, nested)
+            key: _resolve_schema_refs(
+                document,
+                nested,
+                keep_examples=keep_examples,
+            )
             for key, nested in resolved.items()
-            if key not in {"description", "example", "examples"}
+            if keep_examples or key not in {"description", "example", "examples"}
         }
     if isinstance(resolved, list):
-        return [_resolve_schema_refs(document, item) for item in resolved]
+        return [
+            _resolve_schema_refs(document, item, keep_examples=keep_examples)
+            for item in resolved
+        ]
     return resolved
 
 
@@ -261,6 +307,33 @@ def _schema_placeholder(schema: dict[str, Any]) -> Any:
         "array": [],
         "object": {},
     }.get(schema_type, "1")
+
+
+def _schema_example(schema: dict[str, Any]) -> Any:
+    if "example" in schema:
+        return schema["example"]
+    if "default" in schema:
+        return schema["default"]
+    schema_type = str(schema.get("type") or "").strip()
+    if schema_type == "object" or isinstance(schema.get("properties"), dict):
+        properties = schema.get("properties") or {}
+        if not isinstance(properties, dict):
+            return {}
+        required = {
+            str(item)
+            for item in schema.get("required", [])
+            if str(item).strip()
+        }
+        keys = required or {str(key) for key in properties}
+        return {
+            str(key): _schema_example(value if isinstance(value, dict) else {})
+            for key, value in properties.items()
+            if str(key) in keys
+        }
+    if schema_type == "array":
+        item_schema = schema.get("items")
+        return [_schema_example(item_schema if isinstance(item_schema, dict) else {})]
+    return _schema_placeholder(schema)
 
 
 def _server_url(document: dict[str, Any]) -> str:

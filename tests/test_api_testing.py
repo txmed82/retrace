@@ -15,6 +15,7 @@ from retrace.api_testing import (
     run_api_spec,
 )
 from retrace.storage import Storage
+from retrace.test_profiles import apply_api_profiles
 
 
 class _APIHandler(BaseHTTPRequestHandler):
@@ -331,6 +332,125 @@ def test_api_spec_runs_request_sequence_with_extracted_values(
         "update-cart:state",
     ]
     assert sum(item["artifact_type"] == "api_request" for item in result.artifacts) == 2
+
+
+def test_api_env_profile_supplies_runtime_headers_without_persisting_secret(
+    tmp_path: Path, monkeypatch
+) -> None:
+    server, base_url, thread = _server_url()
+    monkeypatch.setenv(
+        "RETRACE_PROFILE_HEADERS",
+        json.dumps({"Authorization": "Bearer test-token"}),
+    )
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Private env headers API",
+            method="GET",
+            url="/api/private",
+            env_profile="local-api",
+            expected_status=200,
+        )
+        spec = apply_api_profiles(
+            spec,
+            defaults={
+                "env_profiles": {
+                    "local-api": {
+                        "api_base_url": base_url,
+                        "headers_env": "RETRACE_PROFILE_HEADERS",
+                    }
+                }
+            },
+        )
+
+        result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is True
+    assert spec.url == f"{base_url}/api/private"
+    assert spec.headers_env == "RETRACE_PROFILE_HEADERS"
+    spec_text = (api_specs_dir_for_data_dir(tmp_path) / f"{spec.spec_id}.json").read_text()
+    assert "test-token" not in spec_text
+    request_artifact = next(
+        item for item in result.artifacts if item["artifact_type"] == "api_request"
+    )
+    request_payload = json.loads(Path(request_artifact["path"]).read_text())
+    assert request_payload["headers"]["Authorization"] == "[redacted]"
+
+
+def test_api_headers_env_reports_invalid_json_cleanly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    server, base_url, thread = _server_url()
+    monkeypatch.setenv("RETRACE_PROFILE_HEADERS", "not-json")
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Invalid env headers API",
+            method="GET",
+            url=f"{base_url}/api/private",
+            headers_env="RETRACE_PROFILE_HEADERS",
+            expected_status=200,
+        )
+
+        result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is False
+    assert result.failure_classification == "network_error"
+    assert (
+        result.error
+        == "auth failure: headers env var RETRACE_PROFILE_HEADERS must be valid JSON"
+    )
+
+
+def test_api_env_profile_applies_base_url_to_sequence_steps(tmp_path: Path) -> None:
+    server, base_url, thread = _server_url()
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Relative cart sequence",
+            method="GET",
+            url="/api/health",
+            env_profile="local-api",
+            steps=[
+                {
+                    "id": "create-cart",
+                    "method": "POST",
+                    "url": "/api/cart",
+                    "body": {"cartId": 42},
+                    "expected_status": 201,
+                    "extract": [{"name": "cart_id", "path": "$.received.cartId"}],
+                },
+                {
+                    "id": "update-cart",
+                    "method": "PATCH",
+                    "url": "/api/cart/{{ vars.cart_id }}",
+                    "expected_status": 200,
+                    "json_assertions": [{"path": "$.cartId", "equals": 42}],
+                },
+            ],
+        )
+        spec = apply_api_profiles(
+            spec,
+            defaults={"env_profiles": {"local-api": {"api_base_url": base_url}}},
+        )
+
+        result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is True
+    assert spec.steps[0]["url"] == f"{base_url}/api/cart"
+    assert spec.steps[1]["url"] == f"{base_url}/api/cart/{{{{ vars.cart_id }}}}"
 
 
 def test_failed_api_run_creates_failure_evidence_and_repair_task(
