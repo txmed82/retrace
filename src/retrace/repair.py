@@ -424,7 +424,7 @@ def _request_response_pairs(evidence: list[dict[str, Any]]) -> list[dict[str, An
             pair["request"] = payload
         elif evidence_type == "api_response":
             pair["response"] = payload
-    return [pair for _, pair in sorted(pairs.items())]
+    return list(pairs.values())
 
 
 def _request_response_pair_key(*, item: dict[str, Any], payload: dict[str, Any]) -> str:

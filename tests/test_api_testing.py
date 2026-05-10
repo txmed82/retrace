@@ -352,7 +352,7 @@ def test_api_sequence_repair_bundle_keeps_each_request_response_step(
             url=f"{base_url}/api/health",
             steps=[
                 {
-                    "id": "create-cart",
+                    "id": "step-2",
                     "method": "POST",
                     "url": f"{base_url}/api/cart",
                     "body": {"cartId": 42},
@@ -360,7 +360,7 @@ def test_api_sequence_repair_bundle_keeps_each_request_response_step(
                     "extract": [{"name": "cart_id", "path": "$.received.cartId"}],
                 },
                 {
-                    "id": "update-cart",
+                    "id": "step-10",
                     "method": "PATCH",
                     "url": f"{base_url}/api/cart/{{{{ vars.cart_id }}}}",
                     "expected_status": 201,
@@ -389,7 +389,7 @@ def test_api_sequence_repair_bundle_keeps_each_request_response_step(
     bundle = build_repair_bundle(store, persisted.failure_id)
     pairs = bundle.backend_context["request_response"]
 
-    assert [item["step_id"] for item in pairs] == ["create-cart", "update-cart"]
+    assert [item["step_id"] for item in pairs] == ["step-2", "step-10"]
     assert pairs[0]["request"]["artifact"]["method"] == "POST"
     assert pairs[0]["request"]["artifact"]["body"] == {"cartId": 42}
     assert pairs[0]["response"]["artifact"]["status_code"] == 201
