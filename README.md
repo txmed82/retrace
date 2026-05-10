@@ -390,6 +390,26 @@ Related monitor failures are also grouped into incidents by stack frame, route,
 service, trace, deploy, and fingerprint. Each incident rolls up severity,
 affected failures, evidence, and a single repair task.
 
+Upload production source maps before or during deploys so minified browser
+errors resolve to original source paths in failure metadata, incident grouping,
+and repair prompts:
+
+```bash
+retrace api upload-source-map \
+  --release "$GITHUB_SHA" \
+  --artifact-url https://cdn.example.com/assets/app.min.js \
+  dist/assets/app.min.js.map
+```
+
+Hosted/self-host API uploads use a service token with `source_maps:write`,
+`ingest`, or `admin`:
+
+- `POST /api/source-maps?environment_id=...`
+
+Send JSON with `release`, `artifact_url`, optional `dist`, and `source_map`.
+Sentry-compatible events map stack frames when their `release`, `dist`,
+generated filename, line, and column match an uploaded Source Map v3 artifact.
+
 Deploy markers can be recorded from CI with `POST /api/deploys?environment_id=...`
 or locally with `retrace api record-deploy --sha <commit> --changed-file <path>`.
 Failures after the deploy are linked to the nearest marker, and incident repair

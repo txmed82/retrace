@@ -378,6 +378,22 @@ CREATE TABLE IF NOT EXISTS deploy_markers (
 CREATE INDEX IF NOT EXISTS idx_deploy_markers_scope_time
 ON deploy_markers(project_id, environment_id, deployed_at_ms DESC);
 
+CREATE TABLE IF NOT EXISTS source_maps (
+    id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    release TEXT NOT NULL,
+    dist TEXT NOT NULL DEFAULT '',
+    artifact_url TEXT NOT NULL,
+    source_map_json TEXT NOT NULL DEFAULT '{}',
+    uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, release, dist, artifact_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_maps_scope_release
+ON source_maps(project_id, environment_id, release, dist, uploaded_at DESC);
+
 CREATE TABLE IF NOT EXISTS otel_events (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -776,6 +792,19 @@ class DeployMarkerRow:
     metadata: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass
+class SourceMapRow:
+    id: str
+    public_id: str
+    project_id: str
+    environment_id: str
+    release: str
+    dist: str
+    artifact_url: str
+    source_map: dict[str, Any]
+    uploaded_at: datetime
 
 
 @dataclass
@@ -2562,6 +2591,123 @@ class Storage:
             metadata=dict(self._safe_json_obj(row["metadata_json"])),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    def upsert_source_map(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        release: str,
+        artifact_url: str,
+        source_map: dict[str, Any],
+        dist: str = "",
+    ) -> str:
+        clean_release = release.strip()
+        clean_artifact_url = artifact_url.strip()
+        if not clean_release:
+            raise ValueError("release is required")
+        if not clean_artifact_url:
+            raise ValueError("artifact_url is required")
+        if not isinstance(source_map, dict) or not source_map:
+            raise ValueError("source_map must be a non-empty object")
+        self._validate_source_map_payload(source_map)
+        try:
+            source_map_json = json.dumps(source_map, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("source_map must be JSON-serializable") from exc
+        source_map_id = self._public_id(
+            "smap", project_id, environment_id, clean_release, dist.strip(), clean_artifact_url
+        )
+        public_id = source_map_id
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO source_maps
+                (id, public_id, project_id, environment_id, release, dist,
+                 artifact_url, source_map_json, uploaded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, environment_id, release, dist, artifact_url)
+                DO UPDATE SET
+                    source_map_json = excluded.source_map_json,
+                    uploaded_at = excluded.uploaded_at
+                """,
+                (
+                    source_map_id,
+                    public_id,
+                    project_id,
+                    environment_id,
+                    clean_release,
+                    dist.strip(),
+                    clean_artifact_url,
+                    source_map_json,
+                    now,
+                ),
+            )
+        return source_map_id
+
+    def list_source_maps(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        release: str,
+        dist: Optional[str] = "",
+        limit: int = 100,
+    ) -> list[SourceMapRow]:
+        where = "project_id = ? AND environment_id = ? AND release = ?"
+        params: list[object] = [project_id, environment_id, release.strip()]
+        if dist is not None:
+            where += " AND dist = ?"
+            params.append(dist.strip())
+        params.append(max(1, min(int(limit), 500)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM source_maps
+                WHERE {where}
+                ORDER BY uploaded_at DESC, artifact_url
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._source_map_from_row(row) for row in rows]
+
+    def _validate_source_map_payload(self, source_map: dict[str, Any]) -> None:
+        if source_map.get("version") != 3:
+            raise ValueError("source_map must be a supported Source Map v3 object")
+        if not isinstance(source_map.get("mappings"), str) or not source_map.get(
+            "mappings"
+        ):
+            raise ValueError("source_map mappings must be a non-empty string")
+        sources = source_map.get("sources")
+        if not isinstance(sources, list) or not sources:
+            raise ValueError("source_map sources must be a non-empty list")
+        if not all(isinstance(item, str) and item.strip() for item in sources):
+            raise ValueError("source_map sources must contain only non-empty strings")
+        names = source_map.get("names")
+        if names is not None and not isinstance(names, list):
+            raise ValueError("source_map names must be a list when provided")
+        source_root = source_map.get("sourceRoot")
+        if source_root is not None and not isinstance(source_root, str):
+            raise ValueError("source_map sourceRoot must be a string when provided")
+        file_value = source_map.get("file")
+        if file_value is not None and not isinstance(file_value, str):
+            raise ValueError("source_map file must be a string when provided")
+
+    def _source_map_from_row(self, row: sqlite3.Row) -> SourceMapRow:
+        return SourceMapRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            release=str(row["release"]),
+            dist=str(row["dist"] or ""),
+            artifact_url=str(row["artifact_url"]),
+            source_map=dict(self._safe_json_obj(row["source_map_json"])),
+            uploaded_at=self._dt(row["uploaded_at"]) or datetime.now(timezone.utc),
         )
 
     def append_otel_event(
