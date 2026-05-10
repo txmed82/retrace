@@ -31,6 +31,14 @@ GITHUB_REVIEW_RUN_STATUSES = ("queued", "running", "succeeded", "failed", "cance
 _SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 INGEST_RATE_LIMIT_RETENTION_SECONDS = 48 * 60 * 60
 INGEST_RATE_LIMIT_MAX_IDENTITIES_PER_BUCKET = 10000
+APP_ERROR_INCIDENT_STATUSES = ("open", "triaged", "investigating", "resolved", "ignored")
+APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS = {
+    "open": "new",
+    "triaged": "triaged",
+    "investigating": "triaged",
+    "resolved": "resolved",
+    "ignored": "ignored",
+}
 
 
 def _rollup_severity(values: list[str]) -> str:
@@ -57,6 +65,16 @@ def _normalize_github_review_run_status(value: str) -> str:
     if status not in GITHUB_REVIEW_RUN_STATUSES:
         allowed = ", ".join(GITHUB_REVIEW_RUN_STATUSES)
         raise ValueError(f"invalid github review run status: {value!r}; allowed: {allowed}")
+    return status
+
+
+def _normalize_app_error_incident_status(value: str) -> str:
+    status = value.strip().lower()
+    if status == "reopened":
+        status = "open"
+    if status not in APP_ERROR_INCIDENT_STATUSES:
+        allowed = ", ".join(APP_ERROR_INCIDENT_STATUSES)
+        raise ValueError(f"invalid app-error incident status: {value!r}; allowed: {allowed}")
     return status
 
 
@@ -360,6 +378,26 @@ ON incident_failures(failure_id, created_at);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_failures_one_incident_per_failure
 ON incident_failures(failure_id);
+
+CREATE TABLE IF NOT EXISTS incident_lifecycle_events (
+    id TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    from_status TEXT NOT NULL DEFAULT '',
+    to_status TEXT NOT NULL,
+    actor_type TEXT NOT NULL DEFAULT '',
+    actor_id TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_incident_lifecycle_events_incident_time
+ON incident_lifecycle_events(incident_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_incident_lifecycle_events_scope_time
+ON incident_lifecycle_events(project_id, environment_id, created_at);
 
 CREATE TABLE IF NOT EXISTS app_error_alert_rules (
     id TEXT PRIMARY KEY,
@@ -817,6 +855,21 @@ class IncidentRow:
 
 
 @dataclass
+class IncidentLifecycleEventRow:
+    id: str
+    incident_id: str
+    project_id: str
+    environment_id: str
+    from_status: str
+    to_status: str
+    actor_type: str
+    actor_id: str
+    reason: str
+    metadata: dict[str, Any]
+    created_at: datetime
+
+
+@dataclass
 class AppErrorAlertRuleRow:
     id: str
     public_id: str
@@ -1252,6 +1305,35 @@ class Storage:
                 conn.execute(
                     "ALTER TABLE app_error_alert_rules ADD COLUMN precedence INTEGER NOT NULL DEFAULT 0"
                 )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS incident_lifecycle_events (
+                    id TEXT PRIMARY KEY,
+                    incident_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    environment_id TEXT NOT NULL,
+                    from_status TEXT NOT NULL DEFAULT '',
+                    to_status TEXT NOT NULL,
+                    actor_type TEXT NOT NULL DEFAULT '',
+                    actor_id TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_incident_lifecycle_events_incident_time
+                ON incident_lifecycle_events(incident_id, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_incident_lifecycle_events_scope_time
+                ON incident_lifecycle_events(project_id, environment_id, created_at)
+                """
+            )
             conn.execute("DROP INDEX IF EXISTS idx_app_error_alert_rules_scope")
             conn.execute(
                 """
@@ -2048,7 +2130,16 @@ class Storage:
             metadata_json = json.dumps(metadata or {}, sort_keys=True)
         except (TypeError, ValueError) as exc:
             raise ValueError("incident metadata must be JSON-serializable") from exc
+        clean_status = _normalize_app_error_incident_status(status)
         with self._conn() as conn:
+            existing = conn.execute(
+                """
+                SELECT id, status
+                FROM incidents
+                WHERE project_id = ? AND environment_id = ? AND group_key = ?
+                """,
+                (project_id, environment_id, group_key),
+            ).fetchone()
             conn.execute(
                 """
                 INSERT INTO incidents
@@ -2059,7 +2150,10 @@ class Storage:
                     title = excluded.title,
                     summary = excluded.summary,
                     severity = excluded.severity,
-                    status = excluded.status,
+                    status = CASE
+                        WHEN incidents.status IN ('resolved', 'ignored') THEN excluded.status
+                        ELSE incidents.status
+                    END,
                     metadata_json = excluded.metadata_json,
                     updated_at = excluded.updated_at
                 """,
@@ -2072,7 +2166,7 @@ class Storage:
                     title,
                     summary,
                     severity,
-                    status,
+                    clean_status,
                     metadata_json,
                     now,
                     now,
@@ -2087,6 +2181,24 @@ class Storage:
                 (project_id, environment_id, group_key),
             ).fetchone()
             assert row is not None
+            if (
+                existing is not None
+                and str(existing["status"] or "") in {"resolved", "ignored"}
+                and clean_status == "open"
+            ):
+                self._append_incident_lifecycle_event(
+                    conn,
+                    incident_id=str(row["id"]),
+                    project_id=project_id,
+                    environment_id=environment_id,
+                    from_status=str(existing["status"] or ""),
+                    to_status="open",
+                    actor_type="system",
+                    actor_id="monitoring_ingest",
+                    reason="new matching app-error failure reopened the incident",
+                    metadata={"trigger": "ingest_regression"},
+                    created_at=now,
+                )
             return str(row["id"])
 
     def link_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
@@ -2341,6 +2453,170 @@ class Storage:
             ).fetchall()
         return [self._evidence_from_row(row) for row in rows]
 
+    def transition_app_error_incident(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        incident_id: str,
+        status: str,
+        actor_type: str = "service_token",
+        actor_id: str = "",
+        reason: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> IncidentRow:
+        clean_status = _normalize_app_error_incident_status(status)
+        clean_actor_type = actor_type.strip()[:80] or "service_token"
+        clean_actor_id = actor_id.strip()[:200]
+        clean_reason = reason.strip()[:2000]
+        clean_metadata = metadata or {}
+        try:
+            metadata_json = json.dumps(clean_metadata, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("lifecycle metadata must be JSON-serializable") from exc
+        failure_status = APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS[clean_status]
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            incident = conn.execute(
+                """
+                SELECT *
+                FROM incidents
+                WHERE (id = ? OR public_id = ?)
+                  AND project_id = ?
+                  AND environment_id = ?
+                """,
+                (incident_id, incident_id, project_id, environment_id),
+            ).fetchone()
+            if incident is None:
+                raise ValueError(f"unknown incident_id: {incident_id}")
+            resolved_incident_id = str(incident["id"])
+            previous_status = str(incident["status"] or "")
+            incident_metadata = dict(self._safe_json_obj(incident["metadata_json"]))
+            incident_metadata.update(
+                {
+                    "last_lifecycle_actor_type": clean_actor_type,
+                    "last_lifecycle_actor_id": clean_actor_id,
+                    "last_lifecycle_reason": clean_reason,
+                    "last_lifecycle_at": now,
+                }
+            )
+            conn.execute(
+                """
+                UPDATE incidents
+                SET status = ?,
+                    metadata_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    clean_status,
+                    json.dumps(incident_metadata, sort_keys=True),
+                    now,
+                    resolved_incident_id,
+                ),
+            )
+            self._append_incident_lifecycle_event(
+                conn,
+                incident_id=resolved_incident_id,
+                project_id=project_id,
+                environment_id=environment_id,
+                from_status=previous_status,
+                to_status=clean_status,
+                actor_type=clean_actor_type,
+                actor_id=clean_actor_id,
+                reason=clean_reason,
+                metadata=clean_metadata,
+                metadata_json=metadata_json,
+                created_at=now,
+            )
+            conn.execute(
+                """
+                UPDATE failures
+                SET status = ?,
+                    updated_at = ?
+                WHERE id IN (
+                    SELECT failure_id
+                    FROM incident_failures
+                    WHERE incident_id = ?
+                )
+                  AND source_type = 'monitor_incident'
+                """,
+                (failure_status, now, resolved_incident_id),
+            )
+            self._refresh_incident_rollup(conn, incident_id=resolved_incident_id)
+            row = conn.execute(
+                """
+                SELECT *
+                FROM incidents
+                WHERE id = ?
+                """,
+                (resolved_incident_id,),
+            ).fetchone()
+            assert row is not None
+        return self._incident_from_row(row)
+
+    def list_incident_lifecycle_events(
+        self,
+        *,
+        incident_id: str,
+        limit: int = 100,
+    ) -> list[IncidentLifecycleEventRow]:
+        resolved_incident_id = self._resolve_incident_id(incident_id)
+        if not resolved_incident_id:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM incident_lifecycle_events
+                WHERE incident_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (resolved_incident_id, max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [self._incident_lifecycle_event_from_row(row) for row in rows]
+
+    def _append_incident_lifecycle_event(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        incident_id: str,
+        project_id: str,
+        environment_id: str,
+        from_status: str,
+        to_status: str,
+        actor_type: str,
+        actor_id: str,
+        reason: str,
+        metadata: Optional[dict[str, Any]] = None,
+        metadata_json: str = "",
+        created_at: str = "",
+    ) -> None:
+        if not metadata_json:
+            metadata_json = json.dumps(metadata or {}, sort_keys=True)
+        conn.execute(
+            """
+            INSERT INTO incident_lifecycle_events
+            (id, incident_id, project_id, environment_id, from_status, to_status,
+             actor_type, actor_id, reason, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self._id("ilc"),
+                incident_id,
+                project_id,
+                environment_id,
+                from_status,
+                to_status,
+                actor_type,
+                actor_id,
+                reason,
+                metadata_json,
+                created_at or datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
     def _resolve_incident_id(self, incident_id: str) -> str:
         with self._conn() as conn:
             row = conn.execute(
@@ -2409,6 +2685,23 @@ class Storage:
             metadata=dict(self._safe_json_obj(row["metadata_json"])),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    def _incident_lifecycle_event_from_row(
+        self, row: sqlite3.Row
+    ) -> IncidentLifecycleEventRow:
+        return IncidentLifecycleEventRow(
+            id=str(row["id"]),
+            incident_id=str(row["incident_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            from_status=str(row["from_status"] or ""),
+            to_status=str(row["to_status"] or ""),
+            actor_type=str(row["actor_type"] or ""),
+            actor_id=str(row["actor_id"] or ""),
+            reason=str(row["reason"] or ""),
+            metadata=dict(self._safe_json_obj(row["metadata_json"])),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
         )
 
     def upsert_app_error_alert_rule(
