@@ -379,9 +379,6 @@ CREATE TABLE IF NOT EXISTS app_error_alert_rules (
     UNIQUE(project_id, environment_id, name)
 );
 
-CREATE INDEX IF NOT EXISTS idx_app_error_alert_rules_scope
-ON app_error_alert_rules(project_id, environment_id, enabled, updated_at DESC);
-
 CREATE TABLE IF NOT EXISTS deploy_markers (
     id TEXT PRIMARY KEY,
     public_id TEXT NOT NULL,
@@ -1213,6 +1210,7 @@ class Storage:
                 conn.execute(
                     "ALTER TABLE app_error_alert_rules ADD COLUMN precedence INTEGER NOT NULL DEFAULT 0"
                 )
+            conn.execute("DROP INDEX IF EXISTS idx_app_error_alert_rules_scope")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_app_error_alert_rules_eval
