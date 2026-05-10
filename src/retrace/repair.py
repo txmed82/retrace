@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any
 
 from retrace.repo_inspection import infer_validation_commands
@@ -178,6 +179,7 @@ def build_repair_bundle(
         reproduction=_reproduction_context(failure),
         linked_tests=[_linked_test_item(item) for item in test_links],
         backend_context=_backend_context(
+            store=store,
             failure=failure,
             evidence=evidence_items,
             repair_task=repair_task,
@@ -354,6 +356,7 @@ def _linked_test_item(link: Any) -> dict[str, Any]:
 
 def _backend_context(
     *,
+    store: Any,
     failure: Any,
     evidence: list[dict[str, Any]],
     repair_task: Any,
@@ -363,6 +366,14 @@ def _backend_context(
     route_matches = _route_match_context(metadata=metadata, repair_task=repair_task)
     log_evidence = _log_evidence_context(evidence)
     trace_ids = _unique_strings(metadata.get("trace_ids", []) or [])
+    log_evidence.extend(
+        _otel_trace_context(
+            store=store,
+            failure=failure,
+            trace_ids=trace_ids,
+            evidence=evidence,
+        )
+    )
     context = {
         "request_response": request_response,
         "route": {
@@ -462,6 +473,60 @@ def _log_evidence_context(evidence: list[dict[str, Any]]) -> list[dict[str, Any]
     return logs
 
 
+def _otel_trace_context(
+    *,
+    store: Any,
+    failure: Any,
+    trace_ids: list[str],
+    evidence: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not trace_ids or not hasattr(store, "list_otel_events"):
+        return []
+    linked_event_ids = {
+        str((item.get("untrusted_payload") or {}).get("otel_event_id") or "")
+        for item in evidence
+    }
+    events: list[Any] = []
+    for trace_id in trace_ids[:10]:
+        events.extend(
+            store.list_otel_events(
+                project_id=failure.project_id,
+                environment_id=failure.environment_id,
+                trace_id=trace_id,
+                limit=25,
+            )
+        )
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in sorted(events, key=lambda item: (item.occurred_at_ms, item.id))[:50]:
+        if event.id in seen or event.id in linked_event_ids:
+            continue
+        seen.add(event.id)
+        evidence_type = "otel_log" if event.signal_type == "log" else "otel_span"
+        out.append(
+            {
+                "id": event.id,
+                "type": evidence_type,
+                "source": f"otel:{event.trace_id or event.span_id}",
+                "occurred_at_ms": event.occurred_at_ms,
+                "redaction_state": "redacted",
+                "untrusted_payload": _scrub_backend_payload(
+                    {
+                        "otel_event_id": event.id,
+                        "signal_type": event.signal_type,
+                        "trace_id": event.trace_id,
+                        "span_id": event.span_id,
+                        "name": event.name,
+                        "severity": event.severity,
+                        "body": event.body,
+                        "attributes": dict(event.attributes),
+                    }
+                ),
+            }
+        )
+    return out
+
+
 def _bundle_likely_files(
     *,
     failure: Any,
@@ -552,3 +617,64 @@ def _unique_strings(values: Any) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def _scrub_backend_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "[redacted]"
+                if _is_sensitive_key(str(key))
+                else _scrub_backend_payload(nested)
+            )
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_scrub_backend_payload(item) for item in value]
+    if isinstance(value, str):
+        return _scrub_backend_text(value)
+    return value
+
+
+def _is_sensitive_key(value: str) -> bool:
+    return bool(
+        re.search(
+            r"(?i)(authorization|api[_-]?key|token|secret|password|session|cookie)",
+            value,
+        )
+    )
+
+
+def _scrub_backend_text(value: str) -> str:
+    value = re.sub(
+        r"(?i)\bBasic\s+[A-Za-z0-9._~+/=-]+\b",
+        "Basic [redacted-token]",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+\b",
+        "Bearer [redacted-token]",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password|session)\b\s*[:=]\s*\S+",
+        lambda match: f"{match.group(1)}=[redacted]",
+        value,
+    )
+    value = re.sub(
+        r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
+        "[redacted-jwt]",
+        value,
+    )
+    value = re.sub(
+        r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        "[redacted-email]",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b",
+        "[redacted-phone]",
+        value,
+    )
+    return value
