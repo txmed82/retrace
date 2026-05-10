@@ -48,6 +48,7 @@ from retrace.sentry_compat import (
     MAX_SENTRY_BODY_BYTES,
     SentryCompatIngestError,
     build_sentry_dsn,
+    extract_sentry_ingest_key,
     ingest_sentry_compat_request,
 )
 from retrace.source_maps import upload_source_map
@@ -95,6 +96,13 @@ def _json_response(
 def _cors_headers(handler: BaseHTTPRequestHandler) -> None:
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    handler.send_header(
+        "Access-Control-Expose-Headers",
+        (
+            "X-Retrace-Trace-Id, Retry-After, X-RateLimit-Limit, "
+            "X-RateLimit-Remaining, X-RateLimit-Reset, X-RateLimit-Window"
+        ),
+    )
     handler.send_header(
         "Access-Control-Allow-Headers",
         (
@@ -150,20 +158,6 @@ def _extract_replay_sdk_key(headers: Any, query: dict[str, str]) -> str:
     return str(
         query.get("key") or query.get("api_key") or query.get("apiKey") or ""
     ).strip()
-
-
-def _extract_sentry_sdk_key(headers: Any, query: dict[str, str]) -> str:
-    for key in ("sentry_key", "key", "api_key", "apiKey"):
-        value = str(query.get(key) or "").strip()
-        if value:
-            return value
-    auth = _header_value(headers, "x-sentry-auth").strip()
-    if auth:
-        for part in auth.removeprefix("Sentry").split(","):
-            name, _, value = part.strip().partition("=")
-            if name.strip() == "sentry_key":
-                return value.strip()
-    return ""
 
 
 def _rate_limit_headers(decision: RateLimitDecision) -> dict[str, str]:
@@ -748,8 +742,15 @@ def _handler(
                     },
                 )
                 return
+            body = self.rfile.read(length)
+            sentry_headers = {k: v for k, v in self.headers.items()}
             sentry_query = _query_dict(query)
-            raw_sentry_key = _extract_sentry_sdk_key(self.headers, sentry_query)
+            raw_sentry_key = extract_sentry_ingest_key(
+                headers=sentry_headers,
+                query=sentry_query,
+                body=body,
+                content_encoding=_header_value(self.headers, "content-encoding"),
+            )
             if raw_sentry_key:
                 sdk_key = authenticate_sdk_key(store, raw_sentry_key)
                 if sdk_key is None:
@@ -782,13 +783,12 @@ def _handler(
                 if not decision.allowed:
                     _rate_limited_response(self, bucket="sentry", decision=decision)
                     return
-            body = self.rfile.read(length)
             try:
                 result = ingest_sentry_compat_request(
                     store=store,
                     project_id=project_id,
                     endpoint=endpoint,
-                    headers={k: v for k, v in self.headers.items()},
+                    headers=sentry_headers,
                     body=body,
                     query=sentry_query,
                 )

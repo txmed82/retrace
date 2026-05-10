@@ -2967,6 +2967,7 @@ class Storage:
         )
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
                 SELECT window_start_ms, count
@@ -3015,26 +3016,31 @@ class Storage:
                 previous_count = int(row["count"] or 0)
                 count = previous_count + 1
                 if count <= clean_limit:
-                    conn.execute(
+                    cursor = conn.execute(
                         """
                         UPDATE ingest_rate_limits
-                        SET count = ?, updated_at = ?
+                        SET count = count + 1, updated_at = ?
                         WHERE project_id = ?
                           AND environment_id = ?
                           AND bucket = ?
                           AND identity_hash = ?
                           AND window_seconds = ?
+                          AND window_start_ms = ?
+                          AND count < ?
                         """,
                         (
-                            count,
                             now,
                             clean_project,
                             clean_environment,
                             clean_bucket,
                             identity_hash,
                             clean_window_seconds,
+                            window_start_ms,
+                            clean_limit,
                         ),
                     )
+                    if cursor.rowcount <= 0:
+                        count = clean_limit + 1
             allowed = count <= clean_limit
             remaining = max(0, clean_limit - count)
         return RateLimitDecision(
