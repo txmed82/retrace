@@ -6,6 +6,7 @@ from threading import Thread
 from unittest.mock import patch
 
 from retrace.commands.ui import (
+    _api_suites_payload,
     _create_sdk_key_payload,
     _generate_replay_issue_api_spec_payload,
     _generate_replay_issue_fix_prompts_payload,
@@ -20,6 +21,7 @@ from retrace.commands.ui import (
     _transition_replay_issue_payload,
     _verify_resolved_issues_payload,
 )
+from retrace.api_suites import create_api_suite
 from retrace.api_testing import APITestRunResult, api_specs_dir_for_data_dir, create_api_spec
 from retrace.replay_core import ReplaySignalConfig, process_replay_sessions
 from retrace.sdk_keys import authenticate_sdk_key
@@ -113,8 +115,13 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "copyEvidenceBundle" in _INDEX_HTML
     assert "timelineTypeFilter" in _INDEX_HTML
     assert "renderIssueWorkflow" in _INDEX_HTML
+    assert "renderIssueReadiness" in _INDEX_HTML
     assert "renderRepairTask" in _INDEX_HTML
     assert "data-workflow-action" in _INDEX_HTML
+    assert "QA Loop Status" in _INDEX_HTML
+    assert "generate_api_regression" in _INDEX_HTML
+    assert "/api/api-suites" in _INDEX_HTML
+    assert "API Suites" in _INDEX_HTML
     assert _INDEX_HTML.index("await refreshTesterAndReplay(issue.public_id);") < (
         _INDEX_HTML.index("renderReplayFixSuggestions(data);")
     )
@@ -179,6 +186,64 @@ def test_issue_workflow_treats_covered_passing_as_terminal_without_repair() -> N
     assert workflow["primary_action"] == "none"
     assert workflow["primary_label"] == "Covered by passing test"
     assert workflow["stage_states"]["verification"] == "complete"
+    assert workflow["readiness"] == "verified"
+    assert workflow["blockers"] == []
+
+
+def test_issue_workflow_recommends_ui_and_api_regressions() -> None:
+    workflow = _issue_workflow_payload(
+        {
+            "status": "unresolved",
+            "timeline": [{"type": "replay_signal"}],
+            "reproduction_steps": ["Open checkout"],
+            "sessions": [{"session_id": "sess-1"}],
+            "api_calls": [{"method": "POST", "url": "/api/checkout", "status": 500}],
+            "test_links": [],
+            "repair_task": None,
+        }
+    )
+
+    assert workflow["readiness"] == "needs_test"
+    assert workflow["counts"]["api_tests"] == 0
+    assert "No regression test covers this issue yet." in workflow["blockers"]
+    assert [item["action"] for item in workflow["recommended_actions"]] == [
+        "generate_replay_spec",
+        "generate_api_regression",
+    ]
+
+
+def test_api_suites_payload_summarizes_import_quality(tmp_path: Path) -> None:
+    create_api_suite(
+        suites_dir=tmp_path / "api-tests" / "suites",
+        name="OpenAPI Demo",
+        source="openapi_import",
+        spec_ids=["api_get_user"],
+        auth_profile="local-jwt",
+        env_profile="staging",
+        import_summary={
+            "coverage_percent": 100.0,
+            "quality_warnings": {
+                "missing_operation_ids": ["api_get_user"],
+                "missing_response_schemas": [],
+            },
+        },
+        operations=[
+            {
+                "spec_id": "api_get_user",
+                "method": "GET",
+                "path": "/v1/users/{id}",
+                "operation_id": "",
+            }
+        ],
+    )
+
+    payload = _api_suites_payload(tmp_path)
+
+    assert payload["suites"][0]["name"] == "OpenAPI Demo"
+    assert payload["suites"][0]["spec_count"] == 1
+    assert payload["suites"][0]["operation_count"] == 1
+    assert payload["suites"][0]["quality_warning_count"] == 1
+    assert payload["suites"][0]["auth_profile"] == "local-jwt"
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(

@@ -19,6 +19,7 @@ import click
 import httpx
 import yaml
 
+from retrace.api_suites import api_suites_dir_for_data_dir, list_api_suites
 from retrace.api_testing import (
     api_runs_dir_for_data_dir,
     api_specs_dir_for_data_dir,
@@ -771,6 +772,12 @@ def _issue_workflow_payload(issue: dict[str, Any]) -> dict[str, Any]:
     status = str(issue.get("status") or "")
     coverage_states = [str(link.get("coverage_state") or "") for link in test_links]
     latest_statuses = [str(link.get("latest_run_status") or "") for link in test_links]
+    api_links = [
+        link
+        for link in test_links
+        if "api" in str(link.get("source") or "").lower()
+        or "/api-tests/" in str(link.get("spec_path") or "")
+    ]
     if not test_links:
         coverage_state = "not_covered"
     elif "covered_failing" in coverage_states:
@@ -822,11 +829,76 @@ def _issue_workflow_payload(issue: dict[str, Any]) -> dict[str, Any]:
         primary_label = "Run linked tests"
         primary_action = "run_tests"
 
+    blockers: list[str] = []
+    recommended_actions: list[dict[str, str]] = []
+    capture_blocked = False
+    if not timeline_count:
+        capture_blocked = True
+        blockers.append("No normalized evidence timeline is available.")
+    if not reproduction_count and not replay_count:
+        capture_blocked = True
+        blockers.append("No replay or reproduction steps are linked.")
+    if not test_links:
+        blockers.append("No regression test covers this issue yet.")
+        recommended_actions.append(
+            {
+                "action": "generate_replay_spec",
+                "label": "Generate UI regression",
+                "reason": "Create an editable UI test from replay evidence.",
+            }
+        )
+    if api_call_count and not api_links:
+        recommended_actions.append(
+            {
+                "action": "generate_api_regression",
+                "label": "Generate API regression",
+                "reason": "A failed network call is present without API coverage.",
+            }
+        )
+    if test_links and coverage_state == "covered_failing" and not repair_task:
+        recommended_actions.append(
+            {
+                "action": "generate_repair",
+                "label": "Generate repair task",
+                "reason": "A linked regression still fails and needs repair context.",
+            }
+        )
+    if status == "resolved" and coverage_state != "covered_passing":
+        recommended_actions.append(
+            {
+                "action": "verify_resolved",
+                "label": "Verify resolved issue",
+                "reason": "Resolved issues should pass linked UI/API regressions.",
+            }
+        )
+    if test_links and not latest_statuses:
+        recommended_actions.append(
+            {
+                "action": "run_tests",
+                "label": "Run linked tests",
+                "reason": "Coverage exists but has no recorded run result.",
+            }
+        )
+    readiness = "ready_for_repair"
+    if capture_blocked:
+        readiness = "needs_capture"
+    elif not test_links:
+        readiness = "needs_test"
+    elif coverage_state == "covered_passing":
+        readiness = "verified"
+    elif coverage_state == "covered_failing" and repair_task:
+        readiness = "repair_ready"
+    elif coverage_state == "covered_failing":
+        readiness = "needs_repair_task"
+
     return {
         "coverage_state": coverage_state,
         "latest_run_statuses": latest_statuses,
         "primary_action": primary_action,
         "primary_label": primary_label,
+        "readiness": readiness,
+        "blockers": blockers,
+        "recommended_actions": recommended_actions,
         "stage_states": stages,
         "counts": {
             "timeline": timeline_count,
@@ -834,6 +906,7 @@ def _issue_workflow_payload(issue: dict[str, Any]) -> dict[str, Any]:
             "replays": replay_count,
             "api_calls": api_call_count,
             "tests": len(test_links),
+            "api_tests": len(api_links),
             "repair_tasks": 1 if repair_task else 0,
         },
     }
@@ -1594,6 +1667,39 @@ def _github_repos_payload(store: Storage) -> dict[str, Any]:
     }
 
 
+def _api_suites_payload(data_dir: Path) -> dict[str, Any]:
+    suites = []
+    for suite in list_api_suites(api_suites_dir_for_data_dir(data_dir)):
+        warnings = suite.import_summary.get("quality_warnings")
+        if not isinstance(warnings, dict):
+            warnings = {}
+        warning_count = sum(
+            len(value) for value in warnings.values() if isinstance(value, list)
+        )
+        suites.append(
+            {
+                "suite_id": suite.suite_id,
+                "name": suite.name,
+                "source": suite.source,
+                "spec_count": len(suite.spec_ids),
+                "spec_ids": suite.spec_ids,
+                "auth_profile": suite.auth_profile,
+                "env_profile": suite.env_profile,
+                "filters": suite.filters,
+                "import_summary": suite.import_summary,
+                "operation_count": len(suite.operations),
+                "operations": suite.operations[:25],
+                "skipped_count": len(suite.skipped),
+                "skipped": suite.skipped[:25],
+                "quality_warning_count": warning_count,
+                "metadata": suite.metadata,
+                "created_at": suite.created_at,
+                "updated_at": suite.updated_at,
+            }
+        )
+    return {"suites": suites}
+
+
 def _connect_github_repo_payload(
     *,
     store: Storage,
@@ -1748,6 +1854,12 @@ _INDEX_HTML = """<!doctype html>
     .workflow-step strong { display:block; font-size:12px; margin-bottom:3px; }
     .workflow-step span { display:block; font-size:12px; color:var(--muted); }
     .workflow-action { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
+    .readiness-panel { border:1px solid #26364f; border-radius:8px; padding:10px; background:#0b1220; margin:10px 0 12px 0; }
+    .readiness-panel .row { display:flex; justify-content:space-between; gap:10px; align-items:center; }
+    .recommendation-list { margin-top:8px; }
+    .recommendation-list button { margin-right:6px; margin-top:4px; }
+    .suite-row { border-top:1px solid #1f2937; padding:10px 0; }
+    .suite-row:first-child { border-top:0; padding-top:0; }
     .ok { color:#86efac; } .bad { color:#fca5a5; }
     @media (max-width: 980px) {
       .app-shell { grid-template-columns: 1fr; height:auto; min-height:100vh; }
@@ -2480,19 +2592,35 @@ const retrace = init({
     }
 
     async function loadTesterPanel(){
-      const [specRes, runsRes, settingsRes] = await Promise.all([
+      const [specRes, runsRes, settingsRes, suitesRes] = await Promise.all([
         fetch('/api/tester/specs'),
         fetch('/api/tester/runs'),
         fetch('/api/settings'),
+        fetch('/api/api-suites'),
       ]);
       const specData = await specRes.json();
       const runData = await runsRes.json();
       const settings = await settingsRes.json();
+      const suiteData = await suitesRes.json();
       const specs = specData.specs || [];
       const runs = runData.runs || [];
+      const apiSuites = suiteData.suites || [];
       const specOptions = specs.map(s =>
         `<option value="${esc(s.spec_id)}">${esc(s.name)} (${esc(s.mode)})</option>`
       ).join('');
+      const suiteRows = apiSuites.map(s => {
+        const summary = s.import_summary || {};
+        const warnings = s.quality_warning_count || 0;
+        const operations = (s.operations || []).slice(0, 5).map(op => `<li><code>${esc(op.method)}</code> ${esc(op.path || op.url || '')}${op.operation_id ? ` · ${esc(op.operation_id)}` : ''}</li>`).join('');
+        return `
+          <div class="suite-row">
+            <div><strong>${esc(s.name || s.suite_id)}</strong> <code>${esc(s.suite_id)}</code></div>
+            <div class="empty">source=<code>${esc(s.source)}</code> · specs=<code>${esc(s.spec_count)}</code> · operations=<code>${esc(s.operation_count)}</code> · skipped=<code>${esc(s.skipped_count)}</code> · warnings=<code class="${warnings ? 'bad' : 'ok'}">${esc(warnings)}</code></div>
+            <div class="empty">coverage=<code>${esc(summary.coverage_percent ?? 0)}%</code>${s.auth_profile ? ` · auth=<code>${esc(s.auth_profile)}</code>` : ''}${s.env_profile ? ` · env=<code>${esc(s.env_profile)}</code>` : ''}</div>
+            ${operations ? `<ul>${operations}</ul>` : ''}
+          </div>
+        `;
+      }).join('');
       const runRows = runs.map(r =>
         `<li><code>${esc(r.run_id || '')}</code> · ${r.ok ? '<span class="ok">ok</span>' : '<span class="bad">fail</span>'} · <code>${esc(r.status || '')}</code> · attempts=<code>${esc(r.attempts || 1)}</code>${r.failure_classification ? ` · class=<code>${esc(r.failure_classification)}</code>` : ''}${r.flake_reason ? ` · flake=<code>${esc(r.flake_reason)}</code>` : ''} · <code>${esc(r.spec_id || '')}</code><br><span class="empty">${esc(r.run_dir || '')}</span></li>`
       ).join('');
@@ -2525,6 +2653,11 @@ const retrace = init({
             <h3>Linked Failures</h3>
             <div id="linkedFailureTests"><div class="empty">Loading linked failures...</div></div>
           </div>
+        </div>
+        <div style="height:12px"></div>
+        <div class="card">
+          <h3>API Suites</h3>
+          ${suiteRows || '<div class="empty">No API suites yet. Import an OpenAPI document with <code>retrace tester api-import-openapi</code>.</div>'}
         </div>
       `;
       byId('runsView').innerHTML = `
@@ -2797,8 +2930,32 @@ const retrace = init({
       `;
     }
 
+    function renderIssueReadiness(issue){
+      const workflow = issue.workflow || {};
+      const blockers = workflow.blockers || [];
+      const actions = workflow.recommended_actions || [];
+      const blockerRows = blockers.map(item => `<li>${esc(item)}</li>`).join('');
+      const actionRows = actions.map(item => `
+        <div>
+          <button class="btn" type="button" data-workflow-action="${esc(item.action)}">${esc(item.label || item.action)}</button>
+          <span class="empty">${esc(item.reason || '')}</span>
+        </div>
+      `).join('');
+      return `
+        <div class="readiness-panel">
+          <div class="row">
+            <div><strong>QA Loop Status</strong><div class="empty">Capture → test → repair → verify across replay, UI, and API evidence.</div></div>
+            <code class="${workflow.readiness === 'verified' ? 'ok' : (blockers.length ? 'bad' : '')}">${esc(workflow.readiness || 'unknown')}</code>
+          </div>
+          ${blockerRows ? `<div class="lbl">Blockers</div><ul>${blockerRows}</ul>` : '<div class="empty" style="margin-top:8px">No blocking evidence gaps detected.</div>'}
+          ${actionRows ? `<div class="lbl">Recommended Actions</div><div class="recommendation-list">${actionRows}</div>` : ''}
+        </div>
+      `;
+    }
+
     function handleIssueWorkflowAction(issue, action){
       if(action === 'generate_replay_spec') return generateReplayIssueSpec(issue);
+      if(action === 'generate_api_regression') return generateReplayIssueApiSpec(issue);
       if(action === 'generate_repair') return generateReplayIssueFixPrompts(issue);
       if(action === 'verify_resolved') return verifyResolvedReplayIssues();
       if(action === 'review_timeline'){
@@ -2895,6 +3052,7 @@ const retrace = init({
         </div>
         <div class="empty" id="replayLifecycleStatus"></div>
         ${renderIssueWorkflow(issue)}
+        ${renderIssueReadiness(issue)}
         <div class="detail-grid">
           <div>
             <div class="card">
@@ -3275,6 +3433,10 @@ def ui_command(
             if path == "/api/tester/runs":
                 runs = load_run_summaries(runs_dir_for_data_dir(data_dir), limit=20)
                 self._json({"runs": runs})
+                return
+
+            if path == "/api/api-suites":
+                self._json(_api_suites_payload(data_dir))
                 return
 
             if path == "/api/replay-dashboard":
