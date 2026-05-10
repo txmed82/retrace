@@ -42,6 +42,7 @@ from retrace.replay_specs import (
     generate_spec_from_replay_issue,
 )
 from retrace.sdk_keys import create_sdk_key
+from retrace.sentry_compat import build_sentry_dsn
 from retrace.storage import GitHubRepoRow, Storage
 from retrace.tester import (
     DEFAULT_APP_URL,
@@ -1673,6 +1674,11 @@ def _create_sdk_key_payload(
             "last4": created.last4,
             "ingest_path": "/api/sdk/replay",
             "ingest_url": "http://127.0.0.1:8788/api/sdk/replay",
+            "sentry_dsn": build_sentry_dsn(
+                public_key=created.key,
+                base_url="http://127.0.0.1:8788",
+                project_id=workspace.project_id,
+            ),
         },
         200,
     )

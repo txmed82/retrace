@@ -450,6 +450,47 @@ run:
     payload = json.loads(result.output)
     assert payload["key"].startswith("rtpk_")
     assert payload["project_id"].startswith("proj_")
+    assert payload["sentry_dsn"] == (
+        f"http://{payload['key']}@127.0.0.1:8788/{payload['project_id']}"
+    )
+
+
+def test_api_create_sdk_key_accepts_scheme_less_dsn_base_url(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        f"""
+posthog:
+  host: https://us.i.posthog.com
+  project_id: "1"
+llm:
+  provider: openai_compatible
+  base_url: http://localhost:8080/v1
+  model: test
+run:
+  data_dir: {tmp_path / "data"}
+  output_dir: {tmp_path / "reports"}
+"""
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "api",
+            "create-sdk-key",
+            "--config",
+            str(cfg),
+            "--project",
+            "Web",
+            "--api-base-url",
+            "localhost:8788",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["sentry_dsn"] == (
+        f"http://{payload['key']}@localhost:8788/{payload['project_id']}"
+    )
 
 
 def test_api_rejects_oversized_content_length_before_reading(tmp_path: Path) -> None:

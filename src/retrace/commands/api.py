@@ -46,6 +46,7 @@ from retrace.sdk_keys import (
 from retrace.sentry_compat import (
     MAX_SENTRY_BODY_BYTES,
     SentryCompatIngestError,
+    build_sentry_dsn,
     ingest_sentry_compat_request,
 )
 from retrace.storage import Storage
@@ -89,6 +90,22 @@ def _cors_headers(handler: BaseHTTPRequestHandler) -> None:
 
 def _query_dict(query: str) -> dict[str, str]:
     return {k: v[-1] for k, v in parse_qs(query, keep_blank_values=True).items()}
+
+
+def _sentry_ingest_path_parts(path: str) -> tuple[str, str] | None:
+    if path.startswith("/api/sentry/"):
+        suffix = path.removeprefix("/api/sentry/").strip("/")
+        parts = [part for part in suffix.split("/") if part]
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip()
+        return None
+    if not path.startswith("/api/"):
+        return None
+    suffix = path.removeprefix("/api/").strip("/")
+    parts = [part for part in suffix.split("/") if part]
+    if len(parts) == 2 and parts[1].strip().lower() in {"store", "envelope"}:
+        return parts[0].strip(), parts[1].strip()
+    return None
 
 
 def _bearer_token(headers: Any) -> str:
@@ -459,6 +476,7 @@ def _handler(
                 and parsed.path != "/api/deploys"
                 and not parsed.path.startswith("/api/otel/")
                 and not parsed.path.startswith("/api/sentry/")
+                and _sentry_ingest_path_parts(parsed.path) is None
                 and not parsed.path.startswith("/api/monitoring/webhook")
                 and parsed.path != "/api/github/webhook"
             ):
@@ -490,6 +508,9 @@ def _handler(
                 self._handle_monitoring_webhook(parsed.path, parsed.query)
                 return
             if parsed.path.startswith("/api/sentry/"):
+                self._handle_sentry_compat_ingest(parsed.path, parsed.query)
+                return
+            if _sentry_ingest_path_parts(parsed.path) is not None:
                 self._handle_sentry_compat_ingest(parsed.path, parsed.query)
                 return
             if parsed.path == "/api/github/webhook":
@@ -543,13 +564,11 @@ def _handler(
                 )
 
         def _handle_sentry_compat_ingest(self, path: str, query: str) -> None:
-            suffix = path.removeprefix("/api/sentry/").strip("/")
-            parts = [part for part in suffix.split("/") if part]
-            if len(parts) != 2:
+            parts = _sentry_ingest_path_parts(path)
+            if parts is None:
                 _json_response(self, 404, {"error": "not_found"})
                 return
-            project_id = parts[0].strip()
-            endpoint = parts[1].strip()
+            project_id, endpoint = parts
             try:
                 length = int(self.headers.get("Content-Length") or "0")
             except ValueError:
@@ -1194,12 +1213,14 @@ def api_group() -> None:
 @click.option("--project", "project_name", default="Default", show_default=True)
 @click.option("--environment", default="production", show_default=True)
 @click.option("--name", default="Browser SDK", show_default=True)
+@click.option("--api-base-url", default="http://127.0.0.1:8788", show_default=True)
 def api_create_sdk_key(
     config_path: Path,
     org: str,
     project_name: str,
     environment: str,
     name: str,
+    api_base_url: str,
 ) -> None:
     """Create a browser-safe write-only SDK key."""
     cfg = load_config(config_path)
@@ -1223,6 +1244,11 @@ def api_create_sdk_key(
                 "project_id": workspace.project_id,
                 "environment_id": workspace.environment_id,
                 "key": created.key,
+                "sentry_dsn": build_sentry_dsn(
+                    public_key=created.key,
+                    base_url=api_base_url,
+                    project_id=workspace.project_id,
+                ),
             },
             indent=2,
         )
