@@ -4502,27 +4502,24 @@ class Storage:
         issue_public_id: Optional[str] = None,
         spec_id: Optional[str] = None,
     ) -> list[FailureTestLinkRow]:
-        where: list[str] = []
-        params: list[object] = []
-        if failure_id is not None:
-            where.append("failure_id = ?")
-            params.append(failure_id)
-        if issue_public_id is not None:
-            where.append("issue_public_id = ?")
-            params.append(issue_public_id)
-        if spec_id is not None:
-            where.append("spec_id = ?")
-            params.append(spec_id)
-        clause = " AND ".join(where) if where else "1 = 1"
         with self._conn() as conn:
             rows = conn.execute(
-                f"""
+                """
                 SELECT *
                 FROM failure_test_links
-                WHERE {clause}
+                WHERE (? IS NULL OR failure_id = ?)
+                  AND (? IS NULL OR issue_public_id = ?)
+                  AND (? IS NULL OR spec_id = ?)
                 ORDER BY updated_at DESC, created_at DESC, id
                 """,
-                params,
+                (
+                    failure_id,
+                    failure_id,
+                    issue_public_id,
+                    issue_public_id,
+                    spec_id,
+                    spec_id,
+                ),
             ).fetchall()
         return [self._failure_test_link_from_row(row) for row in rows]
 
