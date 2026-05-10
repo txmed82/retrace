@@ -352,7 +352,16 @@ def test_standard_sentry_store_endpoint_ingests_sdk_event(tmp_path: Path) -> Non
         conn.close()
 
     assert response.status == 202
+    assert payload["accepted"] is True
+    assert payload["event_count"] == 1
     assert payload["results"][0]["external_id"] == "evt-standard-store-1"
+    failure = store.find_failure_by_source(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        source_type="monitor_incident",
+        source_external_id="sentry:evt-standard-store-1",
+    )
+    assert failure is not None
 
 
 def test_sentry_store_endpoint_dispatches_app_error_notification(
