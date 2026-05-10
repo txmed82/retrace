@@ -540,6 +540,44 @@ run:
     assert "/api/sdk/replay" in onboarding["endpoints"]["replay_ingest"]
     assert "@retrace/browser" in onboarding["snippets"]["browser_sdk_install"]
     assert "retention" in onboarding["snippets"]["retention_cron"]
+    assert "github_actions_source_maps" in onboarding["snippets"]
+    verification = onboarding["verification"]
+    assert [step["id"] for step in verification["ordered_steps"]] == [
+        "health",
+        "source_maps",
+        "alert_rule",
+        "monitoring_smoke",
+        "app_errors",
+        "retention",
+    ]
+    assert verification["release"] == "$GITHUB_SHA"
+    assert "source_maps:write" in verification["required_scopes"]
+    smoke_step = next(
+        step
+        for step in verification["ordered_steps"]
+        if step["id"] == "monitoring_smoke"
+    )
+    assert "retrace-onboarding-smoke-1" in smoke_step["command"]
+    assert smoke_step["expect"]["status"] == 202
+    source_maps_step = next(
+        step for step in verification["ordered_steps"] if step["id"] == "source_maps"
+    )
+    assert source_maps_step["expect"]["status"] == 202
+    assert source_maps_step["expect"]["json_contains"]["source_map"][
+        "release"
+    ] == "$GITHUB_SHA"
+    alert_step = next(
+        step for step in verification["ordered_steps"] if step["id"] == "alert_rule"
+    )
+    assert alert_step["expect"]["status"] == 202
+    assert alert_step["expect"]["json_contains"] == {"rule": {"action": "alert"}}
+    retention_step = next(
+        step for step in verification["ordered_steps"] if step["id"] == "retention"
+    )
+    assert retention_step["expect"]["status"] == 202
+    gha = onboarding["snippets"]["github_actions_source_maps"]
+    assert "${{ secrets.RETRACE_SERVICE_TOKEN }}" in gha
+    assert credentials["service_token"] not in gha
 
 
 def test_hosted_onboarding_endpoint_requires_admin_and_creates_manifest(
@@ -596,6 +634,8 @@ def test_hosted_onboarding_endpoint_requires_admin_and_creates_manifest(
     assert onboarding["endpoints"]["app_errors"].endswith(
         f"/api/app-errors?environment_id={workspace.environment_id}"
     )
+    assert onboarding["verification"]["ordered_steps"][0]["id"] == "health"
+    assert onboarding["verification"]["ordered_steps"][-1]["id"] == "retention"
 
 
 def test_api_rejects_oversized_content_length_before_reading(tmp_path: Path) -> None:

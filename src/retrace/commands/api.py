@@ -439,6 +439,36 @@ def _hosted_onboarding_manifest(
         f"{clean_base_url}/api/app-error-alert-rules?environment_id={environment_id}"
     )
     prune_endpoint = f"{clean_base_url}/api/app-errors/prune?environment_id={environment_id}"
+    health_endpoint = f"{clean_base_url}/healthz"
+    smoke_event_id = "retrace-onboarding-smoke-1"
+    source_map_upload = (
+        "curl -X POST "
+        f"'{source_map_endpoint}' "
+        f"-H 'Authorization: Bearer {service_token}' "
+        "-H 'Content-Type: application/json' "
+        f"-d '{{\"release\":\"{clean_release}\",\"artifact_url\":\"{clean_artifact_url}\",\"source_map\":{{\"version\":3,\"sources\":[\"src/app.ts\"],\"names\":[],\"mappings\":\"AAAA\"}}}}'"
+    )
+    monitoring_smoke = (
+        "curl -X POST "
+        f"'{monitoring_webhook}' "
+        f"-H 'Authorization: Bearer {service_token}' "
+        "-H 'Content-Type: application/json' "
+        f"-d '{{\"event\":{{\"event_id\":\"{smoke_event_id}\",\"title\":\"Retrace onboarding smoke error\",\"level\":\"error\",\"release\":\"{clean_release}\"}}}}'"
+    )
+    alert_rule_create = (
+        "curl -X POST "
+        f"'{alert_rules_endpoint}' "
+        f"-H 'Authorization: Bearer {service_token}' "
+        "-H 'Content-Type: application/json' "
+        "-d '{\"name\":\"Critical production errors\",\"action\":\"alert\",\"min_severity\":\"high\"}'"
+    )
+    retention_prune = (
+        "curl -X POST "
+        f"'{prune_endpoint}' "
+        f"-H 'Authorization: Bearer {service_token}' "
+        "-H 'Content-Type: application/json' "
+        "-d '{\"failure_retention_days\":90,\"evidence_retention_days\":90,\"source_map_retention_days\":30,\"rate_limit_retention_hours\":48}'"
+    )
     return {
         "workspace": {
             "project_id": project_id,
@@ -481,25 +511,13 @@ def _hosted_onboarding_manifest(
                 "});"
             ),
             "monitoring_webhook_curl": (
-                "curl -X POST "
-                f"'{monitoring_webhook}' "
-                f"-H 'Authorization: Bearer {service_token}' "
-                "-H 'Content-Type: application/json' "
-                "-d '{\"event\":{\"event_id\":\"smoke-1\",\"title\":\"Smoke error\",\"level\":\"error\"}}'"
+                monitoring_smoke
             ),
             "source_map_upload_curl": (
-                "curl -X POST "
-                f"'{source_map_endpoint}' "
-                f"-H 'Authorization: Bearer {service_token}' "
-                "-H 'Content-Type: application/json' "
-                f"-d '{{\"release\":\"{clean_release}\",\"artifact_url\":\"{clean_artifact_url}\",\"source_map\":{{\"version\":3,\"sources\":[\"src/app.ts\"],\"names\":[],\"mappings\":\"AAAA\"}}}}'"
+                source_map_upload
             ),
             "alert_rule_curl": (
-                "curl -X POST "
-                f"'{alert_rules_endpoint}' "
-                f"-H 'Authorization: Bearer {service_token}' "
-                "-H 'Content-Type: application/json' "
-                "-d '{\"name\":\"Critical production errors\",\"action\":\"alert\",\"min_severity\":\"high\"}'"
+                alert_rule_create
             ),
             "resolve_incident_curl": (
                 "curl -X POST "
@@ -509,12 +527,90 @@ def _hosted_onboarding_manifest(
                 "-d '{\"action\":\"resolve\",\"reason\":\"fixed and verified\"}'"
             ),
             "retention_cron": (
-                "curl -X POST "
-                f"'{prune_endpoint}' "
-                f"-H 'Authorization: Bearer {service_token}' "
-                "-H 'Content-Type: application/json' "
-                "-d '{\"failure_retention_days\":90,\"evidence_retention_days\":90,\"source_map_retention_days\":30,\"rate_limit_retention_hours\":48}'"
+                retention_prune
             ),
+            "github_actions_source_maps": (
+                "name: Upload Retrace source maps\n"
+                "on: [push]\n"
+                "jobs:\n"
+                "  upload-source-maps:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@v4\n"
+                "      - run: npm ci && npm run build\n"
+                "      - run: |\n"
+                "          curl -X POST "
+                f"'{source_map_endpoint}' \\\n"
+                "            -H 'Authorization: Bearer ${{ secrets.RETRACE_SERVICE_TOKEN }}' \\\n"
+                "            -H 'Content-Type: application/json' \\\n"
+                "            --data-binary @retrace-source-map-upload.json"
+            ),
+        },
+        "verification": {
+            "ordered_steps": [
+                {
+                    "id": "health",
+                    "label": "API health",
+                    "command": f"curl -fsS '{health_endpoint}'",
+                    "expect": {"status": 200, "json": {"ok": True}},
+                },
+                {
+                    "id": "source_maps",
+                    "label": "Upload source map for release",
+                    "command": source_map_upload,
+                    "expect": {
+                        "status": 202,
+                        "json_contains": {
+                            "source_map": {
+                                "release": clean_release,
+                                "artifact_url": clean_artifact_url,
+                            }
+                        },
+                    },
+                },
+                {
+                    "id": "alert_rule",
+                    "label": "Create high-severity alert rule",
+                    "command": alert_rule_create,
+                    "expect": {
+                        "status": 202,
+                        "json_contains": {"rule": {"action": "alert"}},
+                    },
+                },
+                {
+                    "id": "monitoring_smoke",
+                    "label": "Send monitoring smoke error",
+                    "command": monitoring_smoke,
+                    "expect": {
+                        "status": 202,
+                        "json_contains": {"results": [{"external_id": smoke_event_id}]},
+                    },
+                },
+                {
+                    "id": "app_errors",
+                    "label": "Confirm smoke incident is visible",
+                    "command": (
+                        f"curl -fsS '{app_errors_endpoint}' "
+                        f"-H 'Authorization: Bearer {service_token}'"
+                    ),
+                    "expect": {
+                        "status": 200,
+                        "json_path_hint": "$.incidents[?(@.latest_failure.source_external_id contains retrace-onboarding-smoke-1)]",
+                    },
+                },
+                {
+                    "id": "retention",
+                    "label": "Verify hosted retention prune endpoint",
+                    "command": retention_prune,
+                    "expect": {
+                        "status": 202,
+                        "json_contains": {"retention": {"environment_id": environment_id}},
+                    },
+                },
+            ],
+            "required_scopes": [str(scope) for scope in service_token_scopes],
+            "release": clean_release,
+            "artifact_url": clean_artifact_url,
         },
         "checklist": [
             "Start the API with `retrace api serve --host 0.0.0.0 --port 8788` behind TLS.",
