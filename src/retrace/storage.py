@@ -2611,6 +2611,7 @@ class Storage:
             raise ValueError("artifact_url is required")
         if not isinstance(source_map, dict) or not source_map:
             raise ValueError("source_map must be a non-empty object")
+        self._validate_source_map_payload(source_map)
         try:
             source_map_json = json.dumps(source_map, sort_keys=True)
         except (TypeError, ValueError) as exc:
@@ -2652,15 +2653,14 @@ class Storage:
         project_id: str,
         environment_id: str,
         release: str,
-        dist: str = "",
+        dist: Optional[str] = "",
         limit: int = 100,
     ) -> list[SourceMapRow]:
         where = "project_id = ? AND environment_id = ? AND release = ?"
         params: list[object] = [project_id, environment_id, release.strip()]
-        clean_dist = dist.strip()
-        if clean_dist:
+        if dist is not None:
             where += " AND dist = ?"
-            params.append(clean_dist)
+            params.append(dist.strip())
         params.append(max(1, min(int(limit), 500)))
         with self._conn() as conn:
             rows = conn.execute(
@@ -2674,6 +2674,28 @@ class Storage:
                 params,
             ).fetchall()
         return [self._source_map_from_row(row) for row in rows]
+
+    def _validate_source_map_payload(self, source_map: dict[str, Any]) -> None:
+        if source_map.get("version") != 3:
+            raise ValueError("source_map must be a supported Source Map v3 object")
+        if not isinstance(source_map.get("mappings"), str) or not source_map.get(
+            "mappings"
+        ):
+            raise ValueError("source_map mappings must be a non-empty string")
+        sources = source_map.get("sources")
+        if not isinstance(sources, list) or not sources:
+            raise ValueError("source_map sources must be a non-empty list")
+        if not all(isinstance(item, str) and item.strip() for item in sources):
+            raise ValueError("source_map sources must contain only non-empty strings")
+        names = source_map.get("names")
+        if names is not None and not isinstance(names, list):
+            raise ValueError("source_map names must be a list when provided")
+        source_root = source_map.get("sourceRoot")
+        if source_root is not None and not isinstance(source_root, str):
+            raise ValueError("source_map sourceRoot must be a string when provided")
+        file_value = source_map.get("file")
+        if file_value is not None and not isinstance(file_value, str):
+            raise ValueError("source_map file must be a string when provided")
 
     def _source_map_from_row(self, row: sqlite3.Row) -> SourceMapRow:
         return SourceMapRow(

@@ -2222,19 +2222,24 @@ def api_upload_source_map(
     eid = environment_id.strip() or workspace.environment_id
     try:
         source_map = json.loads(source_map_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise click.ClickException(f"failed to read source map: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise click.ClickException(f"invalid source map JSON: {exc}") from exc
     if not isinstance(source_map, dict):
         raise click.ClickException("source map must be a JSON object")
-    row = upload_source_map(
-        store=store,
-        project_id=pid,
-        environment_id=eid,
-        release=release,
-        dist=dist,
-        artifact_url=artifact_url,
-        source_map=source_map,
-    )
+    try:
+        row = upload_source_map(
+            store=store,
+            project_id=pid,
+            environment_id=eid,
+            release=release,
+            dist=dist,
+            artifact_url=artifact_url,
+            source_map=source_map,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     click.echo(
         json.dumps(
             {

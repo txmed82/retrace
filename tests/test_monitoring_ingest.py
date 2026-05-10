@@ -204,6 +204,56 @@ def test_sentry_ingest_applies_uploaded_source_map(tmp_path: Path) -> None:
     assert evidence[0].payload["top_stack_frame"] == "src/checkout.ts:submit:42"
 
 
+def test_sentry_source_map_lookup_does_not_cross_dist(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    upload_source_map(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        release="abc123",
+        dist="beta",
+        artifact_url="https://cdn.example.com/assets/app.min.js",
+        source_map=_source_map(),
+    )
+
+    result = ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={
+            "event": {
+                "event_id": "evt-sourcemap-dist-1",
+                "title": "TypeError: failed checkout",
+                "release": "abc123",
+                "exception": {
+                    "values": [
+                        {
+                            "type": "TypeError",
+                            "value": "Cannot read cart total",
+                            "stacktrace": {
+                                "frames": [
+                                    {
+                                        "filename": "https://cdn.example.com/assets/app.min.js",
+                                        "function": "n",
+                                        "lineno": 1,
+                                        "colno": 143,
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                },
+            }
+        },
+    )
+
+    failure = store.get_failure_by_id(result.failure_id)
+    assert failure is not None
+    assert failure.metadata["top_stack_frame"].endswith("/assets/app.min.js:n:1")
+    assert "source_mapped" not in failure.metadata["stack_frames"][0]
+
+
 def test_source_map_api_endpoint_accepts_upload(tmp_path: Path) -> None:
     store, workspace = _store(tmp_path)
     service = create_service_token(
@@ -245,6 +295,44 @@ def test_source_map_api_endpoint_accepts_upload(tmp_path: Path) -> None:
     assert response.status == 202
     assert payload["source_map"]["release"] == "abc123"
     assert rows[0].artifact_url == "https://cdn.example.com/assets/app.min.js"
+
+
+def test_source_map_api_endpoint_rejects_unsupported_map(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Source maps",
+        scopes=["source_maps:write"],
+    )
+
+    body = json.dumps(
+        {
+            "release": "abc123",
+            "artifact_url": "https://cdn.example.com/assets/app.min.js",
+            "source_map": {"version": 3},
+        }
+    ).encode("utf-8")
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/source-maps?environment_id={workspace.environment_id}",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 400
+    assert payload["error"] == "invalid_source_map"
+    assert "mappings" in payload["message"]
 
 
 def test_raw_sentry_sdk_events_group_into_one_incident(tmp_path: Path) -> None:
