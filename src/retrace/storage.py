@@ -366,6 +366,7 @@ CREATE TABLE IF NOT EXISTS app_error_alert_rules (
     environment_id TEXT NOT NULL,
     name TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
+    precedence INTEGER NOT NULL DEFAULT 0,
     action TEXT NOT NULL DEFAULT 'alert',
     min_severity TEXT NOT NULL DEFAULT '',
     provider TEXT NOT NULL DEFAULT '',
@@ -808,6 +809,7 @@ class AppErrorAlertRuleRow:
     environment_id: str
     name: str
     enabled: bool
+    precedence: int
     action: str
     min_severity: str
     provider: str
@@ -1200,6 +1202,16 @@ class Storage:
             if "environment_id" not in cols_repair_tasks:
                 conn.execute(
                     "ALTER TABLE repair_tasks ADD COLUMN environment_id TEXT NOT NULL DEFAULT ''"
+                )
+            cols_alert_rules = [
+                r["name"]
+                for r in conn.execute(
+                    "PRAGMA table_info(app_error_alert_rules)"
+                ).fetchall()
+            ]
+            if "precedence" not in cols_alert_rules:
+                conn.execute(
+                    "ALTER TABLE app_error_alert_rules ADD COLUMN precedence INTEGER NOT NULL DEFAULT 0"
                 )
             self._backfill_failure_trace_map(conn)
             rows = conn.execute(
@@ -2353,6 +2365,7 @@ class Storage:
         environment_id: str,
         name: str,
         enabled: bool = True,
+        precedence: int = 0,
         action: str = "alert",
         min_severity: str = "",
         provider: str = "",
@@ -2380,12 +2393,13 @@ class Storage:
             conn.execute(
                 """
                 INSERT INTO app_error_alert_rules
-                (id, public_id, project_id, environment_id, name, enabled, action,
+                (id, public_id, project_id, environment_id, name, enabled, precedence, action,
                  min_severity, provider, title_contains, fingerprint_contains,
                  route_contains, metadata_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, environment_id, name) DO UPDATE SET
                     enabled = excluded.enabled,
+                    precedence = excluded.precedence,
                     action = excluded.action,
                     min_severity = excluded.min_severity,
                     provider = excluded.provider,
@@ -2402,6 +2416,7 @@ class Storage:
                     environment_id,
                     clean_name,
                     int(bool(enabled)),
+                    int(precedence),
                     clean_action,
                     clean_severity,
                     provider.strip().lower(),
@@ -2444,7 +2459,7 @@ class Storage:
                 SELECT *
                 FROM app_error_alert_rules
                 WHERE {where}
-                ORDER BY updated_at DESC, name
+                ORDER BY precedence DESC, created_at ASC, id ASC
                 LIMIT ?
                 """,
                 params,
@@ -2462,6 +2477,7 @@ class Storage:
             environment_id=str(row["environment_id"]),
             name=str(row["name"]),
             enabled=bool(row["enabled"]),
+            precedence=int(row["precedence"] or 0),
             action=str(row["action"] or "alert"),
             min_severity=str(row["min_severity"] or ""),
             provider=str(row["provider"] or ""),

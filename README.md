@@ -416,10 +416,28 @@ they reach downstream workflows:
 - `GET /api/app-error-alert-rules?environment_id=...`
 - `POST /api/app-error-alert-rules?environment_id=...`
 
-Rules support `action` (`alert` or `suppress`), `min_severity`, `provider`,
-`title_contains`, `fingerprint_contains`, and `route_contains`. Matching rule
-metadata is written onto the canonical failure and incident response as
-`alert_state` and `alert_rule_name`.
+`POST` upserts by rule `name` and returns `202`. Send JSON with `name`,
+`action` (`alert` or `suppress`), optional `enabled`, optional integer
+`precedence`, and match fields: `min_severity`, `provider`, `title_contains`,
+`fingerprint_contains`, and `route_contains`. Rules with higher `precedence`
+match first; ties keep original creation order. `min_severity` accepts `low`,
+`medium`, `high`, or `critical`; when omitted, the rule has no severity floor.
+
+Example:
+
+```json
+{
+  "name": "Suppress low-priority beta checkout noise",
+  "action": "suppress",
+  "precedence": 10,
+  "min_severity": "medium",
+  "provider": "sentry",
+  "route_contains": "/checkout"
+}
+```
+
+Matching rule metadata is written onto the canonical failure and incident
+response as `alert_state` and `alert_rule_name`.
 
 Deploy markers can be recorded from CI with `POST /api/deploys?environment_id=...`
 or locally with `retrace api record-deploy --sha <commit> --changed-file <path>`.

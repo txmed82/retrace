@@ -1023,6 +1023,7 @@ def test_app_error_alert_rule_api_creates_and_lists_rules(tmp_path: Path) -> Non
         {
             "name": "Critical checkout only",
             "action": "alert",
+            "precedence": 10,
             "min_severity": "critical",
             "provider": "sentry",
             "route_contains": "/checkout",
@@ -1054,9 +1055,39 @@ def test_app_error_alert_rule_api_creates_and_lists_rules(tmp_path: Path) -> Non
 
     assert response.status == 202
     assert created["rule"]["name"] == "Critical checkout only"
+    assert created["rule"]["precedence"] == 10
     assert created["rule"]["min_severity"] == "critical"
     assert list_response.status == 200
     assert listed["rules"][0]["route_contains"] == "/checkout"
+
+
+def test_app_error_alert_rule_api_requires_write_scope(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Read only",
+        scopes=["app_errors:read"],
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/app-error-alert-rules?environment_id={workspace.environment_id}",
+            body=json.dumps({"name": "No write", "action": "suppress"}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 403
+    assert payload["error"] == "forbidden"
 
 
 def test_app_error_incident_api_detail_controls_sensitive_evidence(

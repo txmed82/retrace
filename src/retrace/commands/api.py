@@ -301,6 +301,7 @@ def _alert_rule_api_dict(rule: Any) -> dict[str, Any]:
         "public_id": rule.public_id,
         "name": rule.name,
         "enabled": rule.enabled,
+        "precedence": rule.precedence,
         "action": rule.action,
         "min_severity": rule.min_severity,
         "provider": rule.provider,
@@ -1271,7 +1272,7 @@ def _handler(
             token = _require_service_token(
                 self,
                 store,
-                scopes={"app_errors:write", "app_errors:read", "admin"},
+                scopes={"app_errors:write", "admin"},
             )
             if token is None:
                 return
@@ -1306,6 +1307,7 @@ def _handler(
                     environment_id=environment_id,
                     name=str(payload.get("name") or ""),
                     enabled=bool(payload.get("enabled", True)),
+                    precedence=int(payload.get("precedence") or 0),
                     action=str(payload.get("action") or "alert"),
                     min_severity=str(payload.get("min_severity") or ""),
                     provider=str(payload.get("provider") or ""),
