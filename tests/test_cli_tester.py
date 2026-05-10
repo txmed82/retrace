@@ -390,12 +390,69 @@ tester:
         )
 
         draft_id = draft_specs[0]["spec_id"]
+        review = runner.invoke(main, ["tester", "review-spec", draft_id])
+        assert review.exit_code == 0, review.output
+        review_payload = json.loads(review.output)
+        assert review_payload["review_summary"]["draft_status"] == "draft"
+        assert "edit-draft" in review_payload["review_summary"]["recommended_command"]
+
+        edited_steps = tmp_path / "edited-steps.json"
+        edited_steps.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "open-signup",
+                        "action": "navigate",
+                        "url": app_url,
+                    }
+                ]
+            )
+        )
+        edited_assertions = tmp_path / "edited-assertions.json"
+        edited_assertions.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "page-loads",
+                        "type": "status_code",
+                        "expected_status": 200,
+                    }
+                ]
+            )
+        )
         accepted = runner.invoke(
             main,
-            ["tester", "accept-draft", draft_id, "--name", "Accepted draft"],
+            [
+                "tester",
+                "edit-draft",
+                draft_id,
+                "--name",
+                "Accepted draft",
+                "--steps-file",
+                str(edited_steps),
+                "--assertions-file",
+                str(edited_assertions),
+                "--review-note",
+                "Replaced generated journey with stable smoke path.",
+                "--accept",
+            ],
         )
         assert accepted.exit_code == 0, accepted.output
         assert '"draft_status": "accepted"' in accepted.output
+        assert '"exact_steps"' in accepted.output
+        accepted_spec = json.loads((specs_dir / f"{draft_id}.json").read_text())
+        assert accepted_spec["exact_steps"][0]["id"] == "open-signup"
+        assert accepted_spec["assertions"][0]["id"] == "page-loads"
+        assert accepted_spec["fixtures"]["review_notes"] == [
+            "Replaced generated journey with stable smoke path."
+        ]
+        assert accepted_spec["fixtures"]["last_review_edit"]["fields"] == [
+            "assertions",
+            "draft_status",
+            "exact_steps",
+            "name",
+            "review_notes",
+        ]
         accepted_again = runner.invoke(main, ["tester", "accept-draft", draft_id])
         assert accepted_again.exit_code != 0
         assert "not an unaccepted draft" in accepted_again.output
