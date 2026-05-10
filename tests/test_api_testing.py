@@ -340,6 +340,64 @@ def test_api_spec_runs_request_sequence_with_extracted_values(
     assert sum(item["artifact_type"] == "api_request" for item in result.artifacts) == 2
 
 
+def test_api_sequence_repair_bundle_keeps_each_request_response_step(
+    tmp_path: Path,
+) -> None:
+    server, base_url, thread = _server_url()
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Failing cart sequence",
+            method="GET",
+            url=f"{base_url}/api/health",
+            steps=[
+                {
+                    "id": "create-cart",
+                    "method": "POST",
+                    "url": f"{base_url}/api/cart",
+                    "body": {"cartId": 42},
+                    "expected_status": 201,
+                    "extract": [{"name": "cart_id", "path": "$.received.cartId"}],
+                },
+                {
+                    "id": "update-cart",
+                    "method": "PATCH",
+                    "url": f"{base_url}/api/cart/{{{{ vars.cart_id }}}}",
+                    "expected_status": 201,
+                },
+            ],
+        )
+
+        result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is False
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Default")
+    persisted = persist_api_failure(
+        store=store,
+        spec=spec,
+        result=result,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+
+    bundle = build_repair_bundle(store, persisted.failure_id)
+    pairs = bundle.backend_context["request_response"]
+
+    assert [item["step_id"] for item in pairs] == ["create-cart", "update-cart"]
+    assert pairs[0]["request"]["artifact"]["method"] == "POST"
+    assert pairs[0]["request"]["artifact"]["body"] == {"cartId": 42}
+    assert pairs[0]["response"]["artifact"]["status_code"] == 201
+    assert pairs[1]["request"]["artifact"]["method"] == "PATCH"
+    assert pairs[1]["request"]["artifact"]["url"] == f"{base_url}/api/cart/42"
+    assert pairs[1]["response"]["artifact"]["status_code"] == 200
+
+
 def test_api_env_profile_supplies_runtime_headers_without_persisting_secret(
     tmp_path: Path, monkeypatch
 ) -> None:
