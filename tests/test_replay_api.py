@@ -559,6 +559,25 @@ run:
     )
     assert "retrace-onboarding-smoke-1" in smoke_step["command"]
     assert smoke_step["expect"]["status"] == 202
+    source_maps_step = next(
+        step for step in verification["ordered_steps"] if step["id"] == "source_maps"
+    )
+    assert source_maps_step["expect"]["status"] == 202
+    assert source_maps_step["expect"]["json_contains"]["source_map"][
+        "release"
+    ] == "$GITHUB_SHA"
+    alert_step = next(
+        step for step in verification["ordered_steps"] if step["id"] == "alert_rule"
+    )
+    assert alert_step["expect"]["status"] == 202
+    assert alert_step["expect"]["json_contains"] == {"rule": {"action": "alert"}}
+    retention_step = next(
+        step for step in verification["ordered_steps"] if step["id"] == "retention"
+    )
+    assert retention_step["expect"]["status"] == 202
+    gha = onboarding["snippets"]["github_actions_source_maps"]
+    assert "${{ secrets.RETRACE_SERVICE_TOKEN }}" in gha
+    assert credentials["service_token"] not in gha
 
 
 def test_hosted_onboarding_endpoint_requires_admin_and_creates_manifest(

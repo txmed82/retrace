@@ -541,7 +541,7 @@ def _hosted_onboarding_manifest(
                 "      - run: |\n"
                 "          curl -X POST "
                 f"'{source_map_endpoint}' \\\n"
-                f"            -H 'Authorization: Bearer {service_token}' \\\n"
+                "            -H 'Authorization: Bearer ${{ secrets.RETRACE_SERVICE_TOKEN }}' \\\n"
                 "            -H 'Content-Type: application/json' \\\n"
                 "            --data-binary @retrace-source-map-upload.json"
             ),
@@ -559,7 +559,7 @@ def _hosted_onboarding_manifest(
                     "label": "Upload source map for release",
                     "command": source_map_upload,
                     "expect": {
-                        "status": 201,
+                        "status": 202,
                         "json_contains": {
                             "source_map": {
                                 "release": clean_release,
@@ -573,8 +573,8 @@ def _hosted_onboarding_manifest(
                     "label": "Create high-severity alert rule",
                     "command": alert_rule_create,
                     "expect": {
-                        "status": 200,
-                        "json_contains": {"alert_rule": {"action": "alert"}},
+                        "status": 202,
+                        "json_contains": {"rule": {"action": "alert"}},
                     },
                 },
                 {
@@ -603,7 +603,7 @@ def _hosted_onboarding_manifest(
                     "label": "Verify hosted retention prune endpoint",
                     "command": retention_prune,
                     "expect": {
-                        "status": 200,
+                        "status": 202,
                         "json_contains": {"retention": {"environment_id": environment_id}},
                     },
                 },
