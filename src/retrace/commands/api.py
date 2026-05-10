@@ -1245,7 +1245,7 @@ def _handler(
             token = _require_service_token(
                 self,
                 store,
-                scopes={"app_errors:read", "issues:read", "mcp:read", "admin"},
+                scopes={"app_errors:read", "admin"},
             )
             if token is None:
                 return
@@ -1254,9 +1254,17 @@ def _handler(
             if not environment_id:
                 _json_response(self, 400, {"error": "missing_environment_id"})
                 return
+            try:
+                limit = int(params.get("limit") or "100")
+                offset = int(params.get("offset") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_pagination"})
+                return
             rules = store.list_app_error_alert_rules(
                 project_id=token.project_id,
                 environment_id=environment_id,
+                limit=limit,
+                offset=offset,
             )
             _json_response(
                 self,
@@ -1264,6 +1272,8 @@ def _handler(
                 {
                     "project_id": token.project_id,
                     "environment_id": environment_id,
+                    "limit": max(1, min(limit, 500)),
+                    "offset": max(0, offset),
                     "rules": [_alert_rule_api_dict(rule) for rule in rules],
                 },
             )

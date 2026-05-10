@@ -1090,6 +1090,36 @@ def test_app_error_alert_rule_api_requires_write_scope(tmp_path: Path) -> None:
     assert payload["error"] == "forbidden"
 
 
+def test_app_error_alert_rule_api_requires_app_error_read_scope(tmp_path: Path) -> None:
+    store, workspace = _store(tmp_path)
+    store.upsert_app_error_alert_rule(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Rule",
+    )
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Issue reader",
+        scopes=["issues:read"],
+    )
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "GET",
+            f"/api/app-error-alert-rules?environment_id={workspace.environment_id}",
+            headers={"Authorization": f"Bearer {service.token}"},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 403
+    assert payload["error"] == "forbidden"
+
+
 def test_app_error_incident_api_detail_controls_sensitive_evidence(
     tmp_path: Path,
 ) -> None:

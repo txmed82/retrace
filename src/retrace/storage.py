@@ -2446,6 +2446,7 @@ class Storage:
         environment_id: str,
         enabled: Optional[bool] = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[AppErrorAlertRuleRow]:
         params: list[object] = [project_id, environment_id]
         where = "project_id = ? AND environment_id = ?"
@@ -2453,6 +2454,7 @@ class Storage:
             where += " AND enabled = ?"
             params.append(int(bool(enabled)))
         params.append(max(1, min(int(limit), 500)))
+        params.append(max(0, int(offset)))
         with self._conn() as conn:
             rows = conn.execute(
                 f"""
@@ -2460,7 +2462,7 @@ class Storage:
                 FROM app_error_alert_rules
                 WHERE {where}
                 ORDER BY precedence DESC, created_at ASC, id ASC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
                 params,
             ).fetchall()

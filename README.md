@@ -413,7 +413,7 @@ generated filename, line, and column match an uploaded Source Map v3 artifact.
 App-error alert rules can mark matching incidents active or suppressed before
 they reach downstream workflows:
 
-- `GET /api/app-error-alert-rules?environment_id=...`
+- `GET /api/app-error-alert-rules?environment_id=...&limit=100&offset=0`
 - `POST /api/app-error-alert-rules?environment_id=...`
 
 `POST` upserts by rule `name` and returns `202`. Send JSON with `name`,
