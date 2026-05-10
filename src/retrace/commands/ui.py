@@ -1731,6 +1731,126 @@ def _api_specs_payload(data_dir: Path) -> dict[str, Any]:
     return {"specs": specs}
 
 
+def _hosted_onboarding_readiness_payload(
+    *,
+    store: Storage,
+    data_dir: Path,
+    settings: dict[str, Any],
+    checks: dict[str, Any],
+) -> dict[str, Any]:
+    sdk_keys = store.list_sdk_keys(include_revoked=False, limit=10)
+    replay_sessions = store.list_recent_replay_sessions(limit=10)
+    replay_issues = store.list_recent_replay_issues(limit=10)
+    fallback_workspace = store.ensure_workspace(project_name="Default")
+    if replay_issues:
+        project_id = str(replay_issues[0]["project_id"])
+        environment_id = str(replay_issues[0]["environment_id"])
+    elif sdk_keys:
+        project_id = sdk_keys[0].project_id
+        environment_id = sdk_keys[0].environment_id
+    else:
+        project_id = fallback_workspace.project_id
+        environment_id = fallback_workspace.environment_id
+    ui_specs = list_specs(specs_dir_for_data_dir(data_dir))
+    api_specs = list_api_specs(api_specs_dir_for_data_dir(data_dir))
+    api_suites = list_api_suites(api_suites_dir_for_data_dir(data_dir))
+    source_maps = store.list_recent_source_maps(
+        project_id=project_id,
+        environment_id=environment_id,
+        limit=10,
+    )
+    alert_rules = store.list_app_error_alert_rules(
+        project_id=project_id,
+        environment_id=environment_id,
+        limit=10,
+    )
+    test_links = store.list_all_failure_test_links()
+    repair_tasks = store.list_repair_tasks(limit=10)
+    steps = [
+        {
+            "id": "settings",
+            "label": "Configure hosted settings",
+            "status": "complete"
+            if settings.get("tester_app_url") and checks.get("replay_api", {}).get("reachable") is True
+            else "current",
+            "detail": f"Replay API: {checks.get('replay_api', {}).get('detail') or 'not checked'}",
+            "action": "Save settings and run retrace api serve",
+        },
+        {
+            "id": "capture_key",
+            "label": "Create browser capture key",
+            "status": "complete" if sdk_keys else "current",
+            "detail": f"{len(sdk_keys)} active browser SDK key(s)",
+            "action": "Create SDK Key",
+        },
+        {
+            "id": "capture_smoke",
+            "label": "Verify replay capture",
+            "status": "complete" if replay_sessions or replay_issues else "blocked",
+            "detail": f"{len(replay_sessions)} recent first-party replay session(s)",
+            "action": "Send a smoke replay from the instrumented app",
+        },
+        {
+            "id": "issue_grouping",
+            "label": "Process captured errors into issues",
+            "status": "complete" if replay_issues else "blocked",
+            "detail": f"{len(replay_issues)} recent replay issue(s)",
+            "action": "Process Queued Replays",
+        },
+        {
+            "id": "ui_tests",
+            "label": "Generate and review UI regressions",
+            "status": "complete" if ui_specs and test_links else "current",
+            "detail": f"{len(ui_specs)} UI spec(s), {sum(1 for spec in ui_specs if dict(spec.fixtures or {}).get('draft_status') == 'draft')} draft(s)",
+            "action": "Generate regression tests from issues",
+        },
+        {
+            "id": "api_tests",
+            "label": "Import or generate API coverage",
+            "status": "complete" if api_suites or api_specs else "current",
+            "detail": f"{len(api_suites)} API suite(s), {len(api_specs)} API spec(s)",
+            "action": "Import OpenAPI or generate API regression",
+        },
+        {
+            "id": "monitoring",
+            "label": "Harden monitoring",
+            "status": "complete" if source_maps and alert_rules else "current",
+            "detail": f"{len(source_maps)} source map upload(s), {len(alert_rules)} alert rule(s)",
+            "action": "Upload source maps and create alert rules",
+        },
+        {
+            "id": "repair_loop",
+            "label": "Create repair-ready context",
+            "status": "complete" if repair_tasks else "blocked",
+            "detail": f"{len(repair_tasks)} repair task(s)",
+            "action": "Generate fix prompts from a failing issue",
+        },
+    ]
+    complete = sum(1 for step in steps if step["status"] == "complete")
+    return {
+        "workspace": {
+            "project_id": project_id,
+            "environment_id": environment_id,
+        },
+        "ready": complete == len(steps),
+        "complete": complete,
+        "total": len(steps),
+        "steps": steps,
+        "counts": {
+            "sdk_keys": len(sdk_keys),
+            "replay_sessions": len(replay_sessions),
+            "replay_issues": len(replay_issues),
+            "ui_specs": len(ui_specs),
+            "api_specs": len(api_specs),
+            "api_suites": len(api_suites),
+            "source_maps": len(source_maps),
+            "alert_rules": len(alert_rules),
+            "test_links": len(test_links),
+            "repair_tasks": len(repair_tasks),
+        },
+    }
+
+
 def _run_api_spec_payload(*, data_dir: Path, spec_id: str) -> tuple[dict[str, Any], int]:
     clean_spec_id = spec_id.strip()
     if not clean_spec_id:
@@ -2435,14 +2555,16 @@ const retrace = init({
     }
 
     async function loadOnboarding(){
-      const [sRes, cRes, rRes] = await Promise.all([
+      const [sRes, cRes, rRes, readyRes] = await Promise.all([
         fetch('/api/settings'),
         fetch('/api/system-checks'),
         fetch('/api/github/repos'),
+        fetch('/api/onboarding/readiness'),
       ]);
       const settings = await sRes.json();
       const checks = await cRes.json();
       const repoData = await rRes.json();
+      const readiness = await readyRes.json();
       const repos = repoData.repos || [];
       const gh = checks.gh || {};
       const ph = checks.posthog || {};
@@ -2456,8 +2578,23 @@ const retrace = init({
       const repoRows = repos.map(r => `
         <li><code>${esc(r.repo_full_name)}</code> · provider=<code>${esc(r.provider || 'github')}</code> · branch=<code>${esc(r.default_branch || 'main')}</code>${r.local_path ? ` · path=<code>${esc(r.local_path)}</code>` : ''}</li>
       `).join('');
+      const readinessRows = (readiness.steps || []).map(step => `
+        <li>
+          <span class="${step.status === 'complete' ? 'ok' : (step.status === 'blocked' ? 'bad' : '')}">${esc(step.status)}</span>
+          · <strong>${esc(step.label)}</strong>
+          <br><span class="empty">${esc(step.detail || '')}</span>
+          <br><span class="empty">Next: ${esc(step.action || '')}</span>
+        </li>
+      `).join('');
       byId('onboarding').innerHTML = `
         <h3>Onboarding & Settings</h3>
+        <div class="readiness-panel">
+          <div class="row">
+            <div><strong>Hosted Readiness</strong><div class="empty">Capture, process, test, monitor, and repair loop setup.</div></div>
+            <code class="${readiness.ready ? 'ok' : ''}">${esc(readiness.complete || 0)}/${esc(readiness.total || 0)}</code>
+          </div>
+          ${readinessRows ? `<ul>${readinessRows}</ul>` : '<div class="empty">Readiness checks unavailable.</div>'}
+        </div>
         <form id=\"settingsForm\">
           <div class=\"lbl\">PostHog Host</div>
           <input id=\"phHost\" value=\"${esc(settings.posthog_host)}\" />
@@ -3837,6 +3974,33 @@ def ui_command(
                         ),
                         "replay_api": _replay_api_check(),
                     }
+                )
+                return
+
+            if path == "/api/onboarding/readiness":
+                s = current_settings(include_secrets=True)
+                checks = {
+                    "gh": _gh_checks(),
+                    "posthog": _posthog_check(
+                        s["posthog_host"],
+                        s["posthog_project_id"],
+                        s["posthog_api_key"],
+                    ),
+                    "llm": _llm_check(
+                        s["llm_provider"],
+                        s["llm_base_url"],
+                        s["llm_model"],
+                        s["llm_api_key"],
+                    ),
+                    "replay_api": _replay_api_check(),
+                }
+                self._json(
+                    _hosted_onboarding_readiness_payload(
+                        store=store,
+                        data_dir=data_dir,
+                        settings=s,
+                        checks=checks,
+                    )
                 )
                 return
 
