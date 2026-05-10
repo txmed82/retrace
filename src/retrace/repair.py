@@ -412,16 +412,48 @@ def _request_response_pairs(evidence: list[dict[str, Any]]) -> list[dict[str, An
         if evidence_type not in {"api_request", "api_response", "api_request_response"}:
             continue
         source = str(item.get("source") or "")
-        key = source or str(item.get("id") or "")
-        pair = pairs.setdefault(key, {"source": source})
         payload = dict(item.get("untrusted_payload") or {})
+        key = _request_response_pair_key(item=item, payload=payload)
+        pair = pairs.setdefault(key, {"source": source})
+        step_id = _payload_step_id(payload)
+        if step_id:
+            pair["step_id"] = step_id
         if evidence_type == "api_request_response":
             pair["request_response"] = payload
         elif evidence_type == "api_request":
             pair["request"] = payload
         elif evidence_type == "api_response":
             pair["response"] = payload
-    return [pair for _, pair in sorted(pairs.items())]
+    return list(pairs.values())
+
+
+def _request_response_pair_key(*, item: dict[str, Any], payload: dict[str, Any]) -> str:
+    source = str(item.get("source") or "")
+    step_id = _payload_step_id(payload)
+    if step_id:
+        return f"{source}:{step_id}"
+    artifact_id = str(payload.get("artifact_id") or "").strip()
+    for suffix in ("-request", "-response"):
+        if artifact_id.endswith(suffix):
+            artifact_id = artifact_id[: -len(suffix)]
+            break
+    if artifact_id:
+        return f"{source}:{artifact_id}"
+    return source or str(item.get("id") or "")
+
+
+def _payload_step_id(payload: dict[str, Any]) -> str:
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        step_id = str(metadata.get("step_id") or "").strip()
+        if step_id:
+            return step_id
+    artifact = payload.get("artifact")
+    if isinstance(artifact, dict):
+        step_id = str(artifact.get("step_id") or "").strip()
+        if step_id:
+            return step_id
+    return ""
 
 
 def _route_match_context(*, metadata: dict[str, Any], repair_task: Any) -> list[dict[str, Any]]:
