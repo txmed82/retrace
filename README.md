@@ -447,6 +447,17 @@ Example:
 Matching rule metadata is written onto the canonical failure and incident
 response as `alert_state` and `alert_rule_name`.
 
+App-error retention pruning is available for hosted or self-hosted cleanup jobs:
+
+- `POST /api/app-errors/prune?environment_id=...`
+
+Use a service token with `app_errors:write` or `admin`. The JSON body accepts
+`failure_retention_days`, `evidence_retention_days`, `source_map_retention_days`,
+`rate_limit_retention_hours`, and optional `dry_run`. Pruning removes old
+resolved/ignored app-error failures, associated evidence and incident links,
+stale source maps, and stale rate-limit rows while leaving active incidents
+intact.
+
 Deploy markers can be recorded from CI with `POST /api/deploys?environment_id=...`
 or locally with `retrace api record-deploy --sha <commit> --changed-file <path>`.
 Failures after the deploy are linked to the nearest marker, and incident repair

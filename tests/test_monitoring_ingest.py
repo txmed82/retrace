@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
+import sqlite3
 from threading import Thread
 
 import pytest
@@ -1335,6 +1337,92 @@ def test_app_error_incident_api_detail_controls_sensitive_evidence(
     assert sensitive_payload["evidence"][0]["payload"]["external_id"] == "evt-detail-1"
     assert weak_response.status == 403
     assert weak_payload["error"] == "forbidden"
+
+
+def test_app_error_prune_endpoint_deletes_old_resolved_monitoring_data(
+    tmp_path: Path,
+) -> None:
+    store, workspace = _store(tmp_path)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="App error writer",
+        scopes=["app_errors:write"],
+    )
+    result = ingest_monitoring_webhook(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        provider="sentry",
+        payload={
+            "event": {
+                "event_id": "evt-retention-1",
+                "title": "Old resolved error",
+                "level": "error",
+                "timestamp": "2026-01-01T00:00:00Z",
+            }
+        },
+    )
+    upload_source_map(
+        store=store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        release="old-release",
+        artifact_url="https://cdn.example.com/old.js",
+        source_map=_source_map(),
+    )
+    store.consume_ingest_rate_limit(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        bucket="sentry",
+        identity="old-sdk",
+        limit=10,
+        window_seconds=60,
+    )
+    old_created_at = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("UPDATE failures SET status = 'resolved' WHERE id = ?", (result.failure_id,))
+        conn.execute("UPDATE failure_evidence SET created_at = ?", (old_created_at,))
+        conn.execute("UPDATE source_maps SET uploaded_at = ?", (old_created_at,))
+        conn.execute("UPDATE ingest_rate_limits SET updated_at = ?", (old_created_at,))
+
+    with _server(store) as server:
+        host, port = server.server_address
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            f"/api/app-errors/prune?environment_id={workspace.environment_id}",
+            body=json.dumps(
+                {
+                    "failure_retention_days": 1,
+                    "evidence_retention_days": 1,
+                    "source_map_retention_days": 1,
+                    "rate_limit_retention_hours": 1,
+                }
+            ).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {service.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+    assert response.status == 202
+    assert payload["retention"]["deleted"]["failures"] == 1
+    assert payload["retention"]["deleted"]["evidence"] == 1
+    assert payload["retention"]["deleted"]["source_maps"] == 1
+    assert payload["retention"]["deleted"]["rate_limit_rows"] == 1
+    assert store.get_failure_by_id(result.failure_id) is None
+    assert (
+        store.list_source_maps(
+            project_id=workspace.project_id,
+            environment_id=workspace.environment_id,
+            release="old-release",
+        )
+        == []
+    )
 
 
 def test_monitoring_webhook_endpoint_rejects_empty_payload(tmp_path: Path) -> None:

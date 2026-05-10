@@ -408,6 +408,24 @@ def _alert_rule_api_dict(rule: Any) -> dict[str, Any]:
     }
 
 
+def _retention_result_api_dict(result: Any) -> dict[str, Any]:
+    return {
+        "dry_run": bool(result.dry_run),
+        "failure_retention_days": int(result.failure_retention_days),
+        "evidence_retention_days": int(result.evidence_retention_days),
+        "source_map_retention_days": int(result.source_map_retention_days),
+        "rate_limit_retention_hours": int(result.rate_limit_retention_hours),
+        "deleted": {
+            "failures": int(result.failures),
+            "evidence": int(result.evidence),
+            "incident_links": int(result.incident_links),
+            "incidents": int(result.incidents),
+            "source_maps": int(result.source_maps),
+            "rate_limit_rows": int(result.rate_limit_rows),
+        },
+    }
+
+
 def _app_error_notification_payload(
     *,
     store: Storage,
@@ -629,6 +647,9 @@ def _handler(
                 return
             if parsed.path == "/api/app-error-alert-rules":
                 self._handle_upsert_app_error_alert_rule(parsed.query)
+                return
+            if parsed.path == "/api/app-errors/prune":
+                self._handle_prune_app_errors(parsed.query)
                 return
             if parsed.path in {"/api/otel/v1/logs", "/api/otel/v1/traces"}:
                 self._handle_otel_ingest(parsed.path, parsed.query)
@@ -1528,6 +1549,60 @@ def _handler(
                 202,
                 {"rule": _alert_rule_api_dict(rule) if rule is not None else {"id": rule_id}},
             )
+
+        def _handle_prune_app_errors(self, query: str) -> None:
+            token = _require_service_token(
+                self,
+                store,
+                scopes={"app_errors:write", "admin"},
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length < 0:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length > 64 * 1024:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            payload: dict[str, Any] = {}
+            if length:
+                try:
+                    decoded = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    _json_response(self, 400, {"error": "invalid_json"})
+                    return
+                if not isinstance(decoded, dict):
+                    _json_response(self, 400, {"error": "invalid_payload"})
+                    return
+                payload = decoded
+            try:
+                result = store.prune_app_error_retention(
+                    project_id=token.project_id,
+                    environment_id=environment_id,
+                    failure_retention_days=int(payload.get("failure_retention_days") or 90),
+                    evidence_retention_days=int(payload.get("evidence_retention_days") or 90),
+                    source_map_retention_days=int(
+                        payload.get("source_map_retention_days") or 30
+                    ),
+                    rate_limit_retention_hours=int(
+                        payload.get("rate_limit_retention_hours") or 48
+                    ),
+                    dry_run=bool(payload.get("dry_run")),
+                )
+            except (TypeError, ValueError) as exc:
+                _json_response(self, 400, {"error": "invalid_retention", "message": str(exc)})
+                return
+            _json_response(self, 202, {"retention": _retention_result_api_dict(result)})
 
         def _handle_get_app_error_incident(self, incident_id: str, query: str) -> None:
             token = _require_service_token(
