@@ -6,6 +6,7 @@ from threading import Thread
 from unittest.mock import patch
 
 from retrace.commands.ui import (
+    _api_specs_payload,
     _api_suites_payload,
     _create_sdk_key_payload,
     _edit_ui_draft_payload,
@@ -18,6 +19,7 @@ from retrace.commands.ui import (
     _replay_api_check,
     _generate_replay_issue_spec_payload,
     _run_replay_issue_api_spec_payload,
+    _run_api_spec_payload,
     _to_replay_dashboard_payload,
     _transition_replay_issue_payload,
     _verify_resolved_issues_payload,
@@ -123,6 +125,11 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "generate_api_regression" in _INDEX_HTML
     assert "/api/api-suites" in _INDEX_HTML
     assert "API Suites" in _INDEX_HTML
+    assert "/api/api-specs" in _INDEX_HTML
+    assert "/api/api-spec/run" in _INDEX_HTML
+    assert "UI Spec Inventory" in _INDEX_HTML
+    assert "API Spec Inventory" in _INDEX_HTML
+    assert "runManagedApiSpec" in _INDEX_HTML
     assert "Generated Draft Review" in _INDEX_HTML
     assert "/api/tester/draft" in _INDEX_HTML
     assert "saveDraftSpec" in _INDEX_HTML
@@ -249,6 +256,60 @@ def test_api_suites_payload_summarizes_import_quality(tmp_path: Path) -> None:
     assert payload["suites"][0]["operation_count"] == 1
     assert payload["suites"][0]["quality_warning_count"] == 1
     assert payload["suites"][0]["auth_profile"] == "local-jwt"
+
+
+def test_api_specs_payload_summarizes_management_fields(tmp_path: Path) -> None:
+    spec = create_api_spec(
+        specs_dir=api_specs_dir_for_data_dir(tmp_path),
+        name="Checkout API",
+        method="POST",
+        url="https://app.example/api/checkout",
+        expected_status=201,
+        json_assertions=[{"path": "$.ok", "equals": True}],
+        auth_profile="local-jwt",
+        env_profile="staging",
+        fixtures={
+            "source": "openapi_import",
+            "issue_public_id": "iss_checkout",
+            "operation_id": "createCheckout",
+            "openapi_path": "/api/checkout",
+        },
+    )
+
+    payload = _api_specs_payload(tmp_path)
+
+    assert payload["specs"][0]["spec_id"] == spec.spec_id
+    assert payload["specs"][0]["method"] == "POST"
+    assert payload["specs"][0]["expected_status"] == 201
+    assert payload["specs"][0]["json_assertion_count"] == 1
+    assert payload["specs"][0]["source"] == "openapi_import"
+    assert payload["specs"][0]["issue_public_id"] == "iss_checkout"
+    assert payload["specs"][0]["operation_id"] == "createCheckout"
+
+
+def test_run_api_spec_payload_runs_saved_api_spec(tmp_path: Path) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HealthHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Health API",
+            method="GET",
+            url=f"http://{host}:{port}/healthz",
+            expected_status=200,
+        )
+        payload, status = _run_api_spec_payload(data_dir=tmp_path, spec_id=spec.spec_id)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["result"]["spec_id"] == spec.spec_id
+    assert payload["result"]["status"] == "passed"
 
 
 def test_edit_ui_draft_payload_persists_reviewed_steps_and_accepts(
