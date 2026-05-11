@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import click
 import httpx
@@ -2294,6 +2294,7 @@ _INDEX_HTML = """<!doctype html>
       <div class=\"brand\">Retrace QA</div>
       <button class=\"nav-btn active\" type=\"button\" data-view=\"dashboard\">Dashboard</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"issues\">Issues</button>
+      <button class=\"nav-btn\" type=\"button\" data-view=\"qa\">QA Incidents</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"replays\">Replays</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"findings\">Findings</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"tests\">Tests</button>
@@ -2326,6 +2327,24 @@ _INDEX_HTML = """<!doctype html>
         <div id=\"replaySessionsPanel\"></div>
         <div style=\"height:10px\"></div>
         <div class=\"rr\"><div id=\"firstPartyReplay\"><div class=\"empty\">Select a first-party replay session.</div></div></div>
+      </section>
+      <section class=\"view\" id=\"view-qa\">
+        <div class=\"view-head\">
+          <div><h2>QA Incidents</h2><div class=\"empty\">Unified queue across replay, UI test, API test, error monitor, and PR review.</div></div>
+          <div class=\"actions\">
+            <button class=\"btn\" id=\"qaRefreshBtn\" type=\"button\">Refresh</button>
+            <select class=\"btn\" id=\"qaSourceFilter\" title=\"Filter by source kind\">
+              <option value=\"\">All sources</option>
+              <option value=\"replay\">replay</option>
+              <option value=\"ui_test\">ui_test</option>
+              <option value=\"api_test\">api_test</option>
+              <option value=\"error_monitor\">error_monitor</option>
+              <option value=\"manual\">manual</option>
+            </select>
+          </div>
+        </div>
+        <div id=\"qaList\"><div class=\"empty\">Loading…</div></div>
+        <div id=\"qaDetail\" style=\"margin-top:18px\"></div>
       </section>
       <section class=\"view\" id=\"view-tests\"><div id=\"tester\"></div></section>
       <section class=\"view\" id=\"view-runs\"><div id=\"runsView\"></div></section>
@@ -2370,11 +2389,82 @@ _INDEX_HTML = """<!doctype html>
       document.querySelectorAll('.view').forEach(el => el.classList.toggle('active', el.id === `view-${view}`));
       document.querySelectorAll('.nav-btn').forEach(el => el.classList.toggle('active', el.dataset.view === view));
       const title = byId('railTitle');
-      if(title) title.textContent = view === 'findings' ? 'Report Findings' : 'Issues';
+      if(title) title.textContent = view === 'findings' ? 'Report Findings' : (view === 'qa' ? 'QA Incidents' : 'Issues');
       if(byId('issueWorkflowList')) byId('issueWorkflowList').style.display = view === 'findings' ? 'none' : '';
       if(byId('findings')) byId('findings').style.display = view === 'findings' ? '' : 'none';
+      if(view === 'qa'){ loadQaIncidents(); }
     }
     document.querySelectorAll('.nav-btn').forEach(el => el.addEventListener('click', () => switchView(el.dataset.view)));
+
+    async function loadQaIncidents(){
+      const list = byId('qaList');
+      const detail = byId('qaDetail');
+      if(!list){ return; }
+      list.innerHTML = '<div class="empty">Loading…</div>';
+      if(detail) detail.innerHTML = '';
+      const filter = (byId('qaSourceFilter') || {}).value || '';
+      try {
+        const url = filter ? `/api/qa-incidents?source=${encodeURIComponent(filter)}` : '/api/qa-incidents';
+        const res = await fetch(url);
+        const data = await res.json();
+        const incidents = data.incidents || [];
+        if(!incidents.length){
+          list.innerHTML = '<div class="empty">No QA incidents yet. Try <code>retrace demo all</code> to seed every pillar.</div>';
+          return;
+        }
+        const rows = incidents.map(inc => {
+          const sev = inc.severity || '-';
+          const src = inc.primary_source_kind || '-';
+          const fix = inc.fix_pr_url ? ` · <a href="${inc.fix_pr_url}" target="_blank">PR</a>` : '';
+          return `<div class="card" style="margin-bottom:8px"><div class="hdr"><strong>${inc.public_id}</strong> &nbsp; <span class="tag tag-${src}">${src}</span> &nbsp; <span>${escapeHtml(inc.title || '')}</span></div><div class="empty">${sev} · ${inc.status} · ${inc.affected_users || 0} user(s)${fix} · <a href="javascript:void(0)" data-qa-show="${inc.public_id}">details</a></div></div>`;
+        }).join('');
+        list.innerHTML = rows;
+        list.querySelectorAll('[data-qa-show]').forEach(el => {
+          el.addEventListener('click', () => showQaIncident(el.dataset.qaShow));
+        });
+      } catch (err) {
+        list.innerHTML = `<div class="empty">Failed to load QA incidents: ${escapeHtml(String(err))}</div>`;
+      }
+    }
+    function escapeHtml(s){
+      return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    async function showQaIncident(publicId){
+      const detail = byId('qaDetail');
+      if(!detail) return;
+      detail.innerHTML = '<div class="empty">Loading…</div>';
+      try {
+        const res = await fetch(`/api/qa-incidents/${encodeURIComponent(publicId)}`);
+        if(!res.ok){
+          detail.innerHTML = `<div class="empty">Not found.</div>`;
+          return;
+        }
+        const data = await res.json();
+        const inc = data.incident || {};
+        const repro = (() => { try { return JSON.parse(inc.reproduction_json || '[]'); } catch(e) { return []; } })();
+        const evidence = (() => { try { return JSON.parse(inc.evidence_json || '{}'); } catch(e) { return {}; } })();
+        const steps = repro.map((s, i) => `<li><strong>${escapeHtml(s.action || '?')}</strong> — ${escapeHtml(s.description || '')}</li>`).join('');
+        detail.innerHTML = `
+          <div class="card">
+            <h3>${escapeHtml(inc.public_id || '')}  ${escapeHtml(inc.title || '')}</h3>
+            <div class="empty">severity ${escapeHtml(inc.severity || '-')} · confidence ${escapeHtml(inc.confidence || '-')} · status ${escapeHtml(inc.status || '-')} · source ${escapeHtml(inc.primary_source_kind || '-')}</div>
+            ${inc.summary ? `<p>${escapeHtml(inc.summary)}</p>` : ''}
+            ${inc.suspected_cause ? `<p><em>Suspected cause:</em> ${escapeHtml(inc.suspected_cause)}</p>` : ''}
+            ${steps ? `<h4>Reproduction</h4><ol>${steps}</ol>` : ''}
+            ${evidence.top_stack_frame ? `<p><em>Top stack frame:</em> <code>${escapeHtml(evidence.top_stack_frame)}</code></p>` : ''}
+            ${inc.fix_pr_url ? `<p><strong>Fix PR:</strong> <a href="${inc.fix_pr_url}" target="_blank">${escapeHtml(inc.fix_pr_url)}</a></p>` : ''}
+          </div>
+        `;
+      } catch (err) {
+        detail.innerHTML = `<div class="empty">Failed: ${escapeHtml(String(err))}</div>`;
+      }
+    }
+    document.addEventListener('click', (e) => {
+      if(e.target && e.target.id === 'qaRefreshBtn'){ loadQaIncidents(); }
+    });
+    document.addEventListener('change', (e) => {
+      if(e.target && e.target.id === 'qaSourceFilter'){ loadQaIncidents(); }
+    });
     window.addEventListener('hashchange', () => applyReplayHash(replayState.issues, replayState.sessions));
 
     function statusClass(value){
@@ -4132,6 +4222,56 @@ def ui_command(
                     repo_full_name=repo_full_name,
                 )
                 self._json({"report_path": str(rp) if rp else "", "findings": findings})
+                return
+
+            if path == "/api/qa-incidents":
+                # Unified QA incident queue (replay/UI/API/monitor/review).
+                query_args = parse_qs(urlparse(self.path).query)
+                source_filter = (query_args.get("source") or [""])[0]
+                rows = store.list_qa_incidents(limit=200)
+                if source_filter:
+                    rows = [r for r in rows if str(r["primary_source_kind"]) == source_filter]
+                incidents = [
+                    {
+                        "public_id": str(r["public_id"]),
+                        "title": str(r["title"] or ""),
+                        "summary": str(r["summary"] or ""),
+                        "severity": str(r["severity"] or ""),
+                        "confidence": str(r["confidence"] or ""),
+                        "status": str(r["status"] or ""),
+                        "primary_source_kind": str(r["primary_source_kind"] or ""),
+                        "affected_users": int(r["affected_users"] or 0),
+                        "affected_count": int(r["affected_count"] or 0),
+                        "fix_pr_url": str(r["fix_pr_url"] or ""),
+                        "updated_at": str(r["updated_at"] or ""),
+                    }
+                    for r in rows
+                ]
+                self._json({"incidents": incidents, "count": len(incidents)})
+                return
+
+            if path.startswith("/api/qa-incidents/"):
+                public_id = path[len("/api/qa-incidents/"):]
+                if not re.match(r"^INC-[A-Z0-9]+$", public_id):
+                    self._json({"error": "invalid incident id"}, status=400)
+                    return
+                row = store.get_qa_incident(public_id)
+                if row is None:
+                    self._json({"error": "not found"}, status=404)
+                    return
+                # Project the row to a plain dict the frontend can consume.
+                incident = {
+                    key: (str(row[key]) if row[key] is not None else "")
+                    for key in row.keys()
+                }
+                # Cast known numeric columns.
+                for k in ("affected_count", "affected_users", "first_seen_ms", "last_seen_ms"):
+                    if k in incident:
+                        try:
+                            incident[k] = int(incident[k] or 0)
+                        except (TypeError, ValueError):
+                            incident[k] = 0
+                self._json({"incident": incident})
                 return
 
             if path == "/api/tester/specs":
