@@ -20,6 +20,7 @@ from typing import Any, Optional
 import click
 
 from retrace.config import load_config
+from retrace.llm_pr_review import LLMReviewResult, llm_review
 from retrace.pr_review import analyze_pr_diff, build_pr_review_comment_plan
 from retrace.qa_incident_bridge import sync_qa_incident_from_pr_review_finding
 from retrace.storage import Storage
@@ -99,6 +100,16 @@ _PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
     ),
 )
 @click.option(
+    "--llm/--no-llm",
+    "use_llm",
+    default=None,
+    help=(
+        "Ask an LLM to produce a summary, walkthrough, and inline "
+        "suggestions on top of the templated analysis. Defaults to ON "
+        "when `config.yaml` has an LLM configured."
+    ),
+)
+@click.option(
     "--json",
     "as_json",
     is_flag=True,
@@ -116,6 +127,7 @@ def review_command(
     file_incidents: bool,
     post_comment: bool,
     run_affected_tests: bool,
+    use_llm: Optional[bool],
     as_json: bool,
 ) -> None:
     """Run Retrace's PR review against a diff and (optionally) file qa_incidents.
@@ -178,6 +190,15 @@ def review_command(
             analysis=analysis,
         )
 
+    # LLM review (P0.1). Default on iff the user has configured an
+    # LLM in config.yaml. Falls back to an empty result on error.
+    llm_result = _maybe_llm_review(
+        cfg=cfg,
+        diff_text=diff_text,
+        analysis=analysis,
+        use_llm=use_llm,
+    )
+
     posted_comment_url = ""
     if post_comment:
         # The fail-fast check above already validated `(repo, pr_number)`.
@@ -187,6 +208,7 @@ def review_command(
             analysis=analysis,
             incidents_filed=incidents_filed,
             affected_test_results=affected_test_results,
+            llm_result=llm_result,
         )
 
     if as_json:
@@ -194,6 +216,7 @@ def review_command(
         payload["incidents_filed"] = incidents_filed
         payload["affected_test_results"] = affected_test_results
         payload["posted_comment_url"] = posted_comment_url
+        payload["llm_review"] = llm_result.to_dict()
         click.echo(json.dumps(payload, indent=2))
         return
 
@@ -204,6 +227,7 @@ def review_command(
         incidents_filed=incidents_filed,
         affected_test_results=affected_test_results,
         posted_comment_url=posted_comment_url,
+        llm_result=llm_result,
     )
 
 
@@ -331,6 +355,48 @@ def _file_incidents_for_analysis(
     return out
 
 
+def _maybe_llm_review(
+    *,
+    cfg: Any,
+    diff_text: str,
+    analysis: Any,
+    use_llm: Optional[bool],
+) -> LLMReviewResult:
+    """Run `llm_review` if the user has an LLM configured.
+
+    `use_llm=None` means "auto": run iff `config.yaml` declares an LLM
+    base URL. `True` forces ON (will error if no LLM); `False` forces
+    OFF (returns an empty result).
+    """
+    if use_llm is False:
+        return LLMReviewResult()
+
+    llm_cfg = getattr(cfg, "llm", None)
+    has_llm = bool(llm_cfg and getattr(llm_cfg, "base_url", "").strip())
+
+    if use_llm is None and not has_llm:
+        return LLMReviewResult()
+    if use_llm is True and not has_llm:
+        raise click.UsageError(
+            "--llm requested but no LLM is configured. Run `retrace init` "
+            "or set `llm.base_url` in config.yaml."
+        )
+
+    # Local import — keeps the CLI startup time when --no-llm is used.
+    from retrace.llm.client import LLMClient
+
+    try:
+        with LLMClient(llm_cfg) as client:
+            return llm_review(
+                diff_text=diff_text,
+                analysis=analysis,
+                llm_client=client,
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        # Don't fail the review just because the LLM is down.
+        return LLMReviewResult(error=f"LLM review failed: {exc}")
+
+
 def _run_affected_tests(*, cfg: Any, analysis: Any) -> list[dict[str, Any]]:
     """Run any tester specs that cover an affected flow.
 
@@ -392,11 +458,19 @@ def _format_comment_body(
     analysis: Any,
     incidents_filed: list[str],
     affected_test_results: list[dict[str, Any]],
+    llm_result: Optional[LLMReviewResult] = None,
 ) -> str:
     """Render the PR comment body. Uses `build_pr_review_comment_plan` as
     the trusted summary and tacks on QA-specific additions."""
     plan = build_pr_review_comment_plan(analysis)
-    lines: list[str] = [plan.summary_body.rstrip()]
+    lines: list[str] = []
+    # LLM review goes FIRST when present — that's the meat for humans.
+    if llm_result is not None and not llm_result.is_empty:
+        lines.append("## Retrace LLM review")
+        lines.append("")
+        lines.append(llm_result.to_markdown().rstrip())
+        lines.append("")
+    lines.append(plan.summary_body.rstrip())
     if incidents_filed:
         lines.append("")
         lines.append(f"### Retrace QA — incidents filed ({len(incidents_filed)})")
@@ -427,6 +501,7 @@ def _post_pr_comment(
     analysis: Any,
     incidents_filed: list[str],
     affected_test_results: list[dict[str, Any]],
+    llm_result: Optional[LLMReviewResult] = None,
 ) -> str:
     if not shutil.which("gh"):
         raise click.ClickException(
@@ -436,6 +511,7 @@ def _post_pr_comment(
         analysis=analysis,
         incidents_filed=incidents_filed,
         affected_test_results=affected_test_results,
+        llm_result=llm_result,
     )
     # `gh pr comment` doesn't dedupe; we leave de-duplication to the
     # GitHub-App webhook path (`publish_pr_review_comments`) which keys
@@ -467,12 +543,34 @@ def _render_human(
     incidents_filed: list[str],
     affected_test_results: list[dict[str, Any]] | None = None,
     posted_comment_url: str = "",
+    llm_result: Optional[LLMReviewResult] = None,
 ) -> None:
     header = "PR review"
     if repo and pr_number:
         header += f" — {repo}#{pr_number}"
     click.echo(header)
     click.echo("─" * 64)
+
+    if llm_result is not None and not llm_result.is_empty:
+        click.echo("Retrace LLM review:")
+        if llm_result.summary:
+            click.echo("  " + llm_result.summary.replace("\n", "\n  "))
+        if llm_result.walkthrough:
+            click.echo("")
+            click.echo("  Walkthrough:")
+            for w in llm_result.walkthrough[:20]:
+                click.echo(f"    • {w}")
+        if llm_result.inline_suggestions:
+            click.echo("")
+            click.echo("  Inline suggestions:")
+            for s in llm_result.inline_suggestions[:20]:
+                click.echo(f"    • {s.path}:{s.line} — {s.body[:120]}")
+        if llm_result.risk_notes:
+            click.echo("")
+            click.echo("  Risk notes:")
+            for r in llm_result.risk_notes[:20]:
+                click.echo(f"    • {r}")
+        click.echo("")
 
     click.echo(f"Changed files: {len(analysis.changed_files)}")
     for f in analysis.changed_files[:20]:

@@ -246,11 +246,13 @@ Sentry.init({ dsn: "http://rtpk_…@127.0.0.1:8788/<project_id>" });
 
 ## Code review (`retrace review`)
 
-Run Retrace's PR analyzer against a diff. It parses changed files,
-infers affected flows, links prior failures that match the diff, and
-recommends missing tests. Findings file `qa_incidents` so the same
-`qa auto` flow can turn "PR touches a flaky surface" into a draft fix
-PR.
+Run Retrace's PR analyzer against a diff. With `--llm` (default ON
+when an LLM is configured), it adds an AI summary, a per-file
+walkthrough, and inline suggestions on top of the templated analysis.
+Without an LLM, it still parses changed files, infers affected flows,
+links prior failures that match the diff, and recommends missing
+tests. Findings file `qa_incidents` so the same `qa auto` flow can
+turn "PR touches a flaky surface" into a draft fix PR.
 
 ```bash
 # Read a diff from a file, an URL, or stdin
@@ -258,7 +260,20 @@ retrace review --diff /tmp/pr.diff
 gh pr diff 42 | retrace review --diff -
 retrace review --pr https://github.com/org/repo/pull/42
 retrace review --pr 42 --repo org/repo --file-incidents
+
+# AI review + post to the PR:
+retrace review --pr https://github.com/org/repo/pull/42 \
+  --llm --post-comment --run-affected-tests
+
+# Turn the LLM off explicitly even when configured:
+retrace review --pr <…> --no-llm
 ```
+
+The diff is run through Retrace's PII redactor before it leaves your
+host — passwords, bearer tokens, common API-key shapes, and long
+opaque tokens are masked before the LLM call. Large diffs are
+chunked on file boundaries; anything over ~32k tokens is skipped
+with an explicit "diff too large" note.
 
 The same logic is wired to the GitHub-App webhook (`github_app.py`) so
 you can also drop Retrace on a PR with no CLI step. See

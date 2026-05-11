@@ -168,6 +168,80 @@ def test_review_run_affected_tests_is_no_op_when_no_specs_cover(tmp_path: Path):
     assert payload["affected_test_results"] == []
 
 
+def test_review_llm_flag_off_skips_llm_call(tmp_path: Path, monkeypatch):
+    """`--no-llm` must not invoke the LLM client even when one is configured."""
+    cfg = _config_file(tmp_path)
+    diff_file = tmp_path / "pr.diff"
+    diff_file.write_text(_SAMPLE_DIFF)
+
+    from retrace import commands as _cmds  # noqa: F401
+    from retrace.commands import review as review_mod
+
+    called = {"count": 0}
+
+    def _fake_llm_review(**kwargs):
+        called["count"] += 1
+        from retrace.llm_pr_review import LLMReviewResult
+
+        return LLMReviewResult(summary="should-not-be-called")
+
+    monkeypatch.setattr(review_mod, "llm_review", _fake_llm_review)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        review_mod.review_command,
+        [
+            "--config", str(cfg),
+            "--diff", str(diff_file),
+            "--pr", "https://github.com/org/app/pull/42",
+            "--no-file-incidents",
+            "--no-llm",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert called["count"] == 0
+    payload = json.loads(result.output)
+    # `llm_review` defaults to empty when --no-llm.
+    assert payload["llm_review"]["summary"] == ""
+
+
+def test_review_llm_flag_on_without_configured_llm_errors(tmp_path: Path):
+    """`--llm` with no LLM in config should error cleanly, not crash."""
+    cfg = tmp_path / "config.yaml"
+    # Note: empty LLM base_url
+    cfg.write_text(
+        f"""posthog:
+  host: https://us.i.posthog.com
+  project_id: demo
+llm:
+  provider: openai_compatible
+  base_url: ""
+  model: x
+run:
+  data_dir: {tmp_path / "data"}
+"""
+    )
+    diff_file = tmp_path / "pr.diff"
+    diff_file.write_text(_SAMPLE_DIFF)
+
+    from retrace.commands.review import review_command
+
+    runner = CliRunner()
+    result = runner.invoke(
+        review_command,
+        [
+            "--config", str(cfg),
+            "--diff", str(diff_file),
+            "--pr", "https://github.com/org/app/pull/42",
+            "--no-file-incidents",
+            "--llm",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "no LLM is configured" in result.output or "llm" in result.output.lower()
+
+
 def test_review_format_comment_body_includes_sections(tmp_path: Path):
     """The PR comment body should fold in incidents + test results."""
     from retrace.commands.review import _format_comment_body
@@ -188,3 +262,38 @@ def test_review_format_comment_body_includes_sections(tmp_path: Path):
     assert "spec-2" in body
     assert "1 pass / 1 fail" in body
     assert body.endswith("\n")
+
+
+def test_review_format_comment_body_puts_llm_section_first(tmp_path: Path):
+    """When an LLM review is present, it goes ABOVE the templated
+    summary — the LLM is the meat for human readers."""
+    from retrace.commands.review import _format_comment_body
+    from retrace.llm_pr_review import InlineSuggestion, LLMReviewResult
+    from retrace.pr_review import analyze_pr_diff
+
+    analysis = analyze_pr_diff(diff_text=_SAMPLE_DIFF)
+    llm = LLMReviewResult(
+        summary="Adds 404 handling on /api/login.",
+        walkthrough=["server: returns 404 when user is missing"],
+        inline_suggestions=[
+            InlineSuggestion(
+                path="server/routes/auth.ts",
+                line=12,
+                body="Consider 401 instead of 404 to avoid disclosing user existence.",
+            )
+        ],
+        model="test-model",
+    )
+    body = _format_comment_body(
+        analysis=analysis,
+        incidents_filed=[],
+        affected_test_results=[],
+        llm_result=llm,
+    )
+    llm_pos = body.find("Retrace LLM review")
+    # The templated review uses build_pr_review_comment_plan which starts
+    # with its own header. Just assert the LLM section is at the top.
+    assert llm_pos != -1
+    assert llm_pos < 100  # within the first ~5 lines
+    assert "Adds 404 handling" in body
+    assert "401 instead of 404" in body

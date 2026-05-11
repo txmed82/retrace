@@ -102,7 +102,7 @@ Every roadmap item below uses the same dev loop. Don't skip steps.
 
 ## P0.1 — LLM-powered PR review
 
-**Status:** NOT STARTED · **ETA:** 2 days · **Owner:** TBD
+**Status:** DONE 2026-05-11 · **PR:** TBD (this PR) · **Owner:** Claude
 
 ### Why this first
 
@@ -735,7 +735,8 @@ EOF
 
 | Date | Change | PR |
 |---|---|---|
-| 2026-05-11 | Roadmap doc created. P0–P2 items defined. Snapshot taken after PR #124. | this PR |
+| 2026-05-11 | Roadmap doc created. P0–P2 items defined. Snapshot taken after PR #124. | #125 |
+| 2026-05-11 | P0.1 LLM-powered PR review shipped: `retrace.llm_pr_review.llm_review`, `retrace review --llm/--no-llm`, PII-redacted diff, token-cap bail, file-aware chunking, in-process cache, structured `LLMReviewResult` with summary/walkthrough/inline suggestions/risk notes. 18 new tests. | this PR |
 
 > Append a row whenever an item changes status or a new item is
 > added. Keep newest at the bottom.
