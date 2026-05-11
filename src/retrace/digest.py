@@ -139,9 +139,29 @@ def build_digest(
     window_start = now_dt - timedelta(hours=max(1, int(lookback_hours)))
 
     if source == "qa_incidents":
-        qa_rows = store.list_qa_incidents(
-            project_id=project_id, environment_id=environment_id, limit=500
-        )
+        # Page through the full set; a 500-row cap silently undercounts
+        # new/regressed/resolved buckets on noisy workspaces and lets
+        # genuine high-impact incidents fall out of the digest entirely.
+        qa_rows: list[Any] = []
+        page_size = 200
+        offset = 0
+        while True:
+            page = store.list_qa_incidents(
+                project_id=project_id,
+                environment_id=environment_id,
+                limit=page_size,
+                offset=offset,
+            )
+            if not page:
+                break
+            qa_rows.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+            # Defensive ceiling: 50k incidents in one digest is already
+            # well past anything we'd render usefully.
+            if offset >= 50_000:
+                break
         digest_rows = [_qa_row_to_digest(r) for r in qa_rows]
     elif source == "replay_issues":
         rows = store.list_replay_issues(
@@ -223,6 +243,15 @@ def render_digest_markdown(digest: DigestPayload) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+_AFFECTED_UNIT = {
+    "replay": "session(s)",
+    "ui_test": "run(s)",
+    "api_test": "run(s)",
+    "error_monitor": "occurrence(s)",
+    "manual": "occurrence(s)",
+}
+
+
 def _render_rows(
     rows: Iterable[DigestIssueRow], *, include_status: bool = False
 ) -> list[str]:
@@ -238,10 +267,14 @@ def _render_rows(
             if r.source_kind and r.source_kind != "replay"
             else ""
         )
+        # Pick a per-pillar unit; replay bugs are session-shaped, API/UI
+        # tests are runs, error-monitor signals are occurrences. Falls
+        # back to a neutral term for anything we don't recognise.
+        affected_unit = _AFFECTED_UNIT.get(r.source_kind or "", "occurrence(s)")
         out.append(
             f"- `{r.public_id}`{kind_tag} **{r.title}** — "
             f"{r.severity or 'unknown'}, "
-            f"{r.affected_count} session(s), "
+            f"{r.affected_count} {affected_unit}, "
             f"{r.affected_users} user(s){suffix}"
         )
     return out

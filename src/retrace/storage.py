@@ -6837,6 +6837,7 @@ class Storage:
         environment_id: Optional[str] = None,
         status: Optional[str] = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> list[sqlite3.Row]:
         where: list[str] = []
         params: list[object] = []
@@ -6852,8 +6853,9 @@ class Storage:
         sql = "SELECT * FROM qa_incidents"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY updated_at DESC, last_seen_ms DESC LIMIT ?"
+        sql += " ORDER BY updated_at DESC, last_seen_ms DESC LIMIT ? OFFSET ?"
         params.append(max(1, min(int(limit), 500)))
+        params.append(max(0, int(offset)))
         with self._conn() as conn:
             return conn.execute(sql, params).fetchall()
 
