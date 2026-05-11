@@ -7,16 +7,18 @@
 Your real users are your QA team. Retrace finds the bugs they hit,
 writes the tests, and opens the fix PR.
 
-Retrace gives you one **unified incident** across three surfaces — replays,
-UI tests, and API tests — and then runs the full loop end-to-end:
+One **unified incident queue** across five signal sources — replays,
+UI tests, API tests, error monitoring (Sentry-compatible + OTel), and
+PR review — then one command closes the loop:
 
 > **user bug → auto-generated test → AI fix PR**
-
-One command kicks it off:
 
 ```bash
 retrace qa auto --repo your-org/your-app
 ```
+
+New here? See [`docs/quickstart.md`](docs/quickstart.md) for the
+5-minute walkthrough.
 
 Retrace is an open-source UI reliability loop: it pulls PostHog session
 recordings or ingests first-party browser SDK replays, detects likely
