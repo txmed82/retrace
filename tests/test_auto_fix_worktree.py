@@ -109,9 +109,12 @@ def repo_and_store(tmp_path: Path, monkeypatch):
     work, origin = _make_repo_pair(tmp_path)
     db = Storage(tmp_path / "retrace.db")
     db.init_schema()
-    # Don't let the test pick up a real `gh` binary that might try to talk
-    # to GitHub.com — force the missing-gh path.
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    # Force the "no gh installed" path: GitHub Actions runners ship `gh`
+    # on PATH but without a usable token, so a real call would fail with
+    # a confusing auth error. Patching the helper avoids touching PATH
+    # (which would also hide `git` on some runners).
+    from retrace import auto_fix as _af
+    monkeypatch.setattr(_af, "_gh_available", lambda: False)
     # CI runners often have no global `git config user.name/email`. Export
     # the git identity env vars so every subprocess spawned during the
     # test (including the ones inside `auto_fix.propose_fix_for_incident`)
