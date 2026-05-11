@@ -22,6 +22,7 @@ import click
 
 from retrace.config import load_config
 from retrace.sdk_keys import create_sdk_key
+from retrace.sentry_compat import build_sentry_dsn
 from retrace.storage import Storage
 
 
@@ -98,6 +99,34 @@ def _emit_script_tag(*, api_key: str, ingest_url: str) -> str:
     )
 
 
+def _emit_sentry_snippet(*, dsn: str) -> str:
+    """Render a copy-pasteable `Sentry.init(...)` snippet.
+
+    This is the "Replace Sentry" wedge: paste this DSN where you'd
+    normally put a Sentry one and the SDK pipes events into Retrace's
+    Sentry-compatible ingest. No new client library to learn.
+
+    We deliberately do NOT include an SRI `integrity` attribute on the
+    Sentry CDN script: it has to be regenerated whenever the version
+    bumps, and a stale hash silently breaks every install. Users that
+    want SRI should pin a specific version and compute the hash
+    themselves.
+    """
+    return (
+        "<!-- Drop-in replacement for Sentry.init: point any Sentry SDK at this DSN -->\n"
+        '<script src="https://browser.sentry-cdn.com/7.114.0/bundle.min.js"\n'
+        '        crossorigin="anonymous"></script>\n'
+        "<script>\n"
+        f'  Sentry.init({{ dsn: "{dsn}" }});\n'
+        "</script>\n"
+        "\n"
+        "<!-- For React/Vue/Node etc., just use:\n"
+        f'     Sentry.init({{ dsn: "{dsn}" }})\n'
+        "     Any Sentry SDK works — Retrace ingests the same envelope shape.\n"
+        "-->\n"
+    )
+
+
 @click.command("quickstart")
 @click.option(
     "--config",
@@ -111,6 +140,17 @@ def _emit_script_tag(*, api_key: str, ingest_url: str) -> str:
 @click.option("--environment", default="production", show_default=True)
 @click.option("--api-host", default="127.0.0.1", show_default=True)
 @click.option("--api-port", default=8788, show_default=True, type=int)
+@click.option(
+    "--api-scheme",
+    type=click.Choice(["http", "https"]),
+    default="http",
+    show_default=True,
+    help=(
+        "URL scheme used in the generated ingest URL and Sentry DSN. "
+        "Use `https` for hosted/TLS deployments — browsers will block a "
+        "Sentry DSN with `http://` from an HTTPS page."
+    ),
+)
 @click.option("--name", default="Browser SDK", show_default=True)
 @click.option("--json", "as_json", is_flag=True, default=False)
 @click.option(
@@ -127,6 +167,7 @@ def quickstart_command(
     environment: str,
     api_host: str,
     api_port: int,
+    api_scheme: str,
     name: str,
     as_json: bool,
     snippet_out: Optional[Path],
@@ -152,12 +193,26 @@ def quickstart_command(
         name=name,
     )
 
-    ingest_url = f"http://{api_host}:{api_port}/api/sdk/replay"
+    ingest_url = f"{api_scheme}://{api_host}:{api_port}/api/sdk/replay"
     snippet = _emit_script_tag(api_key=created.key, ingest_url=ingest_url)
+
+    # Mint a Sentry-compatible DSN that points at the same API server.
+    # The SDK key doubles as the DSN public key — Retrace's Sentry
+    # ingest accepts the same write-only credential we just minted, so
+    # paste-replace-Sentry works in one step. Honor the configured
+    # scheme so hosted/TLS deployments don't ship `http://` DSNs that
+    # browsers refuse from an HTTPS page.
+    api_base_url = f"{api_scheme}://{api_host}:{api_port}"
+    sentry_dsn = build_sentry_dsn(
+        public_key=created.key,
+        base_url=api_base_url,
+        project_id=workspace.project_id,
+    )
+    sentry_snippet = _emit_sentry_snippet(dsn=sentry_dsn)
 
     if snippet_out is not None:
         snippet_out.parent.mkdir(parents=True, exist_ok=True)
-        snippet_out.write_text(snippet)
+        snippet_out.write_text(snippet + "\n" + sentry_snippet)
 
     result = {
         "config_path": str(config_path),
@@ -170,7 +225,10 @@ def quickstart_command(
         "sdk_key_id": created.id,
         "sdk_key": created.key,
         "ingest_url": ingest_url,
+        "api_base_url": api_base_url,
+        "sentry_dsn": sentry_dsn,
         "snippet": snippet,
+        "sentry_snippet": sentry_snippet,
     }
     if as_json:
         click.echo(json.dumps(result, indent=2))
@@ -184,6 +242,7 @@ def quickstart_command(
     click.echo(f"  org/project/env: {org} / {project_name} / {environment}")
     click.echo(f"  SDK key:         {created.key}")
     click.echo(f"  ingest URL:      {ingest_url}")
+    click.echo(f"  Sentry DSN:      {sentry_dsn}")
     if snippet_out:
         click.echo(f"  snippet saved:   {snippet_out}")
 
@@ -192,8 +251,16 @@ def quickstart_command(
     click.echo(snippet)
     click.echo("─" * 64)
 
+    click.echo("\nAnd this to capture frontend errors (drop-in replacement for Sentry):\n")
+    click.echo("─" * 64)
+    click.echo(sentry_snippet)
+    click.echo("─" * 64)
+
     click.echo("\nNext steps:")
-    click.echo(f"  1. retrace api serve --host {api_host} --port {api_port}")
+    click.echo(
+        f"  1. retrace api serve --host {api_host} --port {api_port}"
+        + ("  # behind a TLS terminator if --api-scheme=https" if api_scheme == "https" else "")
+    )
     click.echo("  2. (in another terminal) retrace ui")
     click.echo("  3. interact with your app, then:")
     click.echo("     retrace api process-replays")
