@@ -20,7 +20,7 @@ from typing import Any, Optional
 import click
 
 from retrace.config import load_config
-from retrace.pr_review import analyze_pr_diff
+from retrace.pr_review import analyze_pr_diff, build_pr_review_comment_plan
 from retrace.qa_incident_bridge import sync_qa_incident_from_pr_review_finding
 from retrace.storage import Storage
 
@@ -80,6 +80,25 @@ _PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
     help="File a qa_incident for each finding so `retrace qa list` picks them up.",
 )
 @click.option(
+    "--post-comment",
+    is_flag=True,
+    default=False,
+    help=(
+        "Post the analysis as a comment on the PR via `gh`. Requires --pr "
+        "(or --repo + --pr <number>) and the `gh` CLI installed + authed."
+    ),
+)
+@click.option(
+    "--run-affected-tests/--no-run-affected-tests",
+    "run_affected_tests",
+    default=False,
+    show_default=True,
+    help=(
+        "Run the tester specs that cover the affected flows. Fold the "
+        "results into the PR comment summary."
+    ),
+)
+@click.option(
     "--json",
     "as_json",
     is_flag=True,
@@ -95,6 +114,8 @@ def review_command(
     project_id: str,
     environment_id: str,
     file_incidents: bool,
+    post_comment: bool,
+    run_affected_tests: bool,
     as_json: bool,
 ) -> None:
     """Run Retrace's PR review against a diff and (optionally) file qa_incidents.
@@ -144,13 +165,43 @@ def review_command(
             environment_id=environment_id,
         )
 
+    affected_test_results: list[dict[str, Any]] = []
+    if run_affected_tests:
+        affected_test_results = _run_affected_tests(
+            cfg=cfg,
+            analysis=analysis,
+        )
+
+    posted_comment_url = ""
+    if post_comment:
+        if not (repo and pr_number):
+            raise click.UsageError(
+                "--post-comment requires --pr (with a real PR reference)."
+            )
+        posted_comment_url = _post_pr_comment(
+            repo=repo,
+            pr_number=pr_number,
+            analysis=analysis,
+            incidents_filed=incidents_filed,
+            affected_test_results=affected_test_results,
+        )
+
     if as_json:
         payload = analysis.to_dict()
         payload["incidents_filed"] = incidents_filed
+        payload["affected_test_results"] = affected_test_results
+        payload["posted_comment_url"] = posted_comment_url
         click.echo(json.dumps(payload, indent=2))
         return
 
-    _render_human(analysis, repo=repo, pr_number=pr_number, incidents_filed=incidents_filed)
+    _render_human(
+        analysis,
+        repo=repo,
+        pr_number=pr_number,
+        incidents_filed=incidents_filed,
+        affected_test_results=affected_test_results,
+        posted_comment_url=posted_comment_url,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -277,12 +328,131 @@ def _file_incidents_for_analysis(
     return out
 
 
+def _run_affected_tests(*, cfg: Any, analysis: Any) -> list[dict[str, Any]]:
+    """Run any tester specs that cover an affected flow.
+
+    `analysis.existing_tests` carries the spec ids we already know touch
+    the changed surface; this just calls `tester.run_spec` on each. We
+    swallow exceptions so one broken spec doesn't blow up the review.
+    """
+    from retrace.tester import (
+        load_spec,
+        run_spec,
+        runs_dir_for_data_dir,
+        specs_dir_for_data_dir,
+    )
+
+    specs_dir = specs_dir_for_data_dir(cfg.run.data_dir)
+    runs_dir = runs_dir_for_data_dir(cfg.run.data_dir)
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for t in analysis.existing_tests[:6]:
+        spec_id = getattr(t, "spec_id", "") or ""
+        if not spec_id or spec_id in seen:
+            continue
+        seen.add(spec_id)
+        try:
+            spec = load_spec(specs_dir, spec_id)
+        except FileNotFoundError:
+            out.append({"spec_id": spec_id, "status": "missing", "summary": "spec file not found"})
+            continue
+        try:
+            result = run_spec(spec=spec, runs_dir=runs_dir)
+        except Exception as exc:
+            out.append({"spec_id": spec_id, "status": "error", "summary": str(exc)})
+            continue
+        out.append(
+            {
+                "spec_id": spec_id,
+                "spec_name": getattr(spec, "name", ""),
+                "status": "pass" if getattr(result, "ok", False) else "fail",
+                "summary": getattr(result, "status", "") or "",
+                "run_dir": str(getattr(result, "run_dir", "") or ""),
+            }
+        )
+    return out
+
+
+def _format_comment_body(
+    *,
+    analysis: Any,
+    incidents_filed: list[str],
+    affected_test_results: list[dict[str, Any]],
+) -> str:
+    """Render the PR comment body. Uses `build_pr_review_comment_plan` as
+    the trusted summary and tacks on QA-specific additions."""
+    plan = build_pr_review_comment_plan(analysis)
+    lines: list[str] = [plan.summary_body.rstrip()]
+    if incidents_filed:
+        lines.append("")
+        lines.append(f"### Retrace QA — incidents filed ({len(incidents_filed)})")
+        for pid in incidents_filed:
+            lines.append(f"- `{pid}` — run `retrace qa show {pid}` locally for details")
+    if affected_test_results:
+        passes = sum(1 for r in affected_test_results if r.get("status") == "pass")
+        fails = sum(1 for r in affected_test_results if r.get("status") == "fail")
+        errors = sum(1 for r in affected_test_results if r.get("status") not in {"pass", "fail"})
+        lines.append("")
+        lines.append(
+            f"### Retrace tests — ran {len(affected_test_results)}: "
+            f"{passes} pass / {fails} fail / {errors} error"
+        )
+        for r in affected_test_results:
+            icon = "✅" if r.get("status") == "pass" else ("❌" if r.get("status") == "fail" else "⚠️")
+            name = r.get("spec_name") or r.get("spec_id", "?")
+            lines.append(f"- {icon} `{r.get('spec_id', '')}` — {name}  _{r.get('status', '')}_")
+    lines.append("")
+    lines.append("_Posted by `retrace review --post-comment`._")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _post_pr_comment(
+    *,
+    repo: str,
+    pr_number: int,
+    analysis: Any,
+    incidents_filed: list[str],
+    affected_test_results: list[dict[str, Any]],
+) -> str:
+    if not shutil.which("gh"):
+        raise click.ClickException(
+            "`gh` is required to post a PR comment. Install it from https://cli.github.com."
+        )
+    body = _format_comment_body(
+        analysis=analysis,
+        incidents_filed=incidents_filed,
+        affected_test_results=affected_test_results,
+    )
+    # `gh pr comment` doesn't dedupe; we leave de-duplication to the
+    # GitHub-App webhook path (`publish_pr_review_comments`) which keys
+    # off a marker. For ad-hoc CLI use, the user can re-edit manually.
+    proc = subprocess.run(
+        ["gh", "pr", "comment", str(pr_number), "--repo", repo, "--body-file", "-"],
+        input=body,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise click.ClickException(
+            f"gh pr comment failed: {(proc.stderr or proc.stdout).strip()}"
+        )
+    # `gh` prints the comment URL on stdout.
+    for line in (proc.stdout or "").splitlines()[::-1]:
+        line = line.strip()
+        if line.startswith("https://"):
+            return line
+    return ""
+
+
 def _render_human(
     analysis: Any,
     *,
     repo: str,
     pr_number: int,
     incidents_filed: list[str],
+    affected_test_results: list[dict[str, Any]] | None = None,
+    posted_comment_url: str = "",
 ) -> None:
     header = "PR review"
     if repo and pr_number:
@@ -330,3 +500,14 @@ def _render_human(
             click.echo(f"  • {pid}   (retrace qa show {pid})")
         click.echo("")
         click.echo("Next: retrace qa auto --repo " + (repo or "<org/name>"))
+
+    if affected_test_results:
+        click.echo("")
+        click.echo(f"Ran {len(affected_test_results)} affected test(s):")
+        for r in affected_test_results:
+            icon = "✓" if r.get("status") == "pass" else ("✗" if r.get("status") == "fail" else "·")
+            click.echo(f"  {icon} {r.get('spec_id', '')}  {r.get('spec_name', '')}  ({r.get('status', '')})")
+
+    if posted_comment_url:
+        click.echo("")
+        click.echo(f"Posted PR comment: {posted_comment_url}")

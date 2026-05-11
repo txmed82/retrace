@@ -119,3 +119,71 @@ def test_review_requires_diff_or_pr(tmp_path: Path):
     result = runner.invoke(review_command, ["--config", str(cfg)])
     assert result.exit_code != 0
     assert "--diff" in result.output or "--pr" in result.output
+
+
+def test_review_post_comment_requires_pr(tmp_path: Path):
+    """`--post-comment` without a real PR ref should error cleanly."""
+    cfg = _config_file(tmp_path)
+    diff_file = tmp_path / "pr.diff"
+    diff_file.write_text(_SAMPLE_DIFF)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        review_command,
+        [
+            "--config", str(cfg),
+            "--diff", str(diff_file),
+            "--post-comment",
+            "--no-file-incidents",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--pr" in result.output or "post-comment" in result.output.lower()
+
+
+def test_review_run_affected_tests_is_no_op_when_no_specs_cover(tmp_path: Path):
+    """If `analysis.existing_tests` is empty (no specs match), the
+    --run-affected-tests path just produces an empty list without
+    crashing."""
+    cfg = _config_file(tmp_path)
+    diff_file = tmp_path / "pr.diff"
+    diff_file.write_text(_SAMPLE_DIFF)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        review_command,
+        [
+            "--config", str(cfg),
+            "--diff", str(diff_file),
+            "--pr", "https://github.com/org/app/pull/42",
+            "--no-file-incidents",
+            "--run-affected-tests",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert "affected_test_results" in payload
+    assert isinstance(payload["affected_test_results"], list)
+
+
+def test_review_format_comment_body_includes_sections(tmp_path: Path):
+    """The PR comment body should fold in incidents + test results."""
+    from retrace.commands.review import _format_comment_body
+    from retrace.pr_review import analyze_pr_diff
+
+    analysis = analyze_pr_diff(diff_text=_SAMPLE_DIFF)
+    body = _format_comment_body(
+        analysis=analysis,
+        incidents_filed=["INC-AB12CD", "INC-EF34GH"],
+        affected_test_results=[
+            {"spec_id": "spec-1", "spec_name": "login flow", "status": "pass"},
+            {"spec_id": "spec-2", "spec_name": "checkout", "status": "fail"},
+        ],
+    )
+    assert "INC-AB12CD" in body
+    assert "INC-EF34GH" in body
+    assert "spec-1" in body
+    assert "spec-2" in body
+    assert "1 pass / 1 fail" in body
+    assert body.endswith("\n")
