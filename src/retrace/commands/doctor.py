@@ -194,6 +194,138 @@ def doctor_command(config_path: Path) -> None:
         else:
             checks.append(_warn("Playwright runtime", msg))
 
+    # ----- Per-pillar QA-incident pipeline checks -----
+    # The four-pillar promise: replay / UI test / API test / error monitor
+    # / PR review all feed a single qa_incidents queue. Surface where each
+    # pillar stands so a fresh install knows which inputs are still
+    # zeroed out.
+    try:
+        from retrace.storage import Storage
+
+        store = Storage(cfg.run.data_dir / "retrace.db")
+        store.init_schema()
+        checks.append(_ok("Local store", f"opened {cfg.run.data_dir / 'retrace.db'}"))
+
+        qa_rows = store.list_qa_incidents(limit=500)
+        if qa_rows:
+            by_source: dict[str, int] = {}
+            for row in qa_rows:
+                kind = str(row["primary_source_kind"] or "unknown")
+                by_source[kind] = by_source.get(kind, 0) + 1
+            summary = ", ".join(f"{k}={v}" for k, v in sorted(by_source.items()))
+            checks.append(_ok("QA incidents", f"{len(qa_rows)} row(s): {summary}"))
+        else:
+            checks.append(
+                _warn(
+                    "QA incidents",
+                    "no incidents yet — run `retrace demo all` to seed every pillar.",
+                )
+            )
+
+        # Pillar 1: replay capture. The SDK key is the entry signal.
+        sdk_keys = _safe_call(lambda: store.list_sdk_keys())
+        if sdk_keys:
+            checks.append(
+                _ok(
+                    "Replay capture",
+                    f"{len(sdk_keys)} SDK key(s); paste `<script>` snippet from `retrace quickstart`.",
+                )
+            )
+        else:
+            checks.append(
+                _warn(
+                    "Replay capture",
+                    "no SDK keys — run `retrace quickstart` or `retrace api create-sdk-key`.",
+                )
+            )
+
+        # Pillar 2: UI testing. At least one saved spec means the surface is alive.
+        try:
+            from retrace.tester import list_specs as _list_ui_specs
+            from retrace.tester import specs_dir_for_data_dir as _ui_specs_dir
+
+            ui_specs = _list_ui_specs(_ui_specs_dir(cfg.run.data_dir))
+            checks.append(
+                _ok("UI testing", f"{len(ui_specs)} tester spec(s)")
+                if ui_specs
+                else _warn(
+                    "UI testing",
+                    "no tester specs — try `retrace tester create` or `retrace demo seed`.",
+                )
+            )
+        except Exception as exc:
+            checks.append(_warn("UI testing", f"could not list specs: {exc}"))
+
+        # Pillar 3: API testing. Mirror the same shape.
+        try:
+            from retrace.api_testing import api_specs_dir_for_data_dir, list_api_specs
+
+            api_specs = list_api_specs(api_specs_dir_for_data_dir(cfg.run.data_dir))
+            checks.append(
+                _ok("API testing", f"{len(api_specs)} API spec(s)")
+                if api_specs
+                else _warn(
+                    "API testing",
+                    "no API specs — `retrace tester api-create` or `tester api-import-openapi`.",
+                )
+            )
+        except Exception as exc:
+            checks.append(_warn("API testing", f"could not list specs: {exc}"))
+
+        # Pillar 4: error monitoring. Any monitor-source failure (Sentry
+        # compat, OTel, generic webhook) lands in `failures` with
+        # source_type in `monitor_incident`, `app_error`, etc.
+        try:
+            monitor_count = sum(
+                1
+                for row in qa_rows
+                if str(row["primary_source_kind"] or "") == "error_monitor"
+            )
+            if monitor_count:
+                checks.append(
+                    _ok("Error monitoring", f"{monitor_count} monitor-derived incident(s)")
+                )
+            else:
+                checks.append(
+                    _warn(
+                        "Error monitoring",
+                        "no Sentry/OTel/monitor incidents — see `retrace api onboard-hosted` for a DSN.",
+                    )
+                )
+        except Exception as exc:
+            checks.append(_warn("Error monitoring", f"could not inspect: {exc}"))
+
+        # Pillar 5: connected repo for fix-PR + PR review.
+        repos = _safe_call(lambda: store.list_github_repos())
+        if repos:
+            names = ", ".join(getattr(r, "repo_full_name", "?") for r in repos[:3])
+            extra = "" if len(repos) <= 3 else f" (+{len(repos) - 3} more)"
+            checks.append(_ok("Connected repos", f"{names}{extra}"))
+        else:
+            checks.append(
+                _warn(
+                    "Connected repos",
+                    "no repos connected — `retrace github connect --repo org/name --local-path …`.",
+                )
+            )
+
+        # `gh` is required for the fix-PR step. Surface it explicitly.
+        import shutil
+
+        gh_path = shutil.which("gh")
+        if gh_path:
+            checks.append(_ok("gh CLI", f"found at {gh_path} (required for `qa fix --open-pr`)"))
+        else:
+            checks.append(
+                _warn(
+                    "gh CLI",
+                    "not installed — fix-PRs will produce a prompt-only branch. Install: https://cli.github.com",
+                )
+            )
+
+    except Exception as exc:
+        checks.append(_fail("Pipeline pillars", format_user_error(exc)))
+
     any_fail = False
     for name, status, detail in checks:
         label = {"ok": "OK", "fail": "FAIL", "warn": "WARN"}[status]
@@ -203,6 +335,15 @@ def doctor_command(config_path: Path) -> None:
 
     if any_fail:
         sys.exit(1)
+
+
+def _safe_call(fn: Any) -> Any:
+    """Run a doctor probe and swallow exceptions so one bad subsystem
+    doesn't mask the rest of the report."""
+    try:
+        return fn()
+    except Exception:
+        return None
 
 
 def _spec_needs_browser_runtime(cfg: Any) -> bool:
