@@ -378,6 +378,23 @@ def test_classify_outcome_clean_run_is_not_confirmed():
 # ---------------------------------------------------------------------------
 
 
+def test_incident_from_row_preserves_zero_counts(tmp_path: Path):
+    """`affected_users=0` (legitimate for API incidents) must survive round-trip."""
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    inc = _make_incident(fp_seed="zero-counts")
+    inc.affected_users = 0
+    inc.affected_count = 0
+    inc.first_seen_ms = 0
+    store.upsert_qa_incident(inc.to_row())
+    row = store.get_qa_incident(inc.public_id)
+    assert row is not None
+    revived = Incident.from_row(row)
+    assert revived.affected_users == 0
+    assert revived.affected_count == 0
+    assert revived.first_seen_ms == 0
+
+
 def test_incident_from_row_tolerates_malformed_json(tmp_path: Path):
     import sqlite3
 

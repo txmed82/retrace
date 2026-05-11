@@ -243,6 +243,21 @@ class Incident:
         repro_raw = _safe_json(_g("reproduction_json", "[]"), [])
         evidence_raw = _safe_json(_g("evidence_json", "{}"), {})
 
+        def _int_field(name: str, default: int) -> int:
+            """Treat only missing/empty as default; preserve legitimate 0s.
+
+            `int(_g(...) or default)` would silently rewrite stored 0 values
+            (e.g. `affected_users=0` for API incidents) back up to the
+            default on every rehydration.
+            """
+            raw = _g(name, None)
+            if raw is None or raw == "":
+                return default
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return default
+
         return Incident(
             id=str(_g("id", "")),
             public_id=str(_g("public_id", "")),
@@ -289,10 +304,10 @@ class Incident:
                 replay_url=str(evidence_raw.get("replay_url", "")),
                 top_stack_frame=str(evidence_raw.get("top_stack_frame", "")),
             ),
-            affected_count=int(_g("affected_count", 1) or 1),
-            affected_users=int(_g("affected_users", 1) or 1),
-            first_seen_ms=int(_g("first_seen_ms", 0) or 0),
-            last_seen_ms=int(_g("last_seen_ms", 0) or 0),
+            affected_count=_int_field("affected_count", 1),
+            affected_users=_int_field("affected_users", 1),
+            first_seen_ms=_int_field("first_seen_ms", 0),
+            last_seen_ms=_int_field("last_seen_ms", 0),
             repro_status=str(_g("repro_status", "not_attempted")),
             repro_spec_id=str(_g("repro_spec_id", "")),
             repro_run_id=str(_g("repro_run_id", "")),
