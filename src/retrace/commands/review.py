@@ -39,7 +39,9 @@ _PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
 @click.option(
     "--diff",
     "diff_path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    # `allow_dash=True` so the documented stdin form `--diff -` actually
+    # works; without it Click rejects `-` because the path doesn't exist.
+    type=click.Path(exists=True, dir_okay=False, path_type=Path, allow_dash=True),
     default=None,
     help="Path to a unified-diff file. Use `-` to read from stdin.",
 )
@@ -157,23 +159,37 @@ def review_command(
 
 
 def _resolve_pr_ref(pr_ref: str, repo_full_name: str) -> tuple[str, int]:
-    """Accept full URL, `owner/repo#N`, or bare `N` (when --repo is given)."""
+    """Accept full URL, `owner/repo#N`, or bare `N` (when --repo is given).
+
+    Malformed inputs (`owner/repo#foo`, or a URL where the digit group
+    somehow isn't a number) raise a clean `UsageError` rather than
+    leaking a raw `ValueError` to the user.
+    """
     pr_ref = (pr_ref or "").strip()
     repo_full_name = (repo_full_name or "").strip()
     if not pr_ref:
         return repo_full_name, 0
+
+    def _to_int(raw: str) -> int:
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as exc:
+            raise click.UsageError(
+                f"could not parse --pr {pr_ref!r}: pull number must be an integer"
+            ) from exc
+
     m = _PR_URL_RE.search(pr_ref)
     if m:
-        return m.group(1), int(m.group(2))
+        return m.group(1), _to_int(m.group(2))
     if "#" in pr_ref:
         rep, num = pr_ref.split("#", 1)
-        return rep.strip(), int(num)
+        return rep.strip(), _to_int(num)
     if pr_ref.isdigit():
         if not repo_full_name:
             raise click.UsageError(
                 f"--pr {pr_ref} is a bare number; pass --repo owner/name as well."
             )
-        return repo_full_name, int(pr_ref)
+        return repo_full_name, _to_int(pr_ref)
     raise click.UsageError(f"could not parse --pr {pr_ref!r}")
 
 

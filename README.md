@@ -164,8 +164,9 @@ regressions for free.
 ```bash
 retrace tester api-create --name "login should be 200" \
   --method POST --url https://api.example.com/login \
-  --json-body '{"email":"demo@example.com","password":"hunter2"}' \
-  --assertion-type status_equals --assertion-value 200
+  --body-json '{"email":"demo@example.com","password":"hunter2"}' \
+  --expected-status 200 \
+  --json-assertion '{"path":"$.token","exists":true}'
 
 retrace tester api-run <spec_id>
 ```

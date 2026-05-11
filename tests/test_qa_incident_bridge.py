@@ -130,6 +130,11 @@ def test_sync_is_idempotent_on_same_failure(tmp_path: Path):
     assert pid1 and pid2
     # Same fingerprint produces same row — only one qa_incident exists.
     assert len(store.list_qa_incidents()) == 1
+    # And — critically — the bridge returns the stable persisted public_id
+    # on every sync, NOT a fresh transient one. If this drifts, `retrace
+    # review` users get dead INC-XXXX references on rerun.
+    assert pid1 == pid2
+    assert store.get_qa_incident(pid1) is not None
 
 
 # ---------------------------------------------------------------------------

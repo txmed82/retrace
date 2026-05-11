@@ -58,8 +58,13 @@ def sync_qa_incident_from_failure(
         if failure is None:
             return None
         incident = _incident_from_failure(failure)
-        store.upsert_qa_incident(incident.to_row())
-        return incident.public_id
+        # Use the variant that returns the persisted public_id: on a
+        # fingerprint collision the existing row keeps its original
+        # public_id, so the candidate value in `incident.to_row()` is
+        # dropped. Return the canonical one so callers don't get dead
+        # references on resync.
+        _id, public_id, _inserted = store.upsert_qa_incident_returning(incident.to_row())
+        return public_id
     except Exception as exc:  # pragma: no cover - defensive
         log.warning(
             "qa_incident_bridge: failed to sync failure %s: %s",
@@ -108,8 +113,8 @@ def sync_qa_incident_from_replay_issue(
             representative_session_id=representative_session_id,
             replay_url_builder=replay_url_builder,
         )
-        store.upsert_qa_incident(incident.to_row())
-        return incident.public_id
+        _id, public_id, _inserted = store.upsert_qa_incident_returning(incident.to_row())
+        return public_id
     except Exception as exc:  # pragma: no cover - defensive
         log.warning("qa_incident_bridge: failed to sync replay issue: %s", exc)
         return None
@@ -182,8 +187,8 @@ def sync_qa_incident_from_pr_review_finding(
             created_at=now,
             updated_at=now,
         )
-        store.upsert_qa_incident(incident.to_row())
-        return incident.public_id
+        _id, public_id, _inserted = store.upsert_qa_incident_returning(incident.to_row())
+        return public_id
     except Exception as exc:  # pragma: no cover - defensive
         log.warning("qa_incident_bridge: failed to file PR review finding: %s", exc)
         return None
