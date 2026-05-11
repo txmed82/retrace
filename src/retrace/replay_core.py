@@ -472,36 +472,52 @@ class ReplayCoreService:
                 cluster=cluster,
                 signals_by_session=signals_by_session,
             )
-            issues.append(
-                self.store.upsert_replay_issue(
-                    project_id=self.project_id,
-                    environment_id=self.environment_id,
-                    fingerprint=cluster.fingerprint,
-                    session_ids=cluster.session_ids,
-                    signal_summary=cluster.signal_summary,
-                    first_seen_ms=cluster.first_seen_ms,
-                    last_seen_ms=cluster.last_seen_ms,
-                    title=finding.title,
-                    summary=finding.what_happened,
-                    likely_cause=finding.likely_cause,
-                    reproduction_steps=finding.reproduction_steps,
-                    severity=finding.severity,
-                    priority=finding.severity,
-                    confidence=finding.confidence,
-                    analysis_status=analysis.status,
-                    analysis_model=analysis.model,
-                    analysis_prompt_version=analysis.prompt_version,
-                    analysis_created_at=analysis.created_at,
-                    analysis_error=analysis.error,
-                    evidence=analysis.evidence,
-                    distinct_id=finding.distinct_id,
-                    error_issue_ids=list(finding.error_issue_ids),
-                    trace_ids=list(finding.trace_ids),
-                    top_stack_frame=finding.top_stack_frame,
-                    error_tracking_url=finding.error_tracking_url,
-                    logs_url=finding.logs_url,
-                )
+            upsert_result = self.store.upsert_replay_issue(
+                project_id=self.project_id,
+                environment_id=self.environment_id,
+                fingerprint=cluster.fingerprint,
+                session_ids=cluster.session_ids,
+                signal_summary=cluster.signal_summary,
+                first_seen_ms=cluster.first_seen_ms,
+                last_seen_ms=cluster.last_seen_ms,
+                title=finding.title,
+                summary=finding.what_happened,
+                likely_cause=finding.likely_cause,
+                reproduction_steps=finding.reproduction_steps,
+                severity=finding.severity,
+                priority=finding.severity,
+                confidence=finding.confidence,
+                analysis_status=analysis.status,
+                analysis_model=analysis.model,
+                analysis_prompt_version=analysis.prompt_version,
+                analysis_created_at=analysis.created_at,
+                analysis_error=analysis.error,
+                evidence=analysis.evidence,
+                distinct_id=finding.distinct_id,
+                error_issue_ids=list(finding.error_issue_ids),
+                trace_ids=list(finding.trace_ids),
+                top_stack_frame=finding.top_stack_frame,
+                error_tracking_url=finding.error_tracking_url,
+                logs_url=finding.logs_url,
             )
+            issues.append(upsert_result)
+
+            # Mirror into qa_incidents so `retrace qa auto` sees this
+            # replay-backed bug alongside UI/API test failures. Bridge
+            # errors must not break replay processing.
+            try:
+                issue_row = self.store.get_replay_issue(upsert_result.issue_id)
+                if issue_row is not None:
+                    from retrace.qa_incident_bridge import (
+                        sync_qa_incident_from_replay_issue,
+                    )
+
+                    sync_qa_incident_from_replay_issue(
+                        store=self.store,
+                        issue_row=issue_row,
+                    )
+            except Exception:
+                pass
 
         return ReplayProcessingResult(
             sessions_scanned=scanned,

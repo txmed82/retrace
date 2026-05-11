@@ -53,8 +53,9 @@ the full proposal and quality bar.
 
 ## What You Get
 
-- **Unified incidents** across replay findings, UI test failures, and API
-  test failures — same shape, same CLI, same `gh`-backed fix PR.
+- **Unified incidents** across replay findings, UI test failures, API
+  test failures, error-monitor alerts (Sentry-compatible + OTel), and
+  PR-review findings — same shape, same CLI, same `gh`-backed fix PR.
 - **One-click reproduction.** Retrace converts an incident's recipe into a
   Browser Harness UI test, runs it, and confirms whether the bug still
   surfaces.
@@ -154,40 +155,121 @@ retrace qa fix INC-XXXXXX --repo …        # just the PR step
 The fix step runs inside a temporary `git worktree`, so your working tree
 and current branch are never touched and repeat runs are idempotent.
 
-## Backend tests (`retrace api-test`)
+## Backend tests (`retrace tester api-*`)
 
-API test failures flow into the same `qa_incidents` table as UI tests and
-replay findings — `retrace qa auto` handles backend regressions for free.
-
-Create and run a contract test:
+API test failures flow into the same `qa_incidents` table as UI tests,
+replay findings, and monitor alerts — `retrace qa auto` handles backend
+regressions for free.
 
 ```bash
-retrace api-test create \
-  --name "login should be 200" \
-  --method POST \
-  --url https://api.example.com/login \
+retrace tester api-create --name "login should be 200" \
+  --method POST --url https://api.example.com/login \
   --json-body '{"email":"demo@example.com","password":"hunter2"}' \
-  --assert '{"assertion_type":"status_equals","value":200}' \
-  --assert '{"assertion_type":"json_path_equals","target":"token","value":""}'
+  --assertion-type status_equals --assertion-value 200
 
-retrace api-test run <spec_id>
+retrace tester api-run <spec_id>
 ```
 
-If the spec fails it auto-files a `qa_incident`; the CLI prints the
-`INC-...` id and the next-step command. Bulk-run everything with
-`retrace api-test run-all`.
+You can also import an OpenAPI spec to bootstrap a suite:
 
-Supported assertion types:
+```bash
+retrace tester api-import-openapi --spec ./openapi.yaml
+retrace tester api-suite-list
+```
 
-- `status_equals` / `status_in`
-- `header_equals` / `header_contains`
-- `body_contains` / `body_not_contains` / `body_matches` (regex)
-- `json_path_equals` / `json_path_in` (dotted path, list indices supported)
-- `response_time_ms_under`
+When a spec fails it persists a canonical failure (with redacted
+payloads) and mirrors it into `qa_incidents` so `retrace qa list` sees
+it next to your replay and UI bugs.
 
-Request/response payloads are redacted (bearer tokens, password fields,
-common secret keys, long tokens, emails) before they touch storage or fix
-prompts.
+## Error monitoring (Sentry-compatible + OTel)
+
+Retrace ingests frontend and backend error events into the same
+`qa_incidents` model. Three ingest surfaces are live:
+
+- **Sentry-compatible DSN.** `retrace api onboard-hosted` prints a DSN
+  you can drop into a `Sentry.init({ dsn })` call. Events land in
+  `failures` / `incidents` and are mirrored to `qa_incidents`.
+- **OpenTelemetry logs + traces.** `POST /v1/logs` and `POST /v1/traces`
+  on the API server accept the OTLP JSON shape.
+- **Monitoring webhooks.** Sentry alert webhooks, PostHog alerts, and a
+  generic webhook payload are normalised by `monitoring_ingest.py`.
+
+Stack frames are symbolicated via uploaded source maps
+(`retrace api upload-source-map`), and alert rules
+(`alert_rules.py`) gate which events become user-visible incidents.
+
+## Code review (`retrace review`)
+
+Run Retrace's PR analyzer against a diff. It parses changed files,
+infers affected flows, links prior failures that match the diff, and
+recommends missing tests. Findings file `qa_incidents` so the same
+`qa auto` flow can turn "PR touches a flaky surface" into a draft fix
+PR.
+
+```bash
+# Read a diff from a file, an URL, or stdin
+retrace review --diff /tmp/pr.diff
+gh pr diff 42 | retrace review --diff -
+retrace review --pr https://github.com/org/repo/pull/42
+retrace review --pr 42 --repo org/repo --file-incidents
+```
+
+The same logic is wired to the GitHub-App webhook (`github_app.py`) so
+you can also drop Retrace on a PR with no CLI step.
+
+## Repair lifecycle (`retrace repair`)
+
+Once an incident has a fix prompt + likely files, the repair runner
+takes over: it can invoke a local coding agent inside a sandbox, run
+the project's validation commands, and verify the fix.
+
+```bash
+retrace repair list
+retrace repair show <task_id>
+retrace repair run <task_id>
+retrace repair verify <task_id>
+```
+
+`retrace qa fix` and the repair flow can both reach the same incident —
+QA owns the test, repair owns the diff.
+
+## Ticket sinks (Jira / Linear / GitHub Issues)
+
+Promote any incident into an external tracker, then keep state in sync.
+
+```bash
+retrace api promote-issue <issue_id> --sink github --repo org/repo
+retrace api sync-tickets
+retrace api verify-resolved
+retrace api resolve-issue <issue_id>
+```
+
+Sinks are configured under `notifications:` and `issue_sinks:` in
+`config.yaml`. Slack and webhook notifications fire on incident
+lifecycle events.
+
+## Daily digest (`retrace digest`)
+
+A 30-second markdown rollup of new / regressed / resolved incidents
+and the top-impact bugs by affected users. Wire it into a cron or
+schedule it from the hosted control plane.
+
+```bash
+retrace digest --since 24h --out ./reports/digest.md
+```
+
+## Deploy correlation (`retrace api record-deploy`)
+
+Record a deploy with its SHA + changed files; Retrace correlates
+recent failures to the deploy that introduced them.
+
+```bash
+retrace api record-deploy --sha $GIT_SHA --changed-file src/foo.ts \
+  --changed-file src/bar.ts
+```
+
+The deploy reference shows up on the incident detail and feeds the
+PR-review prior-failure linkage.
 
 ## Legacy PostHog flow
 
@@ -338,19 +420,24 @@ Artifacts:
 ## Core Commands
 
 - `retrace quickstart` — zero-config setup; mints an SDK key and prints a `<script>` tag
-- `retrace qa list|show|reproduce|fix|auto` — unified incidents across replay/UI/API
-- `retrace init` — interactive PostHog + LLM setup
-- `retrace doctor` — health checks for config/services
-- `retrace run` — one-shot PostHog ingestion, detection, clustering, report write
-- `retrace demo seed` — seed a local replay-backed issue and generated spec
-- `retrace ui` — local browser UI and onboarding/settings
-- `retrace tester ...` — describe tests or generate suite drafts with Browser Harness
-- `retrace api-test create|list|run|run-all|runs` — first-party HTTP API contract tests; failures file `qa_incidents`
-- `retrace mcp serve` — single MCP server with multiple tools (findings + tester)
+- `retrace qa list|show|reproduce|fix|auto` — unified QA incidents across replay / UI / API / monitor / review
+- `retrace review` — analyze a PR diff, link prior failures, recommend missing tests, file `qa_incidents`
+- `retrace tester ...` — UI tests, AI suite drafts, API tests, API suites, OpenAPI import
+- `retrace repair list|show|run|verify` — drive the local coding-agent repair loop
+- `retrace digest` — daily markdown rollup of new / regressed / resolved incidents
+- `retrace init` / `retrace doctor` — interactive PostHog + LLM setup; health checks
+- `retrace run` — one-shot PostHog ingestion + detection + clustering
+- `retrace demo seed` — seed a local replay-backed incident and generated spec
+- `retrace ui` — local browser UI: onboarding, replay player, findings, fix prompts
+- `retrace mcp serve` — single MCP server (findings + tester tools)
 - `retrace github ...` — repo metadata management
-- `retrace suggest-fixes ...` — candidate matching + prompt generation (legacy report-based flow)
-- `retrace api serve` — first-party replay ingest API
-- `retrace api create-sdk-key` — mint additional browser-safe SDK keys
+- `retrace suggest-fixes ...` — legacy report-based candidate matching + prompt generation
+- `retrace api serve` — first-party replay ingest + Sentry-compat + OTel endpoints
+- `retrace api create-sdk-key` / `create-service-token` / `onboard-hosted` — browser SDK keys + service tokens + hosted-readiness manifest
+- `retrace api promote-issue` / `sync-tickets` / `verify-resolved` / `resolve-issue` — Jira/Linear/GitHub Issues integration
+- `retrace api record-deploy` — record a deploy SHA + changed files so failures correlate to releases
+- `retrace api upload-source-map` — symbolicate frontend stack frames
+- `retrace api import-posthog-replays` — pull PostHog sessions into the first-party replay store
 
 ## The Incident model
 
