@@ -62,6 +62,117 @@ def tester_group() -> None:
     """Browser Harness-first local UI tester workflows."""
 
 
+@tester_group.group("baseline")
+def tester_baseline_group() -> None:
+    """Manage visual-regression baselines for tester specs."""
+
+
+@tester_baseline_group.command("accept")
+@click.argument("spec_id")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--run-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="Path to the tester run directory whose screenshots become the new baseline.",
+)
+def tester_baseline_accept(spec_id: str, config_path: Path, run_dir: Path) -> None:
+    """Promote a run's screenshots to the spec's baseline."""
+    from retrace.visual_baseline import accept_baseline
+
+    cfg = load_config(config_path)
+    try:
+        result = accept_baseline(
+            data_dir=cfg.run.data_dir,
+            spec_id=spec_id,
+            run_dir=run_dir,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(
+            {
+                "spec_id": result.spec_id,
+                "baseline_dir": result.baseline_dir,
+                "accepted": result.accepted_files,
+            },
+            indent=2,
+        )
+    )
+
+
+@tester_baseline_group.command("compare")
+@click.argument("spec_id")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--run-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="Path to a tester run directory to compare against the baseline.",
+)
+def tester_baseline_compare(spec_id: str, config_path: Path, run_dir: Path) -> None:
+    """Compare a run's screenshots to the spec's baseline.
+
+    Writes `*-diff.png` artifacts into the run directory for any
+    mismatched screenshot. The auto-repro classifier treats those as a
+    confirmed-bug signal, so `retrace qa auto` will pick them up.
+    """
+    from retrace.visual_baseline import compare_run_to_baseline
+
+    cfg = load_config(config_path)
+    try:
+        result = compare_run_to_baseline(
+            data_dir=cfg.run.data_dir,
+            spec_id=spec_id,
+            run_dir=run_dir,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(
+            {
+                "spec_id": result.spec_id,
+                "compared": result.compared,
+                "unchanged": result.unchanged,
+                "new": result.new,
+                "diffs": result.diffs,
+                "baseline_dir": result.baseline_dir,
+                "run_dir": result.run_dir,
+            },
+            indent=2,
+        )
+    )
+
+
+@tester_baseline_group.command("list")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def tester_baseline_list(config_path: Path) -> None:
+    """List spec baselines on disk."""
+    from retrace.visual_baseline import list_baselines
+
+    cfg = load_config(config_path)
+    items = list_baselines(cfg.run.data_dir)
+    click.echo(json.dumps(items, indent=2))
+
+
 def _tester_defaults(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         return {}
