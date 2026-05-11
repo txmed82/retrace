@@ -717,6 +717,44 @@ Browser SDK ingest endpoint:
 
 - `POST /api/sdk/replay`
 
+## Python SDK (backend exception capture)
+
+Retrace ships a first-party Python SDK
+([`packages/python-sdk`](packages/python-sdk/)) for capturing backend
+exceptions, breadcrumbs, and user/tag context from FastAPI, Flask,
+and Django apps. Wire-compatible with the Sentry envelope protocol,
+so it speaks to the same `/api/sentry/<project_id>/envelope/` endpoint.
+
+```bash
+pip install retrace-sdk
+# Optional framework extras
+pip install 'retrace-sdk[fastapi]' 'retrace-sdk[flask]' 'retrace-sdk[django]'
+```
+
+```python
+import retrace_sdk
+
+retrace_sdk.init(
+    dsn="http://rtpk_…@127.0.0.1:8788/<project_id>",
+    release="v1.2.3",
+    integrations=[
+        retrace_sdk.FastAPIIntegration(),       # or Flask / Django
+        retrace_sdk.LoggingIntegration(),
+    ],
+)
+
+retrace_sdk.add_breadcrumb(category="auth", message="login attempt")
+retrace_sdk.set_user({"id": "u_123"})
+
+try:
+    do_thing()
+except Exception:
+    retrace_sdk.capture_exception()
+```
+
+Full walkthrough: [`docs/python-sdk.md`](docs/python-sdk.md).
+
+
 Replay dashboard/read endpoints require a service token:
 
 ```bash
