@@ -80,11 +80,19 @@ class LLMReviewResult:
 
     @property
     def is_empty(self) -> bool:
+        """`True` when there's literally nothing to show.
+
+        Note: a `diff_too_large` skip or a captured `error` is still
+        worth surfacing in the PR comment (the user needs to know we
+        looked but stopped), so those count as non-empty.
+        """
         return not (
             self.summary
             or self.walkthrough
             or self.inline_suggestions
             or self.risk_notes
+            or self.diff_too_large
+            or bool(self.error.strip())
         )
 
     def to_dict(self) -> dict[str, Any]:

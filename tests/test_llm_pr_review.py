@@ -287,6 +287,12 @@ def test_llm_review_handles_chat_json_failure_per_chunk():
 def test_result_is_empty_when_truly_empty():
     assert LLMReviewResult().is_empty
     assert not LLMReviewResult(summary="x").is_empty
+    # `diff_too_large` and `error` are user-visible outcomes — the
+    # renderer must NOT skip them. (Regression for the renderer
+    # gating bug that hid the "Skipped LLM review" notice.)
+    assert not LLMReviewResult(diff_too_large=True).is_empty
+    assert not LLMReviewResult(error="LLM 500").is_empty
+    assert LLMReviewResult(error="   ").is_empty  # whitespace-only error doesn't count
 
 
 def test_to_markdown_handles_diff_too_large_note():
