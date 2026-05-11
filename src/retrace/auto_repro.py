@@ -12,6 +12,7 @@ underlying engine is Browser Harness, native Playwright, or anything else.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -134,16 +135,101 @@ def generate_spec_for_incident(
 # ---------------------------------------------------------------------------
 
 
+def _scan_run_dir_signals(run_dir: str) -> dict[str, Any]:
+    """Look at a tester run directory for additional bug-surface signals.
+
+    The UI tester drops typed artifacts into its run directory:
+      - `*screenshot*diff*.{png,jpg}`            visual regression
+      - `*dom*diff*.{json,txt}`                  structural drift
+      - `errors.json` / `errors.txt`             unhandled exceptions
+      - `console-errors.log`                     captured browser errors
+      - `network-failures.json`                  capture of 4xx/5xx
+    None of these exist today on every tester run, so detection has to be
+    permissive: presence is informative, absence is not.
+
+    Returns a dict with `signals` (list of human-readable strings) and
+    `confirms_failure` (bool that, if true, is enough on its own to mark
+    the bug confirmed even without a failed assertion).
+    """
+    out: dict[str, Any] = {"signals": [], "confirms_failure": False}
+    if not run_dir:
+        return out
+    p = Path(run_dir)
+    if not p.exists() or not p.is_dir():
+        return out
+
+    try:
+        entries = list(p.rglob("*"))
+    except OSError:
+        return out
+
+    # Screenshot diffs are the strongest signal — the tester wouldn't
+    # write one unless it had a baseline to compare against. Treat the mere
+    # presence of any diff artifact as confirmation.
+    diff_screens = [
+        e for e in entries
+        if e.is_file()
+        and ("diff" in e.name.lower())
+        and e.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+    ]
+    if diff_screens:
+        out["signals"].append(
+            f"screenshot diff present ({len(diff_screens)} file"
+            f"{'s' if len(diff_screens) != 1 else ''})"
+        )
+        out["confirms_failure"] = True
+
+    dom_diffs = [
+        e for e in entries
+        if e.is_file() and "dom" in e.name.lower() and "diff" in e.name.lower()
+    ]
+    if dom_diffs:
+        out["signals"].append(f"DOM diff present ({len(dom_diffs)} file)")
+        out["confirms_failure"] = True
+
+    # Use semantic checks for JSON files (a pretty-printed empty array like
+    # "[\n]\n" is non-zero bytes but carries no signal); fall back to a
+    # byte-length check for plain-text logs.
+    for name in ("errors.json", "errors.txt", "console-errors.log"):
+        candidate = p / name
+        if not (candidate.exists() and candidate.is_file()):
+            continue
+        try:
+            if name.endswith(".json"):
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                has_signal = bool(payload)
+            else:
+                has_signal = candidate.stat().st_size > 0
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if has_signal:
+            out["signals"].append(f"captured runtime errors in `{name}`")
+            out["confirms_failure"] = True
+
+    net_failures = p / "network-failures.json"
+    if net_failures.exists() and net_failures.is_file():
+        try:
+            payload = json.loads(net_failures.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            payload = None
+        if payload:
+            out["signals"].append("captured 4xx/5xx network failures")
+            out["confirms_failure"] = True
+
+    return out
+
+
 def _classify_outcome(run: TesterRunResult, exact_steps_count: int) -> tuple[bool, str, str]:
     """Decide whether the run confirmed the incident as still broken.
 
-    We deliberately keep three outcomes, not two:
-      - "confirmed":     a failed assertion (or, when the spec has exact
-                         steps to drive, a non-zero runner exit) proves the
-                         bug still surfaces.
-      - "error":         the harness/runner itself crashed and we can't tell
-                         whether the bug reproduces. We must NOT advance
-                         into fix generation on this state.
+    Outcomes:
+      - "confirmed":     a failed assertion, an artifact-level signal
+                         (screenshot diff, DOM diff, captured runtime
+                         errors, captured 4xx/5xx) or — with exact steps —
+                         a non-zero runner exit proves the bug surfaces.
+      - "error":         the harness/runner itself crashed and we can't
+                         tell whether the bug reproduces. We must NOT
+                         advance into fix generation on this state.
       - "not_confirmed": clean run; bug didn't surface.
     """
     failed_assertions = [
@@ -156,6 +242,11 @@ def _classify_outcome(run: TesterRunResult, exact_steps_count: int) -> tuple[boo
             f"assertion `{first.get('assertion_type', '?')}` failed: "
             f"{first.get('message', '')}".strip()
         )
+        return True, "confirmed", summary
+
+    artifact_signals = _scan_run_dir_signals(getattr(run, "run_dir", ""))
+    if artifact_signals["confirms_failure"]:
+        summary = "; ".join(artifact_signals["signals"]) or "artifact signal observed"
         return True, "confirmed", summary
 
     if run.exit_code != 0:

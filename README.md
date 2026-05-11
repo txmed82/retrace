@@ -151,6 +151,44 @@ retrace qa reproduce INC-XXXXXX           # just the test step
 retrace qa fix INC-XXXXXX --repo …        # just the PR step
 ```
 
+The fix step runs inside a temporary `git worktree`, so your working tree
+and current branch are never touched and repeat runs are idempotent.
+
+## Backend tests (`retrace api-test`)
+
+API test failures flow into the same `qa_incidents` table as UI tests and
+replay findings — `retrace qa auto` handles backend regressions for free.
+
+Create and run a contract test:
+
+```bash
+retrace api-test create \
+  --name "login should be 200" \
+  --method POST \
+  --url https://api.example.com/login \
+  --json-body '{"email":"demo@example.com","password":"hunter2"}' \
+  --assert '{"assertion_type":"status_equals","value":200}' \
+  --assert '{"assertion_type":"json_path_equals","target":"token","value":""}'
+
+retrace api-test run <spec_id>
+```
+
+If the spec fails it auto-files a `qa_incident`; the CLI prints the
+`INC-...` id and the next-step command. Bulk-run everything with
+`retrace api-test run-all`.
+
+Supported assertion types:
+
+- `status_equals` / `status_in`
+- `header_equals` / `header_contains`
+- `body_contains` / `body_not_contains` / `body_matches` (regex)
+- `json_path_equals` / `json_path_in` (dotted path, list indices supported)
+- `response_time_ms_under`
+
+Request/response payloads are redacted (bearer tokens, password fields,
+common secret keys, long tokens, emails) before they touch storage or fix
+prompts.
+
 ## Legacy PostHog flow
 
 If you already use PostHog session replay, the original pipeline still
@@ -307,6 +345,7 @@ Artifacts:
 - `retrace demo seed` — seed a local replay-backed issue and generated spec
 - `retrace ui` — local browser UI and onboarding/settings
 - `retrace tester ...` — describe tests or generate suite drafts with Browser Harness
+- `retrace api-test create|list|run|run-all|runs` — first-party HTTP API contract tests; failures file `qa_incidents`
 - `retrace mcp serve` — single MCP server with multiple tools (findings + tester)
 - `retrace github ...` — repo metadata management
 - `retrace suggest-fixes ...` — candidate matching + prompt generation (legacy report-based flow)
