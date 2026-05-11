@@ -80,6 +80,43 @@ jobs:
         working-directory: packages/browser
         run: npm run build
 
+  python-sdk-tests:
+    name: Python SDK Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install retrace-sdk with test extras
+        working-directory: packages/python-sdk
+        run: uv pip install --system -e ".[test]"
+
+      - name: Run SDK tests (no e2e, no main retrace dep)
+        working-directory: packages/python-sdk
+        run: pytest tests -q -m 'not e2e' --ignore=tests/test_e2e_ingest.py
+
+      # Run the e2e test on one matrix entry where the main package is
+      # also installed — it validates the SDK's envelope against the
+      # real ingest pipeline.
+      - name: Install main retrace package for e2e
+        if: matrix.python-version == '3.11'
+        run: uv pip install --system -e ".[dev]"
+
+      - name: Run SDK e2e test
+        if: matrix.python-version == '3.11'
+        run: pytest packages/python-sdk/tests/test_e2e_ingest.py -q
+
   playwright-runner:
     name: Playwright Runner Tests
     runs-on: ubuntu-latest

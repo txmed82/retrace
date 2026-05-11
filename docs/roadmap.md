@@ -208,7 +208,7 @@ credibility win.** PR-Agent and CodeRabbit have set the bar.
 
 ## P0.2 — Python SDK with framework integrations
 
-**Status:** NOT STARTED · **ETA:** 3 days · **Owner:** TBD
+**Status:** DONE 2026-05-11 · **PR:** this PR · **Owner:** Claude
 
 ### Why now
 
