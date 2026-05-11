@@ -94,3 +94,90 @@ def test_mcp_lists_and_processes_replay_sessions(tmp_path: Path, monkeypatch) ->
     )
     assert issues["count"] == 1
     assert issues["issues"][0]["title"] == "Error: mcp on replay"
+
+
+def test_mcp_list_and_get_qa_incidents(tmp_path: Path, monkeypatch) -> None:
+    """The MCP `qa.*` tools must surface unified incidents so editor
+    agents (Cursor / Claude Desktop) can drive the killer demo without
+    shelling out."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_CONFIG_YAML)
+    monkeypatch.chdir(tmp_path)
+
+    # Seed a qa_incident directly. The bridge tests cover the wired-in
+    # paths; here we just need a row to read.
+    import secrets
+    from retrace.qa_incidents import (
+        Incident,
+        IncidentEvidence,
+        ReproductionStep,
+        make_fingerprint,
+        make_public_id,
+        utc_now_iso,
+    )
+
+    store = Storage(tmp_path / "data" / "retrace.db")
+    store.init_schema()
+    inc = Incident(
+        id=secrets.token_hex(16),
+        public_id=make_public_id(),
+        project_id="local",
+        environment_id="production",
+        fingerprint=make_fingerprint(["mcp-test"]),
+        title="Sign-in fails under load",
+        summary="500 from /api/login",
+        suspected_cause="connection pool exhaustion",
+        severity="high",
+        confidence="high",
+        status="open",
+        primary_source_kind="api_test",
+        sources=[],
+        reproduction=[ReproductionStep(0, "describe", "POST /api/login")],
+        expected_outcome="200",
+        actual_outcome="500",
+        app_url="https://api.example/login",
+        evidence=IncidentEvidence(),
+        affected_count=5,
+        affected_users=4,
+        first_seen_ms=0,
+        last_seen_ms=0,
+        created_at=utc_now_iso(),
+        updated_at=utc_now_iso(),
+    )
+    store.upsert_qa_incident(inc.to_row())
+
+    listed = _handle_tool_call(
+        "retrace.list_qa_incidents",
+        {"config": str(cfg)},
+    )
+    assert listed["count"] == 1
+    summary = listed["incidents"][0]
+    assert summary["public_id"] == inc.public_id
+    assert summary["title"] == "Sign-in fails under load"
+    assert summary["primary_source_kind"] == "api_test"
+    assert summary["severity"] == "high"
+
+    fetched = _handle_tool_call(
+        "retrace.get_qa_incident",
+        {"config": str(cfg), "incident_id": inc.public_id},
+    )
+    assert fetched["found"] is True
+    assert fetched["incident"]["public_id"] == inc.public_id
+
+    missing = _handle_tool_call(
+        "retrace.get_qa_incident",
+        {"config": str(cfg), "incident_id": "INC-NOPE"},
+    )
+    assert missing["found"] is False
+
+
+def test_mcp_qa_tools_are_advertised_in_tools_list(tmp_path: Path) -> None:
+    """`tools/list` must expose the new qa.* tools so MCP clients can
+    discover them."""
+    from retrace.commands.mcp import _tools
+
+    names = {t["name"] for t in _tools()}
+    assert "retrace.list_qa_incidents" in names
+    assert "retrace.get_qa_incident" in names
+    assert "retrace.reproduce_qa_incident" in names
+    assert "retrace.fix_qa_incident" in names

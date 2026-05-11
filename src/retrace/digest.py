@@ -28,6 +28,7 @@ class DigestIssueRow:
     affected_users: int
     updated_at: str
     summary: str = ""
+    source_kind: str = "replay"  # set when rows come from qa_incidents
 
     @property
     def is_resolved(self) -> bool:
@@ -39,7 +40,12 @@ class DigestIssueRow:
 
     @property
     def is_open(self) -> bool:
-        return self.status in {"new", "ongoing", "regressed", "ticket_created"}
+        # Cover both `replay_issues` statuses ("new"/"ongoing"/...) and
+        # `qa_incidents` statuses ("open"/"reproducing"/"reproduced"/...).
+        return self.status in {
+            "new", "ongoing", "regressed", "ticket_created",
+            "open", "reproducing", "reproduced", "fix_proposed", "fixing",
+        }
 
 
 @dataclass
@@ -76,6 +82,21 @@ def _row_to_digest(row: Any) -> DigestIssueRow:
     )
 
 
+def _qa_row_to_digest(row: Any) -> DigestIssueRow:
+    """Project a `qa_incidents` row onto the digest shape."""
+    return DigestIssueRow(
+        public_id=str(row["public_id"]),
+        title=str(row["title"] or "QA incident"),
+        severity=str(row["severity"] or ""),
+        status=str(row["status"] or ""),
+        affected_count=int(row["affected_count"] or 0),
+        affected_users=int(row["affected_users"] or 0),
+        updated_at=str(row["updated_at"] or ""),
+        summary=str(row["summary"] or ""),
+        source_kind=str(row["primary_source_kind"] or "replay"),
+    )
+
+
 def _within_window(updated_at: str, window_start: datetime) -> bool:
     """Decide whether an issue's `updated_at` falls inside the digest window.
 
@@ -105,17 +126,37 @@ def build_digest(
     lookback_hours: int = 24,
     top_impact_limit: int = 5,
     now: datetime | None = None,
+    source: str = "qa_incidents",
 ) -> DigestPayload:
+    """Render a digest payload.
+
+    `source` defaults to `qa_incidents` — the unified surface that covers
+    every signal class (replay, UI test, API test, error monitor, PR
+    review). Pass `source="replay_issues"` to render the legacy
+    replay-only view.
+    """
     now_dt = now or datetime.now(timezone.utc)
     window_start = now_dt - timedelta(hours=max(1, int(lookback_hours)))
 
-    rows = store.list_replay_issues(
-        project_id=project_id, environment_id=environment_id
-    )
-    digest_rows = [_row_to_digest(r) for r in rows]
+    if source == "qa_incidents":
+        qa_rows = store.list_qa_incidents(
+            project_id=project_id, environment_id=environment_id, limit=500
+        )
+        digest_rows = [_qa_row_to_digest(r) for r in qa_rows]
+    elif source == "replay_issues":
+        rows = store.list_replay_issues(
+            project_id=project_id, environment_id=environment_id
+        )
+        digest_rows = [_row_to_digest(r) for r in rows]
+    else:
+        raise ValueError(
+            f"unknown digest source {source!r}; "
+            "expected 'qa_incidents' or 'replay_issues'."
+        )
 
     in_window = [r for r in digest_rows if _within_window(r.updated_at, window_start)]
-    new_issues = [r for r in in_window if r.status == "new"]
+    # `qa_incidents` uses "open" for fresh incidents; `replay_issues` uses "new".
+    new_issues = [r for r in in_window if r.status in {"new", "open"}]
     regressed_issues = [r for r in in_window if r.is_regressed]
     resolved_issues = [r for r in in_window if r.is_resolved]
 
@@ -153,7 +194,7 @@ def render_digest_markdown(digest: DigestPayload) -> str:
     )
     lines.append("")
     if digest.is_empty:
-        lines.append("No replay activity in this window.")
+        lines.append("No incident activity in this window.")
         lines.append("")
         return "\n".join(lines)
 
@@ -190,8 +231,15 @@ def _render_rows(
         suffix = ""
         if include_status:
             suffix = f" _[{r.status}]_"
+        # Surface the source kind so a unified digest distinguishes a
+        # replay-derived bug from an API test failure at a glance.
+        kind_tag = (
+            f" `{r.source_kind}`"
+            if r.source_kind and r.source_kind != "replay"
+            else ""
+        )
         out.append(
-            f"- `{r.public_id}` **{r.title}** — "
+            f"- `{r.public_id}`{kind_tag} **{r.title}** — "
             f"{r.severity or 'unknown'}, "
             f"{r.affected_count} session(s), "
             f"{r.affected_users} user(s){suffix}"

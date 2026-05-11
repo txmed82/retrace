@@ -506,7 +506,13 @@ class ReplayCoreService:
             # replay-backed bug alongside UI/API test failures. Bridge
             # errors must not break replay processing.
             try:
-                issue_row = self.store.get_replay_issue(upsert_result.issue_id)
+                # `get_replay_issue` is keyword-only and scoped to a
+                # workspace; the bridge needs the row to convert.
+                issue_row = self.store.get_replay_issue(
+                    project_id=self.project_id,
+                    environment_id=self.environment_id,
+                    issue_id=upsert_result.issue_id,
+                )
                 if issue_row is not None:
                     from retrace.qa_incident_bridge import (
                         sync_qa_incident_from_replay_issue,
@@ -516,8 +522,11 @@ class ReplayCoreService:
                         store=self.store,
                         issue_row=issue_row,
                     )
-            except Exception:
-                pass
+            except Exception as _exc:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "qa_incident bridge sync failed for replay issue: %s", _exc
+                )
 
         return ReplayProcessingResult(
             sessions_scanned=scanned,

@@ -58,10 +58,23 @@ def _seed_one_issue(tmp_path: Path) -> tuple[Storage, str, str, str]:
 
 
 def test_build_digest_buckets_new_issues_in_window(tmp_path: Path) -> None:
-    store, pid, eid, public_id = _seed_one_issue(tmp_path)
+    store, pid, eid, _replay_public_id = _seed_one_issue(tmp_path)
+    # Default `source="qa_incidents"` reads the unified table; the bridge
+    # mirrored the replay issue, but the qa_incident gets its own
+    # `INC-...` id — match on title instead of public_id since the user
+    # contract is "the bug shows up", not "with the original id".
     digest = build_digest(store=store, project_id=pid, environment_id=eid)
+    assert any("TypeError" in (r.title or "") for r in digest.new_issues)
+    assert any("TypeError" in (r.title or "") for r in digest.top_impact_open)
+
+
+def test_build_digest_replay_source_still_works(tmp_path: Path) -> None:
+    """Legacy `source='replay_issues'` is preserved for callers that need it."""
+    store, pid, eid, public_id = _seed_one_issue(tmp_path)
+    digest = build_digest(
+        store=store, project_id=pid, environment_id=eid, source="replay_issues"
+    )
     assert any(r.public_id == public_id for r in digest.new_issues)
-    # The same issue is open and high-impact (1 session); appears in top_impact_open too.
     assert any(r.public_id == public_id for r in digest.top_impact_open)
 
 
@@ -88,7 +101,7 @@ def test_render_digest_markdown_handles_empty() -> None:
             window_end="2026-01-02T00:00:00+00:00",
         )
     )
-    assert "No replay activity" in text
+    assert "No incident activity" in text
 
 
 def test_render_digest_markdown_includes_sections() -> None:
