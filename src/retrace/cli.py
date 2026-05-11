@@ -14,6 +14,7 @@ from retrace.commands.github import github_group
 from retrace.commands.qa import qa_group
 from retrace.commands.init import init_command
 from retrace.commands.mcp import mcp_group
+from retrace.commands.monitor import monitor_group
 from retrace.commands.quickstart import quickstart_command
 from retrace.commands.repair import repair_group
 from retrace.commands.review import review_command
@@ -90,3 +91,4 @@ main.add_command(demo_group)
 main.add_command(repair_group)
 main.add_command(qa_group)
 main.add_command(review_command)
+main.add_command(monitor_group)

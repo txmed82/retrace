@@ -3079,6 +3079,21 @@ def api_verify_resolved(
 @click.option("--author", default="", help="Deploy author.")
 @click.option("--deployed-at-ms", default=0, type=int, help="Deploy timestamp in ms.")
 @click.option("--changed-file", "changed_files", multiple=True, help="Changed file path.")
+@click.option(
+    "--source-map-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Optional directory of source maps to upload as part of this deploy. "
+        "Pairs are inferred from filenames: foo.js.map -> foo.js. "
+        "Use --source-map-artifact-prefix to set the URL prefix."
+    ),
+)
+@click.option(
+    "--source-map-artifact-prefix",
+    default="",
+    help="URL prefix prepended to each source-map's artifact_url (e.g. https://cdn.example.com/static/).",
+)
 def api_record_deploy(
     config_path: Path,
     project_id: str,
@@ -3088,8 +3103,10 @@ def api_record_deploy(
     author: str,
     deployed_at_ms: int,
     changed_files: tuple[str, ...],
+    source_map_dir: Path | None,
+    source_map_artifact_prefix: str,
 ) -> None:
-    """Record a deploy marker and correlate recent failures."""
+    """Record a deploy marker and (optionally) auto-upload source maps."""
     cfg = load_config(config_path)
     store = Storage(cfg.run.data_dir / "retrace.db")
     store.init_schema()
@@ -3112,6 +3129,49 @@ def api_record_deploy(
         project_id=pid,
         environment_id=eid,
     )
+
+    uploaded_maps: list[dict] = []
+    skipped_maps: list[dict] = []
+    if source_map_dir is not None:
+        from retrace.source_maps import upload_source_map
+
+        prefix = (source_map_artifact_prefix or "").rstrip("/")
+        for path in sorted(source_map_dir.rglob("*.map")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                skipped_maps.append({"path": str(path), "reason": f"unreadable: {exc}"})
+                continue
+            if not isinstance(payload, dict):
+                skipped_maps.append({"path": str(path), "reason": "not a JSON object"})
+                continue
+            # foo.js.map -> foo.js for artifact_url
+            relative = path.relative_to(source_map_dir).as_posix()
+            generated = relative[:-4] if relative.endswith(".map") else relative
+            artifact_url = (
+                f"{prefix}/{generated}" if prefix else generated
+            )
+            try:
+                row = upload_source_map(
+                    store=store,
+                    project_id=pid,
+                    environment_id=eid,
+                    release=sha,
+                    dist="",
+                    artifact_url=artifact_url,
+                    source_map=payload,
+                )
+            except ValueError as exc:
+                skipped_maps.append({"path": str(path), "reason": str(exc)})
+                continue
+            uploaded_maps.append(
+                {
+                    "path": str(path),
+                    "artifact_url": row.artifact_url,
+                    "public_id": row.public_id,
+                }
+            )
+
     click.echo(
         json.dumps(
             {
@@ -3125,6 +3185,8 @@ def api_record_deploy(
                     {"failure_id": item.failure_id, "deploy_sha": item.deploy_sha}
                     for item in correlations
                 ],
+                "uploaded_source_maps": uploaded_maps,
+                "skipped_source_maps": skipped_maps,
             },
             indent=2,
         )

@@ -2933,6 +2933,25 @@ class Storage:
             ).fetchall()
         return [self._app_error_alert_rule_from_row(row) for row in rows]
 
+    def delete_app_error_alert_rule(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        name: str,
+    ) -> bool:
+        """Delete one alert rule by (project, env, name). Returns True if a
+        row was removed, False if nothing matched."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM app_error_alert_rules
+                WHERE project_id = ? AND environment_id = ? AND name = ?
+                """,
+                (project_id, environment_id, name.strip()),
+            )
+            return bool(cur.rowcount)
+
     def _app_error_alert_rule_from_row(
         self,
         row: sqlite3.Row,
