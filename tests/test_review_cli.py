@@ -163,8 +163,9 @@ def test_review_run_affected_tests_is_no_op_when_no_specs_cover(tmp_path: Path):
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert "affected_test_results" in payload
-    assert isinstance(payload["affected_test_results"], list)
+    # With no specs covering the diff, the path must return exactly an
+    # empty list — not just "a list".
+    assert payload["affected_test_results"] == []
 
 
 def test_review_format_comment_body_includes_sections(tmp_path: Path):

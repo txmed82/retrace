@@ -132,6 +132,12 @@ def review_command(
         raise click.UsageError("provide --diff or --pr")
 
     repo, pr_number = _resolve_pr_ref(pr_ref, repo_full_name)
+    # Fail fast — we don't want `--run-affected-tests` to spend
+    # 60 seconds before the late `--post-comment` validation rejects.
+    if post_comment and not (repo and pr_number):
+        raise click.UsageError(
+            "--post-comment requires --pr (with a real PR reference)."
+        )
 
     diff_text = _read_diff(diff_path, repo=repo, pr_number=pr_number)
     if not diff_text.strip():
@@ -174,10 +180,7 @@ def review_command(
 
     posted_comment_url = ""
     if post_comment:
-        if not (repo and pr_number):
-            raise click.UsageError(
-                "--post-comment requires --pr (with a real PR reference)."
-            )
+        # The fail-fast check above already validated `(repo, pr_number)`.
         posted_comment_url = _post_pr_comment(
             repo=repo,
             pr_number=pr_number,
@@ -346,15 +349,26 @@ def _run_affected_tests(*, cfg: Any, analysis: Any) -> list[dict[str, Any]]:
     runs_dir = runs_dir_for_data_dir(cfg.run.data_dir)
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for t in analysis.existing_tests[:6]:
+    # Cap at 6 *unique* specs — slicing `existing_tests[:6]` before the
+    # `seen` filter could let duplicate spec_ids in the first 6 rows
+    # silently drop later coverage.
+    for t in analysis.existing_tests:
         spec_id = getattr(t, "spec_id", "") or ""
         if not spec_id or spec_id in seen:
             continue
+        if len(seen) >= 6:
+            break
         seen.add(spec_id)
         try:
             spec = load_spec(specs_dir, spec_id)
         except FileNotFoundError:
             out.append({"spec_id": spec_id, "status": "missing", "summary": "spec file not found"})
+            continue
+        except Exception as exc:
+            # Any other spec-load failure (malformed JSON, schema drift,
+            # unreadable file) must degrade per-spec, not abort the whole
+            # review.
+            out.append({"spec_id": spec_id, "status": "error", "summary": str(exc)})
             continue
         try:
             result = run_spec(spec=spec, runs_dir=runs_dir)
