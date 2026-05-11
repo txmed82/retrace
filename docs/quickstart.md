@@ -51,9 +51,9 @@ One command:
 Both point at the same workspace, so events from either path land in
 the same incident queue.
 
-> **TLS**: `retrace quickstart --api-scheme https --api-host
-> retrace.example.com --api-port 443` for hosted deployments. The
-> browser will reject `http://` DSNs from an HTTPS page.
+> **TLS**: For hosted deployments use
+> `retrace quickstart --api-scheme https --api-host retrace.example.com --api-port 443`.
+> Browsers reject `http://` Sentry DSNs from an HTTPS page.
 
 ## See the product
 

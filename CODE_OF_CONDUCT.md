@@ -19,9 +19,13 @@ contribute. This document is short on purpose.
 
 ## If something goes wrong
 
-Open a private email to **conduct@retrace.dev** (or DM a maintainer
-listed in [CONTRIBUTING.md](CONTRIBUTING.md) if email isn't an option).
-We'll triage and respond within a week.
+Open a private email to **conduct@retrace.dev**. If you'd rather reach
+a maintainer directly, find one through the [GitHub repository's
+contributor list](https://github.com/txmed82/retrace/graphs/contributors)
+and DM them on GitHub. We'll triage and respond within a week.
+
+> Note for maintainers: before public launch, make sure
+> `conduct@retrace.dev` is actually delivered to a monitored inbox.
 
 Repeated or severe violations result in being asked to leave the
 project's spaces. We try to give one clear warning first; we won't
