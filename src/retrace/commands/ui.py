@@ -2396,6 +2396,24 @@ _INDEX_HTML = """<!doctype html>
     }
     document.querySelectorAll('.nav-btn').forEach(el => el.addEventListener('click', () => switchView(el.dataset.view)));
 
+    function escapeHtml(s){
+      return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    // Whitelist URLs to `http(s):` so a tainted `fix_pr_url` can't smuggle
+    // `javascript:` into an anchor href.
+    function safeExternalUrl(raw){
+      const s = String(raw || '').trim();
+      if(!s) return '';
+      try {
+        const u = new URL(s);
+        return (u.protocol === 'http:' || u.protocol === 'https:') ? u.href : '';
+      } catch(e) { return ''; }
+    }
+    // Reduce class-name tokens to a safe alphabet so `tag-${src}` can't
+    // break out of the attribute.
+    function safeToken(raw){
+      return String(raw || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+    }
     async function loadQaIncidents(){
       const list = byId('qaList');
       const detail = byId('qaDetail');
@@ -2413,10 +2431,19 @@ _INDEX_HTML = """<!doctype html>
           return;
         }
         const rows = incidents.map(inc => {
-          const sev = inc.severity || '-';
-          const src = inc.primary_source_kind || '-';
-          const fix = inc.fix_pr_url ? ` · <a href="${inc.fix_pr_url}" target="_blank">PR</a>` : '';
-          return `<div class="card" style="margin-bottom:8px"><div class="hdr"><strong>${inc.public_id}</strong> &nbsp; <span class="tag tag-${src}">${src}</span> &nbsp; <span>${escapeHtml(inc.title || '')}</span></div><div class="empty">${sev} · ${inc.status} · ${inc.affected_users || 0} user(s)${fix} · <a href="javascript:void(0)" data-qa-show="${inc.public_id}">details</a></div></div>`;
+          const publicId = escapeHtml(inc.public_id || '');
+          const title = escapeHtml(inc.title || '');
+          const sev = escapeHtml(inc.severity || '-');
+          const status = escapeHtml(inc.status || '-');
+          const srcRaw = inc.primary_source_kind || '-';
+          const srcClass = safeToken(srcRaw);
+          const srcText = escapeHtml(srcRaw);
+          const fixUrl = safeExternalUrl(inc.fix_pr_url);
+          const fix = fixUrl
+            ? ` · <a href="${escapeHtml(fixUrl)}" target="_blank" rel="noopener noreferrer">PR</a>`
+            : '';
+          const affected = Number(inc.affected_users) || 0;
+          return `<div class="card" style="margin-bottom:8px"><div class="hdr"><strong>${publicId}</strong> &nbsp; <span class="tag tag-${srcClass}">${srcText}</span> &nbsp; <span>${title}</span></div><div class="empty">${sev} · ${status} · ${affected} user(s)${fix} · <a href="javascript:void(0)" data-qa-show="${publicId}">details</a></div></div>`;
         }).join('');
         list.innerHTML = rows;
         list.querySelectorAll('[data-qa-show]').forEach(el => {
@@ -2425,9 +2452,6 @@ _INDEX_HTML = """<!doctype html>
       } catch (err) {
         list.innerHTML = `<div class="empty">Failed to load QA incidents: ${escapeHtml(String(err))}</div>`;
       }
-    }
-    function escapeHtml(s){
-      return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
     async function showQaIncident(publicId){
       const detail = byId('qaDetail');
@@ -2443,7 +2467,9 @@ _INDEX_HTML = """<!doctype html>
         const inc = data.incident || {};
         const repro = (() => { try { return JSON.parse(inc.reproduction_json || '[]'); } catch(e) { return []; } })();
         const evidence = (() => { try { return JSON.parse(inc.evidence_json || '{}'); } catch(e) { return {}; } })();
-        const steps = repro.map((s, i) => `<li><strong>${escapeHtml(s.action || '?')}</strong> — ${escapeHtml(s.description || '')}</li>`).join('');
+        const steps = repro.map(s => `<li><strong>${escapeHtml(s.action || '?')}</strong> — ${escapeHtml(s.description || '')}</li>`).join('');
+        const fixUrl = safeExternalUrl(inc.fix_pr_url);
+        const fixUrlEsc = escapeHtml(fixUrl);
         detail.innerHTML = `
           <div class="card">
             <h3>${escapeHtml(inc.public_id || '')}  ${escapeHtml(inc.title || '')}</h3>
@@ -2452,7 +2478,7 @@ _INDEX_HTML = """<!doctype html>
             ${inc.suspected_cause ? `<p><em>Suspected cause:</em> ${escapeHtml(inc.suspected_cause)}</p>` : ''}
             ${steps ? `<h4>Reproduction</h4><ol>${steps}</ol>` : ''}
             ${evidence.top_stack_frame ? `<p><em>Top stack frame:</em> <code>${escapeHtml(evidence.top_stack_frame)}</code></p>` : ''}
-            ${inc.fix_pr_url ? `<p><strong>Fix PR:</strong> <a href="${inc.fix_pr_url}" target="_blank">${escapeHtml(inc.fix_pr_url)}</a></p>` : ''}
+            ${fixUrl ? `<p><strong>Fix PR:</strong> <a href="${fixUrlEsc}" target="_blank" rel="noopener noreferrer">${fixUrlEsc}</a></p>` : ''}
           </div>
         `;
       } catch (err) {
@@ -4228,9 +4254,26 @@ def ui_command(
                 # Unified QA incident queue (replay/UI/API/monitor/review).
                 query_args = parse_qs(urlparse(self.path).query)
                 source_filter = (query_args.get("source") or [""])[0]
-                rows = store.list_qa_incidents(limit=200)
-                if source_filter:
-                    rows = [r for r in rows if str(r["primary_source_kind"]) == source_filter]
+                # Page through the unified queue and filter on the way so a
+                # filtered source whose matching rows fall outside the first
+                # 200 still surfaces.
+                rows: list = []
+                page_size = 200
+                offset = 0
+                while len(rows) < 200 and offset < 5000:
+                    page = store.list_qa_incidents(limit=page_size, offset=offset)
+                    if not page:
+                        break
+                    if source_filter:
+                        rows.extend(
+                            r for r in page if str(r["primary_source_kind"]) == source_filter
+                        )
+                    else:
+                        rows.extend(page)
+                    if len(page) < page_size:
+                        break
+                    offset += page_size
+                rows = rows[:200]
                 incidents = [
                     {
                         "public_id": str(r["public_id"]),
