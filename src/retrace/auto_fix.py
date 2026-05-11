@@ -180,51 +180,82 @@ def _run(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _git_clean(cwd: Path) -> bool:
-    r = _run(["git", "status", "--porcelain"], cwd=cwd)
-    return r.returncode == 0 and not r.stdout.strip()
-
-
-def _git_current_branch(cwd: Path) -> str:
-    r = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd)
-    return r.stdout.strip() if r.returncode == 0 else ""
-
-
 def _local_branch_exists(cwd: Path, branch: str) -> bool:
     r = _run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=cwd)
     return r.returncode == 0
 
 
-def _checkout_branch(cwd: Path, branch: str, base: str) -> tuple[bool, str]:
-    """Check out `branch` for fix work, reusing it if it already exists.
+def _worktree_dir_for(repo_path: Path, branch: str) -> Path:
+    """Pick a worktree path adjacent to (but outside) the repo.
 
-    Re-running `qa fix` / `qa auto` for the same incident must be safe: the
-    incident-derived branch name is deterministic, so a second run would
-    otherwise blow up on `git checkout -b`. We reuse the existing branch
-    when found.
+    Sibling of the repo so paths stay short on filesystems with limits, and
+    deterministic for the given (repo, branch) pair so manual cleanup is
+    easy.
     """
-    # Make sure base is up to date locally; ignore failures (offline ok).
-    _run(["git", "fetch", "origin", base], cwd=cwd)
-    if _local_branch_exists(cwd, branch):
-        r = _run(["git", "checkout", branch], cwd=cwd)
-        if r.returncode != 0:
-            return False, (r.stderr or r.stdout).strip()
-        return True, ""
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "-", branch).strip("-") or "fix"
+    return repo_path.parent / f".retrace-worktree-{repo_path.name}-{safe}"
 
-    r = _run(["git", "checkout", "-b", branch, f"origin/{base}"], cwd=cwd)
+
+def _add_worktree(repo_path: Path, branch: str, base: str) -> tuple[Optional[Path], str]:
+    """Materialise a worktree on `branch` (creating the branch if missing).
+
+    The user's main checkout is never disturbed. We make a best-effort
+    `git fetch origin <base>` first so the worktree starts from up-to-date
+    code when online; offline runs fall back to the local base ref.
+    """
+    _run(["git", "fetch", "origin", base], cwd=repo_path)
+    worktree = _worktree_dir_for(repo_path, branch)
+
+    # If a previous run left the worktree behind, reuse it cleanly.
+    if worktree.exists():
+        prune = _run(["git", "worktree", "remove", "--force", str(worktree)], cwd=repo_path)
+        # `prune` may fail if git has lost track of it; force removal in that
+        # case so we start from a known-clean state.
+        if prune.returncode != 0 and worktree.exists():
+            import shutil
+            shutil.rmtree(worktree, ignore_errors=True)
+        _run(["git", "worktree", "prune"], cwd=repo_path)
+
+    if _local_branch_exists(repo_path, branch):
+        r = _run(["git", "worktree", "add", str(worktree), branch], cwd=repo_path)
+    else:
+        # Try origin/<base>; fall back to the local base ref.
+        r = _run(
+            ["git", "worktree", "add", "-b", branch, str(worktree), f"origin/{base}"],
+            cwd=repo_path,
+        )
+        if r.returncode != 0:
+            r = _run(
+                ["git", "worktree", "add", "-b", branch, str(worktree), base],
+                cwd=repo_path,
+            )
     if r.returncode != 0:
-        # Fall back to local base if origin/<base> isn't there.
-        r = _run(["git", "checkout", "-b", branch, base], cwd=cwd)
-    if r.returncode != 0:
-        return False, (r.stderr or r.stdout).strip()
-    return True, ""
+        return None, (r.stderr or r.stdout).strip()
+    return worktree, ""
+
+
+def _remove_worktree(repo_path: Path, worktree: Path) -> None:
+    if worktree.exists():
+        _run(["git", "worktree", "remove", "--force", str(worktree)], cwd=repo_path)
+        if worktree.exists():
+            import shutil
+            shutil.rmtree(worktree, ignore_errors=True)
+    _run(["git", "worktree", "prune"], cwd=repo_path)
 
 
 def _commit_and_push(cwd: Path, branch: str, message: str) -> tuple[bool, str]:
+    """Stage everything, commit if there's anything new, then push.
+
+    The fix flow is intentionally re-runnable, so a repeat run with no
+    changes must succeed silently rather than fail at `git commit` (which
+    exits non-zero on "nothing to commit").
+    """
     _run(["git", "add", "-A"], cwd=cwd)
-    r = _run(["git", "commit", "-m", message], cwd=cwd)
-    if r.returncode != 0:
-        return False, (r.stderr or r.stdout).strip()
+    status = _run(["git", "status", "--porcelain"], cwd=cwd)
+    if status.stdout.strip():
+        r = _run(["git", "commit", "-m", message], cwd=cwd)
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout).strip()
     r = _run(["git", "push", "-u", "origin", branch], cwd=cwd)
     if r.returncode != 0:
         return False, (r.stderr or r.stdout).strip()
@@ -383,26 +414,22 @@ def propose_fix_for_incident(
         _persist_error(outcome.error)
         return outcome
 
-    if not _git_clean(repo_path):
-        outcome.status = "error"
-        outcome.error = "working tree is dirty; commit or stash before requesting a fix PR"
-        _persist_error(outcome.error)
-        return outcome
-
     branch = f"retrace/{_sanitize_branch_part(inc.public_id)}-{_sanitize_branch_part(inc.title)}"
     outcome.branch = branch
-    starting_branch = _git_current_branch(repo_path)
 
-    ok, err = _checkout_branch(repo_path, branch, base_branch)
-    if not ok:
+    # Use a git worktree so the user's checked-out branch and working tree
+    # are never touched. This removes the "clean tree required" constraint
+    # entirely and makes repeat runs idempotent.
+    worktree, err = _add_worktree(repo_path, branch, base_branch)
+    if worktree is None:
         outcome.status = "error"
-        outcome.error = f"checkout failed: {err}"
+        outcome.error = f"worktree add failed: {err}"
         _persist_error(outcome.error, branch_name=branch)
         return outcome
 
     try:
         # Always check the prompt into the branch so the PR is self-describing.
-        pr_prompt_path = repo_path / ".retrace" / f"{inc.public_id}.fix.md"
+        pr_prompt_path = worktree / ".retrace" / f"{inc.public_id}.fix.md"
         pr_prompt_path.parent.mkdir(parents=True, exist_ok=True)
         pr_prompt_path.write_text(prompt_md)
 
@@ -410,7 +437,7 @@ def propose_fix_for_incident(
         agent_used = ""
         if apply_with_agent:
             applied, agent_used, agent_msg = _try_run_agent(
-                repo_path, pr_prompt_path, apply_with_agent
+                worktree, pr_prompt_path, apply_with_agent
             )
             outcome.applied = applied
             outcome.agent = agent_used
@@ -421,7 +448,7 @@ def propose_fix_for_incident(
         if applied:
             commit_msg = f"retrace: AI fix for {inc.public_id} — {inc.title[:64]}"
 
-        ok, err = _commit_and_push(repo_path, branch, commit_msg)
+        ok, err = _commit_and_push(worktree, branch, commit_msg)
         if not ok:
             outcome.status = "error"
             outcome.error = f"commit/push failed: {err}"
@@ -432,7 +459,7 @@ def propose_fix_for_incident(
         if _gh_available():
             pr_title = f"Retrace fix: {inc.title[:80]} ({inc.public_id})"
             url, err = _gh_pr_create(
-                cwd=repo_path,
+                cwd=worktree,
                 title=pr_title,
                 body_path=pr_prompt_path,
                 base=base_branch,
@@ -446,7 +473,10 @@ def propose_fix_for_incident(
                 _persist_error(outcome.error, branch_name=branch)
                 return outcome
         else:
-            outcome.error = "gh not installed; branch pushed without PR"
+            outcome.error = (
+                "gh not installed; branch pushed. Open a PR manually or install "
+                "https://cli.github.com and re-run `retrace qa fix`."
+            )
 
         outcome.pr_url = pr_url
         outcome.status = "pr_open" if pr_url else ("applied" if applied else "prompt_ready")
@@ -461,5 +491,5 @@ def propose_fix_for_incident(
         )
         return outcome
     finally:
-        if starting_branch and starting_branch != branch:
-            _run(["git", "checkout", starting_branch], cwd=repo_path)
+        # Always clean up the worktree, even on early return paths above.
+        _remove_worktree(repo_path, worktree)
