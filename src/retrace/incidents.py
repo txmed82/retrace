@@ -55,6 +55,20 @@ def group_failure_into_incident(
     store.move_failure_to_incident(incident_id=incident_id, failure_id=failure.id)
     incident = store.get_incident(incident_id)
     failures = store.list_incident_failures(incident_id=incident_id)
+
+    # Mirror into the QA incident pipeline so `retrace qa list` / `qa auto`
+    # see this signal alongside replay-derived and UI-test-derived
+    # incidents. Only sync the failure we just attached — re-syncing every
+    # failure already on the incident would make each ingest O(N²) for a
+    # noisy incident. Import is local to avoid a circular dependency with
+    # the bridge (which imports from `qa_incidents`/`storage`).
+    try:
+        from retrace.qa_incident_bridge import sync_qa_incident_from_failure
+
+        sync_qa_incident_from_failure(store=store, failure_id=failure.id)
+    except Exception as exc:  # pragma: no cover - bridge errors must not fail ingest
+        logger.warning("qa_incident bridge sync failed for failure %s: %s", failure.id, exc)
+
     return IncidentGroupingResult(
         incident_id=incident_id,
         incident_public_id=str(getattr(incident, "public_id", "") or ""),

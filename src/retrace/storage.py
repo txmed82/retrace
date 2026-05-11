@@ -6690,6 +6690,12 @@ class Storage:
         Atomic upsert via SQLite's ``ON CONFLICT ... DO UPDATE`` so concurrent
         ingesters can't both miss the existence check and race on the unique
         constraint. Returns ``(incident_id, inserted)``.
+
+        Note: callers that need the **persisted** ``public_id`` should use
+        :meth:`upsert_qa_incident_returning` — the public_id is NOT in the
+        DO UPDATE clause, so on conflict the stored value differs from the
+        candidate one in ``row``. Returning a bare ``id`` here preserves
+        the prior signature for existing callers.
         """
         required = (
             "id", "public_id", "project_id", "environment_id", "fingerprint",
@@ -6725,7 +6731,7 @@ class Storage:
         sql = (
             f"INSERT INTO qa_incidents ({cols}) VALUES ({placeholders}) "
             f"ON CONFLICT(project_id, environment_id, fingerprint) DO UPDATE SET {do_update} "
-            "RETURNING id"
+            "RETURNING id, public_id"
         )
 
         with self._conn() as conn:
@@ -6750,6 +6756,29 @@ class Storage:
                 # rather raise than lie about persistence.
                 raise RuntimeError("upsert_qa_incident: no row returned from upsert")
             return str(res["id"]), not existed
+
+    def upsert_qa_incident_returning(
+        self, row: dict[str, Any]
+    ) -> tuple[str, str, bool]:
+        """Same as :meth:`upsert_qa_incident` but returns the **persisted**
+        public_id too.
+
+        Use this from the bridge: on a fingerprint collision the existing
+        row keeps its original public_id (we never overwrite it), so the
+        candidate value baked into ``row["public_id"]`` is dropped. The
+        bridge surfaces these ids straight to the user (`retrace qa show
+        INC-...`), so returning the canonical one prevents dead references
+        on resync. Returns ``(incident_id, persisted_public_id, inserted)``.
+        """
+        incident_id, inserted = self.upsert_qa_incident(row)
+        with self._conn() as conn:
+            stored = conn.execute(
+                "SELECT public_id FROM qa_incidents WHERE id = ?",
+                (incident_id,),
+            ).fetchone()
+        if stored is None:  # pragma: no cover - upsert just wrote it
+            raise RuntimeError("upsert_qa_incident_returning: row vanished")
+        return incident_id, str(stored["public_id"]), inserted
 
     def update_qa_incident_state(
         self,

@@ -727,6 +727,19 @@ def persist_api_failure(
             run_result=result,
             link_id=links[0].id,
         )
+
+    # Mirror into the QA incident pipeline. The monitoring path goes
+    # through `group_failure_into_incident`, but API test failures land
+    # straight in `failures` and skip that grouping — call the bridge
+    # directly so `retrace qa auto` sees them too. Bridge errors must
+    # never break a test run.
+    try:
+        from retrace.qa_incident_bridge import sync_qa_incident_from_failure
+
+        sync_qa_incident_from_failure(store=store, failure_id=persisted_failure_id)
+    except Exception:
+        pass
+
     return APIFailurePersistenceResult(
         failure_id=persisted_failure_id,
         repair_task_id=repair_task_id,

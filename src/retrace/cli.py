@@ -7,7 +7,6 @@ import sys
 import click
 
 from retrace.commands.api import api_group
-from retrace.commands.api_test import api_test_group
 from retrace.commands.demo import demo_group
 from retrace.commands.digest import digest_command
 from retrace.commands.doctor import doctor_command
@@ -17,6 +16,7 @@ from retrace.commands.init import init_command
 from retrace.commands.mcp import mcp_group
 from retrace.commands.quickstart import quickstart_command
 from retrace.commands.repair import repair_group
+from retrace.commands.review import review_command
 from retrace.commands.suggest_fixes import suggest_fixes_command
 from retrace.commands.tester import tester_group
 from retrace.commands.ui import ui_command
@@ -85,8 +85,8 @@ main.add_command(ui_command)
 main.add_command(tester_group)
 main.add_command(mcp_group)
 main.add_command(api_group)
-main.add_command(api_test_group)
 main.add_command(digest_command)
 main.add_command(demo_group)
 main.add_command(repair_group)
 main.add_command(qa_group)
+main.add_command(review_command)
