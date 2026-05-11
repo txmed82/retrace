@@ -237,28 +237,24 @@ def _routes_from_source(repo_path: Path) -> list[RouteDefinition]:
                         )
                     )
             # Django: urlpatterns = [path("api/x", ...), re_path(r"^api/x$", ...)]
-            # Match only inside files plausibly named like urls.py.
-            if rel.endswith("urls.py") or rel.endswith("/urls.py"):
+            # Match only inside files literally named urls.py — using
+            # endswith() would also accept `admin_urls.py` etc.
+            if path.name == "urls.py":
                 for match in _PY_DJANGO_PATH_RE.finditer(text):
-                    raw_route = match.group(1)
-                    # Strip django's leading `^` and trailing `$` for re_path.
-                    raw_route = raw_route.lstrip("^").rstrip("$")
-                    if not raw_route.startswith("/"):
-                        raw_route = "/" + raw_route
+                    normalized = _normalize_django_route(match.group(1))
                     routes.append(
                         RouteDefinition(
                             method="",  # django paths don't carry verb info
-                            route=_normalize_route(raw_route),
+                            route=normalized,
                             file_path=rel,
                             source="django_urlconf",
                         )
                     )
 
         elif suffix == ".rb":
-            # Rails routes.rb: `get '/api/x'`, etc. Restrict to plausible
-            # files so a stray `get` in a model doesn't masquerade as a
-            # route.
-            if rel.endswith("routes.rb") or rel.endswith("/routes.rb"):
+            # Rails routes.rb — basename check (not endswith) so a file
+            # named `myroutes.rb` doesn't masquerade as a route file.
+            if path.name == "routes.rb":
                 for match in _RB_RAILS_VERB_RE.finditer(text):
                     verb = match.group(1).upper()
                     if verb == "MATCH":
@@ -292,6 +288,33 @@ def _next_api_route_from_path(rel: str) -> str:
 def _normalize_route(route: str) -> str:
     clean = route.strip().split("?", 1)[0].rstrip("/")
     return clean or "/"
+
+
+def _normalize_django_route(raw_route: str) -> str:
+    """Project Django path/re_path syntax onto the route shape `route_matches`
+    understands (`:id` placeholders).
+
+    Examples:
+      * `path("api/users/<int:pk>", ...)`         -> `/api/users/:pk`
+      * `path("api/users/<slug:name>", ...)`      -> `/api/users/:name`
+      * `re_path(r"^api/legacy/(?P<id>[0-9]+)$")` -> `/api/legacy/:id`
+
+    Without this, the manifest entry would still contain Django's raw
+    `<int:pk>` form, and `route_matches("/api/users/42")` would never
+    match — breaking route-to-file ownership for any dynamic Django
+    endpoint.
+    """
+    cleaned = raw_route.lstrip("^").rstrip("$")
+    # Order matters: `(?P<id>[0-9]+)` first so the surrounding parens
+    # and the `?` are consumed in one shot. Doing the bare `<id>`
+    # substitution first would leave a stray `?` that
+    # `_normalize_route`'s query-string strip then eats.
+    cleaned = re.sub(r"\(\?P<([^>]+)>[^)]*\)", r":\1", cleaned)
+    # `<int:pk>` / `<pk>` / `<slug:name>` -> `:pk` / `:name`
+    cleaned = re.sub(r"<(?:[^:>]+:)?([^>]+)>", r":\1", cleaned)
+    if not cleaned.startswith("/"):
+        cleaned = "/" + cleaned
+    return _normalize_route(cleaned)
 
 
 @functools.lru_cache(maxsize=256)

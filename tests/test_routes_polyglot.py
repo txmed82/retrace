@@ -123,16 +123,38 @@ from . import views
 urlpatterns = [
     path("api/users", views.user_list),
     path("api/users/<int:pk>", views.user_detail),
+    path("api/items/<slug:name>", views.item),
     re_path(r"^api/legacy/(?P<id>[0-9]+)$", views.legacy),
 ]
 """.lstrip(),
     )
     manifest = load_route_manifest(tmp_path)
     routes = {r.route for r in manifest}
+    # Django dynamic segments must normalize to the `:name` shape the
+    # rest of the matcher understands — otherwise `route_matches`
+    # never matches a real request like `/api/users/42`.
     assert "/api/users" in routes
-    # Django path params survive normalisation as-is.
-    assert any(r.startswith("/api/users/") for r in routes)
-    assert any(r.startswith("/api/legacy/") for r in routes)
+    assert "/api/users/:pk" in routes
+    assert "/api/items/:name" in routes
+    assert "/api/legacy/:id" in routes
+
+    # Verify a real request resolves to the dynamic entry.
+    rd_users = next(r for r in manifest if r.route == "/api/users/:pk")
+    assert route_matches(rd_users, "/api/users/42")
+    rd_legacy = next(r for r in manifest if r.route == "/api/legacy/:id")
+    assert route_matches(rd_legacy, "/api/legacy/123")
+
+
+def test_django_admin_urls_py_is_not_treated_as_url_conf(tmp_path: Path) -> None:
+    """`admin_urls.py` (or any other suffix-only match) must NOT be
+    treated as a Django urls.py — the basename check should keep it
+    out."""
+    _write(
+        tmp_path / "myapp" / "admin_urls.py",
+        'urlpatterns = [path("api/admin-only", lambda r: None)]\n',
+    )
+    manifest = load_route_manifest(tmp_path)
+    assert all(r.route != "/api/admin-only" for r in manifest)
 
 
 def test_django_path_outside_urls_py_is_ignored(tmp_path: Path) -> None:
@@ -181,6 +203,17 @@ def test_rails_get_in_a_model_is_ignored(tmp_path: Path) -> None:
     )
     manifest = load_route_manifest(tmp_path)
     assert all(r.route != "/api/sneaky" for r in manifest)
+
+
+def test_rails_my_routes_rb_is_not_treated_as_routes_file(tmp_path: Path) -> None:
+    """A file called `myroutes.rb` shouldn't pass the basename guard
+    just because it ends in `routes.rb`."""
+    _write(
+        tmp_path / "config" / "myroutes.rb",
+        "get '/api/imposter'\n",
+    )
+    manifest = load_route_manifest(tmp_path)
+    assert all(r.route != "/api/imposter" for r in manifest)
 
 
 # ---------------------------------------------------------------------------
