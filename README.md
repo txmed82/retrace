@@ -18,7 +18,8 @@ retrace qa auto --repo your-org/your-app
 ```
 
 New here? See [`docs/quickstart.md`](docs/quickstart.md) for the
-5-minute walkthrough.
+5-minute walkthrough. Want to know what's coming next, or claim a
+roadmap item to work on? See [`docs/roadmap.md`](docs/roadmap.md).
 
 Retrace is an open-source UI reliability loop: it pulls PostHog session
 recordings or ingests first-party browser SDK replays, detects likely

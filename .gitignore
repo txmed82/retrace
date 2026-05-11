@@ -15,3 +15,7 @@ src/retrace/reports/__pycache__/
 src/retrace/reports/*.pyc
 .DS_Store
 .codex/config.toml
+
+# OSS comparables cloned while following docs/roadmap.md
+# (the roadmap's "Study -> Steal -> Improve" loop pulls these in).
+external/
