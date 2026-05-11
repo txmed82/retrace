@@ -61,6 +61,14 @@ from retrace.storage import Storage
     default="markdown",
     show_default=True,
 )
+@click.option(
+    "--source",
+    "digest_source",
+    type=click.Choice(["qa_incidents", "replay_issues"], case_sensitive=False),
+    default="qa_incidents",
+    show_default=True,
+    help="Which table to roll up. `qa_incidents` is the unified view across replay / UI / API / monitor / review.",
+)
 def digest_command(
     config_path: Path,
     project_id: str,
@@ -70,8 +78,9 @@ def digest_command(
     write_report: bool,
     notify_sinks_flag: bool,
     output_format: str,
+    digest_source: str,
 ) -> None:
-    """Generate a markdown digest of replay-issue activity."""
+    """Generate a markdown digest of incident activity (unified across pillars)."""
     cfg = load_config(config_path)
     store = Storage(cfg.run.data_dir / "retrace.db")
     store.init_schema()
@@ -82,6 +91,7 @@ def digest_command(
         environment_id=environment_id.strip() or workspace.environment_id,
         lookback_hours=lookback_hours,
         top_impact_limit=top_impact_limit,
+        source=digest_source.lower(),
     )
 
     report_path: Path | None = None
