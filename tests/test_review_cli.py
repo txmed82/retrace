@@ -264,6 +264,206 @@ def test_review_format_comment_body_includes_sections(tmp_path: Path):
     assert body.endswith("\n")
 
 
+def test_storage_add_and_list_llm_pr_reviews_by_path(tmp_path: Path):
+    """Persisted LLM reviews are findable via the path overlap query.
+
+    Regression target for the prior-review hint pipeline: if storage
+    can't find prior reviews touching the current diff's files, the
+    LLM never learns what Retrace already flagged.
+    """
+    cfg = _config_file(tmp_path)
+    runner = CliRunner()
+    # Trip init_schema via any CLI invocation.
+    runner.invoke(
+        review_command,
+        ["--config", str(cfg), "--diff", str(tmp_path / "missing.diff")],
+    )
+    store = Storage(tmp_path / "data" / "retrace.db")
+    store.init_schema()
+    store.add_llm_pr_review(
+        repo="org/app",
+        pr_number=41,
+        model="test-model",
+        summary="old summary",
+        risk_notes=["auth bypass risk on /api/login"],
+        suggestions=[],
+        paths=["server/routes/auth.ts", "shared/util.ts"],
+    )
+    # Different repo — must not match.
+    store.add_llm_pr_review(
+        repo="other/repo",
+        pr_number=1,
+        model="test-model",
+        summary="unrelated",
+        risk_notes=["should not appear"],
+        suggestions=[],
+        paths=["server/routes/auth.ts"],
+    )
+    # Path overlap → match.
+    rows = store.list_llm_pr_reviews_for_paths(
+        ["server/routes/auth.ts", "elsewhere.ts"],
+        repo="org/app",
+    )
+    assert len(rows) == 1
+    assert rows[0]["pr_number"] == 41
+    # No overlap → no match.
+    assert store.list_llm_pr_reviews_for_paths(["zzz.ts"], repo="org/app") == []
+    # Excluding the current PR avoids self-feedback.
+    assert (
+        store.list_llm_pr_reviews_for_paths(
+            ["server/routes/auth.ts"],
+            repo="org/app",
+            exclude_pr_number=41,
+        )
+        == []
+    )
+
+
+def test_review_passes_prior_review_hint_to_llm(tmp_path: Path, monkeypatch):
+    """End-to-end: prior persisted reviews show up in the LLM prompt."""
+    cfg = _config_file(tmp_path)
+    diff_file = tmp_path / "pr.diff"
+    diff_file.write_text(_SAMPLE_DIFF)
+
+    # Force LLM-on by giving config.yaml a non-empty base_url.
+    cfg.write_text(
+        cfg.read_text().replace('base_url: http://127.0.0.1:8080/v1', 'base_url: http://127.0.0.1:8080/v1')
+    )
+
+    # Seed storage with a prior review touching the same path.
+    runner = CliRunner()
+    # First, run an unrelated invocation to materialise the DB.
+    runner.invoke(
+        review_command,
+        [
+            "--config", str(cfg),
+            "--diff", str(diff_file),
+            "--pr", "https://github.com/org/app/pull/100",
+            "--no-file-incidents",
+            "--no-llm",
+            "--json",
+        ],
+    )
+    store = Storage(tmp_path / "data" / "retrace.db")
+    store.init_schema()
+    store.add_llm_pr_review(
+        repo="org/app",
+        pr_number=42,
+        model="prior-model",
+        summary="earlier",
+        risk_notes=["existing auth bypass concern"],
+        suggestions=[],
+        paths=["server/routes/auth.ts"],
+    )
+
+    # Stub llm_review so we can inspect what got passed.
+    captured: dict[str, str] = {}
+
+    from retrace.commands import review as review_mod
+    from retrace.llm_pr_review import LLMReviewResult
+
+    def _fake_llm_review(**kwargs):
+        captured["prior_review_summary"] = kwargs.get("prior_review_summary", "")
+        return LLMReviewResult(summary="new-review")
+
+    monkeypatch.setattr(review_mod, "llm_review", _fake_llm_review)
+
+    result = runner.invoke(
+        review_mod.review_command,
+        [
+            "--config", str(cfg),
+            "--diff", str(diff_file),
+            "--pr", "https://github.com/org/app/pull/43",  # different PR
+            "--no-file-incidents",
+            "--llm",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # The prior review's risk note must show up in the hint.
+    assert "existing auth bypass concern" in captured["prior_review_summary"]
+    assert "PR #42" in captured["prior_review_summary"]
+
+
+def test_review_persists_llm_result_after_run(tmp_path: Path, monkeypatch):
+    """After a non-empty review on a real PR, the result is persisted."""
+    cfg = _config_file(tmp_path)
+    diff_file = tmp_path / "pr.diff"
+    diff_file.write_text(_SAMPLE_DIFF)
+
+    from retrace.commands import review as review_mod
+    from retrace.llm_pr_review import InlineSuggestion, LLMReviewResult
+
+    def _fake_llm_review(**kwargs):
+        return LLMReviewResult(
+            summary="a real review",
+            risk_notes=["risk: 404 leaks user existence"],
+            inline_suggestions=[
+                InlineSuggestion(path="server/routes/auth.ts", line=11, body="use 401")
+            ],
+            model="fake-model",
+        )
+
+    monkeypatch.setattr(review_mod, "llm_review", _fake_llm_review)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        review_mod.review_command,
+        [
+            "--config", str(cfg),
+            "--diff", str(diff_file),
+            "--pr", "https://github.com/org/app/pull/77",
+            "--no-file-incidents",
+            "--llm",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    store = Storage(tmp_path / "data" / "retrace.db")
+    rows = store.list_llm_pr_reviews_for_paths(
+        ["server/routes/auth.ts"],
+        repo="org/app",
+    )
+    assert len(rows) == 1
+    assert rows[0]["pr_number"] == 77
+    assert rows[0]["summary"] == "a real review"
+
+
+def test_review_llm_self_critique_flag_passes_through(tmp_path: Path, monkeypatch):
+    """`--llm-self-critique` reaches `llm_review(enable_self_critique=True)`."""
+    cfg = _config_file(tmp_path)
+    diff_file = tmp_path / "pr.diff"
+    diff_file.write_text(_SAMPLE_DIFF)
+
+    from retrace.commands import review as review_mod
+    from retrace.llm_pr_review import LLMReviewResult
+
+    captured: dict[str, bool] = {}
+
+    def _fake_llm_review(**kwargs):
+        captured["enable_self_critique"] = kwargs.get("enable_self_critique", False)
+        return LLMReviewResult(summary="ok")
+
+    monkeypatch.setattr(review_mod, "llm_review", _fake_llm_review)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        review_mod.review_command,
+        [
+            "--config", str(cfg),
+            "--diff", str(diff_file),
+            "--pr", "https://github.com/org/app/pull/1",
+            "--no-file-incidents",
+            "--llm",
+            "--llm-self-critique",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["enable_self_critique"] is True
+
+
 def test_review_format_comment_body_puts_llm_section_first(tmp_path: Path):
     """When an LLM review is present, it goes ABOVE the templated
     summary — the LLM is the meat for human readers."""

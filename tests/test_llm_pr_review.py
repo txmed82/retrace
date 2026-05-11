@@ -7,12 +7,16 @@ from unittest.mock import MagicMock
 import pytest
 
 from retrace.llm_pr_review import (
+    DEFAULT_MAX_INLINE_SUGGESTIONS,
     DEFAULT_TOTAL_TOKEN_CAP,
     InlineSuggestion,
     LLMReviewResult,
     _annotate_new_hunk_line_numbers,
+    _cap_suggestions,
     _chunk_files,
     _estimate_tokens,
+    _extract_added_lines,
+    _filter_suggestions_against_diff,
     _split_diff_by_file,
     clear_cache,
     llm_review,
@@ -240,24 +244,34 @@ def test_llm_review_caches_repeat_calls_for_same_diff_model():
 
 
 def test_llm_review_drops_malformed_inline_suggestions():
-    """Suggestions missing required fields are skipped, not crashed on."""
+    """Suggestions missing required fields are skipped, not crashed on.
+
+    Uses a real `(path, line)` from `_TWO_FILE_DIFF` for the keeper —
+    `server/routes/auth.ts:11` is the first `+` line of the auth hunk
+    (`@@ -10,3 +10,6 @@` + 1 context line). The line-validity filter
+    (item 1 of the P0.1 follow-up) is also exercised here: malformed
+    rows are dropped at parse time, and the keeper must survive the
+    diff-grounded filter too.
+    """
+    real_path = "server/routes/auth.ts"
     client = _stub_client(
         response_payloads=[
             {
                 "summary": "x",
                 "inline_suggestions": [
-                    {"path": "ok.py", "line": 5, "body": "fine"},
-                    {"path": "", "line": 5, "body": "no path"},   # dropped
-                    {"path": "ok.py", "line": 0, "body": "bad line"},  # dropped
-                    {"path": "ok.py", "line": 5, "body": ""},  # dropped
-                    {"path": "ok.py", "line": "not-int", "body": "x"},  # dropped
+                    {"path": real_path, "line": 11, "body": "fine"},
+                    {"path": "", "line": 11, "body": "no path"},   # dropped
+                    {"path": real_path, "line": 0, "body": "bad line"},  # dropped
+                    {"path": real_path, "line": 11, "body": ""},  # dropped
+                    {"path": real_path, "line": "not-int", "body": "x"},  # dropped
                 ],
             }
         ]
     )
     result = llm_review(diff_text=_TWO_FILE_DIFF, llm_client=client)
     assert len(result.inline_suggestions) == 1
-    assert result.inline_suggestions[0].path == "ok.py"
+    assert result.inline_suggestions[0].path == real_path
+    assert result.inline_suggestions[0].line == 11
 
 
 def test_llm_review_handles_chat_json_failure_per_chunk():
@@ -310,3 +324,258 @@ def test_inline_suggestion_to_dict_round_trip():
         "body": "b",
         "suggested_code": "c",
     }
+
+
+# ---------------------------------------------------------------------------
+# P0.1 follow-up: line-validity filter, suggestion cap, self-critique, prior-review hint
+# ---------------------------------------------------------------------------
+
+
+def test_extract_added_lines_picks_up_added_and_context_lines():
+    """Both `+` and ` ` count as new-side lines (GitHub lets you
+    comment on context lines too); `-` lines do not."""
+    valid = _extract_added_lines(_TWO_FILE_DIFF)
+    # `server/routes/auth.ts` hunk: `@@ -10,3 +10,6 @@` then 1 ctx, 3 added, 1 ctx, 1 ctx.
+    # Context line at 10; added at 11, 12, 13; trailing context at 14, 15.
+    assert {10, 11, 12, 13, 14, 15} <= valid["server/routes/auth.ts"]
+    # Removed lines should NOT appear (there are none in this fixture,
+    # but the upper bound is what matters).
+    assert 99 not in valid["server/routes/auth.ts"]
+    # Login.tsx hunk: `@@ -5,2 +5,5 @@` — context 5, added 6/7/8, context 9.
+    assert {5, 6, 7, 8, 9} <= valid["client/src/pages/Login.tsx"]
+
+
+def test_filter_suggestions_drops_invented_lines_and_paths():
+    valid = _extract_added_lines(_TWO_FILE_DIFF)
+    suggestions = [
+        InlineSuggestion(path="server/routes/auth.ts", line=11, body="real"),
+        InlineSuggestion(path="server/routes/auth.ts", line=999, body="fake line"),
+        InlineSuggestion(path="totally/made/up.py", line=1, body="fake path"),
+        # Path prefix variants the model sometimes glues on — we accept.
+        InlineSuggestion(path="b/server/routes/auth.ts", line=12, body="b-prefix"),
+    ]
+    kept = _filter_suggestions_against_diff(suggestions, valid)
+    assert {s.body for s in kept} == {"real", "b-prefix"}
+    # b/-prefix variant is re-rooted to the canonical path.
+    paths = {s.path for s in kept}
+    assert "server/routes/auth.ts" in paths
+    assert "b/server/routes/auth.ts" not in paths
+
+
+def test_filter_passes_through_when_diff_has_no_structure():
+    """A diff we couldn't parse should not punish the model — we accept
+    whatever it returned rather than dropping everything."""
+    kept = _filter_suggestions_against_diff(
+        [InlineSuggestion(path="x", line=1, body="ok")],
+        valid_lines={},
+    )
+    assert len(kept) == 1
+
+
+def test_cap_suggestions_prefers_actionable_with_code():
+    s1 = InlineSuggestion(path="a", line=1, body="prose only")
+    s2 = InlineSuggestion(path="a", line=2, body="with code", suggested_code="return None")
+    s3 = InlineSuggestion(path="a", line=3, body="prose only")
+    s4 = InlineSuggestion(path="a", line=4, body="more code", suggested_code="x = 1")
+    capped = _cap_suggestions([s1, s2, s3, s4], limit=2)
+    # Both winners must have suggested_code; ties broken by original order.
+    assert [s.line for s in capped] == [2, 4]
+
+
+def test_cap_suggestions_keeps_order_when_under_limit():
+    s1 = InlineSuggestion(path="a", line=1, body="x")
+    s2 = InlineSuggestion(path="a", line=2, body="y")
+    assert _cap_suggestions([s1, s2], limit=5) == [s1, s2]
+
+
+def test_llm_review_drops_hallucinated_line_numbers_end_to_end():
+    """LLM returns 4 suggestions, only 1 lands on a real new-side line."""
+    real_path = "server/routes/auth.ts"
+    client = _stub_client(
+        response_payloads=[
+            {
+                "summary": "x",
+                "inline_suggestions": [
+                    {"path": real_path, "line": 11, "body": "real"},
+                    {"path": real_path, "line": 9999, "body": "invented line"},
+                    {"path": "made-up.py", "line": 1, "body": "invented path"},
+                    {"path": real_path, "line": 12, "body": "also real"},
+                ],
+            }
+        ]
+    )
+    result = llm_review(diff_text=_TWO_FILE_DIFF, llm_client=client)
+    bodies = {s.body for s in result.inline_suggestions}
+    assert bodies == {"real", "also real"}
+
+
+def test_llm_review_caps_inline_suggestions_at_default():
+    """Default cap kicks in on overflow with no self-critique."""
+    real = "server/routes/auth.ts"
+    # 5 valid suggestions, default cap 3
+    client = _stub_client(
+        response_payloads=[
+            {
+                "summary": "x",
+                "inline_suggestions": [
+                    {"path": real, "line": 11, "body": "a"},
+                    {"path": real, "line": 12, "body": "b", "suggested_code": "fix()"},
+                    {"path": real, "line": 13, "body": "c"},
+                    {"path": real, "line": 14, "body": "d", "suggested_code": "other()"},
+                    {"path": real, "line": 15, "body": "e"},
+                ],
+            }
+        ]
+    )
+    result = llm_review(diff_text=_TWO_FILE_DIFF, llm_client=client)
+    assert len(result.inline_suggestions) == DEFAULT_MAX_INLINE_SUGGESTIONS
+    # The two with suggested_code must be in the kept set.
+    kept_bodies = {s.body for s in result.inline_suggestions}
+    assert "b" in kept_bodies
+    assert "d" in kept_bodies
+
+
+def test_llm_review_caps_risk_notes():
+    risks = [f"risk #{i}" for i in range(10)]
+    client = _stub_client(
+        response_payloads=[
+            {"summary": "x", "inline_suggestions": [], "risk_notes": risks}
+        ]
+    )
+    result = llm_review(diff_text=_TWO_FILE_DIFF, llm_client=client, max_risk_notes=4)
+    assert len(result.risk_notes) == 4
+    # Order preserved.
+    assert result.risk_notes == risks[:4]
+
+
+def test_llm_review_self_critique_off_by_default_no_extra_call():
+    """With critique off, only one LLM call regardless of overflow."""
+    real = "server/routes/auth.ts"
+    payload = {
+        "summary": "x",
+        "inline_suggestions": [
+            {"path": real, "line": 11 + i, "body": f"s{i}"} for i in range(4)
+        ],
+    }
+    client = _stub_client(response_payloads=[payload])
+    llm_review(diff_text=_TWO_FILE_DIFF, llm_client=client)
+    assert client.chat_json.call_count == 1
+
+
+def test_llm_review_self_critique_runs_on_overflow_and_uses_indices():
+    """With critique on AND overflow, an extra call ranks suggestions."""
+    real = "server/routes/auth.ts"
+    review_payload = {
+        "summary": "x",
+        "inline_suggestions": [
+            {"path": real, "line": 11, "body": "noisy"},
+            {"path": real, "line": 12, "body": "important", "suggested_code": "fix()"},
+            {"path": real, "line": 13, "body": "also noisy"},
+            {"path": real, "line": 14, "body": "second important"},
+        ],
+        "risk_notes": ["minor", "MAJOR", "tiny"],
+    }
+    # Critic keeps the 2nd suggestion (index 1) and the 'MAJOR' risk (index 1)
+    critique_payload = {
+        "kept_suggestion_indices": [1, 3],
+        "kept_risk_indices": [1],
+    }
+    client = _stub_client(response_payloads=[review_payload, critique_payload])
+    result = llm_review(
+        diff_text=_TWO_FILE_DIFF,
+        llm_client=client,
+        enable_self_critique=True,
+        max_inline_suggestions=2,
+        max_risk_notes=1,
+    )
+    assert client.chat_json.call_count == 2
+    bodies = [s.body for s in result.inline_suggestions]
+    assert bodies == ["important", "second important"]
+    assert result.risk_notes == ["MAJOR"]
+
+
+def test_llm_review_self_critique_skipped_when_no_overflow():
+    """No overflow → no critique call even with flag on."""
+    real = "server/routes/auth.ts"
+    payload = {
+        "summary": "x",
+        "inline_suggestions": [
+            {"path": real, "line": 11, "body": "one"},
+        ],
+        "risk_notes": ["just one"],
+    }
+    client = _stub_client(response_payloads=[payload])
+    result = llm_review(
+        diff_text=_TWO_FILE_DIFF,
+        llm_client=client,
+        enable_self_critique=True,
+        max_inline_suggestions=3,
+        max_risk_notes=3,
+    )
+    assert client.chat_json.call_count == 1
+    assert len(result.inline_suggestions) == 1
+
+
+def test_llm_review_self_critique_failure_falls_back_to_uncritiqued():
+    """If the critique LLM call raises, we keep the deterministic cap result."""
+    from unittest.mock import MagicMock
+
+    real = "server/routes/auth.ts"
+    review_payload = {
+        "summary": "x",
+        "inline_suggestions": [
+            {"path": real, "line": 11, "body": "a"},
+            {"path": real, "line": 12, "body": "b"},
+            {"path": real, "line": 13, "body": "c"},
+            {"path": real, "line": 14, "body": "d"},
+        ],
+    }
+    client = MagicMock()
+    client.cfg.model = "test-model"
+    client.chat_json.side_effect = [review_payload, Exception("critic 500")]
+    client.__enter__.return_value = client
+    client.__exit__.return_value = None
+    result = llm_review(
+        diff_text=_TWO_FILE_DIFF,
+        llm_client=client,
+        enable_self_critique=True,
+        max_inline_suggestions=2,
+    )
+    # Critic raised → fallback uses _cap_suggestions deterministically.
+    assert len(result.inline_suggestions) == 2
+
+
+def test_llm_review_prior_review_summary_appears_in_prompt():
+    """`prior_review_summary` is folded into the analysis hint passed to the model."""
+    client = _stub_client(
+        response_payloads=[{"summary": "ok", "walkthrough": []}]
+    )
+    llm_review(
+        diff_text=_TWO_FILE_DIFF,
+        llm_client=client,
+        prior_review_summary="- auth bypass risk flagged on /api/login  (PR #42)",
+    )
+    sent_user = client._calls[0][1]
+    assert "Prior Retrace review notes on these files" in sent_user
+    assert "auth bypass risk" in sent_user
+    assert "PR #42" in sent_user
+
+
+def test_llm_review_caches_separately_on_critique_and_cap_settings():
+    """Two reviews with the same diff but different cap settings must
+    NOT share a cache entry — otherwise turning the cap up would still
+    return yesterday's truncated result."""
+    real = "server/routes/auth.ts"
+    payload = {
+        "summary": "x",
+        "inline_suggestions": [
+            {"path": real, "line": 11 + i, "body": f"s{i}"} for i in range(5)
+        ],
+    }
+    # Two payloads queued: each call should consume one (no cache hit).
+    client = _stub_client(response_payloads=[dict(payload), dict(payload)])
+    r1 = llm_review(diff_text=_TWO_FILE_DIFF, llm_client=client, max_inline_suggestions=2)
+    r2 = llm_review(diff_text=_TWO_FILE_DIFF, llm_client=client, max_inline_suggestions=4)
+    assert client.chat_json.call_count == 2
+    assert len(r1.inline_suggestions) == 2
+    assert len(r2.inline_suggestions) == 4

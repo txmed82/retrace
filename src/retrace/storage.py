@@ -717,6 +717,27 @@ ON qa_incidents(project_id, environment_id, status, updated_at DESC);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_qa_incidents_public
 ON qa_incidents(public_id);
+
+-- LLM-driven PR reviews (`llm_pr_review.py` output, persisted per PR
+-- so the *next* review on overlapping files can fold prior risk notes
+-- into the prompt instead of re-flagging the same issue every time.
+CREATE TABLE IF NOT EXISTS llm_pr_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL DEFAULT '',
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    model TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    risk_notes_json TEXT NOT NULL DEFAULT '[]',
+    suggestions_json TEXT NOT NULL DEFAULT '[]',
+    paths_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_pr_reviews_recent
+ON llm_pr_reviews(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_llm_pr_reviews_pr
+ON llm_pr_reviews(repo, pr_number);
 """
 
 
@@ -6877,6 +6898,99 @@ class Storage:
         params.append(max(0, int(offset)))
         with self._conn() as conn:
             return conn.execute(sql, params).fetchall()
+
+    # ---- LLM PR reviews -------------------------------------------------
+
+    def add_llm_pr_review(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        model: str,
+        summary: str,
+        risk_notes: list[str],
+        suggestions: list[dict],
+        paths: list[str],
+    ) -> int:
+        """Persist one LLM review run so future reviews can reference it.
+
+        Returns the row id. The `(repo, pr_number)` pair is NOT unique —
+        if you call `retrace review --post-comment` twice on the same
+        PR, you get two rows, and `list_llm_pr_reviews_for_paths`
+        returns the most recent first.
+        """
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO llm_pr_reviews
+                    (repo, pr_number, model, summary, risk_notes_json,
+                     suggestions_json, paths_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    repo or "",
+                    int(pr_number or 0),
+                    model or "",
+                    summary or "",
+                    json.dumps(list(risk_notes or [])),
+                    json.dumps(list(suggestions or [])),
+                    json.dumps(list(paths or [])),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def list_llm_pr_reviews_for_paths(
+        self,
+        paths: list[str],
+        *,
+        repo: str = "",
+        exclude_pr_number: int = 0,
+        limit: int = 5,
+    ) -> list[sqlite3.Row]:
+        """Find recent LLM reviews touching any path in `paths`.
+
+        SQLite doesn't have a portable JSON-array-contains operator, so
+        we scan the most-recent N rows (cheap — capped by `limit * 6`)
+        and filter in Python. Good enough for the OSS scale we target.
+
+        Pass `exclude_pr_number` to filter out the PR we're currently
+        reviewing (otherwise the just-persisted review echoes back into
+        its own next-run prompt).
+        """
+        if not paths:
+            return []
+        wanted = {p for p in paths if p}
+        if not wanted:
+            return []
+        # Pull a window large enough to find `limit` matches in
+        # reasonable codebases; cap to keep this O(1).
+        scan_window = max(limit * 6, 30)
+        sql = "SELECT * FROM llm_pr_reviews"
+        clauses: list[str] = []
+        params: list[object] = []
+        if repo:
+            clauses.append("repo = ?")
+            params.append(repo)
+        if exclude_pr_number:
+            clauses.append("pr_number != ?")
+            params.append(int(exclude_pr_number))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(scan_window))
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        out: list[sqlite3.Row] = []
+        for r in rows:
+            try:
+                row_paths = set(json.loads(r["paths_json"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if row_paths & wanted:
+                out.append(r)
+            if len(out) >= limit:
+                break
+        return out
 
     def next_open_qa_incident(
         self,
