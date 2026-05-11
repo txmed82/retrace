@@ -91,6 +91,40 @@ def test_invalid_spec_id_is_rejected(tmp_path: Path) -> None:
         baseline_dir_for_spec(tmp_path, "")
 
 
+def test_subfolder_screenshots_do_not_collide(tmp_path: Path) -> None:
+    """Two screenshots named `home.png` in different subfolders of the
+    run dir must produce two distinct baselines — not have one clobber
+    the other on basename."""
+    data_dir = tmp_path / "data"
+    run = tmp_path / "runs" / "r1"
+    _stage_run(run / "scene-a", {"home.png": _PNG_RED})
+    _stage_run(run / "scene-b", {"home.png": _PNG_BLUE})
+
+    accept = accept_baseline(data_dir=data_dir, spec_id="spec-multi", run_dir=run)
+    # Both files survive — relative paths preserved.
+    assert len(accept.accepted_files) == 2
+
+    baseline_dir = baseline_dir_for_spec(data_dir, "spec-multi")
+    assert (baseline_dir / "scene-a" / "home.png").exists()
+    assert (baseline_dir / "scene-b" / "home.png").exists()
+    # And they have the correct (distinct) bytes.
+    assert (baseline_dir / "scene-a" / "home.png").read_bytes() == _PNG_RED
+    assert (baseline_dir / "scene-b" / "home.png").read_bytes() == _PNG_BLUE
+
+    # Compare against an unchanged run -> zero diffs across both scenes.
+    result = compare_run_to_baseline(data_dir=data_dir, spec_id="spec-multi", run_dir=run)
+    assert result.diffs == []
+    assert result.compared == 2
+
+    # Now mutate just one scene's screenshot and re-compare; only that
+    # scene's diff should be emitted.
+    (run / "scene-a" / "home.png").write_bytes(_PNG_BLUE)
+    result = compare_run_to_baseline(data_dir=data_dir, spec_id="spec-multi", run_dir=run)
+    assert len(result.diffs) == 1
+    assert "scene-a" in result.diffs[0]
+    assert "scene-b" not in result.diffs[0]
+
+
 def test_list_baselines_returns_per_spec_counts(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     run = tmp_path / "runs" / "r1"

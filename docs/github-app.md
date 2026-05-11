@@ -57,7 +57,7 @@ Restart `retrace api serve` so it picks the secret up.
 
 On any PR in an installed repo, leave a comment:
 
-```
+```text
 @retrace review
 ```
 

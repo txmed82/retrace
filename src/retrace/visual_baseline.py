@@ -92,14 +92,17 @@ def accept_baseline(
 ) -> BaselineAcceptResult:
     """Copy every screenshot from `run_dir` into the spec's baseline.
 
-    Overwrites any prior baseline for the same filename — that's the
-    point: "accept this run as the new ground truth".
+    Preserves the screenshot's relative path under `run_dir` so two
+    screenshots with the same basename in different subdirectories
+    don't clobber each other in the baseline.
     """
     baseline_dir = baseline_dir_for_spec(data_dir, spec_id)
     baseline_dir.mkdir(parents=True, exist_ok=True)
     accepted: list[str] = []
     for src in _iter_screenshots(run_dir):
-        dest = baseline_dir / src.name
+        rel = src.relative_to(run_dir)
+        dest = baseline_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
         accepted.append(dest.relative_to(baseline_dir.parent).as_posix())
     return BaselineAcceptResult(
@@ -117,10 +120,11 @@ def compare_run_to_baseline(
 ) -> BaselineCompareResult:
     """Compare each screenshot in `run_dir` to its baseline counterpart.
 
-    On a mismatch we copy the *current* screenshot to `<name>-diff.png`
-    inside `run_dir`. The auto-repro classifier already treats any
-    `*-diff*.png` as a confirmed-failure signal, so dropping the file
-    is enough to make `qa auto` flag the spec as confirmed-broken.
+    Uses the screenshot's relative path under `run_dir` as the key so
+    name collisions across subdirectories can't fake a match. On a
+    mismatch we copy the *current* screenshot to `<name>-diff.png`
+    next to it; the auto-repro classifier already treats any
+    `*-diff*.png` as a confirmed-failure signal.
     """
     baseline_dir = baseline_dir_for_spec(data_dir, spec_id)
     new: list[str] = []
@@ -129,7 +133,8 @@ def compare_run_to_baseline(
     compared = 0
     for current in _iter_screenshots(run_dir):
         compared += 1
-        ref = baseline_dir / current.name
+        rel = current.relative_to(run_dir)
+        ref = baseline_dir / rel
         if not ref.exists():
             new.append(str(current))
             continue
@@ -163,7 +168,10 @@ def list_baselines(data_dir: Path) -> list[dict[str, object]]:
             {
                 "spec_id": spec_dir.name,
                 "image_count": len(screenshots),
-                "images": [s.name for s in screenshots],
+                # Use the relative path so subdirectory layout is
+                # visible — two `home.png` files in different scenes
+                # show up as distinct entries.
+                "images": [s.relative_to(spec_dir).as_posix() for s in screenshots],
                 "baseline_dir": str(spec_dir),
             }
         )
