@@ -113,6 +113,32 @@ def test_init_invalid_dsn_disables_silently():
     assert retrace_sdk.get_client() is None
 
 
+def test_init_with_empty_dsn_closes_previous_client():
+    """Regression for CodeRabbit Major on PR #128: re-`init(dsn="")`
+    must shut the existing transport down rather than leak its
+    worker thread."""
+    # Spin up a real client, then disable.
+    first = retrace_sdk.init(dsn="http://rtpk_first@127.0.0.1:0/proj_a")
+    assert first is not None
+    assert retrace_sdk.get_client() is first
+    first_transport = first.transport
+
+    retrace_sdk.init(dsn="")
+    assert retrace_sdk.get_client() is None
+    # The previous transport thread must have been signalled to stop.
+    # `_stop` is the internal Event we use in `shutdown()`.
+    assert first_transport._stop.is_set()
+
+
+def test_init_with_invalid_dsn_closes_previous_client():
+    first = retrace_sdk.init(dsn="http://rtpk_first@127.0.0.1:0/proj_a")
+    assert first is not None
+    first_transport = first.transport
+    retrace_sdk.init(dsn="not-a-dsn")
+    assert retrace_sdk.get_client() is None
+    assert first_transport._stop.is_set()
+
+
 def test_max_breadcrumbs_setting_resizes_scope():
     """Passing `max_breadcrumbs` through `init()` enforces the cap on
     the current scope (regression for: setting the option on Client

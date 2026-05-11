@@ -50,6 +50,42 @@ def test_flask_captures_unhandled_exception(client_factory, fake_transport):
     assert event["exception"]["values"][0]["value"] == "kapow"
 
 
+def test_flask_per_request_scope_isolation(client_factory, fake_transport):
+    """Regression for CodeRabbit Major on PR #128: tags / user / extra
+    set inside a request must not leak into the next request handled
+    by the same worker context.
+    """
+    from flask import Flask
+    from retrace_sdk import set_user, set_tag
+    from retrace_sdk.scope import Scope
+
+    client = client_factory()
+    set_client(client)
+
+    app = Flask(__name__)
+    app.config["TESTING"] = True
+
+    @app.route("/leak")
+    def _leak():
+        set_user({"id": "from-request"})
+        set_tag("phase", "checkout")
+        return "ok"
+
+    @app.route("/probe")
+    def _probe():
+        snap = Scope.current().snapshot()
+        # If the scope leaked, the prior request's user/tag would show up here.
+        return {"user": snap["user"], "tags": snap["tags"]}
+
+    FlaskIntegration.attach(app)
+
+    with app.test_client() as c:
+        assert c.get("/leak").status_code == 200
+        # Second request must see a clean scope.
+        probe_body = c.get("/probe").get_json()
+        assert probe_body == {"user": {}, "tags": {}}, probe_body
+
+
 def test_flask_attach_is_idempotent(client_factory):
     from flask import Flask
 

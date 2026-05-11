@@ -107,6 +107,38 @@ def test_django_ok_path_is_transparent(client_factory, fake_transport):
     assert fake_transport.sent == []
 
 
+def test_django_dedupes_when_both_call_and_process_exception_fire(client_factory, fake_transport):
+    """Regression for CodeRabbit Major on PR #128: Django's middleware
+    pipeline can call both `__call__`'s try/except AND `process_exception`
+    on the same view exception. The capture must only happen once.
+
+    We simulate both paths against the same request to prove the dedupe
+    marker on `request` blocks the second call.
+    """
+    from django.test import RequestFactory
+    from retrace_sdk.integrations.django import RetraceMiddleware
+
+    client = client_factory()
+    set_client(client)
+
+    def _boom(_request):
+        raise RuntimeError("boom-once")
+
+    mw = RetraceMiddleware(_boom)
+    request = RequestFactory().get("/boom")
+
+    # First path: __call__ catches the exception.
+    with pytest.raises(RuntimeError):
+        mw(request)
+
+    # Django would now call process_exception on the same request — we
+    # simulate it. The marker must short-circuit it.
+    mw.process_exception(request, RuntimeError("boom-once"))
+
+    client.flush(timeout=1.0)
+    assert len(fake_transport.sent) == 1, "exception captured twice (dedupe broken)"
+
+
 def test_django_no_active_client_is_no_op():
     """With the SDK disabled, middleware is transparent."""
     set_client(None)

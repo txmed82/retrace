@@ -68,6 +68,29 @@ def test_info_logs_become_breadcrumbs_not_events(client_factory, fake_transport)
     assert any(b.message == "user clicked button" for b in crumbs)
 
 
+def test_event_level_below_breadcrumb_level_still_captures(client_factory, fake_transport):
+    """Regression for CodeRabbit Major on PR #128: with
+    `breadcrumb_level=ERROR, event_level=WARNING`, the handler must
+    accept WARNING records — earlier code set the handler level to
+    `breadcrumb_level`, which would have filtered WARNING out before
+    `emit()` could promote it."""
+    client = client_factory()
+    set_client(client)
+    _attach_integration(
+        client,
+        breadcrumb_level=logging.ERROR,
+        event_level=logging.WARNING,
+    )
+    log = logging.getLogger("retrace_sdk_test_floor")
+    log.setLevel(logging.DEBUG)
+    log.warning("warn-as-event")
+    client.flush(timeout=1.0)
+    assert len(fake_transport.sent) == 1
+    event = _decode(fake_transport.sent[0]["body"])
+    assert event["message"] == "warn-as-event"
+    assert event["level"] == "warning"
+
+
 def test_double_setup_replaces_handler(client_factory):
     """Calling `setup()` twice must not stack handlers."""
     client = client_factory()

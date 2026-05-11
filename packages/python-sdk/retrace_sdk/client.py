@@ -225,7 +225,9 @@ def init(
 
     if not dsn:
         with _client_lock:
+            prev = _active_client
             _active_client = None
+        _safe_close(prev)
         return None
 
     try:
@@ -245,7 +247,9 @@ def init(
     except DsnError as exc:
         log.warning("retrace_sdk.init: invalid DSN, disabling: %s", exc)
         with _client_lock:
+            prev = _active_client
             _active_client = None
+        _safe_close(prev)
         return None
 
     with _client_lock:
@@ -253,13 +257,23 @@ def init(
         _active_client = client
 
     if prev is not None and prev is not client:
-        try:
-            prev.close(timeout=1.0)
-        except Exception:  # pragma: no cover
-            pass
+        _safe_close(prev)
 
     atexit.register(_atexit_flush)
     return client
+
+
+def _safe_close(client: Optional[Client]) -> None:
+    """Close a previous client without letting its shutdown errors
+    escape into `init()`. Always called outside the singleton lock so
+    a slow transport flush can't block other threads from observing
+    the new state."""
+    if client is None:
+        return
+    try:
+        client.close(timeout=1.0)
+    except Exception:  # pragma: no cover - defensive
+        pass
 
 
 def _atexit_flush() -> None:

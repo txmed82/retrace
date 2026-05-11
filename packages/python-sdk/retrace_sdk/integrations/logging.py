@@ -81,7 +81,12 @@ class _RetraceLoggingHandler(logging.Handler):
         breadcrumb_level: int,
         event_level: int,
     ) -> None:
-        super().__init__(level=breadcrumb_level)
+        # Handler level must be the *floor* of breadcrumb_level and
+        # event_level — otherwise a config like
+        # `breadcrumb=ERROR, event=WARNING` would block WARNING records
+        # at the handler before `emit()` could promote them to events.
+        # (CodeRabbit Major catch on PR #128.)
+        super().__init__(level=min(int(breadcrumb_level), int(event_level)))
         self._client = client
         self._breadcrumb_level = int(breadcrumb_level)
         self._event_level = int(event_level)
