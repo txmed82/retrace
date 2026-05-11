@@ -258,7 +258,32 @@ retrace review --pr 42 --repo org/repo --file-incidents
 ```
 
 The same logic is wired to the GitHub-App webhook (`github_app.py`) so
-you can also drop Retrace on a PR with no CLI step.
+you can also drop Retrace on a PR with no CLI step. See
+[`docs/github-app.md`](docs/github-app.md) for the install walkthrough
+(create the App, set the webhook secret, install on a repo, trigger
+with `@retrace review`).
+
+## Visual regression baselines (`retrace tester baseline`)
+
+Capture a known-good screenshot for each tester step, then have
+subsequent runs compare against it. Mismatches produce `*-diff.png`
+artifacts that `retrace qa auto` already treats as a confirmed-bug
+signal.
+
+```bash
+# After a clean run, accept its screenshots as the baseline:
+retrace tester baseline accept <spec_id> --run-dir data/ui-tests/runs/<run>
+
+# On a later run, compare:
+retrace tester baseline compare <spec_id> --run-dir data/ui-tests/runs/<later-run>
+
+# List spec baselines on disk:
+retrace tester baseline list
+```
+
+The current implementation uses byte-exact comparison (sha256). A
+future PR can add a Pillow extra for perceptual / SSIM diffs without
+changing the CLI shape.
 
 ## Repair lifecycle (`retrace repair`)
 
