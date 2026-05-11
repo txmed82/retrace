@@ -5,9 +5,9 @@ become user-visible incidents. Until now they could only be inspected by
 talking to SQLite directly. This command exposes them through the same
 shape as `retrace qa` / `retrace api`.
 
-The CLI is deliberately small: list / show / set (upsert) / disable /
-delete. Rule fields mirror `Storage.upsert_app_error_alert_rule` so
-options map 1:1 to behaviour.
+The CLI is deliberately small: `list` / `show` / `set` (upsert; disable
+with `set --disabled`) / `delete`. Rule fields mirror
+`Storage.upsert_app_error_alert_rule` so options map 1:1 to behaviour.
 """
 
 from __future__ import annotations
