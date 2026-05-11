@@ -4,78 +4,161 @@
 
 # Retrace
 
-Your real users are your QA team. Retrace finds the bugs they hit.
+Your real users are your QA team. Retrace finds the bugs they hit,
+writes the tests, and opens the fix PR.
 
-Retrace is an open-source UI reliability loop for teams that want real user
-failure capture and automated UI regression testing in one self-hosted tool. It
-pulls PostHog session recordings or ingests first-party browser SDK replays,
-detects likely breakage, clusters repeated failures, generates replay-backed
-regression specs, matches issues to likely source files, and outputs actionable
-fix prompts for coding agents.
+Retrace gives you one **unified incident** across three surfaces — replays,
+UI tests, and API tests — and then runs the full loop end-to-end:
 
-## What Retrace Is Supposed To Be
+> **user bug → auto-generated test → AI fix PR**
 
-Retrace turns production UI failures into verified fixes:
+One command kicks it off:
+
+```bash
+retrace qa auto --repo your-org/your-app
+```
+
+Retrace is an open-source UI reliability loop: it pulls PostHog session
+recordings or ingests first-party browser SDK replays, detects likely
+breakage, clusters repeated failures, generates replay-backed regression
+specs, matches issues to likely source files, and outputs actionable fix
+prompts for coding agents.
+
+## What Retrace Does
 
 1. Capture live user browser sessions from PostHog or the `@retrace/browser`
    SDK.
-2. Detect UX failures such as console errors, failed network calls, rage clicks,
-   dead clicks, blank renders, error toasts, and abandonment after errors.
-3. Cluster repeated failures into replay-backed issues with severity, affected
-   users, session links, and evidence.
-4. Generate deterministic UI regression specs from real replay interactions so
-   failures become testable behavior, not anecdotes.
-5. Link each issue to a GitHub or local checkout, rank likely source files, and
-   produce Codex/Claude prompts that include replay evidence and candidate code.
-6. Re-run generated tests after fixes and track issues as `new`, `ongoing`,
+2. Detect UX failures such as console errors, failed network calls, rage
+   clicks, dead clicks, blank renders, error toasts, and abandonment after
+   errors.
+3. Cluster repeated failures into replay-backed issues with severity,
+   affected users, session links, and evidence.
+4. Surface every signal — replay finding, UI test failure, API test failure
+   — as a single `Incident` shape.
+5. Generate deterministic UI regression specs from real replay interactions
+   so failures become testable behavior, not anecdotes.
+6. Link each issue to a GitHub or local checkout, rank likely source files,
+   and produce Codex/Claude prompts that include replay evidence and
+   candidate code.
+7. Open a draft PR (`gh`) with the fix prompt embedded so a coding agent or
+   human can finish the loop.
+8. Re-run generated tests after fixes and track issues as `new`, `ongoing`,
    `regressed`, or `resolved`.
 
-The intended end state is a BYOK, self-hostable open-source product that closes
-the loop between live user UI errors, automated UX testing, automated UI
-regression testing, and coding-agent repair workflows. See
-[docs/open-source-product-plan.md](docs/open-source-product-plan.md) for the
-full proposal and quality bar.
+The intended end state is a BYOK, self-hostable open-source product that
+closes the loop between live user UI errors, automated UX testing,
+automated UI regression testing, and coding-agent repair workflows. See
+[docs/open-source-product-plan.md](docs/open-source-product-plan.md) for
+the full proposal and quality bar.
 
 ## What You Get
 
-- Session-level bug detection from rrweb data
-- Clustering so repeated user failures become one issue
-- LLM-written summaries and repro context
-- Local UI with rrweb replay, culprit files, and copyable prompts
-- GitHub repo matching via CLI-connected repo metadata
-- Local Browser Harness UI tester with saved reusable specs
-- Regression-state tracking for replay findings (`new`, `ongoing`, `regressed`, `resolved`)
+- **Unified incidents** across replay findings, UI test failures, and API
+  test failures — same shape, same CLI, same `gh`-backed fix PR.
+- **One-click reproduction.** Retrace converts an incident's recipe into a
+  Browser Harness UI test, runs it, and confirms whether the bug still
+  surfaces.
+- **Fix PRs, not prompts in a folder.** Retrace scores the connected repo,
+  writes a fix prompt, opens a branch, and creates a draft PR via `gh`.
+  Optionally invokes a local agent (`claude`, `codex`) to apply changes
+  before pushing.
+- **Zero-config install.** One CLI command for setup, one `<script>` tag
+  for replay capture.
+- Session-level bug detection from rrweb data with regression tracking.
+- LLM-written summaries and reproduction context.
+- Local UI with rrweb replay, culprit files, and copyable prompts.
+- Local Browser Harness UI tester with saved reusable specs.
 
 ## End-to-End Workflow
 
-1. Run `retrace init` or `retrace ui` and provide your own PostHog, LLM, and
-   optional GitHub keys.
-2. Ingest live user sessions through PostHog (`retrace run`) or first-party SDK
-   replay batches (`retrace api serve` plus `@retrace/browser`).
-3. Process replays into signals and replay-backed issues.
-4. Generate replay-derived regression specs with `retrace tester
-   from-replay-issue <bug_public_id>` or the local UI.
+1. Run `retrace quickstart` (zero-config) or `retrace init`/`retrace ui` if
+   you want to wire PostHog, LLM, and GitHub keys interactively.
+2. Ingest live user sessions through PostHog (`retrace run`) or first-party
+   SDK replay batches (`retrace api serve` plus `@retrace/browser`).
+3. Process replays into signals and replay-backed issues, surfaced as
+   unified `Incident` records.
+4. Generate replay-derived regression specs with
+   `retrace qa reproduce <INC-ID>` (or the legacy
+   `retrace tester from-replay-issue <bug_public_id>` / local UI).
 5. Connect a repository with `retrace github connect --repo <org/name>
    --local-path /path/to/repo`.
-6. Run `retrace suggest-fixes --latest --repo <org/name>` to produce likely
-   source files and coding-agent prompts.
-7. Apply fixes, run the generated UI specs plus the normal test suite, then
-   mark issues resolved and let verification catch regressions.
+6. Run `retrace qa fix <INC-ID> --repo <org/name>` (or
+   `retrace qa auto` for the full pipeline) to score the repo,
+   render a fix prompt, and open a draft PR via `gh`. `retrace suggest-fixes`
+   remains for the legacy report-based flow.
+7. Apply fixes (or let `--apply auto` invoke `claude`/`codex`), run the
+   generated specs plus the normal test suite, then mark issues resolved
+   and let verification catch regressions.
 
-## Quickstart
+## Quickstart (60 seconds)
 
 Requires Python 3.11+.
 
 ```bash
 uv venv
 uv pip install -e ".[dev]"
+retrace quickstart
 ```
 
-Set up and run:
+`retrace quickstart` writes a minimal `config.yaml`, initializes the local
+store, mints a browser-safe SDK key, and prints a ready-to-paste
+`<script>` tag for your app's `<head>`:
+
+```html
+<script type="module">
+  import { init } from "https://esm.sh/@retrace/browser@latest";
+  init({
+    apiKey: "rtpk_…",
+    ingestUrl: "http://127.0.0.1:8788/api/sdk/replay",
+  });
+</script>
+```
+
+Then:
 
 ```bash
-retrace init
-retrace run
+retrace api serve          # start the replay ingest API
+retrace ui                 # (in another terminal) open the local UI
+```
+
+Interact with your app. Retrace turns the resulting replays into incidents.
+
+## The killer demo
+
+Once you have an open incident, run:
+
+```bash
+retrace github connect --repo your-org/your-app --local-path /path/to/checkout
+retrace qa auto --repo your-org/your-app
+```
+
+That single command:
+
+1. Picks the highest-priority open incident.
+2. Auto-generates a UI test from the incident's reproduction recipe and
+   runs it via Browser Harness.
+3. If the bug reproduces, scores the repo, renders a fix prompt, opens a
+   branch, and creates a draft PR.
+4. Optionally invokes a local coding agent (`--apply auto`) to apply
+   changes inside the branch before pushing.
+
+Inspect incidents at any time:
+
+```bash
+retrace qa list
+retrace qa show INC-XXXXXX
+retrace qa reproduce INC-XXXXXX           # just the test step
+retrace qa fix INC-XXXXXX --repo …        # just the PR step
+```
+
+## Legacy PostHog flow
+
+If you already use PostHog session replay, the original pipeline still
+works alongside the first-party SDK:
+
+```bash
+retrace init        # interactive PostHog + LLM setup
+retrace run         # pull recent sessions and write a report
 ```
 
 Report output:
@@ -216,15 +299,38 @@ Artifacts:
 
 ## Core Commands
 
-- `retrace init` — interactive setup + validation
+- `retrace quickstart` — zero-config setup; mints an SDK key and prints a `<script>` tag
+- `retrace qa list|show|reproduce|fix|auto` — unified incidents across replay/UI/API
+- `retrace init` — interactive PostHog + LLM setup
 - `retrace doctor` — health checks for config/services
-- `retrace run` — one-shot ingestion, detection, clustering, report write
+- `retrace run` — one-shot PostHog ingestion, detection, clustering, report write
 - `retrace demo seed` — seed a local replay-backed issue and generated spec
 - `retrace ui` — local browser UI and onboarding/settings
 - `retrace tester ...` — describe tests or generate suite drafts with Browser Harness
 - `retrace mcp serve` — single MCP server with multiple tools (findings + tester)
 - `retrace github ...` — repo metadata management
-- `retrace suggest-fixes ...` — candidate matching + prompt generation
+- `retrace suggest-fixes ...` — candidate matching + prompt generation (legacy report-based flow)
+- `retrace api serve` — first-party replay ingest API
+- `retrace api create-sdk-key` — mint additional browser-safe SDK keys
+
+## The Incident model
+
+Every detector, test run, and error monitor signal converges on a single
+`Incident` shape (see [`src/retrace/qa_incidents.py`](src/retrace/qa_incidents.py)):
+
+```text
+Incident
+├─ identity         id, public_id (INC-XXXXXX), fingerprint
+├─ context          project, environment, source_kind, status, severity
+├─ symptom          title, summary, suspected_cause, expected/actual
+├─ reproduction     ordered, typed steps (navigate/click/input/assert/api_call)
+├─ evidence         replay session ids, stack frame, console, network, traces
+└─ pipeline state   repro_status + spec/run ids, fix_status + branch + PR url
+```
+
+That single shape is what powers the killer demo: the same auto-repro and
+auto-fix pipeline runs whether the incident started as a user replay, a
+failed UI test, or a failed API contract test.
 
 ## License
 
