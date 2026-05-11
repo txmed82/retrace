@@ -228,7 +228,18 @@ replay sessions, UI/API test failures, and PR review findings. Run
 reproduce + open a fix PR.
 
 Backend SDKs (Python `sentry-sdk`, Node `@sentry/node`, etc.) work the
-same way — `Sentry.init({ dsn })` is all that changes.
+same way — the init call differs per language but the DSN is the only
+thing that changes. For example:
+
+```python
+# Python
+sentry_sdk.init(dsn="http://rtpk_…@127.0.0.1:8788/<project_id>")
+```
+
+```javascript
+// Node / browser / React / Vue / etc.
+Sentry.init({ dsn: "http://rtpk_…@127.0.0.1:8788/<project_id>" });
+```
 
 ## Code review (`retrace review`)
 

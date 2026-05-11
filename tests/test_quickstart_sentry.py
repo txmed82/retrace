@@ -66,6 +66,28 @@ def test_build_sentry_dsn_shape() -> None:
     assert dsn == "http://rtpk_xyz@127.0.0.1:8788/proj_abc"
 
 
+def test_quickstart_https_scheme_produces_secure_dsn(tmp_path: Path) -> None:
+    """Hosted/TLS deployments need `https://` DSNs — browsers block mixed
+    content from an HTTPS page otherwise."""
+    cfg = tmp_path / "config.yaml"
+    runner = CliRunner()
+    result = runner.invoke(
+        quickstart_command,
+        [
+            "--config", str(cfg),
+            "--api-host", "retrace.example.com",
+            "--api-port", "443",
+            "--api-scheme", "https",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["sentry_dsn"].startswith("https://"), payload["sentry_dsn"]
+    assert payload["ingest_url"].startswith("https://"), payload["ingest_url"]
+    assert payload["api_base_url"] == "https://retrace.example.com:443"
+
+
 def test_quickstart_write_snippet_includes_both(tmp_path: Path) -> None:
     """`--write-snippet` should capture BOTH the replay tag and the
     Sentry one in a single file."""
