@@ -436,7 +436,6 @@ def test_llm_review_caps_inline_suggestions_at_default():
 
 
 def test_llm_review_caps_risk_notes():
-    real = "server/routes/auth.ts"
     risks = [f"risk #{i}" for i in range(10)]
     client = _stub_client(
         response_payloads=[
@@ -548,7 +547,6 @@ def test_llm_review_self_critique_failure_falls_back_to_uncritiqued():
 
 def test_llm_review_prior_review_summary_appears_in_prompt():
     """`prior_review_summary` is folded into the analysis hint passed to the model."""
-    real = "server/routes/auth.ts"
     client = _stub_client(
         response_payloads=[{"summary": "ok", "walkthrough": []}]
     )
