@@ -674,6 +674,49 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(kind, subject_id)
 );
+
+CREATE TABLE IF NOT EXISTS qa_incidents (
+    id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    suspected_cause TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'open',
+    primary_source_kind TEXT NOT NULL DEFAULT 'replay',
+    sources_json TEXT NOT NULL DEFAULT '[]',
+    reproduction_json TEXT NOT NULL DEFAULT '[]',
+    expected_outcome TEXT NOT NULL DEFAULT '',
+    actual_outcome TEXT NOT NULL DEFAULT '',
+    app_url TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    affected_count INTEGER NOT NULL DEFAULT 1,
+    affected_users INTEGER NOT NULL DEFAULT 1,
+    first_seen_ms INTEGER NOT NULL DEFAULT 0,
+    last_seen_ms INTEGER NOT NULL DEFAULT 0,
+    repro_status TEXT NOT NULL DEFAULT 'not_attempted',
+    repro_spec_id TEXT NOT NULL DEFAULT '',
+    repro_run_id TEXT NOT NULL DEFAULT '',
+    repro_summary TEXT NOT NULL DEFAULT '',
+    fix_status TEXT NOT NULL DEFAULT 'not_started',
+    fix_repo TEXT NOT NULL DEFAULT '',
+    fix_branch TEXT NOT NULL DEFAULT '',
+    fix_pr_url TEXT NOT NULL DEFAULT '',
+    fix_prompt_path TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_qa_incidents_status
+ON qa_incidents(project_id, environment_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_qa_incidents_public
+ON qa_incidents(public_id);
 """
 
 
@@ -6632,3 +6675,183 @@ class Storage:
             )
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # QA Incidents — the unified shape for replay/UI/API issues.
+    #
+    # Separate from the master `incidents` table (which tracks monitoring
+    # failure groupings + repair tasks). QA incidents own the
+    # auto-repro + auto-fix pipeline state.
+    # ------------------------------------------------------------------
+
+    def upsert_qa_incident(self, row: dict[str, Any]) -> tuple[str, bool]:
+        """Insert or update a QA incident keyed by (project, env, fingerprint).
+
+        Returns (incident_id, inserted) where `inserted` is True for new rows.
+        """
+        required = (
+            "id", "public_id", "project_id", "environment_id", "fingerprint",
+            "title", "summary", "suspected_cause", "severity", "confidence",
+            "status", "primary_source_kind", "sources_json", "reproduction_json",
+            "expected_outcome", "actual_outcome", "app_url", "evidence_json",
+            "affected_count", "affected_users", "first_seen_ms", "last_seen_ms",
+            "repro_status", "repro_spec_id", "repro_run_id", "repro_summary",
+            "fix_status", "fix_repo", "fix_branch", "fix_pr_url", "fix_prompt_path",
+            "created_at", "updated_at",
+        )
+        missing = [k for k in required if k not in row]
+        if missing:
+            raise ValueError(f"upsert_qa_incident missing keys: {missing}")
+
+        with self._conn() as conn:
+            existing = conn.execute(
+                """
+                SELECT id FROM qa_incidents
+                WHERE project_id = ? AND environment_id = ? AND fingerprint = ?
+                """,
+                (row["project_id"], row["environment_id"], row["fingerprint"]),
+            ).fetchone()
+
+            if existing is None:
+                cols = ", ".join(required)
+                placeholders = ", ".join(["?"] * len(required))
+                conn.execute(
+                    f"INSERT INTO qa_incidents ({cols}) VALUES ({placeholders})",
+                    tuple(row[k] for k in required),
+                )
+                return str(row["id"]), True
+
+            updatable = (
+                "title", "summary", "suspected_cause", "severity", "confidence",
+                "status", "primary_source_kind", "sources_json", "reproduction_json",
+                "expected_outcome", "actual_outcome", "app_url", "evidence_json",
+                "affected_count", "affected_users", "first_seen_ms", "last_seen_ms",
+                "repro_status", "repro_spec_id", "repro_run_id", "repro_summary",
+                "fix_status", "fix_repo", "fix_branch", "fix_pr_url", "fix_prompt_path",
+                "updated_at",
+            )
+            sets = ", ".join(f"{k} = ?" for k in updatable)
+            conn.execute(
+                f"UPDATE qa_incidents SET {sets} WHERE id = ?",
+                tuple(row[k] for k in updatable) + (str(existing["id"]),),
+            )
+            return str(existing["id"]), False
+
+    def update_qa_incident_state(
+        self,
+        incident_id: str,
+        *,
+        status: Optional[str] = None,
+        repro_status: Optional[str] = None,
+        repro_spec_id: Optional[str] = None,
+        repro_run_id: Optional[str] = None,
+        repro_summary: Optional[str] = None,
+        fix_status: Optional[str] = None,
+        fix_repo: Optional[str] = None,
+        fix_branch: Optional[str] = None,
+        fix_pr_url: Optional[str] = None,
+        fix_prompt_path: Optional[str] = None,
+    ) -> bool:
+        """Partial update for the operational state of a QA incident."""
+        updates: list[tuple[str, Any]] = []
+        for key, val in (
+            ("status", status),
+            ("repro_status", repro_status),
+            ("repro_spec_id", repro_spec_id),
+            ("repro_run_id", repro_run_id),
+            ("repro_summary", repro_summary),
+            ("fix_status", fix_status),
+            ("fix_repo", fix_repo),
+            ("fix_branch", fix_branch),
+            ("fix_pr_url", fix_pr_url),
+            ("fix_prompt_path", fix_prompt_path),
+        ):
+            if val is not None:
+                updates.append((key, val))
+        if not updates:
+            return False
+        updates.append(("updated_at", datetime.now(timezone.utc).isoformat()))
+        sets = ", ".join(f"{k} = ?" for k, _ in updates)
+        with self._conn() as conn:
+            cur = conn.execute(
+                f"UPDATE qa_incidents SET {sets} WHERE id = ? OR public_id = ?",
+                tuple(v for _, v in updates) + (incident_id, incident_id),
+            )
+            return int(cur.rowcount) > 0
+
+    def get_qa_incident(self, incident_id_or_public: str) -> Optional[sqlite3.Row]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM qa_incidents WHERE id = ? OR public_id = ?",
+                (incident_id_or_public, incident_id_or_public),
+            ).fetchone()
+        return row
+
+    def list_qa_incidents(
+        self,
+        *,
+        project_id: Optional[str] = None,
+        environment_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        where: list[str] = []
+        params: list[object] = []
+        if project_id:
+            where.append("project_id = ?")
+            params.append(project_id)
+        if environment_id:
+            where.append("environment_id = ?")
+            params.append(environment_id)
+        if status:
+            where.append("status = ?")
+            params.append(status)
+        sql = "SELECT * FROM qa_incidents"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY updated_at DESC, last_seen_ms DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        with self._conn() as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def next_open_qa_incident(
+        self,
+        *,
+        project_id: Optional[str] = None,
+        environment_id: Optional[str] = None,
+    ) -> Optional[sqlite3.Row]:
+        """The single highest-priority QA incident worth working on now.
+
+        Priority order: open > reproduced > fix_proposed; severity critical
+        > high > medium > low; then most recent.
+        """
+        where: list[str] = ["status IN ('open', 'reproduced', 'fix_proposed')"]
+        params: list[object] = []
+        if project_id:
+            where.append("project_id = ?")
+            params.append(project_id)
+        if environment_id:
+            where.append("environment_id = ?")
+            params.append(environment_id)
+        sql = f"""
+            SELECT *,
+                CASE severity
+                    WHEN 'critical' THEN 0
+                    WHEN 'high'     THEN 1
+                    WHEN 'medium'   THEN 2
+                    WHEN 'low'      THEN 3
+                    ELSE 4
+                END AS sev_rank,
+                CASE status
+                    WHEN 'open'         THEN 0
+                    WHEN 'reproduced'   THEN 1
+                    WHEN 'fix_proposed' THEN 2
+                    ELSE 3
+                END AS status_rank
+            FROM qa_incidents
+            WHERE {" AND ".join(where)}
+            ORDER BY status_rank ASC, sev_rank ASC, updated_at DESC
+            LIMIT 1
+        """
+        with self._conn() as conn:
+            return conn.execute(sql, params).fetchone()
