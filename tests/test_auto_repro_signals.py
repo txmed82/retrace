@@ -105,6 +105,38 @@ def test_empty_network_failures_json_is_not_a_signal(tmp_path: Path):
     assert status == "not_confirmed"
 
 
+def test_pretty_printed_empty_json_is_not_a_signal(tmp_path: Path):
+    """`[\\n]\\n` is non-zero bytes but semantically empty — must NOT
+    promote to confirmed (would otherwise hijack `qa auto` into a fix
+    flow for a clean run)."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "errors.json").write_text("[\n]\n")
+    (run_dir / "network-failures.json").write_text("[\n  \n]\n")
+
+    confirmed, status, _ = _classify_outcome(
+        _Run(exit_code=0, run_dir=str(run_dir)),
+        exact_steps_count=0,
+    )
+    assert confirmed is False
+    assert status == "not_confirmed"
+
+
+def test_malformed_signal_json_is_ignored(tmp_path: Path):
+    """If a tester produced a truncated/bad JSON file, the classifier must
+    not crash and must not falsely confirm."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "errors.json").write_text("{this is not json")
+
+    confirmed, status, _ = _classify_outcome(
+        _Run(exit_code=0, run_dir=str(run_dir)),
+        exact_steps_count=0,
+    )
+    assert confirmed is False
+    assert status == "not_confirmed"
+
+
 def test_missing_run_dir_is_handled(tmp_path: Path):
     # run_dir points at a nonexistent path — must not crash.
     confirmed, status, _ = _classify_outcome(

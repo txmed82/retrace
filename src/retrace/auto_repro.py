@@ -12,6 +12,7 @@ underlying engine is Browser Harness, native Playwright, or anything else.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -186,24 +187,34 @@ def _scan_run_dir_signals(run_dir: str) -> dict[str, Any]:
         out["signals"].append(f"DOM diff present ({len(dom_diffs)} file)")
         out["confirms_failure"] = True
 
+    # Use semantic checks for JSON files (a pretty-printed empty array like
+    # "[\n]\n" is non-zero bytes but carries no signal); fall back to a
+    # byte-length check for plain-text logs.
     for name in ("errors.json", "errors.txt", "console-errors.log"):
         candidate = p / name
-        if candidate.exists() and candidate.is_file():
-            try:
-                if candidate.stat().st_size > 0:
-                    out["signals"].append(f"captured runtime errors in `{name}`")
-                    out["confirms_failure"] = True
-            except OSError:
-                continue
+        if not (candidate.exists() and candidate.is_file()):
+            continue
+        try:
+            if name.endswith(".json"):
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                has_signal = bool(payload)
+            else:
+                has_signal = candidate.stat().st_size > 0
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if has_signal:
+            out["signals"].append(f"captured runtime errors in `{name}`")
+            out["confirms_failure"] = True
 
     net_failures = p / "network-failures.json"
-    if net_failures.exists():
+    if net_failures.exists() and net_failures.is_file():
         try:
-            if net_failures.stat().st_size > 2:  # not just "[]"
-                out["signals"].append("captured 4xx/5xx network failures")
-                out["confirms_failure"] = True
-        except OSError:
-            pass
+            payload = json.loads(net_failures.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            payload = None
+        if payload:
+            out["signals"].append("captured 4xx/5xx network failures")
+            out["confirms_failure"] = True
 
     return out
 
