@@ -112,6 +112,14 @@ def repo_and_store(tmp_path: Path, monkeypatch):
     # Don't let the test pick up a real `gh` binary that might try to talk
     # to GitHub.com — force the missing-gh path.
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    # CI runners often have no global `git config user.name/email`. Export
+    # the git identity env vars so every subprocess spawned during the
+    # test (including the ones inside `auto_fix.propose_fix_for_incident`)
+    # can commit without falling over on "empty ident name".
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Retrace Test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@retrace.dev")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Retrace Test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@retrace.dev")
     return work, origin, db
 
 
