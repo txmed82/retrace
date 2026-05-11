@@ -32,7 +32,7 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Optional
 
 from retrace.llm.client import LLMClient
@@ -42,12 +42,18 @@ from retrace.qa_incidents import redact_sensitive_text
 log = logging.getLogger(__name__)
 
 
-PROMPT_VERSION = "llm_pr_review/v1"
+PROMPT_VERSION = "llm_pr_review/v2"
 
 # Conservative defaults that fit in even small context windows; users
 # with a 200k-token model can override via `llm_review(...)` kwargs.
 DEFAULT_CHUNK_TOKEN_BUDGET = 6_000
 DEFAULT_TOTAL_TOKEN_CAP = 32_000
+
+# Final inline-suggestion cap applied after merge + line-validity filter.
+# Three is the same number the system prompt asks for — we enforce it
+# here because the model often misses the cap on multi-file PRs.
+DEFAULT_MAX_INLINE_SUGGESTIONS = 3
+DEFAULT_MAX_RISK_NOTES = 5
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +190,111 @@ def _split_diff_by_file(diff_text: str) -> list[tuple[str, str]]:
         path = m.group("b")
         out.append((path, chunk))
     return out
+
+
+def _extract_added_lines(diff_text: str) -> dict[str, set[int]]:
+    """Map `path -> set of new-side line numbers actually present` in the
+    diff.
+
+    Used to filter out hallucinated inline suggestions: any `(path,
+    line)` not in this map points at code the model is making up.
+
+    Both `+` (added) and ` ` (context) new-side lines are valid targets
+    for an inline comment — GitHub's PR-comment API accepts a comment
+    on any line that appears on the new side of the diff. `-` (removed)
+    lines don't have a new-side line number, so they don't count.
+    """
+    by_path: dict[str, set[int]] = {}
+    current_path = ""
+    current_new_line = 0
+    in_hunk = False
+    for raw in diff_text.splitlines():
+        m_file = _FILE_HEADER_RE.match(raw)
+        if m_file:
+            current_path = m_file.group("b")
+            by_path.setdefault(current_path, set())
+            in_hunk = False
+            continue
+        if raw.startswith("+++ b/"):
+            # Some tools emit `+++ b/X` without the `diff --git` header.
+            current_path = raw[len("+++ b/") :].strip()
+            by_path.setdefault(current_path, set())
+            in_hunk = False
+            continue
+        if raw.startswith("@@"):
+            in_hunk = True
+            m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
+            current_new_line = int(m.group(1)) if m else 0
+            continue
+        if not in_hunk or not current_path:
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            by_path[current_path].add(current_new_line)
+            current_new_line += 1
+        elif raw.startswith(" "):
+            by_path[current_path].add(current_new_line)
+            current_new_line += 1
+        elif raw.startswith("-") and not raw.startswith("---"):
+            # removed line — no new-side number
+            continue
+        else:
+            continue
+    return by_path
+
+
+def _filter_suggestions_against_diff(
+    suggestions: list[InlineSuggestion],
+    valid_lines: dict[str, set[int]],
+) -> list[InlineSuggestion]:
+    """Drop suggestions whose `(path, line)` doesn't exist in the diff.
+
+    This is the cheap defense against the model inventing line numbers.
+    It does NOT validate that the body refers to the right code — that's
+    the self-critique pass's job.
+    """
+    if not valid_lines:
+        # No diff structure to validate against — accept what we got.
+        return list(suggestions)
+    out: list[InlineSuggestion] = []
+    for sug in suggestions:
+        # Be lenient about leading `./` or `a/`/`b/` prefixes the model
+        # sometimes glues on.
+        candidates = {sug.path, sug.path.lstrip("./"), sug.path.removeprefix("a/"),
+                      sug.path.removeprefix("b/")}
+        match_path = next((p for p in candidates if p in valid_lines), None)
+        if match_path is None:
+            log.debug("dropped suggestion: path %r not in diff", sug.path)
+            continue
+        if sug.line not in valid_lines[match_path]:
+            log.debug(
+                "dropped suggestion: %s:%d not on new side of diff",
+                sug.path,
+                sug.line,
+            )
+            continue
+        # Re-root to the canonical path so the renderer is consistent.
+        if match_path != sug.path:
+            sug = replace(sug, path=match_path)
+        out.append(sug)
+    return out
+
+
+def _cap_suggestions(
+    suggestions: list[InlineSuggestion],
+    *,
+    limit: int,
+) -> list[InlineSuggestion]:
+    """Keep at most `limit` suggestions, preferring ones with an
+    `suggested_code` block (more actionable for the author).
+
+    Sort is stable on (has_code DESC, original order ASC) so the model's
+    own ordering wins ties.
+    """
+    if limit <= 0 or len(suggestions) <= limit:
+        return suggestions
+    indexed = list(enumerate(suggestions))
+    indexed.sort(key=lambda pair: (0 if pair[1].suggested_code.strip() else 1, pair[0]))
+    return [s for _, s in indexed[:limit]]
 
 
 def _annotate_new_hunk_line_numbers(file_diff: str) -> str:
@@ -327,29 +438,37 @@ def _build_user_message(
     return "\n".join(parts)
 
 
-def _analysis_hint(analysis: Any) -> str:
-    """Tiny context summary so the LLM knows what Retrace already saw."""
-    if analysis is None:
-        return ""
+def _analysis_hint(analysis: Any, *, prior_review_summary: str = "") -> str:
+    """Tiny context summary so the LLM knows what Retrace already saw.
+
+    `prior_review_summary` (item 4) is folded in verbatim when present —
+    it carries notes from prior LLM reviews on files touched in this
+    PR, so we don't keep re-flagging the same issue across reviews.
+    """
     lines: list[str] = []
-    if getattr(analysis, "affected_flows", None):
-        flows = ", ".join(
-            getattr(f, "name", "") for f in analysis.affected_flows[:5]
-        )
-        if flows:
-            lines.append(f"Affected flows (top 5): {flows}")
-    if getattr(analysis, "prior_failures", None):
-        priors = ", ".join(
-            getattr(p, "public_id", "") for p in analysis.prior_failures[:5]
-        )
-        if priors:
-            lines.append(f"Prior failures touching the diff: {priors}")
-    if getattr(analysis, "missing_tests", None):
-        misses = ", ".join(
-            getattr(m, "flow", "") for m in analysis.missing_tests[:5]
-        )
-        if misses:
-            lines.append(f"Flows lacking coverage: {misses}")
+    if analysis is not None:
+        if getattr(analysis, "affected_flows", None):
+            flows = ", ".join(
+                getattr(f, "name", "") for f in analysis.affected_flows[:5]
+            )
+            if flows:
+                lines.append(f"Affected flows (top 5): {flows}")
+        if getattr(analysis, "prior_failures", None):
+            priors = ", ".join(
+                getattr(p, "public_id", "") for p in analysis.prior_failures[:5]
+            )
+            if priors:
+                lines.append(f"Prior failures touching the diff: {priors}")
+        if getattr(analysis, "missing_tests", None):
+            misses = ", ".join(
+                getattr(m, "flow", "") for m in analysis.missing_tests[:5]
+            )
+            if misses:
+                lines.append(f"Flows lacking coverage: {misses}")
+    prior_review_summary = (prior_review_summary or "").strip()
+    if prior_review_summary:
+        lines.append("Prior Retrace review notes on these files:")
+        lines.append(prior_review_summary)
     return "\n".join(lines)
 
 
@@ -422,6 +541,101 @@ def _merge_results(results: list[LLMReviewResult], *, model: str) -> LLMReviewRe
 
 
 # ---------------------------------------------------------------------------
+# Optional self-critique pass
+# ---------------------------------------------------------------------------
+
+
+_SELF_CRITIQUE_SYSTEM = """\
+You are Retrace's PR-review critic. You are given the inline suggestions
+and risk notes another model produced for this PR. Your job is to rank
+them and drop noise.
+
+Return a single JSON object:
+
+{
+  "kept_suggestion_indices": [0, 3, 5],     // up to 3 indices, ordered most-important first
+  "kept_risk_indices":       [1, 0],        // up to 5 indices, ordered most-important first
+  "rationale": "one short line, optional"
+}
+
+Rules:
+- Drop anything that's stylistic-only, obvious from the diff, or
+  speculative (e.g. "consider adding tests" with no specific scenario).
+- Prefer items that name a concrete failure mode (security, data loss,
+  null deref, regression against named flow).
+- Indices refer to the lists in the user message, 0-based.
+- Return only the JSON object — no prose.
+"""
+
+
+def _self_critique(
+    *,
+    client: LLMClient,
+    suggestions: list[InlineSuggestion],
+    risk_notes: list[str],
+    max_suggestions: int,
+    max_risks: int,
+) -> tuple[list[InlineSuggestion], list[str]]:
+    """Ask the LLM to rank/dedupe.
+
+    Falls back to the input on any error — the critique pass must never
+    degrade the result (worst case is "same as before").
+    """
+    if not suggestions and not risk_notes:
+        return suggestions, risk_notes
+    user_parts: list[str] = []
+    if suggestions:
+        user_parts.append("Inline suggestions (index — path:line — body):")
+        for i, s in enumerate(suggestions):
+            body = s.body.replace("\n", " ").strip()
+            user_parts.append(f"  {i} — {s.path}:{s.line} — {body[:240]}")
+        user_parts.append("")
+    if risk_notes:
+        user_parts.append("Risk notes (index — body):")
+        for i, r in enumerate(risk_notes):
+            user_parts.append(f"  {i} — {r[:240]}")
+        user_parts.append("")
+    user_parts.append(
+        f"Keep at most {max_suggestions} suggestion(s) and {max_risks} risk note(s)."
+    )
+    user_msg = "\n".join(user_parts)
+
+    try:
+        raw = client.chat_json(
+            system=_SELF_CRITIQUE_SYSTEM,
+            user=user_msg,
+            temperature=0.1,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("self-critique pass failed; using uncritiqued result: %s", exc)
+        return suggestions, risk_notes
+    if not isinstance(raw, dict):
+        return suggestions, risk_notes
+
+    def _pick(idx_list: Any, source: list, cap: int) -> list:
+        if not isinstance(idx_list, list):
+            return source[:cap]
+        seen: set[int] = set()
+        out: list = []
+        for v in idx_list:
+            try:
+                i = int(v)
+            except (TypeError, ValueError):
+                continue
+            if i < 0 or i >= len(source) or i in seen:
+                continue
+            seen.add(i)
+            out.append(source[i])
+            if len(out) >= cap:
+                break
+        return out
+
+    kept_suggestions = _pick(raw.get("kept_suggestion_indices"), suggestions, max_suggestions)
+    kept_risks = _pick(raw.get("kept_risk_indices"), risk_notes, max_risks)
+    return kept_suggestions, kept_risks
+
+
+# ---------------------------------------------------------------------------
 # In-memory cache (sha256(diff) + model -> result). Process-local.
 # ---------------------------------------------------------------------------
 
@@ -454,11 +668,30 @@ def llm_review(
     llm_client: Optional[LLMClient] = None,
     max_tokens_per_chunk: int = DEFAULT_CHUNK_TOKEN_BUDGET,
     total_token_cap: int = DEFAULT_TOTAL_TOKEN_CAP,
+    max_inline_suggestions: int = DEFAULT_MAX_INLINE_SUGGESTIONS,
+    max_risk_notes: int = DEFAULT_MAX_RISK_NOTES,
+    enable_self_critique: bool = False,
+    prior_review_summary: str = "",
 ) -> LLMReviewResult:
     """Run an LLM review over `diff_text`.
 
     Returns an empty `LLMReviewResult` when no LLM client is provided,
     so callers can opt-in without an LLM key gracefully.
+
+    Quality guardrails applied to the merged result before returning:
+
+      1. **Line-validity filter** — inline suggestions whose
+         `(path, line)` doesn't appear on the new side of the diff are
+         dropped. Defends against hallucinated line numbers.
+      2. **Suggestion cap** — at most `max_inline_suggestions` and
+         `max_risk_notes` survive. Suggestions with a concrete
+         `suggested_code` block win ties.
+      3. **Optional self-critique** — when `enable_self_critique=True`
+         and we have more findings than the cap, one extra LLM call
+         ranks/dedupes the candidates before the deterministic cap.
+      4. **Prior-review summary** — `prior_review_summary` is folded
+         into the analysis hint so the model knows what Retrace
+         already flagged on these files in earlier PRs.
     """
     if llm_client is None:
         return LLMReviewResult()
@@ -488,7 +721,12 @@ def llm_review(
     # this to the user; we don't.
     safe_diff = redact_sensitive_text(diff_text, max_len=10 * total_token_cap)
 
-    cache_key = _cache_key(safe_diff, llm_client.cfg.model)
+    cache_key = _cache_key(
+        safe_diff
+        + f"|crit={int(enable_self_critique)}|cap={max_inline_suggestions},{max_risk_notes}"
+        + f"|prior={prior_review_summary}",
+        llm_client.cfg.model,
+    )
     cached = _CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -512,7 +750,7 @@ def llm_review(
         return LLMReviewResult(model=llm_client.cfg.model)
 
     chunks = _chunk_files(files, max_tokens_per_chunk=max_tokens_per_chunk)
-    hint = _analysis_hint(analysis)
+    hint = _analysis_hint(analysis, prior_review_summary=prior_review_summary)
 
     chunk_results: list[LLMReviewResult] = []
     for chunk_files_list in chunks:
@@ -535,6 +773,42 @@ def llm_review(
         chunk_results.append(_coerce_result(raw, model=llm_client.cfg.model))
 
     merged = _merge_results(chunk_results, model=llm_client.cfg.model)
+
+    # (1) Line-validity filter against the redacted diff (the same lines
+    # the LLM saw).
+    valid_lines = _extract_added_lines(safe_diff)
+    filtered_suggestions = _filter_suggestions_against_diff(
+        merged.inline_suggestions, valid_lines
+    )
+
+    # (3) Optional self-critique — only run if there's actually overflow,
+    # otherwise we're paying a second LLM call for nothing.
+    risk_notes_after = list(merged.risk_notes)
+    suggestions_after = filtered_suggestions
+    overflow = (
+        len(suggestions_after) > max_inline_suggestions
+        or len(risk_notes_after) > max_risk_notes
+    )
+    if enable_self_critique and overflow:
+        suggestions_after, risk_notes_after = _self_critique(
+            client=llm_client,
+            suggestions=suggestions_after,
+            risk_notes=risk_notes_after,
+            max_suggestions=max_inline_suggestions,
+            max_risks=max_risk_notes,
+        )
+
+    # (2) Deterministic cap — applied even after self-critique as a
+    # belt-and-braces guarantee.
+    suggestions_after = _cap_suggestions(suggestions_after, limit=max_inline_suggestions)
+    risk_notes_after = risk_notes_after[:max_risk_notes]
+
+    merged = replace(
+        merged,
+        inline_suggestions=suggestions_after,
+        risk_notes=risk_notes_after,
+    )
+
     _CACHE[cache_key] = merged
     return merged
 

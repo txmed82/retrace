@@ -110,6 +110,18 @@ _PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
     ),
 )
 @click.option(
+    "--llm-self-critique/--no-llm-self-critique",
+    "llm_self_critique",
+    default=False,
+    show_default=True,
+    help=(
+        "After the LLM review, make one more LLM call to rank/dedupe "
+        "the inline suggestions and risk notes. Doubles cost on PRs "
+        "with overflow; cheap on quiet PRs (only runs when there's "
+        "more than the suggestion/risk cap)."
+    ),
+)
+@click.option(
     "--json",
     "as_json",
     is_flag=True,
@@ -128,6 +140,7 @@ def review_command(
     post_comment: bool,
     run_affected_tests: bool,
     use_llm: Optional[bool],
+    llm_self_critique: bool,
     as_json: bool,
 ) -> None:
     """Run Retrace's PR review against a diff and (optionally) file qa_incidents.
@@ -197,7 +210,23 @@ def review_command(
         diff_text=diff_text,
         analysis=analysis,
         use_llm=use_llm,
+        enable_self_critique=llm_self_critique,
+        store=store,
+        repo=repo,
+        pr_number=pr_number,
     )
+
+    # P0.1 follow-up: persist non-empty reviews so the *next* PR review
+    # on overlapping files can fold the prior risk notes into its
+    # prompt instead of re-flagging the same issue.
+    if llm_result and not llm_result.is_empty and not llm_result.diff_too_large:
+        _persist_llm_review(
+            store=store,
+            repo=repo,
+            pr_number=pr_number,
+            analysis=analysis,
+            llm_result=llm_result,
+        )
 
     posted_comment_url = ""
     if post_comment:
@@ -361,6 +390,10 @@ def _maybe_llm_review(
     diff_text: str,
     analysis: Any,
     use_llm: Optional[bool],
+    enable_self_critique: bool = False,
+    store: Optional[Storage] = None,
+    repo: str = "",
+    pr_number: int = 0,
 ) -> LLMReviewResult:
     """Run `llm_review` if the user has an LLM configured.
 
@@ -382,6 +415,15 @@ def _maybe_llm_review(
             "or set `llm.base_url` in config.yaml."
         )
 
+    prior_summary = ""
+    if store is not None and repo:
+        prior_summary = _prior_review_hint(
+            store=store,
+            repo=repo,
+            paths=[f.path for f in getattr(analysis, "changed_files", [])],
+            exclude_pr_number=pr_number,
+        )
+
     # Local import — keeps the CLI startup time when --no-llm is used.
     from retrace.llm.client import LLMClient
 
@@ -391,10 +433,76 @@ def _maybe_llm_review(
                 diff_text=diff_text,
                 analysis=analysis,
                 llm_client=client,
+                enable_self_critique=enable_self_critique,
+                prior_review_summary=prior_summary,
             )
     except Exception as exc:  # pragma: no cover - defensive
         # Don't fail the review just because the LLM is down.
         return LLMReviewResult(error=f"LLM review failed: {exc}")
+
+
+def _prior_review_hint(
+    *,
+    store: Storage,
+    repo: str,
+    paths: list[str],
+    exclude_pr_number: int,
+) -> str:
+    """Compact summary of past LLM reviews that touched these files.
+
+    Folds the most-recent (up to 3) prior reviews' risk notes into a
+    few short lines. Each line ends with `(PR #N)` so the model can see
+    we're talking about a different PR, not the current one.
+    """
+    if not paths or not repo:
+        return ""
+    rows = store.list_llm_pr_reviews_for_paths(
+        paths,
+        repo=repo,
+        exclude_pr_number=exclude_pr_number,
+        limit=3,
+    )
+    if not rows:
+        return ""
+    lines: list[str] = []
+    for row in rows:
+        try:
+            risks = list(json.loads(row["risk_notes_json"] or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            risks = []
+        pr_n = int(row["pr_number"] or 0)
+        for note in risks[:2]:  # up to 2 per prior review
+            note = str(note or "").strip()
+            if note:
+                lines.append(f"- {note}  (PR #{pr_n})")
+        if len(lines) >= 5:
+            break
+    return "\n".join(lines[:5])
+
+
+def _persist_llm_review(
+    *,
+    store: Storage,
+    repo: str,
+    pr_number: int,
+    analysis: Any,
+    llm_result: LLMReviewResult,
+) -> None:
+    """Best-effort persistence — never raises into the caller."""
+    try:
+        paths = [f.path for f in getattr(analysis, "changed_files", [])]
+        store.add_llm_pr_review(
+            repo=repo,
+            pr_number=pr_number,
+            model=llm_result.model,
+            summary=llm_result.summary,
+            risk_notes=list(llm_result.risk_notes),
+            suggestions=[s.to_dict() for s in llm_result.inline_suggestions],
+            paths=paths,
+        )
+    except Exception:  # pragma: no cover - defensive
+        # Persistence failure shouldn't break the review surface.
+        pass
 
 
 def _run_affected_tests(*, cfg: Any, analysis: Any) -> list[dict[str, Any]]:

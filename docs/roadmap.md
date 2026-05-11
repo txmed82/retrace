@@ -102,7 +102,7 @@ Every roadmap item below uses the same dev loop. Don't skip steps.
 
 ## P0.1 — LLM-powered PR review
 
-**Status:** DONE 2026-05-11 · **PR:** TBD (this PR) · **Owner:** Claude
+**Status:** DONE 2026-05-11 · **PRs:** #126 (initial) + this PR (quality follow-up: line-validity, suggestion cap, self-critique, prior-review memory) · **Owner:** Claude
 
 ### Why this first
 

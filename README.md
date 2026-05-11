@@ -265,6 +265,10 @@ retrace review --pr 42 --repo org/repo --file-incidents
 retrace review --pr https://github.com/org/repo/pull/42 \
   --llm --post-comment --run-affected-tests
 
+# Same, but ask the LLM to rank/dedupe its own suggestions in a second
+# pass (doubles cost only when there is overflow):
+retrace review --pr <…> --llm --llm-self-critique --post-comment
+
 # Turn the LLM off explicitly even when configured:
 retrace review --pr <…> --no-llm
 ```
@@ -274,6 +278,21 @@ host — passwords, bearer tokens, common API-key shapes, and long
 opaque tokens are masked before the LLM call. Large diffs are
 chunked on file boundaries; anything over ~32k tokens is skipped
 with an explicit "diff too large" note.
+
+Quality guardrails applied to every review:
+
+- **Line-validity filter** — inline suggestions whose `(path, line)`
+  doesn't appear on the new side of the diff are dropped, so the model
+  can't post a comment on a line that doesn't exist.
+- **Suggestion + risk caps** — at most 3 inline suggestions and 5 risk
+  notes survive per review, preferring suggestions that include
+  concrete `suggested_code`.
+- **Optional self-critique** (`--llm-self-critique`) — one extra LLM
+  call ranks/dedupes when there's overflow.
+- **Prior-review memory** — non-empty reviews are persisted to
+  `data/retrace.db`. The next review on a PR touching the same files
+  folds the prior risk notes into its prompt, so we don't keep
+  re-flagging the same issue PR after PR.
 
 The same logic is wired to the GitHub-App webhook (`github_app.py`) so
 you can also drop Retrace on a PR with no CLI step. See
