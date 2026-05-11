@@ -296,39 +296,88 @@ def _gh_pr_create(
 # ---------------------------------------------------------------------------
 
 
-def _try_run_agent(cwd: Path, prompt_path: Path, agent: str) -> tuple[bool, str, str]:
-    """Best-effort: run a local coding agent against the prompt.
+def _run_agent_via_repair_runner(
+    *,
+    worktree: Path,
+    inc: "Incident",
+    candidates: list[CodeCandidate],
+    prompt_path: Path,
+    repo_full_name: str,
+    apply_with_agent: str,
+) -> tuple[bool, str, str, Any]:
+    """Run the local coding agent through `repair_runner.run_repair`.
 
-    Returns (ran, agent_used, error_or_summary). Failure is non-fatal — the
-    PR still ships with the prompt for a human or a CI agent.
+    Returns ``(applied, agent_used, summary, repair_result)``. We delegate
+    to repair_runner so the QA fix flow gets validation-command execution
+    and a structured `RepairRunResult` (changed_files + diff) for free —
+    the prior bespoke `_try_run_agent` only knew "did it exit 0".
+
+    Failure is non-fatal: the worktree path still ships a prompt-only
+    branch, just without applied changes.
     """
-    agent = (agent or "auto").lower()
-    candidates: list[tuple[str, list[str]]] = []
-    if agent in {"auto", "claude"}:
-        if shutil.which("claude"):
-            candidates.append((
-                "claude",
-                ["claude", "--print", "--dangerously-skip-permissions", f"@{prompt_path}"],
-            ))
-    if agent in {"auto", "codex"}:
-        if shutil.which("codex"):
-            candidates.append((
-                "codex",
-                ["codex", "exec", "--full-auto", f"Read @{prompt_path} and follow it."],
-            ))
-    if not candidates:
-        return False, "", "no agent CLI found (looked for: claude, codex)"
+    from retrace.qa_repair_adapter import (
+        qa_incident_to_repair_bundle,
+        resolve_agent_command,
+    )
+    from retrace.repair_runner import RepairRunnerConfig, run_repair
 
-    for name, cmd in candidates:
-        try:
-            r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=1800)
-            if r.returncode == 0:
-                return True, name, (r.stdout or "")[-2000:]
-            # if first attempt errors, try the next
-            log.warning("agent %s exited %d: %s", name, r.returncode, (r.stderr or "")[-500:])
-        except Exception as exc:
-            log.warning("agent %s failed: %s", name, exc)
-    return False, "", "all agents returned non-zero"
+    agent_command = resolve_agent_command(apply_with_agent)
+    if not agent_command:
+        return False, "", "no agent CLI found (looked for: claude, codex)", None
+    agent_name = agent_command[0]
+
+    bundle = qa_incident_to_repair_bundle(
+        inc,
+        repo_path=worktree,
+        likely_files=[c.file_path for c in candidates],
+        prompt_path=str(prompt_path),
+        repo_full_name=repo_full_name,
+    )
+    cfg = RepairRunnerConfig(
+        repo_path=worktree,
+        agent_command=agent_command,
+        validation_commands=bundle.validation_commands,
+        dry_run=False,
+        allow_draft_pr=False,
+        create_draft_pr=False,
+        repo_full_name=repo_full_name,
+    )
+    try:
+        result = run_repair(bundle, cfg)
+    except Exception as exc:
+        log.warning("repair_runner failed: %s", exc)
+        return False, agent_name, f"repair_runner errored: {exc}", None
+
+    if result.status == "applied" and result.changed_files:
+        return True, agent_name, result.diff[-2000:] if result.diff else "applied", result
+
+    summary = result.error or result.status
+    return False, agent_name, summary, result
+
+
+def _render_repair_appendix(repair_result: Any) -> str:
+    """Format the validation + diff summary appended to the PR prompt."""
+    lines: list[str] = []
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## Repair runner output")
+    lines.append("")
+    lines.append(f"- Status: `{repair_result.status}`")
+    if getattr(repair_result, "agent_result", None) is not None:
+        ar = repair_result.agent_result
+        lines.append(f"- Agent exit: `{ar.returncode}`")
+    if getattr(repair_result, "changed_files", None):
+        lines.append(f"- Changed files: {len(repair_result.changed_files)}")
+        for f in repair_result.changed_files[:25]:
+            lines.append(f"  - `{f}`")
+    if getattr(repair_result, "tests_run", None):
+        lines.append("- Validation commands:")
+        for t in repair_result.tests_run[:10]:
+            status = "✓" if t.returncode == 0 else "✗"
+            lines.append(f"  - {status} `{t.command}` (exit {t.returncode})")
+    lines.append("")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -435,9 +484,15 @@ def propose_fix_for_incident(
 
         applied = False
         agent_used = ""
+        repair_result = None
         if apply_with_agent:
-            applied, agent_used, agent_msg = _try_run_agent(
-                worktree, pr_prompt_path, apply_with_agent
+            applied, agent_used, agent_msg, repair_result = _run_agent_via_repair_runner(
+                worktree=worktree,
+                inc=inc,
+                candidates=candidates,
+                prompt_path=pr_prompt_path,
+                repo_full_name=repo_full_name,
+                apply_with_agent=apply_with_agent,
             )
             outcome.applied = applied
             outcome.agent = agent_used
@@ -447,6 +502,12 @@ def propose_fix_for_incident(
         commit_msg = f"retrace: open fix request {inc.public_id} — {inc.title[:64]}"
         if applied:
             commit_msg = f"retrace: AI fix for {inc.public_id} — {inc.title[:64]}"
+            # Append validation-command summary to the prompt file so the
+            # PR body documents what we ran.
+            if repair_result is not None:
+                pr_prompt_path.write_text(
+                    prompt_md + _render_repair_appendix(repair_result)
+                )
 
         ok, err = _commit_and_push(worktree, branch, commit_msg)
         if not ok:
