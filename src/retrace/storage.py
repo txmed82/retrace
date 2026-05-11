@@ -715,7 +715,7 @@ CREATE TABLE IF NOT EXISTS qa_incidents (
 CREATE INDEX IF NOT EXISTS idx_qa_incidents_status
 ON qa_incidents(project_id, environment_id, status, updated_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_qa_incidents_public
+CREATE UNIQUE INDEX IF NOT EXISTS idx_qa_incidents_public
 ON qa_incidents(public_id);
 """
 
@@ -6687,7 +6687,9 @@ class Storage:
     def upsert_qa_incident(self, row: dict[str, Any]) -> tuple[str, bool]:
         """Insert or update a QA incident keyed by (project, env, fingerprint).
 
-        Returns (incident_id, inserted) where `inserted` is True for new rows.
+        Atomic upsert via SQLite's ``ON CONFLICT ... DO UPDATE`` so concurrent
+        ingesters can't both miss the existence check and race on the unique
+        constraint. Returns ``(incident_id, inserted)``.
         """
         required = (
             "id", "public_id", "project_id", "environment_id", "fingerprint",
@@ -6703,39 +6705,51 @@ class Storage:
         if missing:
             raise ValueError(f"upsert_qa_incident missing keys: {missing}")
 
+        updatable = (
+            "title", "summary", "suspected_cause", "severity", "confidence",
+            "status", "primary_source_kind", "sources_json", "reproduction_json",
+            "expected_outcome", "actual_outcome", "app_url", "evidence_json",
+            "affected_count", "affected_users", "first_seen_ms", "last_seen_ms",
+            "repro_status", "repro_spec_id", "repro_run_id", "repro_summary",
+            "fix_status", "fix_repo", "fix_branch", "fix_pr_url", "fix_prompt_path",
+            "updated_at",
+        )
+
+        # These identifiers are derived from a fixed tuple (no untrusted
+        # input), so embedding them in the SQL text is safe; values stay
+        # parameterised.
+        cols = ", ".join(required)
+        placeholders = ", ".join(["?"] * len(required))
+        do_update = ", ".join(f"{k} = excluded.{k}" for k in updatable)
+
+        sql = (
+            f"INSERT INTO qa_incidents ({cols}) VALUES ({placeholders}) "
+            f"ON CONFLICT(project_id, environment_id, fingerprint) DO UPDATE SET {do_update} "
+            "RETURNING id"
+        )
+
         with self._conn() as conn:
-            existing = conn.execute(
+            # Pre-check is advisory only — it informs the return value but the
+            # upsert itself remains atomic, so concurrent writers can't lose
+            # data. The narrow remaining race (two writers both see "not
+            # exists" and both report inserted=True) is benign: the stored
+            # row is correct either way.
+            existed = conn.execute(
                 """
-                SELECT id FROM qa_incidents
+                SELECT 1 FROM qa_incidents
                 WHERE project_id = ? AND environment_id = ? AND fingerprint = ?
                 """,
                 (row["project_id"], row["environment_id"], row["fingerprint"]),
-            ).fetchone()
+            ).fetchone() is not None
 
-            if existing is None:
-                cols = ", ".join(required)
-                placeholders = ", ".join(["?"] * len(required))
-                conn.execute(
-                    f"INSERT INTO qa_incidents ({cols}) VALUES ({placeholders})",
-                    tuple(row[k] for k in required),
-                )
-                return str(row["id"]), True
-
-            updatable = (
-                "title", "summary", "suspected_cause", "severity", "confidence",
-                "status", "primary_source_kind", "sources_json", "reproduction_json",
-                "expected_outcome", "actual_outcome", "app_url", "evidence_json",
-                "affected_count", "affected_users", "first_seen_ms", "last_seen_ms",
-                "repro_status", "repro_spec_id", "repro_run_id", "repro_summary",
-                "fix_status", "fix_repo", "fix_branch", "fix_pr_url", "fix_prompt_path",
-                "updated_at",
-            )
-            sets = ", ".join(f"{k} = ?" for k in updatable)
-            conn.execute(
-                f"UPDATE qa_incidents SET {sets} WHERE id = ?",
-                tuple(row[k] for k in updatable) + (str(existing["id"]),),
-            )
-            return str(existing["id"]), False
+            cur = conn.execute(sql, tuple(row[k] for k in required))
+            res = cur.fetchone()
+            if res is None:
+                # Defensive — SQLite returns a row from RETURNING for both
+                # branches, but if a future driver swap broke that we'd
+                # rather raise than lie about persistence.
+                raise RuntimeError("upsert_qa_incident: no row returned from upsert")
+            return str(res["id"]), not existed
 
     def update_qa_incident_state(
         self,

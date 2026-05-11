@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 from retrace.auto_fix import render_fix_prompt
+from retrace.auto_repro import _classify_outcome
 from retrace.qa_incidents import (
     Incident,
     IncidentEvidence,
@@ -16,6 +17,7 @@ from retrace.qa_incidents import (
     incident_from_tester_run,
     make_fingerprint,
     make_public_id,
+    redact_sensitive_text,
     reproduction_prompt_for_incident,
     utc_now_iso,
 )
@@ -270,3 +272,130 @@ def test_render_fix_prompt_handles_no_evidence_gracefully():
     inc.evidence = IncidentEvidence()
     md = render_fix_prompt(inc=inc, candidates=[])
     assert "_No structured evidence" in md
+
+
+# ---------------------------------------------------------------------------
+# Secret redaction
+# ---------------------------------------------------------------------------
+
+
+def test_redact_sensitive_text_masks_secrets_in_json_payloads():
+    raw = (
+        '{"email":"alice@example.com","password":"hunter2",'
+        '"api_key":"sk-abcdef0123456789abcdef0123456789","note":"ok"}'
+    )
+    redacted = redact_sensitive_text(raw)
+    assert "hunter2" not in redacted
+    assert "sk-abcdef0123456789abcdef0123456789" not in redacted
+    assert "alice@example.com" not in redacted
+    # the structural envelope and non-sensitive fields survive
+    assert '"note"' in redacted
+    assert "<redacted>" in redacted
+
+
+def test_redact_sensitive_text_masks_bearer_tokens():
+    redacted = redact_sensitive_text("Authorization: Bearer abcdefghijklmnop1234567890")
+    assert "abcdefghijklmnop1234567890" not in redacted
+    assert "<redacted>" in redacted
+
+
+def test_redact_sensitive_text_is_safe_on_empty():
+    assert redact_sensitive_text("") == ""
+
+
+def test_incident_from_api_test_redacts_request_and_response_bodies():
+    inc = incident_from_api_test(
+        project_id="local",
+        environment_id="production",
+        title="POST /api/login -> 500",
+        summary="Login returns 500",
+        method="POST",
+        url="https://app.example/api/login",
+        expected_status=200,
+        actual_status=500,
+        request_body='{"email":"alice@example.com","password":"hunter2"}',
+        response_body='{"token":"eyJabcdefghijklmnopqrstuvwxyz1234567890"}',
+        run_id="api-run-1",
+    )
+    # The captured request value should not contain the cleartext password.
+    api_step = inc.reproduction[0]
+    assert "hunter2" not in api_step.value
+    assert "alice@example.com" not in api_step.value
+    # The actual_outcome echoes a truncated response; the token must be gone.
+    assert "eyJabcdefghijklmnopqrstuvwxyz1234567890" not in inc.actual_outcome
+
+
+# ---------------------------------------------------------------------------
+# Runner outcome classification — don't promote setup errors to "confirmed"
+# ---------------------------------------------------------------------------
+
+
+class _RunStub:
+    def __init__(self, *, exit_code: int, error: str = "", assertion_results=None) -> None:
+        self.exit_code = exit_code
+        self.error = error
+        self.assertion_results = assertion_results or []
+        self.run_id = "run-x"
+
+
+def test_classify_outcome_confirmed_on_failed_assertion():
+    run = _RunStub(
+        exit_code=1,
+        assertion_results=[{"assertion_type": "visible", "ok": False, "message": "missing"}],
+    )
+    confirmed, status, summary = _classify_outcome(run, exact_steps_count=0)
+    assert confirmed is True
+    assert status == "confirmed"
+    assert "missing" in summary
+
+
+def test_classify_outcome_error_when_runner_crashes_with_no_exact_steps():
+    run = _RunStub(exit_code=2, error="harness failed to launch")
+    confirmed, status, summary = _classify_outcome(run, exact_steps_count=0)
+    assert confirmed is False
+    assert status == "error"
+    assert "harness failed to launch" in summary
+
+
+def test_classify_outcome_confirmed_when_runner_fails_with_exact_steps():
+    run = _RunStub(exit_code=1, error="step 3 click failed")
+    confirmed, status, summary = _classify_outcome(run, exact_steps_count=3)
+    assert confirmed is True
+    assert status == "confirmed"
+    assert "step 3 click failed" in summary
+
+
+def test_classify_outcome_clean_run_is_not_confirmed():
+    run = _RunStub(exit_code=0)
+    confirmed, status, summary = _classify_outcome(run, exact_steps_count=2)
+    assert confirmed is False
+    assert status == "not_confirmed"
+    assert "bug did not surface" in summary
+
+
+# ---------------------------------------------------------------------------
+# from_row robustness — single bad JSON cell must not nuke the whole query
+# ---------------------------------------------------------------------------
+
+
+def test_incident_from_row_tolerates_malformed_json(tmp_path: Path):
+    import sqlite3
+
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    inc = _make_incident(fp_seed="malformed")
+    store.upsert_qa_incident(inc.to_row())
+
+    # Corrupt the evidence_json cell out-of-band.
+    with sqlite3.connect(str(tmp_path / "retrace.db")) as conn:
+        conn.execute(
+            "UPDATE qa_incidents SET evidence_json = ? WHERE public_id = ?",
+            ("{ this is not json", inc.public_id),
+        )
+
+    row = store.get_qa_incident(inc.public_id)
+    assert row is not None
+    revived = Incident.from_row(row)
+    # We should still get a usable Incident with default-empty evidence.
+    assert revived.public_id == inc.public_id
+    assert revived.evidence.console_excerpts == []

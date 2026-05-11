@@ -190,9 +190,27 @@ def _git_current_branch(cwd: Path) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def _local_branch_exists(cwd: Path, branch: str) -> bool:
+    r = _run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=cwd)
+    return r.returncode == 0
+
+
 def _checkout_branch(cwd: Path, branch: str, base: str) -> tuple[bool, str]:
+    """Check out `branch` for fix work, reusing it if it already exists.
+
+    Re-running `qa fix` / `qa auto` for the same incident must be safe: the
+    incident-derived branch name is deterministic, so a second run would
+    otherwise blow up on `git checkout -b`. We reuse the existing branch
+    when found.
+    """
     # Make sure base is up to date locally; ignore failures (offline ok).
     _run(["git", "fetch", "origin", base], cwd=cwd)
+    if _local_branch_exists(cwd, branch):
+        r = _run(["git", "checkout", branch], cwd=cwd)
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout).strip()
+        return True, ""
+
     r = _run(["git", "checkout", "-b", branch, f"origin/{base}"], cwd=cwd)
     if r.returncode != 0:
         # Fall back to local base if origin/<base> isn't there.
@@ -349,14 +367,26 @@ def propose_fix_for_incident(
     if not open_pr:
         return outcome
 
+    def _persist_error(reason: str, branch_name: str = "") -> None:
+        """Mirror an error outcome back to storage so `qa show` is honest."""
+        store.update_qa_incident_state(
+            inc.public_id,
+            fix_status="error",
+            fix_repo=repo_full_name,
+            fix_branch=branch_name or None,
+            fix_prompt_path=str(prompt_file),
+        )
+
     if not repo_path or not repo_path.exists():
         outcome.status = "error"
         outcome.error = f"repo path not found: {repo_path}"
+        _persist_error(outcome.error)
         return outcome
 
     if not _git_clean(repo_path):
         outcome.status = "error"
         outcome.error = "working tree is dirty; commit or stash before requesting a fix PR"
+        _persist_error(outcome.error)
         return outcome
 
     branch = f"retrace/{_sanitize_branch_part(inc.public_id)}-{_sanitize_branch_part(inc.title)}"
@@ -367,6 +397,7 @@ def propose_fix_for_incident(
     if not ok:
         outcome.status = "error"
         outcome.error = f"checkout failed: {err}"
+        _persist_error(outcome.error, branch_name=branch)
         return outcome
 
     try:
@@ -394,6 +425,7 @@ def propose_fix_for_incident(
         if not ok:
             outcome.status = "error"
             outcome.error = f"commit/push failed: {err}"
+            _persist_error(outcome.error, branch_name=branch)
             return outcome
 
         pr_url = ""
@@ -411,6 +443,7 @@ def propose_fix_for_incident(
             elif err:
                 outcome.status = "error"
                 outcome.error = f"gh pr create failed: {err}"
+                _persist_error(outcome.error, branch_name=branch)
                 return outcome
         else:
             outcome.error = "gh not installed; branch pushed without PR"

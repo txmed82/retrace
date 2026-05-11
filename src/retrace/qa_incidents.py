@@ -214,9 +214,34 @@ class Incident:
             except (KeyError, IndexError):
                 return default
 
-        sources_raw = json.loads(_g("sources_json", "[]") or "[]")
-        repro_raw = json.loads(_g("reproduction_json", "[]") or "[]")
-        evidence_raw = json.loads(_g("evidence_json", "{}") or "{}")
+        def _safe_json(raw: Any, fallback: Any) -> Any:
+            """Decode a JSON column; never raise for one malformed row.
+
+            A single bad `evidence_json` (e.g. truncated mid-write or hand-
+            edited in sqlite) used to crash the whole `qa list` / `qa auto`
+            pipeline. We swallow the parse error, log it, and substitute
+            the typed default so other incidents in the same query still
+            render. If the parsed value isn't the expected container type
+            we also fall back, so downstream `.get(...)` is safe.
+            """
+            if raw is None or raw == "":
+                return fallback
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError) as exc:
+                logger = __import__("logging").getLogger(__name__)
+                logger.warning(
+                    "qa_incidents: malformed JSON column for incident, falling back: %s",
+                    exc,
+                )
+                return fallback
+            if not isinstance(parsed, type(fallback)):
+                return fallback
+            return parsed
+
+        sources_raw = _safe_json(_g("sources_json", "[]"), [])
+        repro_raw = _safe_json(_g("reproduction_json", "[]"), [])
+        evidence_raw = _safe_json(_g("evidence_json", "{}"), {})
 
         return Incident(
             id=str(_g("id", "")),
@@ -306,6 +331,50 @@ def make_fingerprint(parts: Iterable[str]) -> str:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Sensitive-data redaction.
+#
+# Incidents are persisted to SQLite and later embedded in fix prompts that
+# may be checked into a git branch and surfaced inside a PR. Anything raw
+# we capture from production-shaped payloads (API request bodies, response
+# bodies, custom headers) can leak credentials and PII downstream. The
+# redactor below is intentionally conservative: it lower-cases known secret-
+# key patterns (`api_key`, `password`, `authorization`, ...), masks long
+# bearer-looking tokens, and trims to the size budget caller asked for.
+# ---------------------------------------------------------------------------
+
+
+_SECRET_KEY_RE = __import__("re").compile(
+    r'(?P<key>"(?:api[_-]?key|secret|password|token|authorization|bearer|access[_-]?token|refresh[_-]?token|client[_-]?secret|cookie|set-cookie|x-api-key)"\s*:\s*)"(?P<val>[^"\\]{0,2048}(?:\\.[^"\\]{0,2048}){0,8})"',
+    __import__("re").IGNORECASE,
+)
+_BEARER_RE = __import__("re").compile(r"(?i)\b(bearer\s+)([A-Za-z0-9._\-]{8,})")
+_LONG_TOKEN_RE = __import__("re").compile(r"\b([A-Za-z0-9._\-]{32,})\b")
+_EMAIL_RE = __import__("re").compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def redact_sensitive_text(text: str, *, max_len: int = 2048) -> str:
+    """Best-effort redaction of secrets/PII from free-form payload strings.
+
+    Designed for the API-test ingest path where request/response bodies are
+    captured as opaque strings. We don't try to parse JSON (payloads may be
+    truncated or non-JSON) — we just substitute the common shapes that
+    would otherwise leak into stored incidents and fix prompts.
+    """
+    if not text:
+        return ""
+    redacted = _SECRET_KEY_RE.sub(lambda m: f'{m.group("key")}"<redacted>"', text)
+    redacted = _BEARER_RE.sub(lambda m: f"{m.group(1)}<redacted>", redacted)
+    redacted = _LONG_TOKEN_RE.sub(
+        lambda m: "<redacted>" if "_" in m.group(1) or "-" in m.group(1) else m.group(1),
+        redacted,
+    )
+    redacted = _EMAIL_RE.sub("<redacted-email>", redacted)
+    if len(redacted) > max_len:
+        return redacted[: max_len - 16] + "…<truncated>"
+    return redacted
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +583,11 @@ def incident_from_tester_run(
     """Build an Incident from a failed `TesterRunResult`."""
 
     now = utc_now_iso()
-    title = f"UI test failed: {getattr(spec, 'name', spec.spec_id)}"
+    # `spec` is typed as `Any` so the fallback must also use `getattr`;
+    # otherwise the inner `spec.spec_id` evaluates eagerly and explodes on
+    # specs that lack one (some tests pass minimal stubs).
+    spec_name = getattr(spec, "name", None) or getattr(spec, "spec_id", "unknown-spec")
+    title = f"UI test failed: {spec_name}"
     summary = str(getattr(run_result, "error", "") or "UI test produced a failing assertion.")
     failed = [
         a for a in getattr(run_result, "assertion_results", []) or []
@@ -600,6 +673,10 @@ def incident_from_api_test(
     """Build an Incident from an API test failure."""
 
     now = utc_now_iso()
+    # Captured payloads can carry credentials and PII. Always redact before
+    # we persist or echo them through fix prompts.
+    safe_request_body = redact_sensitive_text(request_body or "", max_len=2048)
+    safe_response_body = redact_sensitive_text(response_body or "", max_len=2048)
     fp = make_fingerprint([title, method, url, str(expected_status), str(actual_status)])
     repro = [
         ReproductionStep(
@@ -607,7 +684,7 @@ def incident_from_api_test(
             action="api_call",
             description=f"{method.upper()} {url}",
             target={"method": method.upper(), "url": url},
-            value=(request_body or "")[:2048],
+            value=safe_request_body,
             url=url,
         ),
         ReproductionStep(
@@ -641,7 +718,7 @@ def incident_from_api_test(
         ],
         reproduction=repro,
         expected_outcome=f"HTTP {expected_status}",
-        actual_outcome=f"HTTP {actual_status}: {response_body[:200]}",
+        actual_outcome=f"HTTP {actual_status}: {safe_response_body[:200]}",
         app_url=url,
         evidence=IncidentEvidence(
             api_test_run_ids=[run_id] if run_id else [],

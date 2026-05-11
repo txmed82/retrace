@@ -137,30 +137,39 @@ def generate_spec_for_incident(
 def _classify_outcome(run: TesterRunResult, exact_steps_count: int) -> tuple[bool, str, str]:
     """Decide whether the run confirmed the incident as still broken.
 
-    Heuristic:
-      - If the runner exited non-zero, the test failed -> the bug was
-        successfully reproduced (we expected failure).
-      - If exact_steps exist and any assertion was marked not-ok, that's also
-        a confirmed reproduction.
-      - If everything passed cleanly, we couldn't reproduce.
+    We deliberately keep three outcomes, not two:
+      - "confirmed":     a failed assertion (or, when the spec has exact
+                         steps to drive, a non-zero runner exit) proves the
+                         bug still surfaces.
+      - "error":         the harness/runner itself crashed and we can't tell
+                         whether the bug reproduces. We must NOT advance
+                         into fix generation on this state.
+      - "not_confirmed": clean run; bug didn't surface.
     """
     failed_assertions = [
         a for a in (run.assertion_results or [])
         if isinstance(a, dict) and not a.get("ok", True)
     ]
-    if run.exit_code != 0 or failed_assertions:
-        msg_parts: list[str] = []
-        if failed_assertions:
-            first = failed_assertions[0]
-            msg_parts.append(
-                f"assertion `{first.get('assertion_type', '?')}` failed: "
-                f"{first.get('message', '')}".strip()
-            )
-        elif run.error:
-            msg_parts.append(run.error)
-        else:
-            msg_parts.append(f"exit code {run.exit_code}")
-        return True, "confirmed", " | ".join(p for p in msg_parts if p)
+    if failed_assertions:
+        first = failed_assertions[0]
+        summary = (
+            f"assertion `{first.get('assertion_type', '?')}` failed: "
+            f"{first.get('message', '')}".strip()
+        )
+        return True, "confirmed", summary
+
+    if run.exit_code != 0:
+        # With exact steps we trust the runner to fail meaningfully on the
+        # bug. Without them, a non-zero exit is more likely a harness or
+        # bootstrap failure than a reproduction.
+        if exact_steps_count > 0:
+            msg = run.error or f"exit code {run.exit_code}"
+            return True, "confirmed", msg
+        msg = run.error or f"runner exited with code {run.exit_code}"
+        return False, "error", msg
+
+    if run.error:
+        return False, "error", run.error
 
     return False, "not_confirmed", "test ran clean; bug did not surface"
 
@@ -218,7 +227,13 @@ def reproduce_incident(
 
     confirmed, status, summary = _classify_outcome(run_result, len(spec.exact_steps))
 
-    new_incident_status = "reproduced" if confirmed else "not_reproduced"
+    if status == "confirmed":
+        new_incident_status = "reproduced"
+    elif status == "error":
+        # Leave the incident open; we couldn't determine reproduction.
+        new_incident_status = "open"
+    else:
+        new_incident_status = "not_reproduced"
     store.update_qa_incident_state(
         inc.public_id,
         status=new_incident_status,

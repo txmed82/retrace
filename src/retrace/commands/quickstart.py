@@ -60,6 +60,12 @@ def _write_stub_files_if_missing(config_path: Path, env_path: Path) -> tuple[boo
     """Create config.yaml + .env only if they don't already exist."""
     wrote_config = False
     wrote_env = False
+    # `--config` may point into a directory that doesn't exist yet (e.g. a
+    # fresh user project under ./.retrace/config.yaml). Make sure the parent
+    # directories exist before write_text, otherwise bootstrap breaks for
+    # any non-CWD config location.
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.parent.mkdir(parents=True, exist_ok=True)
     if not config_path.exists():
         config_path.write_text(_DEFAULT_CONFIG_TEMPLATE)
         wrote_config = True
@@ -191,7 +197,7 @@ def quickstart_command(
     click.echo("  2. (in another terminal) retrace ui")
     click.echo("  3. interact with your app, then:")
     click.echo("     retrace api process-replays")
-    click.echo("     retrace incident list")
+    click.echo("     retrace qa list")
     click.echo("")
     click.echo("To go end-to-end on the top incident in one command:")
-    click.echo("  retrace incident auto --repo <org/name>")
+    click.echo("  retrace qa auto --repo <org/name>")

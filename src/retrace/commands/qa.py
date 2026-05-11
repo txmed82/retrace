@@ -209,6 +209,18 @@ def incident_fix(
 @click.option("--draft/--ready", default=True, show_default=True)
 @click.option("--no-pr", is_flag=True, default=False, help="Skip opening the PR; just produce the prompt.")
 @click.option("--id", "explicit_id", default="", help="Specific incident id; otherwise picks the top open incident.")
+@click.option(
+    "--project-id",
+    "scope_project_id",
+    default="",
+    help="Restrict next-incident selection to this project id. Required when --id is omitted in multi-workspace stores.",
+)
+@click.option(
+    "--environment-id",
+    "scope_environment_id",
+    default="",
+    help="Restrict next-incident selection to this environment id (used with --project-id).",
+)
 def incident_auto(
     config_path: Path,
     repo_full_name: str,
@@ -220,6 +232,8 @@ def incident_auto(
     draft: bool,
     no_pr: bool,
     explicit_id: str,
+    scope_project_id: str,
+    scope_environment_id: str,
 ) -> None:
     """The killer demo: pick top incident -> auto-generate test -> open fix PR.
 
@@ -228,15 +242,33 @@ def incident_auto(
       2. Generate + run a UI test that reproduces it.
       3. If reproduced, score the repo, build the fix prompt, and open a
          draft PR. Optionally invoke a local agent to apply changes.
+
+    In multi-workspace databases there is no automatic mapping from `--repo`
+    back to a (project, environment). To avoid picking an incident from a
+    different workspace than the one whose code lives in this repo, pass
+    `--id` (preferred for repeat runs) or scope selection with
+    `--project-id` (and optionally `--environment-id`).
     """
     store, cfg = _open_store(config_path)
 
     if explicit_id:
         row = store.get_qa_incident(explicit_id)
     else:
-        row = store.next_open_qa_incident()
+        row = store.next_open_qa_incident(
+            project_id=scope_project_id or None,
+            environment_id=scope_environment_id or None,
+        )
     if row is None:
-        raise click.ClickException("No open incident to work on.")
+        scope_hint = ""
+        if scope_project_id:
+            scope_hint = f" (project_id={scope_project_id}"
+            if scope_environment_id:
+                scope_hint += f", environment_id={scope_environment_id}"
+            scope_hint += ")"
+        raise click.ClickException(
+            f"No open incident to work on{scope_hint}. "
+            "Pass --id <INC-...> or --project-id/--environment-id to scope selection."
+        )
     inc = Incident.from_row(row)
 
     click.echo(f"→ Working on {inc.public_id}: {inc.title}")
