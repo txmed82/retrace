@@ -187,9 +187,9 @@ it next to your replay and UI bugs.
 Retrace ingests frontend and backend error events into the same
 `qa_incidents` model. Three ingest surfaces are live:
 
-- **Sentry-compatible DSN.** `retrace api onboard-hosted` prints a DSN
-  you can drop into a `Sentry.init({ dsn })` call. Events land in
-  `failures` / `incidents` and are mirrored to `qa_incidents`.
+- **Sentry-compatible DSN.** `retrace quickstart` prints a DSN you can
+  drop into a `Sentry.init({ dsn })` call. Events land in `failures` /
+  `incidents` and are mirrored to `qa_incidents`.
 - **OpenTelemetry logs + traces.** `POST /v1/logs` and `POST /v1/traces`
   on the API server accept the OTLP JSON shape.
 - **Monitoring webhooks.** Sentry alert webhooks, PostHog alerts, and a
@@ -198,6 +198,37 @@ Retrace ingests frontend and backend error events into the same
 Stack frames are symbolicated via uploaded source maps
 (`retrace api upload-source-map`), and alert rules
 (`alert_rules.py`) gate which events become user-visible incidents.
+
+### Replace Sentry in 5 minutes
+
+`retrace quickstart` mints both a replay SDK key **and** a
+Sentry-compatible DSN against the same workspace. Two snippets, paste
+both:
+
+```html
+<!-- 1. Replay capture (rrweb-based) -->
+<script type="module">
+  import { init } from "https://esm.sh/@retrace/browser@latest";
+  init({
+    apiKey: "rtpk_…",
+    ingestUrl: "http://127.0.0.1:8788/api/sdk/replay",
+  });
+</script>
+
+<!-- 2. Drop-in Sentry replacement (any Sentry SDK works) -->
+<script src="https://browser.sentry-cdn.com/7.114.0/bundle.min.js"></script>
+<script>
+  Sentry.init({ dsn: "http://rtpk_…@127.0.0.1:8788/<project_id>" });
+</script>
+```
+
+That's the swap. Frontend errors flow into `qa_incidents` alongside
+replay sessions, UI/API test failures, and PR review findings. Run
+`retrace qa list` to see them; `retrace qa auto --repo org/app` to
+reproduce + open a fix PR.
+
+Backend SDKs (Python `sentry-sdk`, Node `@sentry/node`, etc.) work the
+same way — `Sentry.init({ dsn })` is all that changes.
 
 ## Code review (`retrace review`)
 
