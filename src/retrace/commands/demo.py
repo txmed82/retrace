@@ -199,6 +199,39 @@ def seed_demo(
         )
     )
 
+
+@demo_group.command("all")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--project", "project_name", default="Default", show_default=True)
+@click.option("--environment", "environment_name", default="production", show_default=True)
+def demo_all(
+    config_path: Path,
+    project_name: str,
+    environment_name: str,
+) -> None:
+    """Seed every pillar of the QA incident pipeline at once.
+
+    Produces incidents from all five sources — replay, UI test, API test,
+    error monitor (Sentry-compat), and PR review — so a fresh install
+    can immediately run `retrace qa list` and see the unified queue in
+    action.
+    """
+    from retrace.commands.demo_all import seed_all_pillars
+
+    _write_demo_config_if_missing(config_path)
+    seed_all_pillars(
+        config_path=config_path,
+        project_name=project_name,
+        environment_name=environment_name,
+    )
+
+
 def _write_demo_config_if_missing(config_path: Path) -> None:
     if config_path.exists():
         return
