@@ -84,7 +84,7 @@ runs:
           echo "::error::pr-number is empty. Trigger this action on `pull_request` events or set it explicitly."
           exit 1
         fi
-        if [ "${{ inputs.use-llm }}" = "on" ] && [ -z "${{ inputs.llm-base-url }}" ]; then
+        if [ "${{ inputs.use-llm }}" = "on" ] && { [ -z "${{ inputs.llm-base-url }}" ] || [ -z "${{ inputs.llm-api-key }}" ]; }; then
           echo "::error::use-llm=on requires llm-base-url + llm-api-key."
           exit 1
         fi

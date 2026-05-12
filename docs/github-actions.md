@@ -53,7 +53,7 @@ release for stability once we ship them).
 
 | Name | Required | Default | Notes |
 |---|---|---|---|
-| `pr-number` | no | `${{ github.event.pull_request.number || github.event.number }}` | The PR to review. |
+| `pr-number` | no | `${{ github.event.pull_request.number \|\| github.event.number }}` | The PR to review. |
 | `repo` | no | `${{ github.repository }}` | `owner/name`. |
 | `post-comment` | no | `true` | Set `false` for dry runs. Requires `pull-requests: write`. |
 | `run-affected-tests` | no | `false` | Run Retrace tester specs that cover affected flows. Slow on big PRs. |

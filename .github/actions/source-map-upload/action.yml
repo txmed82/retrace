@@ -107,6 +107,11 @@ runs:
         RETRACE_SERVICE_TOKEN: ${{ inputs.service-token }}
       run: |
         set -euo pipefail
+        # Normalize the source-map-dir before string-stripping it off
+        # each path — otherwise a caller passing `dist/` (with trailing
+        # slash) ends up with double-slash artifact_urls.
+        src_dir="${{ inputs.source-map-dir }}"
+        src_dir="${src_dir%/}"
         url="${{ inputs.api-base-url }}/api/source-maps?environment_id=${{ inputs.environment-id }}"
         prefix="${{ inputs.artifact-prefix }}"
         prefix="${prefix%/}"
@@ -116,7 +121,7 @@ runs:
         # We can't pipe straight to a `while` loop because that would
         # spawn a subshell, and the counters wouldn't propagate.
         while IFS= read -r -d '' map_path; do
-          relative="${map_path#${{ inputs.source-map-dir }}/}"
+          relative="${map_path#${src_dir}/}"
           # foo.js.map → foo.js
           generated="${relative%.map}"
           if [ -n "$prefix" ]; then
@@ -154,7 +159,7 @@ runs:
             fi
             skipped=$((skipped+1))
           fi
-        done < <(find "${{ inputs.source-map-dir }}" -type f -name "*.map" -print0)
+        done < <(find "${src_dir}" -type f -name "*.map" -print0)
         echo "uploaded-count=${uploaded}" >>"$GITHUB_OUTPUT"
         echo "skipped-count=${skipped}"   >>"$GITHUB_OUTPUT"
         echo "::notice::Source maps: ${uploaded} uploaded, ${skipped} skipped (release=${{ inputs.sha }})"

@@ -165,6 +165,42 @@ def test_source_map_upload_has_no_python_dependency():
     )
 
 
+def test_pr_review_on_mode_requires_both_base_url_and_api_key():
+    """Regression for CodeRabbit Minor on PR #129: the validation step
+    must reject `use-llm=on` when EITHER `llm-base-url` OR `llm-api-key`
+    is empty — the error message claims both are required, so the
+    check should match the message.
+    """
+    action = _load_action("pr-review")
+    steps = action["runs"]["steps"]
+    validate = next(s for s in steps if s.get("name") == "Validate inputs")
+    body = validate["run"]
+    # The on-mode guard must mention both inputs.
+    assert "inputs.llm-base-url" in body
+    assert "inputs.llm-api-key" in body
+    # And the guard must error on either-empty, not just one.
+    assert "[ -z \"${{ inputs.llm-base-url }}\" ]" in body
+    assert "[ -z \"${{ inputs.llm-api-key }}\" ]" in body
+
+
+def test_source_map_upload_normalizes_trailing_slash():
+    """Regression for CodeRabbit Minor on PR #129: a caller passing
+    `source-map-dir: dist/` (with trailing slash) must not produce
+    `artifact_url` values with double slashes after the prefix
+    strip."""
+    action = _load_action("source-map-upload")
+    upload_step = next(
+        s for s in action["runs"]["steps"] if s.get("id") == "upload"
+    )
+    body = upload_step["run"]
+    # The script must normalize the directory before using it.
+    assert 'src_dir="${{ inputs.source-map-dir }}"' in body
+    assert 'src_dir="${src_dir%/}"' in body
+    # And the normalized value must be what's stripped + searched.
+    assert "${map_path#${src_dir}/}" in body
+    assert 'find "${src_dir}"' in body
+
+
 def test_qa_auto_passes_through_optional_id():
     """The script body must reference the `incident-id` input; otherwise
     the --id passthrough is broken."""
