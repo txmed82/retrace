@@ -1268,39 +1268,60 @@ class Storage:
         path: Path | str,
         replay_blob_dir: Optional[Path] = None,
     ):
-        # P1.5 foundation: reject `postgresql://` URLs here with a clean
-        # `NotImplementedError` so users get a useful message instead of
-        # a confusing `sqlite3.OperationalError`. The Postgres backend
-        # itself lands in follow-up table-slice PRs; the chassis is in
-        # `retrace.storage_backend`.
-        if isinstance(path, str) and "://" in path:
-            from retrace.storage_backend import parse_storage_url
+        # P1.5: route to a Backend (`SqliteBackend` or `PostgresBackend`).
+        # The 290+ existing `conn.execute(...)` call sites keep their
+        # sqlite-flavored SQL — `WrappedConnection` translates at
+        # execute time (see `retrace.sql_dialect`).
+        from retrace.storage_backend import (
+            ParsedDsn,
+            SqliteBackend,
+            backend_from_url,
+            parse_storage_url,
+        )
 
+        if isinstance(path, str) and "://" in path:
             dsn = parse_storage_url(path)
+            self._backend = backend_from_url(path)
             if dsn.is_postgres():
-                raise NotImplementedError(
-                    "Storage(postgresql://...) is on the P1.5 roadmap but "
-                    "not yet implemented. The chassis is in "
-                    "`retrace.storage_backend` and per-table migrations "
-                    "ship in follow-up PRs. Use a SQLite path for now."
-                )
-            # Resolve a `sqlite://...` URL to its file path so the rest
-            # of this class keeps using `self.path` unchanged.
-            path = dsn.path
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+                # `self.path` stays defined for back-compat callers; it
+                # points at the database name so existing diagnostics
+                # don't crash on `str(self.path)`.
+                self.path = Path(f"postgres:{dsn.database}")
+            else:
+                self.path = Path(dsn.path)
+        else:
+            # Bare path → SQLite (back-compat).
+            self.path = Path(path)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._backend = SqliteBackend(ParsedDsn(scheme="sqlite", path=str(self.path)))
+
         self.replay_blob_store: ReplayBlobStore | None = (
             LocalReplayBlobStore(replay_blob_dir) if replay_blob_dir is not None else None
         )
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    @property
+    def backend_name(self) -> str:
+        """`"sqlite"` or `"postgres"` — useful for tests + diagnostics."""
+        return self._backend.name
+
+    def _conn(self):
+        """Return a connection wrapped with the sqlite3.Connection
+        surface — sqlite3-flavored SQL still works against Postgres
+        via the dialect translator in `retrace.sql_dialect`."""
+        return self._backend.connect()
 
     def init_schema(self) -> None:
+        from retrace.sql_schema import translate_schema
+
+        schema_sql = translate_schema(SCHEMA, dialect=self._backend.name)
         with self._conn() as conn:
-            conn.executescript(SCHEMA)
+            conn.executescript(schema_sql)
+            if self._backend.name != "sqlite":
+                # Postgres path: lightweight `PRAGMA table_info`-based
+                # migrations below don't apply — a fresh Postgres install
+                # gets the current schema from the CREATE TABLE block.
+                # SQLite-side, they catch up old DBs.
+                return
             # Lightweight migrations for existing DBs.
             cols_repo = [
                 r["name"]
