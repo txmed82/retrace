@@ -115,6 +115,28 @@ class TesterConfig(BaseModel):
     env_profiles: dict[str, TesterEnvProfileConfig] = Field(default_factory=dict)
 
 
+class RetentionConfig(BaseModel):
+    """TTLs for the `retrace data retention apply` sweep.
+
+    Defaults match `retention.RetentionPolicy` defaults; the policy
+    dataclass is the source of truth at runtime, this Pydantic
+    model is just the typed handle on `config.yaml`.
+
+    `ge=1` (greater-than-or-equal) guards at the schema level — a
+    user typo of `0` or a negative value gets caught at config-load
+    time with a clean Pydantic error instead of being silently
+    coerced by the downstream `max(1, ...)` in `_retention_interval`.
+    """
+
+    failures_days: int = Field(default=90, ge=1)
+    evidence_days: int = Field(default=90, ge=1)
+    source_maps_days: int = Field(default=30, ge=1)
+    rate_limit_hours: int = Field(default=48, ge=1)
+    replay_batches_days: int = Field(default=30, ge=1)
+    otel_events_days: int = Field(default=30, ge=1)
+    run_artifact_days: int = Field(default=30, ge=1)
+
+
 class RetraceConfig(BaseModel):
     posthog: PostHogConfig
     llm: LLMConfig
@@ -126,6 +148,7 @@ class RetraceConfig(BaseModel):
     github_app: GitHubAppConfig = Field(default_factory=GitHubAppConfig)
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
     tester: TesterConfig = Field(default_factory=TesterConfig)
+    retention: RetentionConfig = Field(default_factory=RetentionConfig)
 
 
 def load_config(path: Path) -> RetraceConfig:

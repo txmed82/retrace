@@ -94,7 +94,7 @@ Every roadmap item below uses the same dev loop. Don't skip steps.
 |---|---|
 | **Now (this week)** | P0.1 LLM-powered PR review · P0.2 Python SDK · P0.3 GitHub Actions templates · P0.4 Browser SDK breadcrumbs |
 | **Next (weeks 2–3)** | P1.1 Real-time alerts · P1.2 Perceptual visual diff · P1.3 Diff-aware affected tests · P1.4 API tester env profiles UI |
-| **Later (month 2+)** | P2.2 Rate limiting + sampling · P2.3 Retention + backups · P2.4 Multi-tenancy + audit log (P1.5 ✅ done, P2.1 deferred — GitHub-only at launch) |
+| **Later (month 2+)** | P2.2 Rate limiting + sampling · P2.4 Multi-tenancy + audit log (P1.5 ✅, P2.3 ✅ done; P2.1 deferred — GitHub-only at launch) |
 
 ---
 
@@ -655,14 +655,44 @@ work speculatively. · **ETA when revived:** 3 days each (~1 week total)
 
 ## P2.3 — Retention + backups
 
-**Status:** NOT STARTED · **ETA:** 2 days
+**Status:** DONE 2026-05-12 · **PR:** this PR · **Owner:** Claude
 
 ### Plan
 
 1. `retrace data retention apply` — purges replay batches + failures
-   older than N days (configurable per project).
+   older than N days (install-global TTLs in `config.yaml`;
+   per-project overrides explicitly deferred — see below).
 2. `retrace data backup --to <path>` — sqlite + data dir tarball.
-3. Cron in Docker Compose.
+3. Cron in Docker Compose. *(left for ops docs — the CLI is the
+   primitive; how a self-host operator schedules it is their call.)*
+
+### What shipped
+
+- `src/retrace/retention.py` — `RetentionPolicy` + `apply_retention()`
+  orchestrator. Touches the app-error domain via the existing
+  `Storage.prune_app_error_retention()` (per project+env pair), plus
+  two new global helpers `Storage.prune_replay_batches()` and
+  `Storage.prune_otel_events()`. Filesystem sweep removes per-run
+  directories under `ui-tests/runs/` and `api-tests/runs/`; specs,
+  baselines, queues are NEVER touched.
+- `src/retrace/backup.py` — `create_backup()` writes a `.tar.gz` of
+  a consistent sqlite snapshot (via the online `BACKUP` API, not raw
+  bytes — survives concurrent writes) plus the `data_dir` contents.
+  Postgres backups deferred (use `pg_dump` against the DSN).
+- `src/retrace/config.py` — new `RetentionConfig` block.
+- `src/retrace/commands/data.py` — `retrace data retention apply [--dry-run]`
+  and `retrace data backup --to PATH`.
+- 26 new tests across `tests/test_retention.py`, `tests/test_backup.py`,
+  `tests/test_data_cli.py` (dry-run / sweep / round-trip /
+  CLI happy + error paths).
+
+### Per-project retention is NOT modeled yet
+
+The roadmap mentions "configurable per project" but the schema
+doesn't carry per-project retention columns. Today the policy is
+install-global via the `retention:` block in `config.yaml`. Adding
+`project_retention_policies` is a separate slice — wait for a real
+multi-project user to ask before paying that complexity.
 
 ---
 
@@ -749,7 +779,8 @@ EOF
 | 2026-05-12 | P1.4 (partial) OpenAPI contract diff — new `retrace tester api-diff --new --old` emits breaking-vs-safe contract changes across two OpenAPI / Swagger documents (operation removed, required-request-field added, response-schema field removed, success-status removed, enum-value removed). Each breaking change files a `qa_incident` (`--no-file-incidents` to opt out). One-level `$ref` resolution; deterministic ordering. 24 new tests. Env-profile UI + `tester record` deferred. | #134 |
 | 2026-05-12 | P1.5 (foundation) Postgres adapter chassis — new `retrace.storage_backend` module with `Backend` Protocol + `SqliteBackend` + `PostgresBackend` stub + URL factory. `Storage(...)` accepts `sqlite:///`, bare paths, and rejects `postgresql://` with a clean `NotImplementedError` pointing at this slice. `[postgres]` extra reserves `psycopg[binary]>=3.2`. Per-table migration ordering documented for follow-up PRs. 27 new tests; existing Storage behavior unchanged. | #135 |
 | 2026-05-12 | P1.5 (full) Postgres adapter — real `PostgresBackend.connect()` via psycopg3, SQL dialect translation at execute time (`?` → `%s`, `datetime('now', ?)` → ISO-text `to_char(now() + interval)`, `INSERT OR IGNORE` → `INSERT ... ON CONFLICT DO NOTHING`), portable SCHEMA via `sql_schema.translate_schema` (`AUTOINCREMENT` → `BIGSERIAL`, ISO-text defaults). `Storage(postgresql://...)` works end-to-end. CI Postgres service container runs gated smoke tests covering `alert_routes`/`alert_dispatches`/`llm_pr_reviews` round-trips. 18 new tests (translation + WrappedConnection + schema translator + PG smoke). | #136 |
-| 2026-05-12 | P1.4 (finish) env-profile management CLI + HAR import recorder — new `retrace tester env list/show/yaml` (read-only against `config.yaml`; emits paste-ready stanzas, never overwrites the hand-edited file). New `retrace tester record --har` ingests a browser DevTools HAR export into one APITestSpec per matching request (sensitive headers stripped, JSON bodies structured, `--include-host`/`--include-method`/`--exclude-path` filters). P2.1 GitLab/Bitbucket deferred — GitHub-only at launch. 41 new tests. | this PR |
+| 2026-05-12 | P1.4 (finish) env-profile management CLI + HAR import recorder — new `retrace tester env list/show/yaml` (read-only against `config.yaml`; emits paste-ready stanzas, never overwrites the hand-edited file). New `retrace tester record --har` ingests a browser DevTools HAR export into one APITestSpec per matching request (sensitive headers stripped, JSON bodies structured, `--include-host`/`--include-method`/`--exclude-path` filters). P2.1 GitLab/Bitbucket deferred — GitHub-only at launch. 41 new tests. | #137 |
+| 2026-05-12 | P2.3 Retention + backups — `retrace data retention apply [--dry-run]` purges old rows across the app-error domain (per project+env via existing `prune_app_error_retention`) + globally for `replay_batches` and `otel_events`, plus a filesystem sweep that removes old `ui-tests/runs/` and `api-tests/runs/` subdirectories (specs / baselines / queues untouched). `retrace data backup --to PATH` writes a `.tar.gz` of a consistent sqlite snapshot (via the online BACKUP API) plus the `data_dir` contents. New `RetentionConfig` in `config.yaml`. 26 new tests. | this PR |
 
 > Append a row whenever an item changes status or a new item is
 > added. Keep newest at the bottom.
