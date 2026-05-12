@@ -532,7 +532,7 @@ perceptual diff with a configurable threshold.
 
 ## P1.3 — Diff-aware affected-test selection
 
-**Status:** DONE 2026-05-12 · **PR:** this PR · **Owner:** Claude
+**Status:** DONE 2026-05-12 · **PR:** #133 · **Owner:** Claude
 
 ### Why
 

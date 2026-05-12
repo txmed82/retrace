@@ -604,8 +604,19 @@ def _run_affected_api_tests(*, cfg: Any, analysis: Any) -> list[dict[str, Any]]:
     runs_dir = api_runs_dir_for_data_dir(cfg.run.data_dir)
     try:
         candidates = affected_api_specs(analysis=analysis, specs_dir=specs_dir)
-    except Exception:  # pragma: no cover - defensive
-        return []
+    except Exception as exc:  # pragma: no cover - defensive
+        # Don't pretend "no matches" — surface the failure as an
+        # explicit error row so users can distinguish a real failure
+        # from an empty-match result. (CodeRabbit Major catch on PR #133.)
+        return [
+            {
+                "spec_id": "",
+                "kind": "api",
+                "status": "error",
+                "summary": f"failed to select affected API specs: {exc}",
+                "matched_flows": [],
+            }
+        ]
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for cand in candidates:
