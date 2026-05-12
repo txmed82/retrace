@@ -170,6 +170,17 @@ def compare_run_to_baseline(
     diffs: list[str] = []
     ssim_scores: dict[str, float] = {}
     compared = 0
+
+    def _sha256_compare(ref: Path, current: Path, diff_path: Path) -> None:
+        # Same byte-equality behaviour as before P1.2. We still write a
+        # `*-diff.png` artifact (copy of the current) on mismatch so
+        # the auto-repro classifier fires.
+        if _hash(current) == _hash(ref):
+            unchanged.append(str(current))
+            return
+        shutil.copy2(current, diff_path)
+        diffs.append(str(diff_path))
+
     for current in _iter_screenshots(run_dir):
         compared += 1
         rel = current.relative_to(run_dir)
@@ -179,11 +190,18 @@ def compare_run_to_baseline(
             continue
         diff_path = current.with_name(current.stem + "-diff.png")
         if resolved_mode == "perceptual":
-            result = perceptual_diff(
-                ref, current,
-                threshold=threshold,
-                diff_path=diff_path,
-            )
+            try:
+                result = perceptual_diff(
+                    ref, current,
+                    threshold=threshold,
+                    diff_path=diff_path,
+                )
+            except (OSError, ValueError):
+                # Pillow can't read this image (truncated, synthetic
+                # fixture, malformed). Fall back to sha256 so a single
+                # bad file doesn't fail the whole comparison.
+                _sha256_compare(ref, current, diff_path)
+                continue
             ssim_scores[str(current)] = result.ssim
             if result.changed:
                 # `perceptual_diff` already wrote the annotated PNG.
@@ -197,14 +215,7 @@ def compare_run_to_baseline(
                     pass
                 unchanged.append(str(current))
         else:
-            # sha256 fallback — same byte-equality behaviour as before
-            # P1.2. We still write a `*-diff.png` artifact (copy of the
-            # current) on mismatch so the auto-repro classifier fires.
-            if _hash(current) == _hash(ref):
-                unchanged.append(str(current))
-                continue
-            shutil.copy2(current, diff_path)
-            diffs.append(str(diff_path))
+            _sha256_compare(ref, current, diff_path)
     return BaselineCompareResult(
         spec_id=spec_id,
         compared=compared,

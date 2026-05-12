@@ -260,6 +260,29 @@ def test_compare_invalid_mode_raises(tmp_path: Path):
         )
 
 
+def test_compare_falls_back_to_sha256_on_unreadable_image(tmp_path: Path):
+    """Regression for the P1.2 CI failure on PR #132: when a
+    screenshot can't be parsed by Pillow (truncated / synthetic /
+    malformed PNG), auto-perceptual mode must fall back to sha256
+    for THAT image rather than abort the whole comparison.
+    """
+    data_dir, run_dir, spec_id = _spec_layout(tmp_path)
+    base_img = data_dir / "ui-tests" / "baselines" / spec_id / "home.png"
+    base_img.write_bytes(b"\x89PNG\r\n\x1a\n broken-stream-content")
+    cur = run_dir / "home.png"
+    cur.write_bytes(b"\x89PNG\r\n\x1a\n broken-stream-content")
+    result = compare_run_to_baseline(
+        data_dir=data_dir, spec_id=spec_id, run_dir=run_dir,
+    )
+    assert result.mode == "perceptual"
+    assert result.compared == 1
+    # Bytes are equal → fallback says unchanged. The fallback never
+    # records an SSIM score for the image.
+    assert result.diffs == []
+    assert result.unchanged
+    assert result.ssim_scores == {}
+
+
 def test_accept_then_compare_perceptual_round_trip(tmp_path: Path):
     """End-to-end: take a `run_dir`, accept it as the baseline, then a
     fresh run with identical pixels comes back unchanged."""
