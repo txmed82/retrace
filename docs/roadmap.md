@@ -559,7 +559,7 @@ routes the PR touches.
 
 ## P1.4 — API tester env profiles UI + request recording
 
-**Status:** NOT STARTED · **ETA:** 3 days
+**Status:** PARTIAL DONE 2026-05-12 · **PR:** #134 ships the contract-diff piece (`retrace tester api-diff`); env-profile UI + `tester record` deferred to a follow-up. · **Owner:** Claude
 
 ### OSS to study
 
@@ -744,6 +744,7 @@ EOF
 | 2026-05-12 | P1.2 Perceptual visual diff — new `[image]` extra (Pillow + numpy); `visual_perceptual.perceptual_diff(...)` runs single-window SSIM with annotated red-overlay diff PNG. `compare_run_to_baseline(mode="auto", threshold=0.95)` uses perceptual when extra installed, falls back to sha256 otherwise. `retrace tester baseline compare --mode --threshold` CLI flags. | #132 |
 | 2026-05-12 | P1.1 Real-time alert fan-out — `alert_dispatch.dispatch_alert()` posts fired alerts to Slack / Discord / PagerDuty Events v2 / generic webhook targets. New `alert_routes` + `alert_dispatches` tables; per-route severity floor + dedup window. `retrace monitor route add/list/delete/test` CLI. Wired into `ingest_monitoring_webhook` as a best-effort tail step. 13 new tests. | #131 |
 | 2026-05-12 | P1.3 Diff-aware affected-test selection — new `pr_review.affected_api_specs(analysis, specs_dir)` intersects API spec URL paths with the PR's affected flows under an equality + strict-prefix matching rule (`/api/login` does NOT match `/api/login-history`). `retrace review --run-affected-tests` extended with `--include-api/--no-include-api`; JSON output + PR comment body carry `affected_api_test_results`. 11 new tests. | #133 |
+| 2026-05-12 | P1.4 (partial) OpenAPI contract diff — new `retrace tester api-diff --new --old` emits breaking-vs-safe contract changes across two OpenAPI / Swagger documents (operation removed, required-request-field added, response-schema field removed, success-status removed, enum-value removed). Each breaking change files a `qa_incident` (`--no-file-incidents` to opt out). One-level `$ref` resolution; deterministic ordering. 24 new tests. Env-profile UI + `tester record` deferred. | #134 |
 
 > Append a row whenever an item changes status or a new item is
 > added. Keep newest at the bottom.
