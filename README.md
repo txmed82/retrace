@@ -484,6 +484,39 @@ Outgoing fetch/XHR calls carry W3C `traceparent` context when possible, and
 captured network evidence preserves request/response trace IDs for repair
 prompts and log correlation.
 
+### Breadcrumb trail
+
+The SDK keeps a 50-entry ring buffer of recent activity — clicks,
+console output, fetch/XHR completions, history navigations, and
+manually-added entries via `client.addBreadcrumb({...})`. When an
+exception fires (or an external Sentry SDK sends an event with
+`event.breadcrumbs.values`), the trail is attached and the server-side
+ingest promotes it to `IncidentEvidence`:
+
+- `category="console"` breadcrumbs → `console_excerpts`
+- `category="http|fetch|xhr"` with `status >= 400` or `data.error` → `network_failures`
+- The full raw trail also survives on `failure.metadata.breadcrumbs` for
+  the repair prompt and dashboard to read.
+
+Manual breadcrumbs follow the Sentry shape so any code that already
+calls `Sentry.addBreadcrumb({...})` works as-is against Retrace:
+
+```ts
+import { init } from "@retrace/browser";
+const client = init({ apiKey: "rtpk_…", maxBreadcrumbs: 50 });
+
+client.addBreadcrumb({
+  category: "auth",
+  message: "login attempt",
+  level: "info",
+  data: { user_id: "u_123" },
+});
+```
+
+Privacy: clicks on elements matching `privacy.maskTextSelector` record
+the breadcrumb with the element's selector but without its visible text,
+so a masked element can't leak content via the trail.
+
 ## Fix Suggestions Workflow
 
 1. Connect repo metadata from the local UI or CLI:

@@ -399,7 +399,7 @@ example workflows.
 
 ## P0.4 — Browser SDK breadcrumbs
 
-**Status:** NOT STARTED · **ETA:** 2 days · **Owner:** TBD
+**Status:** DONE 2026-05-11 · **PR:** this PR · **Owner:** Claude
 
 ### Why now
 

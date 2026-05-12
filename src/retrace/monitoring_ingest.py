@@ -232,6 +232,9 @@ def _sentry_alert(
         external_id,
         event.get("fingerprint") or issue.get("fingerprint") or title,
     )
+    breadcrumb_trail = _breadcrumbs_from_sentry(event)
+    console_excerpts = _console_excerpts_from_breadcrumbs(breadcrumb_trail)
+    network_failures = _network_failures_from_breadcrumbs(breadcrumb_trail)
     metadata = {
         "external_id": external_id,
         "issue_id": _first_str(issue, "id", default=""),
@@ -246,6 +249,15 @@ def _sentry_alert(
         "dist": dist,
         "environment": _first_str(event, "environment", default=""),
         "grouping_fingerprint": grouping_fingerprint,
+        # Breadcrumbs flow from the browser SDK or any Sentry SDK with
+        # an `event.breadcrumbs.values` array. We promote the obvious
+        # signal classes (console / HTTP) into the `IncidentEvidence`
+        # fields the bridge already reads, and keep the raw trail in
+        # metadata so future consumers (e.g. the repair prompt) can
+        # see the full sequence.
+        "breadcrumbs": breadcrumb_trail,
+        "console_excerpts": console_excerpts,
+        "network_failures": network_failures,
     }
     return MonitoringAlert(
         provider="sentry",
@@ -568,6 +580,98 @@ def _trace_ids_from_sentry(event: dict[str, Any]) -> list[str]:
             if str(item[0]) in {"trace_id", "traceId"}:
                 values.append(item[1])
     return _string_list([item for item in values if item])
+
+
+def _breadcrumbs_from_sentry(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize Sentry-style breadcrumbs to a clean list of dicts.
+
+    Sentry's wire shape is `event.breadcrumbs.values = [...]`, but
+    older SDKs and synthetic payloads sometimes send `breadcrumbs`
+    directly as a list. We handle both; entries that aren't dicts are
+    dropped.
+    """
+    raw = event.get("breadcrumbs")
+    if isinstance(raw, dict):
+        items = raw.get("values")
+    else:
+        items = raw
+    if not isinstance(items, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        normalized: dict[str, Any] = {
+            "timestamp": entry.get("timestamp"),
+            "category": str(entry.get("category") or "default").strip(),
+            "message": str(entry.get("message") or "").strip(),
+            "level": str(entry.get("level") or "info").strip().lower(),
+        }
+        data = entry.get("data")
+        if isinstance(data, dict):
+            normalized["data"] = data
+        out.append(normalized)
+    return out
+
+
+def _console_excerpts_from_breadcrumbs(crumbs: list[dict[str, Any]]) -> list[str]:
+    """Pick console / log breadcrumbs out of the trail.
+
+    Mirrors the rule used in `auto_fix.py`: a short, ordered list of
+    strings that the repair prompt can quote verbatim.
+    """
+    out: list[str] = []
+    for c in crumbs:
+        category = str(c.get("category") or "").lower()
+        if category not in {"console", "log"}:
+            continue
+        message = str(c.get("message") or "").strip()
+        if not message:
+            continue
+        out.append(message[:500])
+        if len(out) >= 20:
+            break
+    return out
+
+
+def _network_failures_from_breadcrumbs(crumbs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pick failed HTTP-category breadcrumbs (status >= 400 or explicit
+    error) out of the trail.
+
+    Shape matches `IncidentEvidence.network_failures` in
+    `qa_incidents.py` so the bridge can ingest verbatim.
+    """
+    out: list[dict[str, Any]] = []
+    for c in crumbs:
+        category = str(c.get("category") or "").lower()
+        if category not in {"http", "fetch", "xhr"}:
+            continue
+        data = c.get("data") if isinstance(c.get("data"), dict) else {}
+        status = data.get("status_code") or data.get("status")
+        try:
+            status_int = int(status) if status is not None else 0
+        except (TypeError, ValueError):
+            status_int = 0
+        err = str(data.get("error") or "").strip()
+        if status_int < 400 and not err:
+            continue
+        entry: dict[str, Any] = {
+            "method": str(data.get("method") or "").upper() or "GET",
+            "url": str(data.get("url") or ""),
+        }
+        if status_int:
+            entry["status_code"] = status_int
+        if err:
+            entry["error"] = err
+        if data.get("duration_ms") is not None:
+            try:
+                entry["duration_ms"] = int(data["duration_ms"])
+            except (TypeError, ValueError):
+                pass
+        out.append(entry)
+        if len(out) >= 20:
+            break
+    return out
 
 
 def _safe_int(value: Any) -> int:
