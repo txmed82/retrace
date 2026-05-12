@@ -208,23 +208,37 @@ def _entry_to_spec_params(
 
 
 _SUPPORTED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+_SUPPORTED_SCHEMES = frozenset({"http", "https"})
 
 
 def _parse_url(url: str):
+    """Parse the URL and reject anything that isn't a normal http(s)
+    request. HAR files can capture `ws://`, `file://`, `chrome-
+    extension://`, etc.; none of those make sense as API test specs."""
     try:
         parsed = urlparse(url)
     except ValueError:
         return None
-    if not parsed.scheme or not parsed.netloc:
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _SUPPORTED_SCHEMES:
+        return None
+    if not parsed.hostname:
         return None
     return parsed
 
 
 def _bare_url(parsed) -> str:
-    """Return the URL without query string — `query` is stored
-    separately on the spec, so we don't want both."""
+    """Return the URL without query string OR userinfo.
+
+    `parsed.netloc` for a URL like `https://admin:hunter2@api.x.com/y`
+    is `admin:hunter2@api.x.com` — persisting that into a spec file
+    leaks credentials. Rebuild from `hostname` + `port` so the spec
+    only carries the safe pieces. The `query` is stored separately on
+    the spec, so we also drop it here."""
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
     path = parsed.path or "/"
-    return f"{parsed.scheme}://{parsed.netloc}{path}"
+    return f"{parsed.scheme}://{host}{port}{path}"
 
 
 def _host_matches(host: str, globs: list[str]) -> bool:
@@ -334,11 +348,16 @@ def import_summary(har: dict[str, Any], result: list[dict[str, Any]]) -> dict[st
     }
 
 
-__all__ = ["import_har", "import_summary"]
+__all__ = ["import_har", "import_summary", "looks_like_har"]
 
 
-# Loose regex for HAR sanity-check, used by the CLI when reading a file.
-_HAR_FILE_HINT = re.compile(r'"log"\s*:\s*\{', re.IGNORECASE)
+# Loose regex for HAR sanity-check, used by the CLI when reading a
+# file. Match either the standard `log: { entries: [...] }` envelope
+# OR the bare `entries: [...]` form that the importer also accepts
+# (curl --har, some test fixtures). Keep this lenient — false-negatives
+# block valid input; false-positives are fine since the importer
+# returns an empty list for non-HAR JSON anyway.
+_HAR_FILE_HINT = re.compile(r'"(log|entries)"\s*:\s*[\{\[]', re.IGNORECASE)
 
 
 def looks_like_har(text: str) -> bool:

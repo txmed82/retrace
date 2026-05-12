@@ -2037,7 +2037,18 @@ def tester_record(
     stripped at import time. Re-attach them via `--env-profile` or
     `auth_profile` on the spec.
     """
-    text = Path(har_path).read_text(encoding="utf-8")
+    try:
+        text = Path(har_path).read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # HAR files are JSON, which is text. If the bytes aren't
+        # valid UTF-8 the user pointed at a binary or a HAR exported
+        # with an unusual encoding — surface a clean message rather
+        # than a stack trace.
+        raise click.ClickException(
+            f"{har_path}: file is not valid UTF-8 text: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise click.ClickException(f"{har_path}: cannot read file: {exc}") from exc
     if not looks_like_har(text):
         raise click.ClickException(
             f"{har_path}: does not look like a HAR file (expected a "

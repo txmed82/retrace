@@ -303,10 +303,55 @@ def test_summary_counts_filtered_entries():
     assert summary == {"total_entries": 3, "kept": 1}
 
 
+def test_url_userinfo_stripped_from_persisted_url():
+    """Regression: URLs with `user:password@host` would otherwise be
+    written verbatim to the spec file, leaking creds. Strip the
+    userinfo at import time — same posture as the sensitive-header
+    drop. (CodeRabbit critical finding on PR #137.)"""
+    har = _har(
+        _entry(
+            method="GET",
+            url="https://admin:hunter2@api.example.com/v1/users",
+        )
+    )
+    params = import_har(har)[0]
+    assert "admin" not in params["url"]
+    assert "hunter2" not in params["url"]
+    assert params["url"] == "https://api.example.com/v1/users"
+
+
+def test_url_port_preserved():
+    """Stripping userinfo must not also strip the port."""
+    har = _har(_entry(url="https://api.example.com:8443/v1/x"))
+    params = import_har(har)[0]
+    assert params["url"] == "https://api.example.com:8443/v1/x"
+
+
+def test_non_http_schemes_rejected():
+    """HAR captures can include ws://, file://, chrome-extension://,
+    etc. None of those make sense as API regression specs."""
+    har = _har(
+        _entry(url="https://api.example.com/v1/keep"),
+        _entry(url="ws://realtime.example.com/socket"),
+        _entry(url="file:///etc/passwd"),
+        _entry(url="chrome-extension://abc/popup.html"),
+    )
+    result = import_har(har)
+    assert len(result) == 1
+    assert result[0]["url"].endswith("/v1/keep")
+
+
 def test_looks_like_har_positive_negative():
     assert looks_like_har('{"log": {"entries": []}}') is True
     assert looks_like_har('{"random": "json"}') is False
     assert looks_like_har('not even json') is False
+
+
+def test_looks_like_har_accepts_bare_entries_form():
+    """`{"entries": [...]}` without the `log` wrapper — some HAR-
+    adjacent tools (curl --har style) emit this. The importer
+    accepts it, so the sigil-check must too."""
+    assert looks_like_har('{"entries": [{"request": {}}]}') is True
 
 
 def test_non_dict_input_safe():

@@ -162,6 +162,20 @@ def test_tester_record_invalid_json(tmp_path):
     assert "invalid JSON" in result.output
 
 
+def test_tester_record_non_utf8_file(tmp_path):
+    """Binary or unusual-encoding HAR file → clean Click error, no
+    stack trace. (CodeRabbit major finding on PR #137.)"""
+    cfg = _write_config(tmp_path)
+    bad = tmp_path / "binary.har"
+    bad.write_bytes(b"\xff\xfe\x00\x00binary garbage")
+    runner = CliRunner()
+    result = runner.invoke(
+        tester_cli, ["record", "--config", str(cfg), "--har", str(bad)]
+    )
+    assert result.exit_code != 0
+    assert "UTF-8" in result.output
+
+
 def test_tester_record_unknown_env_profile_fails_fast(tmp_path):
     """If --env-profile references a missing profile, we surface the
     error before writing any spec files."""
