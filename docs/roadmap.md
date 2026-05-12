@@ -580,7 +580,7 @@ routes the PR touches.
 
 ## P1.5 — Postgres adapter
 
-**Status:** NOT STARTED · **ETA:** 7 days (carefully)
+**Status:** FOUNDATION SHIPPED 2026-05-12 · **PR:** this PR — `Backend` Protocol + `SqliteBackend` + `PostgresBackend` stub + URL factory + `[postgres]` extra. Per-table migration in follow-up PRs (suggested ordering in `docs/study-notes/postgres-backend.md`). · **Owner:** Claude
 
 ### Why
 
@@ -745,6 +745,7 @@ EOF
 | 2026-05-12 | P1.1 Real-time alert fan-out — `alert_dispatch.dispatch_alert()` posts fired alerts to Slack / Discord / PagerDuty Events v2 / generic webhook targets. New `alert_routes` + `alert_dispatches` tables; per-route severity floor + dedup window. `retrace monitor route add/list/delete/test` CLI. Wired into `ingest_monitoring_webhook` as a best-effort tail step. 13 new tests. | #131 |
 | 2026-05-12 | P1.3 Diff-aware affected-test selection — new `pr_review.affected_api_specs(analysis, specs_dir)` intersects API spec URL paths with the PR's affected flows under an equality + strict-prefix matching rule (`/api/login` does NOT match `/api/login-history`). `retrace review --run-affected-tests` extended with `--include-api/--no-include-api`; JSON output + PR comment body carry `affected_api_test_results`. 11 new tests. | #133 |
 | 2026-05-12 | P1.4 (partial) OpenAPI contract diff — new `retrace tester api-diff --new --old` emits breaking-vs-safe contract changes across two OpenAPI / Swagger documents (operation removed, required-request-field added, response-schema field removed, success-status removed, enum-value removed). Each breaking change files a `qa_incident` (`--no-file-incidents` to opt out). One-level `$ref` resolution; deterministic ordering. 24 new tests. Env-profile UI + `tester record` deferred. | #134 |
+| 2026-05-12 | P1.5 (foundation) Postgres adapter chassis — new `retrace.storage_backend` module with `Backend` Protocol + `SqliteBackend` + `PostgresBackend` stub + URL factory. `Storage(...)` accepts `sqlite:///`, bare paths, and rejects `postgresql://` with a clean `NotImplementedError` pointing at this slice. `[postgres]` extra reserves `psycopg[binary]>=3.2`. Per-table migration ordering documented for follow-up PRs. 27 new tests; existing Storage behavior unchanged. | #135 |
 
 > Append a row whenever an item changes status or a new item is
 > added. Keep newest at the bottom.

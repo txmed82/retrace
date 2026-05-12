@@ -28,6 +28,12 @@ image = [
     "pillow>=10.0",
     "numpy>=1.26",
 ]
+# P1.5 — Postgres backend chassis. The URL scheme is accepted today
+# (raising a clean `NotImplementedError` from `PostgresBackend`); the
+# per-table migration ships in follow-up PRs.
+postgres = [
+    "psycopg[binary]>=3.2",
+]
 dev = [
     "pytest>=8.0",
     "pytest-httpx>=0.30",
