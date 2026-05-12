@@ -582,13 +582,21 @@ def _trace_ids_from_sentry(event: dict[str, Any]) -> list[str]:
     return _string_list([item for item in values if item])
 
 
+# Hard cap on stored breadcrumbs per failure. A hostile external event
+# can otherwise bloat `failure.metadata` (and downstream evidence JSON)
+# without bound. We keep the most recent N — same end-trail-first
+# bias as the Sentry SDK. (CodeRabbit Major catch on PR #130.)
+_BREADCRUMB_HARD_CAP = 500
+
+
 def _breadcrumbs_from_sentry(event: dict[str, Any]) -> list[dict[str, Any]]:
     """Normalize Sentry-style breadcrumbs to a clean list of dicts.
 
     Sentry's wire shape is `event.breadcrumbs.values = [...]`, but
     older SDKs and synthetic payloads sometimes send `breadcrumbs`
     directly as a list. We handle both; entries that aren't dicts are
-    dropped.
+    dropped. Hard-capped at `_BREADCRUMB_HARD_CAP` so a 50k-crumb
+    event can't bloat the failure row.
     """
     raw = event.get("breadcrumbs")
     if isinstance(raw, dict):
@@ -598,7 +606,9 @@ def _breadcrumbs_from_sentry(event: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(items, list):
         return []
     out: list[dict[str, Any]] = []
-    for entry in items:
+    # Keep the most recent N — the SDKs prepend chronological order, so
+    # tail = newest.
+    for entry in items[-_BREADCRUMB_HARD_CAP:]:
         if not isinstance(entry, dict):
             continue
         normalized: dict[str, Any] = {
@@ -612,6 +622,32 @@ def _breadcrumbs_from_sentry(event: dict[str, Any]) -> list[dict[str, Any]]:
             normalized["data"] = data
         out.append(normalized)
     return out
+
+
+def _sanitize_breadcrumb_url(raw: Any) -> str:
+    """Strip query, fragment, and credentials from a URL before it
+    lands in `failure.metadata` / `IncidentEvidence`. Query strings
+    routinely carry tokens, emails, and other PII. (CodeRabbit Major
+    catch on PR #130.)
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    raw_str = str(raw or "").strip()
+    if not raw_str:
+        return ""
+    try:
+        parts = urlsplit(raw_str)
+    except ValueError:
+        # Coarse strip when urlsplit can't parse.
+        return raw_str.split("?", 1)[0].split("#", 1)[0]
+    # Drop username:password embedded in netloc, if any.
+    host = parts.hostname or ""
+    if parts.port:
+        netloc = f"{host}:{parts.port}"
+    else:
+        netloc = host
+    cleaned = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    return cleaned or raw_str.split("?", 1)[0].split("#", 1)[0]
 
 
 def _console_excerpts_from_breadcrumbs(crumbs: list[dict[str, Any]]) -> list[str]:
@@ -657,7 +693,7 @@ def _network_failures_from_breadcrumbs(crumbs: list[dict[str, Any]]) -> list[dic
             continue
         entry: dict[str, Any] = {
             "method": str(data.get("method") or "").upper() or "GET",
-            "url": str(data.get("url") or ""),
+            "url": _sanitize_breadcrumb_url(data.get("url")),
         }
         if status_int:
             entry["status_code"] = status_int

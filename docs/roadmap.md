@@ -736,7 +736,11 @@ EOF
 | Date | Change | PR |
 |---|---|---|
 | 2026-05-11 | Roadmap doc created. P0–P2 items defined. Snapshot taken after PR #124. | #125 |
-| 2026-05-11 | P0.1 LLM-powered PR review shipped: `retrace.llm_pr_review.llm_review`, `retrace review --llm/--no-llm`, PII-redacted diff, token-cap bail, file-aware chunking, in-process cache, structured `LLMReviewResult` with summary/walkthrough/inline suggestions/risk notes. 18 new tests. | this PR |
+| 2026-05-11 | P0.1 LLM-powered PR review shipped: `retrace.llm_pr_review.llm_review`, `retrace review --llm/--no-llm`, PII-redacted diff, token-cap bail, file-aware chunking, in-process cache, structured `LLMReviewResult` with summary/walkthrough/inline suggestions/risk notes. 18 new tests. | #126 |
+| 2026-05-11 | P0.1 follow-up: review-quality guardrails — line-validity filter, deterministic suggestion + risk caps, optional `--llm-self-critique`, prior-review memory via new `llm_pr_reviews` table. | #127 |
+| 2026-05-11 | P0.2 Python SDK + FastAPI / Flask / Django / logging integrations. Stdlib-only runtime, background-thread transport with bounded queue + atexit flush. 53 tests + 1 e2e through the real Sentry-compat ingest. | #128 |
+| 2026-05-11 | P0.3 GitHub Actions composite templates — `pr-review`, `source-map-upload` (curl + jq, dep-free), `qa-auto`. Contract pinned with 14 tests. | #129 |
+| 2026-05-11 | P0.4 Browser SDK breadcrumbs — 50-entry ring buffer (Sentry-shape), `addBreadcrumb` public API, auto-capture for click/console/http/navigation/error, exception events carry the trail. Server-side `monitoring_ingest` promotes console + failed-HTTP breadcrumbs to `IncidentEvidence` and persists the raw trail on `failure.metadata.breadcrumbs`. | this PR |
 
 > Append a row whenever an item changes status or a new item is
 > added. Keep newest at the bottom.

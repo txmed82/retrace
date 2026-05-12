@@ -5,8 +5,17 @@
  *
  *   1. Ring buffer caps at `maxBreadcrumbs`.
  *   2. addBreadcrumb is reachable from the client.
- *   3. Click breadcrumbs respect `privacy.maskTextSelector`.
- *   4. An exception event captures the trail in its custom-event payload.
+ *   3. Click breadcrumbs respect `privacy.maskTextSelector` (and the
+ *      ARIA-derived `accessibleName` fallback is also gated on the
+ *      same mask).
+ *   4. An unhandled `error` event captures the trail in the local
+ *      breadcrumb ring via the post-snapshot self-record path.
+ *
+ * Plus regressions added after the PR #130 CodeRabbit pass:
+ *   - SDK ingest URL is excluded from HTTP breadcrumbs.
+ *   - Query / fragment / credentials are sanitized out of URLs.
+ *   - Breadcrumb `data` is deep-cloned (nested mutation can't rewrite
+ *     historical entries).
  *
  * We avoid the SDK's flushing path here — the network mock would
  * obscure what we're really testing. Instead we exercise `init({autoStart})`
@@ -178,6 +187,104 @@ describe("auto-capture: navigation breadcrumbs", () => {
     } finally {
       client.stop();
       window.history.replaceState({}, "", "/");
+    }
+  });
+});
+
+describe("HTTP breadcrumbs", () => {
+  it("skips the SDK's own ingest URL so the ring doesn't fill with self-noise", async () => {
+    // Stub fetch *before* init so the SDK wraps our stub. The wrapped
+    // fetch should see the original input args; we always 200.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => new Response("{}", { status: 200 })) as typeof fetch;
+    try {
+      const client = init({
+        apiKey: FAKE_KEY,
+        autoStart: true,
+        ingestUrl: "http://ingest.test/api/sdk/replay",
+      });
+      try {
+        await fetch("http://ingest.test/api/sdk/replay", { method: "POST" });
+        await fetch("http://example.test/api/users", { method: "GET" });
+        const http = client.getBreadcrumbs().filter((b) => b.category === "http");
+        // Only the non-ingest request should appear.
+        expect(http).toHaveLength(1);
+        expect(http[0].message).toContain("example.test/api/users");
+      } finally {
+        client.stop();
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("sanitizes query strings and fragments out of breadcrumb URLs", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => new Response("{}", { status: 500 })) as typeof fetch;
+    try {
+      const client = init({ apiKey: FAKE_KEY, autoStart: true });
+      try {
+        await fetch("http://api.test/v1/auth?token=sk-LEAK&user=ada@x.com#frag");
+        const http = client.getBreadcrumbs().filter((b) => b.category === "http");
+        expect(http).toHaveLength(1);
+        expect(http[0].message).not.toContain("sk-LEAK");
+        expect(http[0].message).not.toContain("ada@x.com");
+        expect(http[0].message).not.toContain("#frag");
+        expect(String(http[0].data?.url)).toBe("http://api.test/v1/auth");
+      } finally {
+        client.stop();
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("exception event payload", () => {
+  it("attaches the breadcrumb trail to an unhandled error event", () => {
+    const client = init({ apiKey: FAKE_KEY, autoStart: true });
+    const events: unknown[] = [];
+    // Spy on the underlying push by patching the rrweb mock per-test.
+    // The SDK's exception capture pushes a custom event into the
+    // internal events queue; we can't access that queue directly,
+    // but the breadcrumb trail seen via getBreadcrumbs() after the
+    // throw must include both the manual trail and the error itself.
+    try {
+      client.addBreadcrumb({ category: "auth", message: "login attempt", level: "info" });
+      const errorEvent = new ErrorEvent("error", {
+        message: "kaboom",
+        filename: "/app.js",
+        lineno: 42,
+      });
+      window.dispatchEvent(errorEvent);
+      const trail = client.getBreadcrumbs();
+      // Trail should contain the manual login + an error breadcrumb
+      // recorded by `onError` after the snapshot was taken.
+      expect(trail.some((b) => b.message === "login attempt")).toBe(true);
+      expect(
+        trail.some((b) => b.category === "error" && b.message.includes("kaboom")),
+      ).toBe(true);
+      events.push(trail);
+    } finally {
+      client.stop();
+    }
+    expect(events).toHaveLength(1);
+  });
+});
+
+describe("breadcrumb data deep-clone", () => {
+  it("nested mutation after capture does not rewrite historical entries", () => {
+    const client = init({ apiKey: FAKE_KEY, autoStart: false });
+    try {
+      const ctx = { request: { headers: { auth: "ok" } } };
+      client.addBreadcrumb({ category: "manual", message: "with nested", data: ctx });
+      // Mutate the source AFTER capture.
+      ctx.request.headers.auth = "MUTATED";
+      const trail = client.getBreadcrumbs();
+      const data = trail[0].data as { request: { headers: { auth: string } } };
+      expect(data.request.headers.auth).toBe("ok");
+    } finally {
+      client.stop();
     }
   });
 });

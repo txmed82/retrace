@@ -216,6 +216,51 @@ def test_end_to_end_breadcrumbs_reach_qa_incident_evidence(tmp_path: Path):
     assert any(nf.get("status_code") == 500 for nf in failures)
 
 
+def test_network_failure_urls_are_sanitized():
+    """Regression for CodeRabbit Major on PR #130: query strings can
+    carry tokens / emails, so URLs persisted to
+    `IncidentEvidence.network_failures` must have their query +
+    fragment + credentials stripped before they're stored."""
+    crumbs = [
+        {
+            "category": "http",
+            "message": "GET https://api.example.com/auth?token=sk-LEAK#x → 500",
+            "level": "error",
+            "data": {
+                "method": "GET",
+                "url": "https://api.example.com/auth?token=sk-LEAK&user=ada@x.com#frag",
+                "status_code": 500,
+            },
+        },
+        {
+            "category": "http",
+            "message": "POST https://user:pass@api.example.com/v2/orders → 502",
+            "level": "error",
+            "data": {
+                "method": "POST",
+                "url": "https://user:pass@api.example.com/v2/orders",
+                "status_code": 502,
+            },
+        },
+    ]
+    failures = _network_failures_from_breadcrumbs(crumbs)
+    assert [f["url"] for f in failures] == [
+        "https://api.example.com/auth",
+        "https://api.example.com/v2/orders",
+    ]
+
+
+def test_breadcrumbs_from_sentry_caps_at_hard_limit():
+    """Regression for CodeRabbit Major on PR #130: a hostile event
+    with thousands of breadcrumbs must not bloat `failure.metadata`."""
+    items = [{"category": "ui.click", "message": f"m{i}", "level": "info"} for i in range(2000)]
+    crumbs = _breadcrumbs_from_sentry({"breadcrumbs": {"values": items}})
+    # Hard cap kicks in; we keep the most-recent N (Sentry's chronological
+    # order is oldest-first, so the tail is freshest).
+    assert len(crumbs) == 500
+    assert crumbs[-1]["message"] == "m1999"
+
+
 def test_breadcrumbs_absent_is_a_no_op(tmp_path: Path):
     """An event with no breadcrumbs must not crash the ingest path
     (regression guard for None-handling in `_breadcrumbs_from_sentry`)."""

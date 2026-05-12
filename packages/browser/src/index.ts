@@ -169,6 +169,67 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
   );
   const breadcrumbs: RetraceBreadcrumb[] = [];
 
+  // Best-effort deep clone — `structuredClone` is available in all
+  // modern browsers and Node 17+. JSON fallback covers anything that
+  // refuses the structured clone algorithm (functions, DOM nodes).
+  // This stops nested-object mutation after capture from rewriting
+  // historical breadcrumbs. (CodeRabbit Major catch on PR #130.)
+  function cloneBreadcrumbData(
+    data: Record<string, unknown> | undefined,
+  ): Record<string, unknown> | undefined {
+    if (!data) return undefined;
+    const sc = (globalThis as { structuredClone?: (v: unknown) => unknown })
+      .structuredClone;
+    if (typeof sc === "function") {
+      try {
+        return sc(data) as Record<string, unknown>;
+      } catch {
+        /* fall through to JSON */
+      }
+    }
+    try {
+      return JSON.parse(JSON.stringify(data)) as Record<string, unknown>;
+    } catch {
+      // Last-resort shallow copy — rare (circular refs that bypass
+      // structuredClone). Still better than handing out a live ref.
+      return { ...data };
+    }
+  }
+
+  // Strip query/fragment and credentials from URLs that end up in
+  // breadcrumb data. Query strings carry tokens/emails/PII far more
+  // often than we'd like; the path+origin is the useful signal.
+  // (CodeRabbit Major catch on PR #130.)
+  function sanitizeBreadcrumbUrl(raw: string): string {
+    if (!raw) return raw;
+    try {
+      // Allow relative URLs by using a dummy base.
+      const u = new URL(raw, "http://_b/");
+      u.search = "";
+      u.hash = "";
+      u.username = "";
+      u.password = "";
+      if (u.origin === "http://_b") return u.pathname;
+      return u.origin + u.pathname;
+    } catch {
+      // Not a URL we can parse — coarse strip.
+      return raw.split("?")[0].split("#")[0];
+    }
+  }
+
+  // Filter out our own ingest traffic so the ring doesn't fill with
+  // self-noise on busy pages. (CodeRabbit Major catch on PR #130.)
+  function isSdkIngestUrl(raw: string): boolean {
+    if (!raw) return false;
+    try {
+      const probe = new URL(raw, "http://_b/");
+      const target = new URL(ingestUrl, "http://_b/");
+      return probe.origin === target.origin && probe.pathname === target.pathname;
+    } catch {
+      return raw === ingestUrl;
+    }
+  }
+
   function addBreadcrumbInternal(
     raw: Partial<RetraceBreadcrumb> & { message: string },
   ): void {
@@ -179,7 +240,7 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
       category: String(raw.category || "default").slice(0, 80),
       message,
       level: (raw.level || "info") as RetraceBreadcrumbLevel,
-      data: raw.data ? { ...raw.data } : undefined,
+      data: cloneBreadcrumbData(raw.data),
     });
     while (breadcrumbs.length > maxBreadcrumbs) {
       breadcrumbs.shift();
@@ -187,11 +248,11 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
   }
 
   function snapshotBreadcrumbs(): RetraceBreadcrumb[] {
-    // Shallow copy of the ring so the exception event payload doesn't
-    // share mutable state with future captures.
+    // Independent deep copies of the ring so the exception event
+    // payload doesn't share mutable state with future captures.
     return breadcrumbs.map((b) => ({
       ...b,
-      data: b.data ? { ...b.data } : undefined,
+      data: cloneBreadcrumbData(b.data),
     }));
   }
   const compiledRedactionPatterns = (() => {
@@ -356,7 +417,10 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
       });
       // Click breadcrumb — drop the visible text when the privacy
       // filter masks it, so we don't leak content from a masked
-      // element via the breadcrumb trail.
+      // element via the breadcrumb trail. Both `text` AND the
+      // ARIA-derived `accessibleName` fallback are gated on
+      // `allowText`; otherwise an aria-label on a masked element
+      // would still slip through. (CodeRabbit Major catch on PR #130.)
       const targetEl = event.target instanceof Element ? event.target : null;
       const allowText = targetEl ? shouldCaptureTargetText(targetEl) : false;
       const labelBits: string[] = [];
@@ -364,7 +428,7 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
       if (typeof targetDesc.id === "string" && targetDesc.id) labelBits.push(`#${targetDesc.id}`);
       if (allowText && typeof targetDesc.text === "string" && targetDesc.text) {
         labelBits.push(`"${String(targetDesc.text).slice(0, 80)}"`);
-      } else if (typeof targetDesc.accessibleName === "string" && targetDesc.accessibleName) {
+      } else if (allowText && typeof targetDesc.accessibleName === "string" && targetDesc.accessibleName) {
         labelBits.push(`"${String(targetDesc.accessibleName).slice(0, 80)}"`);
       }
       addBreadcrumbInternal({
@@ -568,12 +632,17 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
               response.headers.get("x-retrace-trace-id"),
             ),
           });
-          addBreadcrumbInternal({
-            category: "http",
-            message: `${method} ${url} → ${response.status}`,
-            level: response.status >= 400 ? "error" : "info",
-            data: { method, url, status_code: response.status, duration_ms: durationMs },
-          });
+          // Skip our own ingest traffic from the breadcrumb trail —
+          // otherwise the ring fills with self-noise on busy pages.
+          if (!isSdkIngestUrl(url)) {
+            const safeUrl = sanitizeBreadcrumbUrl(url);
+            addBreadcrumbInternal({
+              category: "http",
+              message: `${method} ${safeUrl} → ${response.status}`,
+              level: response.status >= 400 ? "error" : "info",
+              data: { method, url: safeUrl, status_code: response.status, duration_ms: durationMs },
+            });
+          }
           return response;
         } catch (error) {
           const durationMs = Date.now() - startedAt;
@@ -586,12 +655,15 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
             durationMs,
             trace: tracePayload(requestTraceparent),
           });
-          addBreadcrumbInternal({
-            category: "http",
-            message: `${method} ${url} (failed: ${errMsg})`,
-            level: "error",
-            data: { method, url, error: errMsg, duration_ms: durationMs },
-          });
+          if (!isSdkIngestUrl(url)) {
+            const safeUrl = sanitizeBreadcrumbUrl(url);
+            addBreadcrumbInternal({
+              category: "http",
+              message: `${method} ${safeUrl} (failed: ${errMsg})`,
+              level: "error",
+              data: { method, url: safeUrl, error: errMsg, duration_ms: durationMs },
+            });
+          }
           throw error;
         }
       };
@@ -657,12 +729,15 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
               this.getResponseHeader("x-retrace-trace-id"),
             ),
           });
-          addBreadcrumbInternal({
-            category: "http",
-            message: `${xhrMethod} ${xhrUrl} → ${this.status}`,
-            level: this.status >= 400 ? "error" : "info",
-            data: { method: xhrMethod, url: xhrUrl, status_code: this.status, duration_ms: durationMs },
-          });
+          if (!isSdkIngestUrl(xhrUrl)) {
+            const safeUrl = sanitizeBreadcrumbUrl(xhrUrl);
+            addBreadcrumbInternal({
+              category: "http",
+              message: `${xhrMethod} ${safeUrl} → ${this.status}`,
+              level: this.status >= 400 ? "error" : "info",
+              data: { method: xhrMethod, url: safeUrl, status_code: this.status, duration_ms: durationMs },
+            });
+          }
         });
         return originalSend.call(this, body);
       };
