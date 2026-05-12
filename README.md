@@ -318,9 +318,27 @@ retrace tester baseline compare <spec_id> --run-dir data/ui-tests/runs/<later-ru
 retrace tester baseline list
 ```
 
-The current implementation uses byte-exact comparison (sha256). A
-future PR can add a Pillow extra for perceptual / SSIM diffs without
-changing the CLI shape.
+### Perceptual comparison (optional)
+
+Install the `[image]` extra (Pillow + numpy) for perceptual SSIM
+comparison + an annotated red-overlay diff PNG that shows the regions
+that actually changed:
+
+```bash
+pip install 'retrace[image]'
+
+retrace tester baseline compare <spec_id> \
+  --run-dir data/ui-tests/runs/<later-run> \
+  --mode auto \
+  --threshold 0.95
+```
+
+`--mode auto` (default) uses perceptual when the extra is installed
+and sha256 otherwise. `--mode sha256` forces byte equality (the
+pre-P1.2 behavior). `--threshold 0.95` is the SSIM floor — gentle on
+sub-pixel rendering and antialiasing, sensitive to real layout
+shifts. Per-screenshot SSIM scores come back in the JSON output for
+borderline runs.
 
 ## Repair lifecycle (`retrace repair`)
 

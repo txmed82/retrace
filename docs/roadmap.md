@@ -496,7 +496,7 @@ incidents shallower than they need to be.
 
 ## P1.2 — Perceptual visual diff (Pillow + SSIM)
 
-**Status:** NOT STARTED · **ETA:** 2 days
+**Status:** DONE 2026-05-12 · **PR:** this PR · **Owner:** Claude
 
 ### Why
 
@@ -740,7 +740,8 @@ EOF
 | 2026-05-11 | P0.1 follow-up: review-quality guardrails — line-validity filter, deterministic suggestion + risk caps, optional `--llm-self-critique`, prior-review memory via new `llm_pr_reviews` table. | #127 |
 | 2026-05-11 | P0.2 Python SDK + FastAPI / Flask / Django / logging integrations. Stdlib-only runtime, background-thread transport with bounded queue + atexit flush. 53 tests + 1 e2e through the real Sentry-compat ingest. | #128 |
 | 2026-05-11 | P0.3 GitHub Actions composite templates — `pr-review`, `source-map-upload` (curl + jq, dep-free), `qa-auto`. Contract pinned with 14 tests. | #129 |
-| 2026-05-11 | P0.4 Browser SDK breadcrumbs — 50-entry ring buffer (Sentry-shape), `addBreadcrumb` public API, auto-capture for click/console/http/navigation/error, exception events carry the trail. Server-side `monitoring_ingest` promotes console + failed-HTTP breadcrumbs to `IncidentEvidence` and persists the raw trail on `failure.metadata.breadcrumbs`. | this PR |
+| 2026-05-11 | P0.4 Browser SDK breadcrumbs — 50-entry ring buffer (Sentry-shape), `addBreadcrumb` public API, auto-capture for click/console/http/navigation/error, exception events carry the trail. Server-side `monitoring_ingest` promotes console + failed-HTTP breadcrumbs to `IncidentEvidence` and persists the raw trail on `failure.metadata.breadcrumbs`. | #130 |
+| 2026-05-12 | P1.2 Perceptual visual diff — new `[image]` extra (Pillow + numpy); `visual_perceptual.perceptual_diff(...)` runs single-window SSIM with annotated red-overlay diff PNG. `compare_run_to_baseline(mode="auto", threshold=0.95)` uses perceptual when extra installed, falls back to sha256 otherwise. `retrace tester baseline compare --mode --threshold` CLI flags. | this PR |
 
 > Append a row whenever an item changes status or a new item is
 > added. Keep newest at the bottom.

@@ -21,10 +21,19 @@ retrace = "retrace.cli:main"
 browser = [
     "playwright>=1.45",
 ]
+# P1.2 — perceptual visual diff (SSIM + annotated diff PNG). Optional
+# because byte-equality is still the default; the perceptual path only
+# kicks in when these are installed.
+image = [
+    "pillow>=10.0",
+    "numpy>=1.26",
+]
 dev = [
     "pytest>=8.0",
     "pytest-httpx>=0.30",
     "ruff>=0.5",
+    "pillow>=10.0",
+    "numpy>=1.26",
 ]
 
 [build-system]
