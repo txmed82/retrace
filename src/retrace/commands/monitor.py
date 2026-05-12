@@ -257,6 +257,27 @@ def route_group() -> None:
     """
 
 
+def _redact_target_url(url: str) -> str:
+    """For Slack / Discord / generic-webhook routes the URL itself
+    often embeds a webhook token in the path. Show only
+    `scheme://host/…` so an operator can confirm "yes, this points at
+    hooks.slack.com" without printing the credential. (CodeRabbit
+    Major catch on PR #131.)
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return ""
+    if not parts.netloc:
+        return ""
+    return urlunsplit((parts.scheme, parts.netloc, "/…", "", ""))
+
+
 def _route_row_to_dict(row) -> dict:
     return {
         "id": row.id,
@@ -265,7 +286,9 @@ def _route_row_to_dict(row) -> dict:
         "enabled": bool(row.enabled),
         "rule_name": row.rule_name,
         "target_kind": row.target_kind,
-        "target_url": row.target_url,
+        # Redacted by default so `--json` output is safe to paste into
+        # shared workflows.
+        "target_url_redacted": _redact_target_url(row.target_url),
         # Never echo the routing key / signing secret.
         "target_secret_set": bool(row.target_secret),
         "min_severity": row.min_severity,
@@ -338,7 +361,7 @@ def _route_row_to_dict(row) -> dict:
     "--disabled/--enabled",
     "disabled",
     default=False,
-    help="Create the route disabled (won't fire until `route enable`).",
+    help="Create the route disabled (re-run `route add --name ... --enabled` to flip it on).",
 )
 @click.option("--json", "as_json", is_flag=True, default=False)
 def route_add(
@@ -382,7 +405,10 @@ def route_add(
         click.echo(json.dumps(_route_row_to_dict(row), indent=2))
     else:
         icon = "○" if row.enabled else "—"
-        click.echo(f"  {icon} {row.public_id}  {row.name}  ({row.target_kind})  → {row.target_url}")
+        click.echo(
+            f"  {icon} {row.public_id}  {row.name}  ({row.target_kind})  "
+            f"→ {_redact_target_url(row.target_url)}"
+        )
 
 
 @route_group.command("list")
@@ -423,7 +449,7 @@ def route_list(
         sev_suffix = f"  ≥{r.min_severity}" if r.min_severity else ""
         click.echo(
             f"  {icon} {r.public_id}  {r.name}  ({r.target_kind})"
-            f"{rule_suffix}{sev_suffix}  → {r.target_url}"
+            f"{rule_suffix}{sev_suffix}  → {_redact_target_url(r.target_url)}"
         )
 
 
@@ -525,23 +551,29 @@ def route_test(
         action="alert",
         rule_name=route.rule_name,
     )
+    # Scope dispatch to JUST this route so a synthetic test alert
+    # cannot leak to other routes that match the (project, env, rule)
+    # tuple. (CodeRabbit Major catch on PR #131.)
     results = dispatch_alert(
         store=store,
         project_id=pid,
         environment_id=eid,
         alert=fake_alert,
         decision=decision,
+        only_route_ids=[route.id],
     )
-    # Filter to only this route's result.
-    me = [r for r in results if r.route_id == route.id]
-    if not me:
+    if not results:
         click.echo(
             json.dumps({
                 "status": "no_dispatch",
-                "hint": "Severity gate / dedup may have suppressed.",
+                "hint": (
+                    "Route didn't match dispatch (rule_name mismatch, severity "
+                    "gate, or disabled). Run `retrace monitor route list`."
+                ),
             }, indent=2)
         )
         sys.exit(2)
-    click.echo(json.dumps(me[0].to_dict(), indent=2))
-    if me[0].status != "sent":
+    me = results[0]
+    click.echo(json.dumps(me.to_dict(), indent=2))
+    if me.status != "sent":
         sys.exit(2)

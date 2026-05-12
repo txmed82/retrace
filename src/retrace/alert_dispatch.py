@@ -74,12 +74,20 @@ def dispatch_alert(
     alert: MonitoringAlert,
     decision: AlertRuleDecision,
     timeout: float = _DEFAULT_HTTP_TIMEOUT,
+    only_route_ids: Optional[list[str]] = None,
     _post=None,
 ) -> list[DispatchResult]:
     """Fan out one fired alert to every matching enabled route.
 
     `_post` is a test seam — when supplied, dispatch calls
-    `_post(url, headers, body)` instead of the real HTTP request.
+    `_post(url, headers, body, timeout)` instead of the real HTTP
+    request. The fourth `timeout` argument matches `_real_post`'s
+    signature; seams that omit it will hit `TypeError`.
+
+    `only_route_ids` (P1.1 follow-up): when set, dispatch filters the
+    matched routes to those id's BEFORE any send — used by
+    `retrace monitor route test` so a synthetic alert can't leak to
+    other routes.
     """
     if decision.action != "alert" or decision.state == "suppressed":
         return []
@@ -90,6 +98,9 @@ def dispatch_alert(
         enabled=True,
         rule_name=decision.rule_name or "",
     )
+    if only_route_ids is not None:
+        allowed = set(only_route_ids)
+        routes = [r for r in routes if r.id in allowed]
     if not routes:
         return []
 
@@ -120,10 +131,24 @@ def _dispatch_one(
     sender,
 ) -> DispatchResult:
     # Severity gate: if the route requires `>= high` and the alert is
-    # medium, skip without recording a row.
+    # medium, skip. Persist a `skipped` row for audit parity — the
+    # operator still wants to see "this dispatch decided not to
+    # send" in `list_recent_alert_dispatches`. (CodeRabbit Major
+    # catch on PR #131.)
     if route.min_severity and _severity_score(alert.severity) < _severity_score(
         route.min_severity
     ):
+        store.record_alert_dispatch(
+            route_id=route.id,
+            project_id=project_id,
+            environment_id=environment_id,
+            fingerprint=alert.fingerprint,
+            status="skipped",
+            target_kind=route.target_kind,
+            target_url=route.target_url,
+            payload={},
+            error=f"below min_severity {route.min_severity!r}",
+        )
         return DispatchResult(
             route_id=route.id,
             route_name=route.name,
@@ -159,11 +184,16 @@ def _dispatch_one(
             payload={},
         )
 
-    # Build the per-target payload + send.
-    url, headers, body, json_payload = _build_request(route, alert)
+    # Build the per-target payload + send. Payload build is wrapped in
+    # the same try as the send so a `_build_request` / `json.dumps`
+    # failure still records a `failed` row and preserves the
+    # non-fatal-tail-step contract. (CodeRabbit Critical catch on
+    # PR #131.)
     status_code = 0
     error = ""
+    json_payload: dict[str, Any] = {}
     try:
+        url, headers, body, json_payload = _build_request(route, alert)
         status_code = sender(url, headers, body, timeout)
         status = "sent"
     except urllib.error.HTTPError as exc:

@@ -3092,6 +3092,23 @@ class Storage:
         target_url = target_url.strip()
         if not target_url:
             raise ValueError("alert route target_url cannot be empty")
+        # Validate `min_severity` + PagerDuty secret at write-time so
+        # we fail loudly on misconfig instead of silently producing
+        # 401s / wrong-rank dispatches at runtime. (CodeRabbit Major
+        # catch on PR #131.)
+        _ALLOWED_SEVERITIES = {"low", "medium", "high", "critical"}
+        clean_min_severity = min_severity.strip().lower()
+        if clean_min_severity and clean_min_severity not in _ALLOWED_SEVERITIES:
+            raise ValueError(
+                f"invalid min_severity: {min_severity!r} "
+                f"(allowed: {sorted(_ALLOWED_SEVERITIES)})"
+            )
+        clean_target_secret = target_secret.strip()
+        if target_kind == "pagerduty" and not clean_target_secret:
+            raise ValueError(
+                "pagerduty routes require target_secret "
+                "(the Events v2 routing key)"
+            )
         with self._conn() as conn:
             existing = conn.execute(
                 "SELECT id, public_id FROM alert_routes "
@@ -3112,8 +3129,8 @@ class Storage:
                         rule_name.strip(),
                         target_kind,
                         target_url,
-                        target_secret,
-                        min_severity.strip().lower(),
+                        clean_target_secret,
+                        clean_min_severity,
                         max(0, int(dedup_window_seconds)),
                         existing["id"],
                     ),
@@ -3135,8 +3152,8 @@ class Storage:
                     (
                         row_id, public_id, project_id, environment_id, name,
                         int(bool(enabled)), rule_name.strip(), target_kind,
-                        target_url, target_secret,
-                        min_severity.strip().lower(),
+                        target_url, clean_target_secret,
+                        clean_min_severity,
                         max(0, int(dedup_window_seconds)),
                     ),
                 )

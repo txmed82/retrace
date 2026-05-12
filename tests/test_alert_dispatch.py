@@ -235,6 +235,112 @@ def test_dispatch_no_op_when_decision_is_suppress(tmp_path: Path):
     assert sent == []
 
 
+def test_dispatch_persists_skipped_row_for_audit(tmp_path: Path):
+    """Regression for CodeRabbit Major on PR #131: a severity-gated
+    skip must leave an `alert_dispatches` row with `status=skipped`
+    so the operator can see "this dispatch decided not to send"."""
+    store, pid, eid = _store_with_workspace(tmp_path)
+    store.upsert_alert_route(
+        project_id=pid, environment_id=eid,
+        name="critical-only-audit",
+        target_kind="webhook",
+        target_url="https://example.com/x",
+        min_severity="critical",
+    )
+    sent, post = _capture_sender()
+    dispatch_alert(
+        store=store, project_id=pid, environment_id=eid,
+        alert=_alert(severity="high"), decision=_decision(), _post=post,
+    )
+    rows = store.list_recent_alert_dispatches(project_id=pid, environment_id=eid)
+    statuses = [r["status"] for r in rows]
+    assert "skipped" in statuses
+    assert sent == []
+
+
+def test_dispatch_catches_payload_build_failure(tmp_path: Path, monkeypatch):
+    """Regression for CodeRabbit Critical on PR #131: an exception
+    inside `_build_request` (or json serialization) must not escape
+    `dispatch_alert` — that breaks the non-fatal-tail-step contract."""
+    from retrace import alert_dispatch
+
+    store, pid, eid = _store_with_workspace(tmp_path)
+    store.upsert_alert_route(
+        project_id=pid, environment_id=eid,
+        name="broken",
+        target_kind="webhook",
+        target_url="https://example.com/x",
+    )
+
+    def _boom(route, alert):
+        raise RuntimeError("payload build exploded")
+
+    monkeypatch.setattr(alert_dispatch, "_build_request", _boom)
+    results = dispatch_alert(
+        store=store, project_id=pid, environment_id=eid,
+        alert=_alert(), decision=_decision(),
+        _post=lambda *a, **k: 200,
+    )
+    assert results[0].status == "failed"
+    assert "payload build exploded" in results[0].error
+
+
+def test_dispatch_only_route_ids_restricts_send(tmp_path: Path):
+    """Regression for CodeRabbit Major on PR #131: `route test` uses
+    `only_route_ids` so a synthetic alert can't leak to other routes
+    matching the same `(project, env, rule)`."""
+    store, pid, eid = _store_with_workspace(tmp_path)
+    a = store.upsert_alert_route(
+        project_id=pid, environment_id=eid,
+        name="primary",
+        target_kind="webhook",
+        target_url="https://example.com/primary",
+    )
+    store.upsert_alert_route(
+        project_id=pid, environment_id=eid,
+        name="secondary",
+        target_kind="webhook",
+        target_url="https://example.com/secondary",
+    )
+    sent, post = _capture_sender()
+    results = dispatch_alert(
+        store=store, project_id=pid, environment_id=eid,
+        alert=_alert(), decision=_decision(),
+        only_route_ids=[a.id],
+        _post=post,
+    )
+    assert [r.route_name for r in results] == ["primary"]
+    assert len(sent) == 1
+    assert sent[0]["url"] == "https://example.com/primary"
+
+
+def test_storage_rejects_invalid_min_severity(tmp_path: Path):
+    """Regression for CodeRabbit Major on PR #131."""
+    store, pid, eid = _store_with_workspace(tmp_path)
+    with pytest.raises(ValueError, match="min_severity"):
+        store.upsert_alert_route(
+            project_id=pid, environment_id=eid,
+            name="bad-sev",
+            target_kind="webhook",
+            target_url="https://example.com/x",
+            min_severity="bogus",
+        )
+
+
+def test_storage_pagerduty_requires_secret(tmp_path: Path):
+    """Regression for CodeRabbit Major on PR #131: a PagerDuty route
+    without a routing key would silently 401 at dispatch time."""
+    store, pid, eid = _store_with_workspace(tmp_path)
+    with pytest.raises(ValueError, match="pagerduty.*target_secret"):
+        store.upsert_alert_route(
+            project_id=pid, environment_id=eid,
+            name="pd-no-key",
+            target_kind="pagerduty",
+            target_url="https://events.pagerduty.com/v2/enqueue",
+            target_secret="",
+        )
+
+
 def test_dispatch_records_send_errors_but_doesnt_raise(tmp_path: Path):
     store, pid, eid = _store_with_workspace(tmp_path)
     store.upsert_alert_route(
