@@ -4156,6 +4156,100 @@ class Storage:
             rate_limit_rows=rate_limit_count,
         )
 
+    # ---------------------------------------------------------------
+    # P2.3 — global retention helpers.
+    #
+    # `prune_app_error_retention` above is scoped to a single
+    # (project, environment) and the app-error domain. These two
+    # helpers prune the high-volume "global" tables that grow
+    # regardless of which project they came from. They take the same
+    # `dry_run` / `now` parameters so callers can preview the cut.
+    # ---------------------------------------------------------------
+
+    def prune_replay_batches(
+        self,
+        *,
+        retention_days: int,
+        dry_run: bool = False,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Delete `replay_batches` rows older than `retention_days`.
+
+        Replay batches store the rrweb payload blobs — by far the
+        largest table by bytes in a healthy install. Pruning by
+        `received_at` is safe because nothing else references batch
+        rows by FK; orphaned `replay_sessions` rows are tiny and
+        retained for the lifecycle-event history.
+        """
+        days = max(1, int(retention_days))
+        current = now or datetime.now(timezone.utc)
+        cutoff = datetime.fromtimestamp(
+            current.timestamp() - (days * 24 * 60 * 60),
+            tz=timezone.utc,
+        ).isoformat()
+        with self._conn() as conn:
+            count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM replay_batches WHERE received_at < ?",
+                    (cutoff,),
+                ).fetchone()["count"]
+            )
+            if not dry_run and count:
+                conn.execute(
+                    "DELETE FROM replay_batches WHERE received_at < ?",
+                    (cutoff,),
+                )
+            return count
+
+    def prune_otel_events(
+        self,
+        *,
+        retention_days: int,
+        dry_run: bool = False,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Delete `otel_events` rows older than `retention_days`.
+
+        Pruned by `created_at` rather than `occurred_at_ms` because
+        a misconfigured collector that backfills with stale
+        timestamps could otherwise wipe fresh ingest. Server clock
+        is the source of truth here.
+        """
+        days = max(1, int(retention_days))
+        current = now or datetime.now(timezone.utc)
+        cutoff = datetime.fromtimestamp(
+            current.timestamp() - (days * 24 * 60 * 60),
+            tz=timezone.utc,
+        ).isoformat()
+        with self._conn() as conn:
+            count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM otel_events WHERE created_at < ?",
+                    (cutoff,),
+                ).fetchone()["count"]
+            )
+            if not dry_run and count:
+                conn.execute(
+                    "DELETE FROM otel_events WHERE created_at < ?",
+                    (cutoff,),
+                )
+            return count
+
+    def project_environment_pairs(self) -> list[tuple[str, str]]:
+        """Return every (project_id, environment_id) pair that has
+        observed failure data. Used by the retention CLI to iterate
+        `prune_app_error_retention` across an install — the existing
+        method requires per-pair scoping by design."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT project_id, environment_id
+                FROM failures
+                ORDER BY project_id, environment_id
+                """
+            ).fetchall()
+        return [(str(row["project_id"]), str(row["environment_id"])) for row in rows]
+
     def _source_map_from_row(self, row: sqlite3.Row) -> SourceMapRow:
         return SourceMapRow(
             id=str(row["id"]),

@@ -7,6 +7,7 @@ import sys
 import click
 
 from retrace.commands.api import api_group
+from retrace.commands.data import data_group
 from retrace.commands.demo import demo_group
 from retrace.commands.digest import digest_command
 from retrace.commands.doctor import doctor_command
@@ -92,3 +93,4 @@ main.add_command(repair_group)
 main.add_command(qa_group)
 main.add_command(review_command)
 main.add_command(monitor_group)
+main.add_command(data_group)
