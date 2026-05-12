@@ -718,6 +718,55 @@ ON qa_incidents(project_id, environment_id, status, updated_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_qa_incidents_public
 ON qa_incidents(public_id);
 
+-- Alert routes (P1.1) — fan-out destinations for alert-rule trips.
+-- A rule firing an `action=alert` decision triggers a lookup in this
+-- table; every matching enabled route posts to its target. Routes can
+-- be scoped to a specific named `rule_name`, or left empty to match
+-- every alert at-or-above `min_severity`.
+CREATE TABLE IF NOT EXISTS alert_routes (
+    id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL UNIQUE,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    rule_name TEXT NOT NULL DEFAULT '',
+    target_kind TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    target_secret TEXT NOT NULL DEFAULT '',
+    min_severity TEXT NOT NULL DEFAULT '',
+    dedup_window_seconds INTEGER NOT NULL DEFAULT 300,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, environment_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_routes_lookup
+ON alert_routes(project_id, environment_id, enabled);
+
+-- Alert dispatches (P1.1) — per-fired-alert delivery log. Doubles as
+-- the dedup table: we look up `(route_id, fingerprint)` rows newer
+-- than `dedup_window_seconds` to suppress fast-repeat sends.
+CREATE TABLE IF NOT EXISTS alert_dispatches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    route_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    target_kind TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_dispatches_dedup
+ON alert_dispatches(route_id, fingerprint, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_alert_dispatches_recent
+ON alert_dispatches(project_id, environment_id, created_at DESC);
+
 -- LLM-driven PR reviews (`llm_pr_review.py` output, persisted per PR
 -- so the *next* review on overlapping files can fold prior risk notes
 -- into the prompt instead of re-flagging the same issue every time.
@@ -953,6 +1002,24 @@ class AppErrorAlertRuleRow:
     fingerprint_contains: str
     route_contains: str
     metadata: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
+class AlertRouteRow:
+    id: str
+    public_id: str
+    project_id: str
+    environment_id: str
+    name: str
+    enabled: bool
+    rule_name: str
+    target_kind: str
+    target_url: str
+    target_secret: str
+    min_severity: str
+    dedup_window_seconds: int
     created_at: datetime
     updated_at: datetime
 
@@ -2992,6 +3059,250 @@ class Storage:
             fingerprint_contains=str(row["fingerprint_contains"] or ""),
             route_contains=str(row["route_contains"] or ""),
             metadata=dict(self._safe_json_obj(row["metadata_json"])),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    # ---- Alert routes (P1.1) -------------------------------------------
+
+    def upsert_alert_route(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        name: str,
+        target_kind: str,
+        target_url: str,
+        target_secret: str = "",
+        rule_name: str = "",
+        min_severity: str = "",
+        dedup_window_seconds: int = 300,
+        enabled: bool = True,
+    ) -> "AlertRouteRow":
+        """Insert or update one route by `(project, env, name)`."""
+        name = name.strip()
+        if not name:
+            raise ValueError("alert route name cannot be empty")
+        target_kind = target_kind.strip().lower()
+        if target_kind not in {"slack", "discord", "pagerduty", "webhook"}:
+            raise ValueError(
+                f"unsupported target_kind: {target_kind!r} "
+                "(expected slack/discord/pagerduty/webhook)"
+            )
+        target_url = target_url.strip()
+        if not target_url:
+            raise ValueError("alert route target_url cannot be empty")
+        # Validate `min_severity` + PagerDuty secret at write-time so
+        # we fail loudly on misconfig instead of silently producing
+        # 401s / wrong-rank dispatches at runtime. (CodeRabbit Major
+        # catch on PR #131.)
+        _ALLOWED_SEVERITIES = {"low", "medium", "high", "critical"}
+        clean_min_severity = min_severity.strip().lower()
+        if clean_min_severity and clean_min_severity not in _ALLOWED_SEVERITIES:
+            raise ValueError(
+                f"invalid min_severity: {min_severity!r} "
+                f"(allowed: {sorted(_ALLOWED_SEVERITIES)})"
+            )
+        clean_target_secret = target_secret.strip()
+        if target_kind == "pagerduty" and not clean_target_secret:
+            raise ValueError(
+                "pagerduty routes require target_secret "
+                "(the Events v2 routing key)"
+            )
+        with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT id, public_id FROM alert_routes "
+                "WHERE project_id = ? AND environment_id = ? AND name = ?",
+                (project_id, environment_id, name),
+            ).fetchone()
+            if existing is not None:
+                conn.execute(
+                    """
+                    UPDATE alert_routes
+                    SET enabled = ?, rule_name = ?, target_kind = ?,
+                        target_url = ?, target_secret = ?, min_severity = ?,
+                        dedup_window_seconds = ?, updated_at = datetime('now')
+                    WHERE id = ?
+                    """,
+                    (
+                        int(bool(enabled)),
+                        rule_name.strip(),
+                        target_kind,
+                        target_url,
+                        clean_target_secret,
+                        clean_min_severity,
+                        max(0, int(dedup_window_seconds)),
+                        existing["id"],
+                    ),
+                )
+                row_id = str(existing["id"])
+            else:
+                row_id = self._id("artr")
+                public_id = self._public_id(
+                    "ARTR", project_id, environment_id, name
+                )
+                conn.execute(
+                    """
+                    INSERT INTO alert_routes
+                        (id, public_id, project_id, environment_id, name,
+                         enabled, rule_name, target_kind, target_url,
+                         target_secret, min_severity, dedup_window_seconds)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row_id, public_id, project_id, environment_id, name,
+                        int(bool(enabled)), rule_name.strip(), target_kind,
+                        target_url, clean_target_secret,
+                        clean_min_severity,
+                        max(0, int(dedup_window_seconds)),
+                    ),
+                )
+            row = conn.execute(
+                "SELECT * FROM alert_routes WHERE id = ?", (row_id,)
+            ).fetchone()
+        return self._alert_route_from_row(row)
+
+    def list_alert_routes(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        enabled: Optional[bool] = None,
+        rule_name: Optional[str] = None,
+    ) -> list["AlertRouteRow"]:
+        params: list[object] = [project_id, environment_id]
+        where = "project_id = ? AND environment_id = ?"
+        if enabled is not None:
+            where += " AND enabled = ?"
+            params.append(int(bool(enabled)))
+        if rule_name is not None:
+            where += " AND (rule_name = ? OR rule_name = '')"
+            params.append(rule_name.strip())
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM alert_routes WHERE {where} "
+                "ORDER BY created_at ASC, id ASC",
+                params,
+            ).fetchall()
+        return [self._alert_route_from_row(r) for r in rows]
+
+    def get_alert_route(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        name: str,
+    ) -> Optional["AlertRouteRow"]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM alert_routes "
+                "WHERE project_id = ? AND environment_id = ? AND name = ?",
+                (project_id, environment_id, name.strip()),
+            ).fetchone()
+        return self._alert_route_from_row(row) if row is not None else None
+
+    def delete_alert_route(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        name: str,
+    ) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM alert_routes "
+                "WHERE project_id = ? AND environment_id = ? AND name = ?",
+                (project_id, environment_id, name.strip()),
+            )
+            return bool(cur.rowcount)
+
+    def record_alert_dispatch(
+        self,
+        *,
+        route_id: str,
+        project_id: str,
+        environment_id: str,
+        fingerprint: str,
+        status: str,
+        target_kind: str,
+        target_url: str,
+        payload: dict,
+        error: str = "",
+    ) -> int:
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO alert_dispatches
+                    (route_id, project_id, environment_id, fingerprint,
+                     status, error, target_kind, target_url, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    route_id, project_id, environment_id, fingerprint,
+                    status, error, target_kind, target_url,
+                    json.dumps(payload or {}),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def recent_alert_dispatch_for(
+        self,
+        *,
+        route_id: str,
+        fingerprint: str,
+        within_seconds: int,
+    ) -> Optional[sqlite3.Row]:
+        """Find a successful dispatch for this (route, fingerprint) pair
+        in the last `within_seconds` — used to dedup fast repeats."""
+        within_seconds = max(0, int(within_seconds))
+        if within_seconds <= 0:
+            return None
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM alert_dispatches
+                WHERE route_id = ?
+                  AND fingerprint = ?
+                  AND status = 'sent'
+                  AND created_at >= datetime('now', ?)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (route_id, fingerprint, f"-{within_seconds} seconds"),
+            ).fetchone()
+
+    def list_recent_alert_dispatches(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM alert_dispatches
+                WHERE project_id = ? AND environment_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (project_id, environment_id, max(1, min(int(limit), 500))),
+            ).fetchall()
+
+    def _alert_route_from_row(self, row: sqlite3.Row) -> "AlertRouteRow":
+        return AlertRouteRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            name=str(row["name"]),
+            enabled=bool(row["enabled"]),
+            rule_name=str(row["rule_name"] or ""),
+            target_kind=str(row["target_kind"]),
+            target_url=str(row["target_url"]),
+            target_secret=str(row["target_secret"] or ""),
+            min_severity=str(row["min_severity"] or ""),
+            dedup_window_seconds=int(row["dedup_window_seconds"] or 0),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
         )

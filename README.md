@@ -866,6 +866,46 @@ Related monitor failures are also grouped into incidents by stack frame, route,
 service, trace, deploy, and fingerprint. Each incident rolls up severity,
 affected failures, evidence, and a single repair task.
 
+### Alert fan-out (Slack / Discord / PagerDuty / webhook)
+
+When an alert rule fires (`action=alert`), Retrace can fan it out to
+one or more external channels. Routes are scoped by `(project,
+environment)` and optionally by named rule. Each route ships its own
+payload format (Slack Block Kit, Discord embeds, PagerDuty Events v2,
+or a generic descriptive JSON for custom webhooks) and has a
+configurable dedup window so a flapping fingerprint doesn't double-post.
+
+```bash
+# Wire production crashes to Slack and an archive webhook
+retrace monitor route add \
+  --name prod-slack \
+  --kind slack \
+  --url https://hooks.slack.com/services/T0/B0/X \
+  --severity high
+
+retrace monitor route add \
+  --name archive \
+  --kind webhook \
+  --url https://archive.example.com/alerts
+
+# PagerDuty Events v2 — `--secret` is the routing key
+retrace monitor route add \
+  --name oncall-pd \
+  --kind pagerduty \
+  --url https://events.pagerduty.com/v2/enqueue \
+  --secret "$PAGERDUTY_ROUTING_KEY" \
+  --severity critical
+
+retrace monitor route list
+retrace monitor route test prod-slack   # synthetic alert, bypasses dedup
+retrace monitor route delete archive
+```
+
+Every dispatch attempt is logged in `alert_dispatches` for audit; the
+table also drives the dedup gate. Network failures never roll back
+the failure/incident write — the dispatcher swallows per-route errors
+and records `status=failed` on the dispatch row.
+
 Ingest endpoints use per-project, per-environment fixed-window rate limits before
 expensive parsing or persistence. Default limits are 600 replay batches/minute
 per SDK key, 600 Sentry-compatible events/minute per SDK key, 300 monitoring

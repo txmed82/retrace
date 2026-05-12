@@ -463,7 +463,7 @@ incidents shallower than they need to be.
 
 ## P1.1 — Real-time alert fanout
 
-**Status:** NOT STARTED · **ETA:** 2 days
+**Status:** DONE 2026-05-12 · **PR:** #131 · **Owner:** Claude
 
 ### OSS to study
 
@@ -741,7 +741,8 @@ EOF
 | 2026-05-11 | P0.2 Python SDK + FastAPI / Flask / Django / logging integrations. Stdlib-only runtime, background-thread transport with bounded queue + atexit flush. 53 tests + 1 e2e through the real Sentry-compat ingest. | #128 |
 | 2026-05-11 | P0.3 GitHub Actions composite templates — `pr-review`, `source-map-upload` (curl + jq, dep-free), `qa-auto`. Contract pinned with 14 tests. | #129 |
 | 2026-05-11 | P0.4 Browser SDK breadcrumbs — 50-entry ring buffer (Sentry-shape), `addBreadcrumb` public API, auto-capture for click/console/http/navigation/error, exception events carry the trail. Server-side `monitoring_ingest` promotes console + failed-HTTP breadcrumbs to `IncidentEvidence` and persists the raw trail on `failure.metadata.breadcrumbs`. | #130 |
-| 2026-05-12 | P1.2 Perceptual visual diff — new `[image]` extra (Pillow + numpy); `visual_perceptual.perceptual_diff(...)` runs single-window SSIM with annotated red-overlay diff PNG. `compare_run_to_baseline(mode="auto", threshold=0.95)` uses perceptual when extra installed, falls back to sha256 otherwise. `retrace tester baseline compare --mode --threshold` CLI flags. | this PR |
+| 2026-05-12 | P1.2 Perceptual visual diff — new `[image]` extra (Pillow + numpy); `visual_perceptual.perceptual_diff(...)` runs single-window SSIM with annotated red-overlay diff PNG. `compare_run_to_baseline(mode="auto", threshold=0.95)` uses perceptual when extra installed, falls back to sha256 otherwise. `retrace tester baseline compare --mode --threshold` CLI flags. | #132 |
+| 2026-05-12 | P1.1 Real-time alert fan-out — `alert_dispatch.dispatch_alert()` posts fired alerts to Slack / Discord / PagerDuty Events v2 / generic webhook targets. New `alert_routes` + `alert_dispatches` tables; per-route severity floor + dedup window. `retrace monitor route add/list/delete/test` CLI. Wired into `ingest_monitoring_webhook` as a best-effort tail step. 13 new tests. | #131 |
 
 > Append a row whenever an item changes status or a new item is
 > added. Keep newest at the bottom.
