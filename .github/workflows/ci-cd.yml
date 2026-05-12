@@ -80,6 +80,10 @@ jobs:
         working-directory: packages/browser
         run: npm run build
 
+      - name: Run browser SDK tests
+        working-directory: packages/browser
+        run: npm test
+
   python-sdk-tests:
     name: Python SDK Tests
     runs-on: ubuntu-latest

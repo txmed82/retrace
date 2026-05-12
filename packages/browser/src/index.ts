@@ -10,6 +10,22 @@ export type RetracePrivacyOptions = {
   redactionPatterns?: Array<string | RegExp>;
 };
 
+export type RetraceBreadcrumbLevel = "debug" | "info" | "warning" | "error" | "fatal";
+
+export type RetraceBreadcrumb = {
+  /**
+   * ms-since-epoch when the breadcrumb fired (defaults to `Date.now()`
+   * when `addBreadcrumb` is called).
+   */
+  timestamp: number;
+  /** `ui.click`, `http`, `console`, `navigation`, ... — Sentry shape. */
+  category: string;
+  /** Short human-readable trail line. */
+  message: string;
+  level: RetraceBreadcrumbLevel;
+  data?: Record<string, unknown>;
+};
+
 export type RetraceBrowserOptions = {
   apiKey: string;
   ingestUrl?: string;
@@ -20,6 +36,12 @@ export type RetraceBrowserOptions = {
   distinctId?: string;
   metadata?: Record<string, unknown>;
   privacy?: RetracePrivacyOptions;
+  /**
+   * Ring-buffer cap for auto- + manually-added breadcrumbs. Default
+   * 50 (Sentry caps at 100 — we tilt smaller because every exception
+   * event copies the buffer).
+   */
+  maxBreadcrumbs?: number;
 };
 
 export type RetraceClient = {
@@ -27,9 +49,16 @@ export type RetraceClient = {
   start: () => void;
   stop: () => void;
   flush: (flushType?: "normal" | "final") => Promise<void>;
+  /** Append a breadcrumb to the ring buffer (also used internally by
+   *  the auto-capture hooks). Drops the oldest entry when full. */
+  addBreadcrumb: (breadcrumb: Partial<RetraceBreadcrumb> & { message: string }) => void;
+  /** Read the current breadcrumb trail. Returns a copy so callers
+   *  can't accidentally mutate the live ring. */
+  getBreadcrumbs: () => RetraceBreadcrumb[];
 };
 
 const DEFAULT_INGEST_URL = "http://127.0.0.1:8788/api/sdk/replay";
+const DEFAULT_MAX_BREADCRUMBS = 50;
 const DEFAULT_REDACTION_PATTERNS = [
   /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
   /\b(?:token|secret|password|api[_-]?key)=([^&\s]+)/gi,
@@ -129,6 +158,112 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
   let flushTimer: ReturnType<typeof setInterval> | undefined;
   let flushInFlight: Promise<void> | undefined;
   const cleanupFns: Array<() => void> = [];
+
+  // Breadcrumb ring buffer. Bounded by `maxBreadcrumbs`; oldest is
+  // dropped on overflow. We attach a copy to every "exception" event
+  // so the server-side `monitoring_ingest` can promote them to
+  // `IncidentEvidence.console_excerpts` / `network_failures`.
+  //
+  // Defensive normalization: `maxBreadcrumbs?: number` accepts anything
+  // from the host, including `NaN` / `Infinity` / negative values. If
+  // `NaN` slipped through, `breadcrumbs.length > NaN` is always false
+  // and the ring would grow without bound. (CodeRabbit Major catch on
+  // PR #130.)
+  const requestedMaxBreadcrumbs = options.maxBreadcrumbs;
+  const normalizedMaxBreadcrumbs =
+    typeof requestedMaxBreadcrumbs === "number" &&
+    Number.isFinite(requestedMaxBreadcrumbs)
+      ? Math.trunc(requestedMaxBreadcrumbs)
+      : DEFAULT_MAX_BREADCRUMBS;
+  const maxBreadcrumbs = Math.max(1, Math.min(500, normalizedMaxBreadcrumbs));
+  const breadcrumbs: RetraceBreadcrumb[] = [];
+
+  // Best-effort deep clone — `structuredClone` is available in all
+  // modern browsers and Node 17+. JSON fallback covers anything that
+  // refuses the structured clone algorithm (functions, DOM nodes).
+  // This stops nested-object mutation after capture from rewriting
+  // historical breadcrumbs. (CodeRabbit Major catch on PR #130.)
+  function cloneBreadcrumbData(
+    data: Record<string, unknown> | undefined,
+  ): Record<string, unknown> | undefined {
+    if (!data) return undefined;
+    const sc = (globalThis as { structuredClone?: (v: unknown) => unknown })
+      .structuredClone;
+    if (typeof sc === "function") {
+      try {
+        return sc(data) as Record<string, unknown>;
+      } catch {
+        /* fall through to JSON */
+      }
+    }
+    try {
+      return JSON.parse(JSON.stringify(data)) as Record<string, unknown>;
+    } catch {
+      // Last-resort shallow copy — rare (circular refs that bypass
+      // structuredClone). Still better than handing out a live ref.
+      return { ...data };
+    }
+  }
+
+  // Strip query/fragment and credentials from URLs that end up in
+  // breadcrumb data. Query strings carry tokens/emails/PII far more
+  // often than we'd like; the path+origin is the useful signal.
+  // (CodeRabbit Major catch on PR #130.)
+  function sanitizeBreadcrumbUrl(raw: string): string {
+    if (!raw) return raw;
+    try {
+      // Allow relative URLs by using a dummy base.
+      const u = new URL(raw, "http://_b/");
+      u.search = "";
+      u.hash = "";
+      u.username = "";
+      u.password = "";
+      if (u.origin === "http://_b") return u.pathname;
+      return u.origin + u.pathname;
+    } catch {
+      // Not a URL we can parse — coarse strip.
+      return raw.split("?")[0].split("#")[0];
+    }
+  }
+
+  // Filter out our own ingest traffic so the ring doesn't fill with
+  // self-noise on busy pages. (CodeRabbit Major catch on PR #130.)
+  function isSdkIngestUrl(raw: string): boolean {
+    if (!raw) return false;
+    try {
+      const probe = new URL(raw, "http://_b/");
+      const target = new URL(ingestUrl, "http://_b/");
+      return probe.origin === target.origin && probe.pathname === target.pathname;
+    } catch {
+      return raw === ingestUrl;
+    }
+  }
+
+  function addBreadcrumbInternal(
+    raw: Partial<RetraceBreadcrumb> & { message: string },
+  ): void {
+    const message = String(raw.message || "").slice(0, 500);
+    if (!message) return;
+    breadcrumbs.push({
+      timestamp: typeof raw.timestamp === "number" ? raw.timestamp : Date.now(),
+      category: String(raw.category || "default").slice(0, 80),
+      message,
+      level: (raw.level || "info") as RetraceBreadcrumbLevel,
+      data: cloneBreadcrumbData(raw.data),
+    });
+    while (breadcrumbs.length > maxBreadcrumbs) {
+      breadcrumbs.shift();
+    }
+  }
+
+  function snapshotBreadcrumbs(): RetraceBreadcrumb[] {
+    // Independent deep copies of the ring so the exception event
+    // payload doesn't share mutable state with future captures.
+    return breadcrumbs.map((b) => ({
+      ...b,
+      data: cloneBreadcrumbData(b.data),
+    }));
+  }
   const compiledRedactionPatterns = (() => {
     const custom = options.privacy?.redactionPatterns || [];
     const compiled = custom.flatMap((pattern) => {
@@ -281,12 +416,39 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
 
   function installInteractionCapture(): void {
     const onClick = (event: MouseEvent) => {
+      const targetDesc = describeTarget(event.target);
       emitCustom("click", {
         x: event.clientX,
         y: event.clientY,
         button: event.button,
-        target: describeTarget(event.target),
+        target: targetDesc,
         url: globalThis.location?.href,
+      });
+      // Click breadcrumb — drop the visible text when the privacy
+      // filter masks it, so we don't leak content from a masked
+      // element via the breadcrumb trail. Both `text` AND the
+      // ARIA-derived `accessibleName` fallback are gated on
+      // `allowText`; otherwise an aria-label on a masked element
+      // would still slip through. (CodeRabbit Major catch on PR #130.)
+      const targetEl = event.target instanceof Element ? event.target : null;
+      const allowText = targetEl ? shouldCaptureTargetText(targetEl) : false;
+      const labelBits: string[] = [];
+      if (typeof targetDesc.tagName === "string") labelBits.push(String(targetDesc.tagName));
+      if (typeof targetDesc.id === "string" && targetDesc.id) labelBits.push(`#${targetDesc.id}`);
+      if (allowText && typeof targetDesc.text === "string" && targetDesc.text) {
+        labelBits.push(`"${String(targetDesc.text).slice(0, 80)}"`);
+      } else if (allowText && typeof targetDesc.accessibleName === "string" && targetDesc.accessibleName) {
+        labelBits.push(`"${String(targetDesc.accessibleName).slice(0, 80)}"`);
+      }
+      addBreadcrumbInternal({
+        category: "ui.click",
+        message: labelBits.join(" ") || "click",
+        level: "info",
+        data: {
+          tagName: targetDesc.tagName,
+          testIdValue: targetDesc.testIdValue,
+          url: sanitizeBreadcrumbUrl(globalThis.location?.href || ""),
+        },
       });
     };
     const onInput = (event: Event) => {
@@ -305,15 +467,88 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     });
   }
 
+  function installNavigationCapture(): void {
+    if (typeof globalThis.history === "undefined") return;
+    const lastUrlRef = { value: globalThis.location?.href || "" };
+    const recordNav = (to: string, from: string, trigger: string) => {
+      if (!to || to === from) return;
+      // Sanitize URLs so query-string tokens (e.g. `?reset_token=…`)
+      // and fragments don't end up in the breadcrumb metadata.
+      // (CodeRabbit Major catch on PR #130.)
+      const safeFrom = sanitizeBreadcrumbUrl(from);
+      const safeTo = sanitizeBreadcrumbUrl(to);
+      addBreadcrumbInternal({
+        category: "navigation",
+        message: `${safeFrom || "—"} → ${safeTo}`,
+        level: "info",
+        data: { from: safeFrom, to: safeTo, trigger },
+      });
+    };
+    const wrapHistoryMethod = (
+      name: "pushState" | "replaceState",
+    ): (() => void) => {
+      const orig = globalThis.history[name] as History[typeof name];
+      const wrapped = function patched(
+        this: History,
+        data: unknown,
+        unused: string,
+        url?: string | URL | null,
+      ): void {
+        const before = globalThis.location?.href || "";
+        // History constructor types are strict on the 2nd arg; cast to
+        // string for compatibility with all browsers.
+        orig.call(this, data, unused, url ?? null);
+        const after = globalThis.location?.href || "";
+        recordNav(after, before, `history.${name}`);
+        lastUrlRef.value = after;
+      };
+      (globalThis.history as History)[name] = wrapped as History[typeof name];
+      return () => {
+        (globalThis.history as History)[name] = orig;
+      };
+    };
+    const restorePush = wrapHistoryMethod("pushState");
+    const restoreReplace = wrapHistoryMethod("replaceState");
+    const onPopState = () => {
+      const before = lastUrlRef.value;
+      const after = globalThis.location?.href || "";
+      recordNav(after, before, "popstate");
+      lastUrlRef.value = after;
+    };
+    const onHashChange = () => {
+      const before = lastUrlRef.value;
+      const after = globalThis.location?.href || "";
+      recordNav(after, before, "hashchange");
+      lastUrlRef.value = after;
+    };
+    globalThis.addEventListener?.("popstate", onPopState);
+    globalThis.addEventListener?.("hashchange", onHashChange);
+    cleanupFns.push(() => {
+      restorePush();
+      restoreReplace();
+      globalThis.removeEventListener?.("popstate", onPopState);
+      globalThis.removeEventListener?.("hashchange", onHashChange);
+    });
+  }
+
   function installConsoleCapture(): void {
     const originals: Partial<Record<"error" | "warn" | "info", (...data: unknown[]) => void>> = {};
     (["error", "warn", "info"] as const).forEach((level) => {
       originals[level] = globalThis.console[level].bind(globalThis.console);
       globalThis.console[level] = (...data: unknown[]) => {
+        const serialized = data.map((item) => redactText(safeSerializeConsoleArg(item)));
         emitCustom("console", {
           level,
-          payload: data.map((item) => redactText(safeSerializeConsoleArg(item))),
+          payload: serialized,
           url: redactText(globalThis.location?.href || ""),
+        });
+        // Breadcrumb mirror — Sentry maps console levels to its own
+        // breadcrumb levels (`error` ↔ `error`, `warn` ↔ `warning`).
+        addBreadcrumbInternal({
+          category: "console",
+          message: serialized.join(" "),
+          level: level === "warn" ? "warning" : level,
+          data: { url: sanitizeBreadcrumbUrl(globalThis.location?.href || "") },
         });
         originals[level]?.(...data);
       };
@@ -329,6 +564,10 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
 
   function installErrorCapture(): void {
     const onError = (event: ErrorEvent) => {
+      // Snapshot BEFORE we record the error-as-breadcrumb so the
+      // exception payload's `breadcrumbs` are the trail leading up to
+      // the error, not the error itself.
+      const trail = snapshotBreadcrumbs();
       emitCustom("exception", {
         kind: "onerror",
         message: redactText(event.message || messageFromError(event.error)),
@@ -339,9 +578,17 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
         url: redactText(globalThis.location?.href || ""),
         sessionId,
         trace: traceContext(),
+        breadcrumbs: trail,
+      });
+      addBreadcrumbInternal({
+        category: "error",
+        message: redactText(event.message || messageFromError(event.error)),
+        level: "error",
+        data: { source: event.filename, line: event.lineno },
       });
     };
     const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      const trail = snapshotBreadcrumbs();
       emitCustom("exception", {
         kind: "unhandledrejection",
         message: redactText(messageFromError(event.reason)),
@@ -349,6 +596,12 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
         url: redactText(globalThis.location?.href || ""),
         sessionId,
         trace: traceContext(),
+        breadcrumbs: trail,
+      });
+      addBreadcrumbInternal({
+        category: "error",
+        message: redactText(messageFromError(event.reason)),
+        level: "error",
       });
     };
     globalThis.addEventListener?.("error", onError);
@@ -380,28 +633,51 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
           const response = await originalFetch(input, nextInit);
           const responseTraceparent = response.headers.get("traceparent");
           rememberTraceparent(responseTraceparent);
+          const durationMs = Date.now() - startedAt;
           emitCustom("network", {
             kind: "fetch",
             method,
             url,
             status: response.status,
-            durationMs: Date.now() - startedAt,
+            durationMs,
             trace: tracePayload(
               requestTraceparent,
               responseTraceparent,
               response.headers.get("x-retrace-trace-id"),
             ),
           });
+          // Skip our own ingest traffic from the breadcrumb trail —
+          // otherwise the ring fills with self-noise on busy pages.
+          if (!isSdkIngestUrl(url)) {
+            const safeUrl = sanitizeBreadcrumbUrl(url);
+            addBreadcrumbInternal({
+              category: "http",
+              message: `${method} ${safeUrl} → ${response.status}`,
+              level: response.status >= 400 ? "error" : "info",
+              data: { method, url: safeUrl, status_code: response.status, duration_ms: durationMs },
+            });
+          }
           return response;
         } catch (error) {
+          const durationMs = Date.now() - startedAt;
+          const errMsg = error instanceof Error ? error.message : String(error);
           emitCustom("network", {
             kind: "fetch",
             method,
             url,
-            error: error instanceof Error ? error.message : String(error),
-            durationMs: Date.now() - startedAt,
+            error: errMsg,
+            durationMs,
             trace: tracePayload(requestTraceparent),
           });
+          if (!isSdkIngestUrl(url)) {
+            const safeUrl = sanitizeBreadcrumbUrl(url);
+            addBreadcrumbInternal({
+              category: "http",
+              message: `${method} ${safeUrl} (failed: ${errMsg})`,
+              level: "error",
+              data: { method, url: safeUrl, error: errMsg, duration_ms: durationMs },
+            });
+          }
           throw error;
         }
       };
@@ -452,18 +728,30 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
         this.addEventListener("loadend", () => {
           const responseTraceparent = this.getResponseHeader("traceparent");
           rememberTraceparent(responseTraceparent);
+          const xhrMethod = this.__retrace?.method || "GET";
+          const xhrUrl = this.__retrace?.url || "";
+          const durationMs = Date.now() - startedAt;
           emitCustom("network", {
             kind: "xhr",
-            method: this.__retrace?.method || "GET",
-            url: this.__retrace?.url || "",
+            method: xhrMethod,
+            url: xhrUrl,
             status: this.status,
-            durationMs: Date.now() - startedAt,
+            durationMs,
             trace: tracePayload(
               requestTraceparent,
               responseTraceparent,
               this.getResponseHeader("x-retrace-trace-id"),
             ),
           });
+          if (!isSdkIngestUrl(xhrUrl)) {
+            const safeUrl = sanitizeBreadcrumbUrl(xhrUrl);
+            addBreadcrumbInternal({
+              category: "http",
+              message: `${xhrMethod} ${safeUrl} → ${this.status}`,
+              level: this.status >= 400 ? "error" : "info",
+              data: { method: xhrMethod, url: safeUrl, status_code: this.status, duration_ms: durationMs },
+            });
+          }
         });
         return originalSend.call(this, body);
       };
@@ -536,6 +824,7 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
   function start(): void {
     if (!enabled || stopRecording) return;
     installInteractionCapture();
+    installNavigationCapture();
     installConsoleCapture();
     installErrorCapture();
     installNetworkCapture();
@@ -588,5 +877,15 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     start();
   }
 
-  return { identify, start, stop, flush };
+  function addBreadcrumb(
+    breadcrumb: Partial<RetraceBreadcrumb> & { message: string },
+  ): void {
+    addBreadcrumbInternal(breadcrumb);
+  }
+
+  function getBreadcrumbs(): RetraceBreadcrumb[] {
+    return snapshotBreadcrumbs();
+  }
+
+  return { identify, start, stop, flush, addBreadcrumb, getBreadcrumbs };
 }
