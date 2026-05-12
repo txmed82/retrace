@@ -332,7 +332,7 @@ users — the majority of indie backend devs.
 
 ## P0.3 — GitHub Actions templates
 
-**Status:** NOT STARTED · **ETA:** 1 day · **Owner:** TBD
+**Status:** DONE 2026-05-11 · **PR:** this PR · **Owner:** Claude
 
 ### Why now
 

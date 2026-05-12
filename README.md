@@ -754,6 +754,39 @@ except Exception:
 
 Full walkthrough: [`docs/python-sdk.md`](docs/python-sdk.md).
 
+## GitHub Actions
+
+Three drop-in composite actions live under
+[`.github/actions/`](.github/actions/):
+
+- [`pr-review`](docs/github-actions.md#pr-review) — post Retrace's
+  templated + optional LLM review as a PR comment on every pull
+  request.
+- [`source-map-upload`](docs/github-actions.md#source-map-upload) —
+  record a deploy marker and upload all `*.map` files. Pure
+  `curl` + `jq`, no Python install per run.
+- [`qa-auto`](docs/github-actions.md#qa-auto) — `workflow_dispatch`
+  trigger for the killer-demo flow: pick the top open QA incident,
+  auto-generate a UI test that reproduces it, open a draft fix PR.
+
+8-line quickstart:
+
+```yaml
+# .github/workflows/retrace-review.yml
+name: Retrace review
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: txmed82/retrace/.github/actions/pr-review@main
+```
+
+Full reference + fork-safety patterns: [`docs/github-actions.md`](docs/github-actions.md).
 
 Replay dashboard/read endpoints require a service token:
 

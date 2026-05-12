@@ -1,0 +1,169 @@
+name: "Retrace source-map upload"
+description: >-
+  Record a deploy marker AND upload every `*.map` file under
+  `source-map-dir` to a Retrace server, in a single workflow step.
+
+  Pure bash + curl + jq — no Python install, no Retrace CLI install.
+  Targets the existing `POST /api/deploys` and `POST /api/source-maps`
+  endpoints, which only need a service token with `source_maps:write`
+  + `deploy:write` (or `ingest`).
+
+inputs:
+  api-base-url:
+    description: "Retrace API base URL (e.g. `https://retrace.example.com`)."
+    required: true
+  service-token:
+    description: >-
+      Service token with `source_maps:write` and `deploy:write` scopes.
+      Pass as `${{ secrets.RETRACE_SERVICE_TOKEN }}`.
+    required: true
+  environment-id:
+    description: "Target environment id (e.g. `env_production`)."
+    required: true
+  source-map-dir:
+    description: "Directory under which `*.map` files will be uploaded recursively."
+    required: true
+  sha:
+    description: "Deploy commit SHA. Used as `release` on each source map and as the deploy marker SHA."
+    required: false
+    default: ${{ github.sha }}
+  artifact-prefix:
+    description: >-
+      URL prefix to prepend to each map's artifact_url. For a map at
+      `dist/static/app.js.map`, the artifact_url becomes
+      `<prefix>/static/app.js`. Use your CDN's static-asset base URL.
+    required: false
+    default: ""
+  branch:
+    description: "Deploy branch."
+    required: false
+    default: ${{ github.ref_name }}
+  author:
+    description: "Deploy author."
+    required: false
+    default: ${{ github.actor }}
+  record-deploy:
+    description: "Record the deploy marker too. Off when you've already done it in a prior step."
+    required: false
+    default: "true"
+  fail-on-upload-error:
+    description: "Fail the action if any single map fails to upload. Default `true`."
+    required: false
+    default: "true"
+
+outputs:
+  uploaded-count:
+    description: "Number of source maps successfully uploaded."
+    value: ${{ steps.upload.outputs.uploaded-count }}
+  skipped-count:
+    description: "Number of files skipped (not a JSON object, unreadable, etc.)."
+    value: ${{ steps.upload.outputs.skipped-count }}
+  deploy-public-id:
+    description: "`public_id` of the recorded deploy marker (empty if `record-deploy=false`)."
+    value: ${{ steps.deploy.outputs.deploy-public-id }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Sanity-check inputs + dir existence
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ ! -d "${{ inputs.source-map-dir }}" ]; then
+          echo "::error::source-map-dir does not exist: ${{ inputs.source-map-dir }}"
+          exit 1
+        fi
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "::error::jq is required. GitHub-hosted runners ship it; on self-hosted, install it first."
+          exit 1
+        fi
+
+    - name: Record deploy marker
+      id: deploy
+      if: ${{ inputs.record-deploy == 'true' }}
+      shell: bash
+      env:
+        RETRACE_SERVICE_TOKEN: ${{ inputs.service-token }}
+      run: |
+        set -euo pipefail
+        url="${{ inputs.api-base-url }}/api/deploys?environment_id=${{ inputs.environment-id }}"
+        payload=$(jq -nc \
+          --arg sha "${{ inputs.sha }}" \
+          --arg branch "${{ inputs.branch }}" \
+          --arg author "${{ inputs.author }}" \
+          '{sha: $sha, branch: $branch, author: $author}')
+        response=$(curl -fsS -X POST "${url}" \
+          -H "Authorization: Bearer ${RETRACE_SERVICE_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d "${payload}")
+        public_id=$(printf '%s' "${response}" | jq -r '.deploy.public_id // ""')
+        echo "deploy-public-id=${public_id}" >>"$GITHUB_OUTPUT"
+        echo "::notice::Recorded deploy ${{ inputs.sha }} → ${public_id}"
+
+    - name: Upload source maps
+      id: upload
+      shell: bash
+      env:
+        RETRACE_SERVICE_TOKEN: ${{ inputs.service-token }}
+      run: |
+        set -euo pipefail
+        # Normalize the source-map-dir before string-stripping it off
+        # each path — otherwise a caller passing `dist/` (with trailing
+        # slash) ends up with double-slash artifact_urls.
+        src_dir="${{ inputs.source-map-dir }}"
+        src_dir="${src_dir%/}"
+        url="${{ inputs.api-base-url }}/api/source-maps?environment_id=${{ inputs.environment-id }}"
+        prefix="${{ inputs.artifact-prefix }}"
+        prefix="${prefix%/}"
+        uploaded=0
+        skipped=0
+        # `find -print0` + read-with-IFS handles paths containing spaces.
+        # We can't pipe straight to a `while` loop because that would
+        # spawn a subshell, and the counters wouldn't propagate.
+        while IFS= read -r -d '' map_path; do
+          relative="${map_path#${src_dir}/}"
+          # foo.js.map → foo.js
+          generated="${relative%.map}"
+          if [ -n "$prefix" ]; then
+            artifact_url="${prefix}/${generated}"
+          else
+            artifact_url="${generated}"
+          fi
+          # Make sure the file is JSON before we try to upload — Retrace's
+          # ingest requires a JSON object.
+          if ! jq empty "$map_path" >/dev/null 2>&1; then
+            echo "::warning::Skipping ${map_path}: not valid JSON"
+            skipped=$((skipped+1))
+            continue
+          fi
+          if ! source_map_body=$(jq -cR --slurpfile sm "$map_path" \
+              --arg release "${{ inputs.sha }}" \
+              --arg artifact_url "$artifact_url" \
+              -n '{release: $release, artifact_url: $artifact_url, source_map: $sm[0]}'); then
+            echo "::warning::Skipping ${map_path}: failed to build JSON payload"
+            skipped=$((skipped+1))
+            continue
+          fi
+          if curl -fsS -X POST "$url" \
+              -H "Authorization: Bearer ${RETRACE_SERVICE_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$source_map_body" \
+              -o /dev/null; then
+            uploaded=$((uploaded+1))
+            echo "::debug::Uploaded ${relative} → ${artifact_url}"
+          else
+            echo "::warning::Failed to upload ${map_path}"
+            if [ "${{ inputs.fail-on-upload-error }}" = "true" ]; then
+              echo "::error::Aborting: failed to upload ${map_path} (fail-on-upload-error=true)"
+              exit 1
+            fi
+            skipped=$((skipped+1))
+          fi
+        done < <(find "${src_dir}" -type f -name "*.map" -print0)
+        echo "uploaded-count=${uploaded}" >>"$GITHUB_OUTPUT"
+        echo "skipped-count=${skipped}"   >>"$GITHUB_OUTPUT"
+        echo "::notice::Source maps: ${uploaded} uploaded, ${skipped} skipped (release=${{ inputs.sha }})"
+
+branding:
+  icon: "upload-cloud"
+  color: "purple"
