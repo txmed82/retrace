@@ -215,6 +215,48 @@ def test_wrapped_connection_executescript_runs_per_statement():
     assert len(fake.cur.calls) == 2
 
 
+def test_executescript_treats_semicolons_in_line_comments_as_comments():
+    """Regression for the second P1.5 CI failure: a `;` inside a
+    `-- ...` line comment was being treated as a statement boundary,
+    cutting the schema in half mid-CREATE-TABLE and dumping prose
+    into the next "statement".
+    """
+    fake = _FakeConn()
+    conn = WrappedConnection(fake, dialect="postgres")
+    conn.executescript(
+        "-- this comment; has a semicolon in it\n"
+        "CREATE TABLE a (id INTEGER);\n"
+        "-- another;comment;with;many;semicolons\n"
+        "CREATE TABLE b (id INTEGER);"
+    )
+    # Two real statements, regardless of how many semicolons live
+    # inside the line comments.
+    assert len(fake.cur.calls) == 2
+    assert "CREATE TABLE a" in fake.cur.calls[0][0]
+    assert "CREATE TABLE b" in fake.cur.calls[1][0]
+
+
+def test_executescript_treats_semicolons_in_block_comments_as_comments():
+    fake = _FakeConn()
+    conn = WrappedConnection(fake, dialect="postgres")
+    conn.executescript(
+        "/* multi-line block;\n   comment with ; semicolons */\n"
+        "CREATE TABLE a (id INTEGER);"
+    )
+    assert len(fake.cur.calls) == 1
+    assert "CREATE TABLE a" in fake.cur.calls[0][0]
+
+
+def test_executescript_respects_semicolon_inside_string_literal():
+    fake = _FakeConn()
+    conn = WrappedConnection(fake, dialect="postgres")
+    conn.executescript(
+        "INSERT INTO a VALUES ('hello; world');\n"
+        "CREATE TABLE b (id INTEGER);"
+    )
+    assert len(fake.cur.calls) == 2
+
+
 def test_wrapped_connection_context_manager_commits_on_success():
     fake = _FakeConn()
     conn = WrappedConnection(fake, dialect="postgres")

@@ -291,40 +291,83 @@ def _wrap_row(row: Any, description: Any) -> Any:
 
 
 def _split_statements(sql: str) -> list[str]:
-    """Split a multi-statement SQL string into individual statements,
-    respecting `BEGIN ... END;` blocks (used by SQLite triggers — not
-    currently in our schema, but cheap insurance) and string literals.
+    """Split a multi-statement SQL string into individual statements.
 
-    SQLite's `executescript` is permissive; our split needs to be at
-    least as permissive for the schema strings we feed it.
+    Respects:
+      * String literals (`'...'`, `"..."`) including doubled-quote
+        escapes.
+      * Line comments (`-- ...` to end of line) — a `;` inside a
+        line comment is NOT a statement boundary. This matters
+        because our schema has comment blocks with semicolons in
+        the prose, like `-- table; every matching...`.
+      * Block comments (`/* ... */`) — same rule.
+
+    SQLite's `executescript` is permissive; our split needs to be
+    at least as permissive for the schema strings we feed it.
     """
     statements: list[str] = []
     buf: list[str] = []
     in_string = False
+    in_line_comment = False
+    in_block_comment = False
     string_char = ""
     i = 0
     while i < len(sql):
         ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+        if in_line_comment:
+            buf.append(ch)
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            buf.append(ch)
+            if ch == "*" and nxt == "/":
+                buf.append(nxt)
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
         if in_string:
             buf.append(ch)
             if ch == string_char:
-                # Look-ahead for doubled-quote escape (`'` inside string).
-                if i + 1 < len(sql) and sql[i + 1] == string_char:
-                    buf.append(sql[i + 1])
+                # Look-ahead for doubled-quote escape (`''` inside string).
+                if nxt == string_char:
+                    buf.append(nxt)
                     i += 2
                     continue
                 in_string = False
-        elif ch in ("'", '"'):
+            i += 1
+            continue
+        # Not inside a string or comment.
+        if ch == "-" and nxt == "-":
+            in_line_comment = True
+            buf.append(ch)
+            buf.append(nxt)
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            buf.append(ch)
+            buf.append(nxt)
+            i += 2
+            continue
+        if ch in ("'", '"'):
             in_string = True
             string_char = ch
             buf.append(ch)
-        elif ch == ";":
+            i += 1
+            continue
+        if ch == ";":
             statement = "".join(buf).strip()
             if statement:
                 statements.append(statement)
             buf = []
-        else:
-            buf.append(ch)
+            i += 1
+            continue
+        buf.append(ch)
         i += 1
     tail = "".join(buf).strip()
     if tail:
