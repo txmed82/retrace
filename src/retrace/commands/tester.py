@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1163,6 +1164,168 @@ def tester_api_import_openapi(
             indent=2,
         )
     )
+
+
+@tester_group.command("api-diff")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--new",
+    "new_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Path to the new OpenAPI / Swagger document (JSON or YAML).",
+)
+@click.option(
+    "--old",
+    "old_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Path to the previous OpenAPI document — typically `git show HEAD:openapi.yaml > /tmp/old.yaml`.",
+)
+@click.option(
+    "--file-incidents/--no-file-incidents",
+    default=True,
+    show_default=True,
+    help=(
+        "File one `qa_incident` per breaking change so they ride the "
+        "same `qa list` / `qa auto` rails as everything else. Safe "
+        "additions never produce incidents."
+    ),
+)
+@click.option("--project-id", default="")
+@click.option("--environment-id", default="")
+@click.option(
+    "--repo",
+    "repo",
+    default="",
+    help="Optional `owner/name`. Recorded on each filed incident so the QA queue can attribute the contract regression to a deploy.",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=50,
+    show_default=True,
+    help="Cap incidents filed per run. Breaking changes beyond this still appear in the JSON output.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False)
+@click.option(
+    "--fail-on-breaking/--no-fail-on-breaking",
+    default=True,
+    show_default=True,
+    help="Exit non-zero when any breaking change is detected. Set `--no-fail-on-breaking` for CI consumers that prefer a status query over an exit code.",
+)
+def tester_api_diff(
+    config_path: Path,
+    new_path: Path,
+    old_path: Path,
+    file_incidents: bool,
+    project_id: str,
+    environment_id: str,
+    repo: str,
+    limit: int,
+    as_json: bool,
+    fail_on_breaking: bool,
+) -> None:
+    """Compare two OpenAPI / Swagger documents and surface breaking changes.
+
+    Breaking-change kinds:
+      - operation_removed
+      - required_request_field_added
+      - response_schema_field_removed
+      - success_status_removed
+      - enum_value_removed
+
+    Each breaking change can become a `qa_incident` (off-switch:
+    `--no-file-incidents`) so the existing repair flow handles
+    contract regressions alongside replay / UI / API-test failures.
+    """
+    from retrace.openapi_diff import (
+        diff_openapi_documents,
+        load_openapi,
+    )
+    from retrace.qa_incident_bridge import (
+        sync_qa_incident_from_pr_review_finding,
+    )
+
+    try:
+        old_doc = load_openapi(old_path)
+        new_doc = load_openapi(new_path)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    diff = diff_openapi_documents(old=old_doc, new=new_doc)
+
+    incidents_filed: list[str] = []
+    if file_incidents and diff.has_breaking:
+        cfg = load_config(config_path)
+        store = Storage(cfg.run.data_dir / "retrace.db")
+        store.init_schema()
+        pid = (project_id or "").strip()
+        eid = (environment_id or "").strip()
+        if not pid or not eid:
+            workspace = store.ensure_workspace(project_name="Default")
+            pid = pid or workspace.project_id
+            eid = eid or workspace.environment_id
+        # Cap at `--limit` to avoid filing 1000 incidents on a
+        # full-rewrite spec.
+        for change in diff.breaking[: max(1, int(limit))]:
+            try:
+                public_id = sync_qa_incident_from_pr_review_finding(
+                    store=store,
+                    project_id=pid,
+                    environment_id=eid,
+                    title=change.title,
+                    summary=change.detail
+                    or f"{change.method} {change.path}: {change.kind}",
+                    repo=repo or "",
+                    pr_number=0,
+                    files=[],
+                    suspected_cause=change.kind,
+                    severity="high",
+                )
+            except Exception:  # pragma: no cover - defensive
+                continue
+            if public_id:
+                incidents_filed.append(public_id)
+
+    payload = {
+        **diff.to_dict(),
+        "breaking_count": len(diff.breaking),
+        "safe_count": len(diff.safe),
+        "incidents_filed": incidents_filed,
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        click.echo(
+            f"Breaking changes: {len(diff.breaking)}  "
+            f"Safe changes: {len(diff.safe)}"
+        )
+        for change in diff.breaking[:40]:
+            click.echo(f"  ✗ [{change.kind}] {change.title}")
+            if change.field_path:
+                click.echo(f"      field: {change.field_path}")
+            if change.detail:
+                click.echo(f"      note:  {change.detail}")
+        if diff.safe and not diff.breaking:
+            click.echo("")
+            click.echo("Safe additions:")
+            for change in diff.safe[:20]:
+                click.echo(f"  ✓ [{change.kind}] {change.title}")
+        if incidents_filed:
+            click.echo("")
+            click.echo(f"Filed {len(incidents_filed)} qa_incident(s):")
+            for pid_ in incidents_filed:
+                click.echo(f"  • {pid_}")
+
+    if fail_on_breaking and diff.has_breaking:
+        sys.exit(2)
 
 
 @tester_group.command("api-suite-list")
