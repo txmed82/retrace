@@ -1263,7 +1263,30 @@ class LocalReplayBlobStore:
 
 
 class Storage:
-    def __init__(self, path: Path, replay_blob_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        path: Path | str,
+        replay_blob_dir: Optional[Path] = None,
+    ):
+        # P1.5 foundation: reject `postgresql://` URLs here with a clean
+        # `NotImplementedError` so users get a useful message instead of
+        # a confusing `sqlite3.OperationalError`. The Postgres backend
+        # itself lands in follow-up table-slice PRs; the chassis is in
+        # `retrace.storage_backend`.
+        if isinstance(path, str) and "://" in path:
+            from retrace.storage_backend import parse_storage_url
+
+            dsn = parse_storage_url(path)
+            if dsn.is_postgres():
+                raise NotImplementedError(
+                    "Storage(postgresql://...) is on the P1.5 roadmap but "
+                    "not yet implemented. The chassis is in "
+                    "`retrace.storage_backend` and per-table migrations "
+                    "ship in follow-up PRs. Use a SQLite path for now."
+                )
+            # Resolve a `sqlite://...` URL to its file path so the rest
+            # of this class keeps using `self.path` unchanged.
+            path = dsn.path
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.replay_blob_store: ReplayBlobStore | None = (
