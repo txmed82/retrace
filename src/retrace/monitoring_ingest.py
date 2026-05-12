@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -131,6 +132,28 @@ def ingest_monitoring_webhook(
     evidence_id = store.append_failure_evidence(evidence)
     correlate_failure_to_deploy(store=store, failure_id=failure_id)
     incident = group_failure_into_incident(store=store, failure_id=failure_id)
+
+    # P1.1 — fan out to alert routes. Best-effort: any HTTP failure
+    # is logged + persisted on the dispatch row but never aborts the
+    # ingest pipeline.
+    try:
+        # Local import to avoid a circular dep (alert_dispatch imports
+        # MonitoringAlert from this module).
+        from retrace.alert_dispatch import dispatch_alert
+
+        dispatch_alert(
+            store=store,
+            project_id=project_id,
+            environment_id=environment_id,
+            alert=alert,
+            decision=rule_decision,
+        )
+    except Exception:  # pragma: no cover - defensive
+        # The dispatcher already swallows per-route errors; this is
+        # the belt-and-braces wrapper for the truly unexpected.
+        log = logging.getLogger(__name__)
+        log.exception("alert_dispatch raised unexpectedly; ignoring")
+
     return MonitoringIngestResult(
         provider=alert.provider,
         external_id=alert.external_id,
