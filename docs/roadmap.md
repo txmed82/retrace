@@ -94,7 +94,7 @@ Every roadmap item below uses the same dev loop. Don't skip steps.
 |---|---|
 | **Now (this week)** | P0.1 LLM-powered PR review · P0.2 Python SDK · P0.3 GitHub Actions templates · P0.4 Browser SDK breadcrumbs |
 | **Next (weeks 2–3)** | P1.1 Real-time alerts · P1.2 Perceptual visual diff · P1.3 Diff-aware affected tests · P1.4 API tester env profiles UI |
-| **Later (month 2+)** | P2.2 Rate limiting + sampling · P2.4 Multi-tenancy + audit log (P1.5 ✅, P2.3 ✅ done; P2.1 deferred — GitHub-only at launch) |
+| **Later (month 2+)** | P2.4 Multi-tenancy + audit log (P1.5 ✅, P2.2 ✅, P2.3 ✅ done; P2.1 deferred — GitHub-only at launch) |
 
 ---
 
@@ -636,7 +636,7 @@ work speculatively. · **ETA when revived:** 3 days each (~1 week total)
 
 ## P2.2 — Rate limiting + sampling on ingest
 
-**Status:** NOT STARTED · **ETA:** 2 days
+**Status:** DONE 2026-05-12 · **PR:** this PR · **Owner:** Claude
 
 ### OSS to study
 
@@ -644,12 +644,37 @@ work speculatively. · **ETA when revived:** 3 days each (~1 week total)
 - **github.com/redis/redis-py-cluster** token-bucket reference.
 - **GlitchTip** sampling implementation.
 
-### Plan
+### Plan vs. what shipped
 
-1. Per-SDK-key token bucket in SQLite (`sdk_key_rate_limits`).
-2. `Retry-After` header on `/api/sdk/error` and `/api/sdk/replay`
-   when exceeded.
-3. `--sample-rate` on `@retrace/browser` `init()`.
+Most of the plan was already in place from earlier PRs — the
+roadmap entry was written before the supporting machinery landed
+incidentally. The audit:
+
+1. **Per-SDK-key token bucket in SQLite** — `ingest_rate_limits`
+   table + `Storage.consume_ingest_rate_limit()` already shipped
+   (used by replay / Sentry / monitoring / source-map ingest).
+   The table name is `ingest_rate_limits` rather than
+   `sdk_key_rate_limits`; same model.
+2. **`Retry-After` header on 429** — `_rate_limit_headers()`
+   already emits `Retry-After`, `X-RateLimit-Limit`,
+   `X-RateLimit-Remaining`, `X-RateLimit-Reset`,
+   `X-RateLimit-Window` on every throttled response.
+3. **`--sample-rate` on `@retrace/browser` `init()`** —
+   `RetraceBrowserOptions.sampleRate` + `shouldSample()` already
+   shipped; clamps to `[0, 1]`, deterministic at the endpoints,
+   uses `Math.random()` for the middle.
+
+This PR closed the audit gaps:
+
+* **OTel ingest endpoint** (`/api/otel/v1/logs`,
+  `/api/otel/v1/traces`) was the one ingest handler not calling
+  `_consume_rate_limit`. Now bucketed under `"otel"` with the
+  same 600/60s ceiling as replay, identity = service-token id.
+  Rate check fires BEFORE reading the request body so a flooded
+  client doesn't get to spend ingress bandwidth.
+* **Regression tests** pinning both the OTel 429-with-Retry-After
+  contract and the browser `sampleRate` opt-out — neither was
+  guarded before and both could regress silently.
 
 ---
 
@@ -780,7 +805,8 @@ EOF
 | 2026-05-12 | P1.5 (foundation) Postgres adapter chassis — new `retrace.storage_backend` module with `Backend` Protocol + `SqliteBackend` + `PostgresBackend` stub + URL factory. `Storage(...)` accepts `sqlite:///`, bare paths, and rejects `postgresql://` with a clean `NotImplementedError` pointing at this slice. `[postgres]` extra reserves `psycopg[binary]>=3.2`. Per-table migration ordering documented for follow-up PRs. 27 new tests; existing Storage behavior unchanged. | #135 |
 | 2026-05-12 | P1.5 (full) Postgres adapter — real `PostgresBackend.connect()` via psycopg3, SQL dialect translation at execute time (`?` → `%s`, `datetime('now', ?)` → ISO-text `to_char(now() + interval)`, `INSERT OR IGNORE` → `INSERT ... ON CONFLICT DO NOTHING`), portable SCHEMA via `sql_schema.translate_schema` (`AUTOINCREMENT` → `BIGSERIAL`, ISO-text defaults). `Storage(postgresql://...)` works end-to-end. CI Postgres service container runs gated smoke tests covering `alert_routes`/`alert_dispatches`/`llm_pr_reviews` round-trips. 18 new tests (translation + WrappedConnection + schema translator + PG smoke). | #136 |
 | 2026-05-12 | P1.4 (finish) env-profile management CLI + HAR import recorder — new `retrace tester env list/show/yaml` (read-only against `config.yaml`; emits paste-ready stanzas, never overwrites the hand-edited file). New `retrace tester record --har` ingests a browser DevTools HAR export into one APITestSpec per matching request (sensitive headers stripped, JSON bodies structured, `--include-host`/`--include-method`/`--exclude-path` filters). P2.1 GitLab/Bitbucket deferred — GitHub-only at launch. 41 new tests. | #137 |
-| 2026-05-12 | P2.3 Retention + backups — `retrace data retention apply [--dry-run]` purges old rows across the app-error domain (per project+env via existing `prune_app_error_retention`) + globally for `replay_batches` and `otel_events`, plus a filesystem sweep that removes old `ui-tests/runs/` and `api-tests/runs/` subdirectories (specs / baselines / queues untouched). `retrace data backup --to PATH` writes a `.tar.gz` of a consistent sqlite snapshot (via the online BACKUP API) plus the `data_dir` contents. New `RetentionConfig` in `config.yaml`. 26 new tests. | this PR |
+| 2026-05-12 | P2.3 Retention + backups — `retrace data retention apply [--dry-run]` purges old rows across the app-error domain (per project+env via existing `prune_app_error_retention`) + globally for `replay_batches` and `otel_events`, plus a filesystem sweep that removes old `ui-tests/runs/` and `api-tests/runs/` subdirectories (specs / baselines / queues untouched). `retrace data backup --to PATH` writes a `.tar.gz` of a consistent sqlite snapshot (via the online BACKUP API) plus the `data_dir` contents. New `RetentionConfig` in `config.yaml`. 26 new tests. | #138 |
+| 2026-05-12 | P2.2 Rate limiting + sampling — audit pass: most of the original plan was already in place (the `ingest_rate_limits` table, `Storage.consume_ingest_rate_limit`, `_rate_limit_headers` with `Retry-After`, browser `sampleRate`). This PR closes the one remaining gap (OTel ingest endpoints `/api/otel/v1/{logs,traces}` were not calling `_consume_rate_limit` — now bucketed under `"otel"`, identity = service-token id, rate check fires before reading the request body) and adds regression tests pinning both the OTel 429-with-`Retry-After` contract and the browser `sampleRate` opt-out (`sampleRate: 0` keeps rrweb dormant even on explicit `client.start()`). 14 new tests (7 pytest + 7 vitest). | this PR |
 
 > Append a row whenever an item changes status or a new item is
 > added. Keep newest at the bottom.
