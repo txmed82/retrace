@@ -1262,6 +1262,20 @@ class LocalReplayBlobStore:
         return [item for item in payload if isinstance(item, dict)]
 
 
+def _retention_interval(days: int) -> str:
+    """Format the `datetime('now', ?)` modifier for a retention sweep.
+
+    Using SQLite's `datetime('now', '-N days')` (translated by the
+    P1.5 dialect layer to `now() - interval` on Postgres) means the
+    cutoff is computed by the DB engine in the SAME shape as the
+    column DEFAULT was stored — sidesteps the
+    Python-isoformat-vs-SQLite-stored-format mismatch (`T` 0x54 vs
+    ` ` 0x20) that would otherwise over-prune any row whose
+    time-of-day was later than the cutoff's.
+    """
+    return f"-{max(1, int(days))} days"
+
+
 class Storage:
     def __init__(
         self,
@@ -4171,7 +4185,6 @@ class Storage:
         *,
         retention_days: int,
         dry_run: bool = False,
-        now: Optional[datetime] = None,
     ) -> int:
         """Delete `replay_batches` rows older than `retention_days`.
 
@@ -4180,24 +4193,27 @@ class Storage:
         `received_at` is safe because nothing else references batch
         rows by FK; orphaned `replay_sessions` rows are tiny and
         retained for the lifecycle-event history.
+
+        The cutoff is computed DB-side via `datetime('now', ?)` so
+        it matches the column DEFAULT format under both SQLite and
+        Postgres (the P1.5 dialect layer translates the expression).
         """
-        days = max(1, int(retention_days))
-        current = now or datetime.now(timezone.utc)
-        cutoff = datetime.fromtimestamp(
-            current.timestamp() - (days * 24 * 60 * 60),
-            tz=timezone.utc,
-        ).isoformat()
+        interval = _retention_interval(retention_days)
         with self._conn() as conn:
             count = int(
                 conn.execute(
-                    "SELECT COUNT(*) AS count FROM replay_batches WHERE received_at < ?",
-                    (cutoff,),
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM replay_batches
+                    WHERE received_at < datetime('now', ?)
+                    """,
+                    (interval,),
                 ).fetchone()["count"]
             )
             if not dry_run and count:
                 conn.execute(
-                    "DELETE FROM replay_batches WHERE received_at < ?",
-                    (cutoff,),
+                    "DELETE FROM replay_batches WHERE received_at < datetime('now', ?)",
+                    (interval,),
                 )
             return count
 
@@ -4206,7 +4222,6 @@ class Storage:
         *,
         retention_days: int,
         dry_run: bool = False,
-        now: Optional[datetime] = None,
     ) -> int:
         """Delete `otel_events` rows older than `retention_days`.
 
@@ -4215,40 +4230,47 @@ class Storage:
         timestamps could otherwise wipe fresh ingest. Server clock
         is the source of truth here.
         """
-        days = max(1, int(retention_days))
-        current = now or datetime.now(timezone.utc)
-        cutoff = datetime.fromtimestamp(
-            current.timestamp() - (days * 24 * 60 * 60),
-            tz=timezone.utc,
-        ).isoformat()
+        interval = _retention_interval(retention_days)
         with self._conn() as conn:
             count = int(
                 conn.execute(
-                    "SELECT COUNT(*) AS count FROM otel_events WHERE created_at < ?",
-                    (cutoff,),
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM otel_events
+                    WHERE created_at < datetime('now', ?)
+                    """,
+                    (interval,),
                 ).fetchone()["count"]
             )
             if not dry_run and count:
                 conn.execute(
-                    "DELETE FROM otel_events WHERE created_at < ?",
-                    (cutoff,),
+                    "DELETE FROM otel_events WHERE created_at < datetime('now', ?)",
+                    (interval,),
                 )
             return count
 
     def project_environment_pairs(self) -> list[tuple[str, str]]:
-        """Return every (project_id, environment_id) pair that has
-        observed failure data. Used by the retention CLI to iterate
-        `prune_app_error_retention` across an install — the existing
-        method requires per-pair scoping by design."""
+        """Return every (project_id, environment_id) pair that the
+        retention sweep needs to visit. Unions across `failures`,
+        `incidents`, `source_maps`, and `ingest_rate_limits` so a
+        scope with source-map uploads or rate-limit rows but no
+        failures yet doesn't get skipped."""
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT DISTINCT project_id, environment_id
-                FROM failures
-                ORDER BY project_id, environment_id
+                SELECT project_id, environment_id FROM failures
+                UNION
+                SELECT project_id, environment_id FROM incidents
+                UNION
+                SELECT project_id, environment_id FROM source_maps
+                UNION
+                SELECT project_id, environment_id FROM ingest_rate_limits
                 """
             ).fetchall()
-        return [(str(row["project_id"]), str(row["environment_id"])) for row in rows]
+        pairs = sorted(
+            (str(row["project_id"]), str(row["environment_id"])) for row in rows
+        )
+        return list(pairs)
 
     def _source_map_from_row(self, row: sqlite3.Row) -> SourceMapRow:
         return SourceMapRow(

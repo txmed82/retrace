@@ -53,7 +53,10 @@ def data_retention_group() -> None:
 )
 def data_retention_apply(config_path: Path, dry_run: bool) -> None:
     """Purge rows + run artifacts older than configured TTLs."""
-    cfg = load_config(config_path)
+    try:
+        cfg = load_config(config_path)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"{config_path}: {exc}") from exc
     policy = RetentionPolicy(
         failures_days=cfg.retention.failures_days,
         evidence_days=cfg.retention.evidence_days,
@@ -91,7 +94,10 @@ def data_retention_apply(config_path: Path, dry_run: bool) -> None:
 )
 def data_backup(config_path: Path, output_path: Path) -> None:
     """Snapshot sqlite + data_dir into a tarball."""
-    cfg = load_config(config_path)
+    try:
+        cfg = load_config(config_path)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"{config_path}: {exc}") from exc
     db_path = Path(cfg.run.data_dir) / "retrace.db"
     if not db_path.exists():
         raise click.ClickException(

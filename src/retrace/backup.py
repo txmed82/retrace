@@ -77,6 +77,43 @@ def create_backup(
 
     created_at = datetime.fromtimestamp(time.time(), tz=timezone.utc).isoformat()
 
+    # Files we must NOT include in the recursive `data_dir` add:
+    #   - The live `retrace.db` (we already have the consistent
+    #     snapshot; including the raw file too risks a torn copy AND
+    #     wastes archive space).
+    #   - The `-wal` / `-shm` sidecar files for that DB (sqlite WAL
+    #     mode artifacts that are meaningless without the DB they
+    #     accompany — restoring them out of context corrupts).
+    #   - The output archive itself (if the user writes the tarball
+    #     under `data_dir`, the in-progress `.tar.gz` would otherwise
+    #     get recursively re-included).
+    #
+    # We can't resolve `tarinfo.name` back to a source path (tarfile
+    # doesn't carry the link), so we compute the EXPECTED archive
+    # names for the excluded files up-front and match against them.
+    db_path_resolved = db_path.resolve()
+    output_resolved = output_path.resolve() if output_path.exists() else output_path
+    data_dir_resolved = data_dir.resolve() if data_dir.exists() else data_dir
+    excluded_sources = {
+        db_path_resolved,
+        db_path_resolved.with_name(db_path_resolved.name + "-wal"),
+        db_path_resolved.with_name(db_path_resolved.name + "-shm"),
+        output_resolved,
+    }
+    excluded_arcnames: set[str] = set()
+    if data_dir.exists():
+        for src in excluded_sources:
+            try:
+                rel = src.relative_to(data_dir_resolved)
+            except ValueError:
+                continue
+            excluded_arcnames.add(f"data/{data_dir.name}/{rel.as_posix()}")
+
+    def _filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        if tarinfo.name in excluded_arcnames:
+            return None
+        return tarinfo
+
     # Step 1: write a consistent snapshot of the DB to a temp file.
     # SQLite's online BACKUP API copies the DB even while writers
     # are touching it — using `.read_bytes()` would risk a torn
@@ -88,14 +125,21 @@ def create_backup(
         db_bytes = snapshot_path.stat().st_size
 
         # Step 2: tar up the snapshot + the data_dir into the
-        # output path. Use a tarinfo that strips the temp prefix so
-        # the archive layout matches the live install (`./retrace.db`,
-        # `./data/...`).
-        data_files_count, data_bytes = _data_dir_stats(data_dir)
+        # output path. The filter strips the live DB (and its WAL
+        # sidecars) plus the output archive itself if it lives under
+        # `data_dir`.
+        data_files_count, data_bytes = _data_dir_stats(
+            data_dir, excluded=excluded_sources
+        )
         with tarfile.open(output_path, "w:gz") as tar:
             tar.add(snapshot_path, arcname="retrace.db")
             if data_dir.exists():
-                tar.add(data_dir, arcname=f"data/{data_dir.name}", recursive=True)
+                tar.add(
+                    data_dir,
+                    arcname=f"data/{data_dir.name}",
+                    recursive=True,
+                    filter=_filter,
+                )
 
     bytes_written = output_path.stat().st_size
     return BackupResult(
@@ -128,18 +172,27 @@ def _snapshot_sqlite(src: Path, dst: Path) -> None:
         src_conn.close()
 
 
-def _data_dir_stats(data_dir: Path) -> tuple[int, int]:
+def _data_dir_stats(
+    data_dir: Path,
+    *,
+    excluded: set[Path] | None = None,
+) -> tuple[int, int]:
     """Count files and total bytes inside `data_dir`. Symlinks not
-    followed."""
+    followed. Files in `excluded` are skipped — used to keep the
+    stats consistent with what the tar filter actually packs."""
     if not data_dir.exists():
         return 0, 0
+    excluded = excluded or set()
     file_count = 0
     total_bytes = 0
     for entry in data_dir.rglob("*"):
         try:
-            if entry.is_file() and not entry.is_symlink():
-                file_count += 1
-                total_bytes += entry.stat().st_size
+            if not entry.is_file() or entry.is_symlink():
+                continue
+            if entry.resolve() in excluded:
+                continue
+            file_count += 1
+            total_bytes += entry.stat().st_size
         except OSError:
             continue
     return file_count, total_bytes

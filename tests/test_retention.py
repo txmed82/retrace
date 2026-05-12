@@ -6,6 +6,7 @@ than backdating data — simpler and tests the same semantics.
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,8 +24,14 @@ def _store(tmp_path: Path) -> Storage:
     return store
 
 
-def _insert_replay_batch(store: Storage) -> None:
-    """Insert one replay batch + its session at the current time."""
+def _insert_replay_batch(store: Storage, *, backdated_days: int = 0) -> None:
+    """Insert one replay batch. If `backdated_days > 0`, rewrite
+    `received_at` after insert so the row appears that many days old.
+
+    Backdating in the DB rather than fake-clocking the prune helpers
+    is more honest: the DB engine computes the cutoff via
+    `datetime('now', ?)`, which we cannot override from Python.
+    """
     store.insert_replay_batch(
         project_id="proj_1",
         environment_id="env_1",
@@ -33,10 +40,18 @@ def _insert_replay_batch(store: Storage) -> None:
         events=[{"type": 0, "timestamp": 1}],
         flush_type="normal",
     )
+    if backdated_days > 0:
+        backdated = (
+            datetime.now(timezone.utc) - timedelta(days=backdated_days)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        _raw(store.path).execute(
+            "UPDATE replay_batches SET received_at = ?", (backdated,)
+        ).connection.commit()
 
 
-def _insert_otel_event(store: Storage) -> None:
-    """Insert one OTel event at the current time."""
+def _insert_otel_event(store: Storage, *, backdated_days: int = 0) -> None:
+    """Insert one OTel event. Backdates `created_at` like the replay
+    helper above for testability."""
     store.append_otel_event(
         project_id="proj_1",
         environment_id="env_1",
@@ -49,6 +64,21 @@ def _insert_otel_event(store: Storage) -> None:
         occurred_at_ms=1,
         attributes={},
     )
+    if backdated_days > 0:
+        backdated = (
+            datetime.now(timezone.utc) - timedelta(days=backdated_days)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        _raw(store.path).execute(
+            "UPDATE otel_events SET created_at = ?", (backdated,)
+        ).connection.commit()
+
+
+def _raw(path: Path) -> sqlite3.Cursor:
+    """Direct sqlite cursor for test-time backdating only. Bypasses
+    the Storage abstraction so we can write to columns that aren't
+    exposed through the public API."""
+    conn = sqlite3.connect(str(path))
+    return conn.cursor()
 
 
 # ---------------------------------------------------------------------------
@@ -58,30 +88,20 @@ def _insert_otel_event(store: Storage) -> None:
 
 def test_prune_replay_batches_dry_run_counts_without_deleting(tmp_path):
     store = _store(tmp_path)
-    _insert_replay_batch(store)
-    future = datetime.now(timezone.utc) + timedelta(days=60)
-    count = store.prune_replay_batches(
-        retention_days=30, dry_run=True, now=future
-    )
+    _insert_replay_batch(store, backdated_days=60)
+    count = store.prune_replay_batches(retention_days=30, dry_run=True)
     assert count == 1
     # Row still there.
-    assert store.prune_replay_batches(
-        retention_days=30, dry_run=True, now=future
-    ) == 1
+    assert store.prune_replay_batches(retention_days=30, dry_run=True) == 1
 
 
 def test_prune_replay_batches_deletes_when_not_dry_run(tmp_path):
     store = _store(tmp_path)
-    _insert_replay_batch(store)
-    future = datetime.now(timezone.utc) + timedelta(days=60)
-    count = store.prune_replay_batches(
-        retention_days=30, dry_run=False, now=future
-    )
+    _insert_replay_batch(store, backdated_days=60)
+    count = store.prune_replay_batches(retention_days=30, dry_run=False)
     assert count == 1
     # Second call: nothing left to prune.
-    assert store.prune_replay_batches(
-        retention_days=30, dry_run=False, now=future
-    ) == 0
+    assert store.prune_replay_batches(retention_days=30, dry_run=False) == 0
 
 
 def test_prune_replay_batches_respects_cutoff(tmp_path):
@@ -93,21 +113,70 @@ def test_prune_replay_batches_respects_cutoff(tmp_path):
     assert store.prune_replay_batches(retention_days=1, dry_run=False) == 0
 
 
+def test_prune_replay_batches_handles_evening_time_of_day(tmp_path):
+    """Regression for the cutoff-format bug CodeRabbit caught on
+    PR #138: a row stored at e.g. `2026-04-12 23:00:00` (SQLite
+    space format) would over-prune under any cutoff later in the
+    same day if the cutoff was an isoformat string (`T` separator
+    sorts after space). Using `datetime('now', ?)` for the cutoff
+    avoids the format mismatch by computing the cutoff DB-side."""
+    store = _store(tmp_path)
+    # Insert a row whose `received_at` is in the recent past, then
+    # force a time-of-day in the second half of the day.
+    store.insert_replay_batch(
+        project_id="proj_1",
+        environment_id="env_1",
+        session_id="sess_a",
+        sequence=1,
+        events=[{"type": 0}],
+        flush_type="normal",
+    )
+    today_evening = datetime.now(timezone.utc).replace(
+        hour=23, minute=0, second=0, microsecond=0
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    _raw(store.path).execute(
+        "UPDATE replay_batches SET received_at = ?", (today_evening,)
+    ).connection.commit()
+    # 1 day retention — a row from this evening must NOT be pruned.
+    assert store.prune_replay_batches(retention_days=1, dry_run=False) == 0
+
+
 def test_prune_otel_events(tmp_path):
     store = _store(tmp_path)
-    _insert_otel_event(store)
-    future = datetime.now(timezone.utc) + timedelta(days=60)
-    assert (
-        store.prune_otel_events(retention_days=30, dry_run=False, now=future) == 1
-    )
-    assert (
-        store.prune_otel_events(retention_days=30, dry_run=False, now=future) == 0
-    )
+    _insert_otel_event(store, backdated_days=60)
+    assert store.prune_otel_events(retention_days=30, dry_run=False) == 1
+    assert store.prune_otel_events(retention_days=30, dry_run=False) == 0
 
 
 def test_project_environment_pairs_empty_on_fresh_install(tmp_path):
     store = _store(tmp_path)
     assert store.project_environment_pairs() == []
+
+
+def test_project_environment_pairs_unions_source_maps_without_failures(tmp_path):
+    """Regression for CodeRabbit's PR #138 finding: a project with
+    source-map uploads but no failures yet would otherwise never
+    have its source_maps swept, because the old query only looked
+    at the `failures` table."""
+    store = _store(tmp_path)
+    # Insert a source_maps row directly — there's no Storage method
+    # that lets us bypass project provisioning for this test.
+    conn = sqlite3.connect(str(store.path))
+    try:
+        conn.execute(
+            """
+            INSERT INTO source_maps
+              (id, public_id, project_id, environment_id,
+               release, artifact_url, uploaded_at)
+            VALUES (?, ?, ?, ?, 'v1', 'https://x/app.js', datetime('now'))
+            """,
+            ("sm_1", "sm_pub_1", "proj_x", "env_x"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    pairs = store.project_environment_pairs()
+    assert ("proj_x", "env_x") in pairs
 
 
 # ---------------------------------------------------------------------------
@@ -134,16 +203,14 @@ def test_apply_retention_dry_run_on_empty_install(tmp_path):
 
 def test_apply_retention_prunes_replay_batches_and_otel(tmp_path):
     store = _store(tmp_path)
-    _insert_replay_batch(store)
-    _insert_otel_event(store)
+    _insert_replay_batch(store, backdated_days=60)
+    _insert_otel_event(store, backdated_days=60)
 
-    future = datetime.now(timezone.utc) + timedelta(days=60)
     result = apply_retention(
         store=store,
         data_dir=tmp_path,
         policy=RetentionPolicy(replay_batches_days=30, otel_events_days=30),
         dry_run=False,
-        now=future,
     )
     assert result.replay_batches == 1
     assert result.otel_events == 1
@@ -151,16 +218,14 @@ def test_apply_retention_prunes_replay_batches_and_otel(tmp_path):
 
 def test_apply_retention_dry_run_does_not_delete(tmp_path):
     store = _store(tmp_path)
-    _insert_replay_batch(store)
-    _insert_otel_event(store)
+    _insert_replay_batch(store, backdated_days=60)
+    _insert_otel_event(store, backdated_days=60)
 
-    future = datetime.now(timezone.utc) + timedelta(days=60)
     apply_retention(
         store=store,
         data_dir=tmp_path,
         policy=RetentionPolicy(replay_batches_days=30, otel_events_days=30),
         dry_run=True,
-        now=future,
     )
     # Row still queryable via a second pass.
     second = apply_retention(
@@ -168,7 +233,6 @@ def test_apply_retention_dry_run_does_not_delete(tmp_path):
         data_dir=tmp_path,
         policy=RetentionPolicy(replay_batches_days=30, otel_events_days=30),
         dry_run=True,
-        now=future,
     )
     assert second.replay_batches == 1
     assert second.otel_events == 1

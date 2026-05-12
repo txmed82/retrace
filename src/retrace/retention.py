@@ -134,16 +134,17 @@ def apply_retention(
     # Global high-volume tables — single cutoff, no per-project
     # filtering. Pruning these per-project would be slower for the
     # same net effect; the cutoff is identical regardless of which
-    # project owns a row.
+    # project owns a row. These helpers compute the cutoff DB-side
+    # via `datetime('now', ?)` so the `now` override only applies
+    # to the app-error scope above (where the existing
+    # `prune_app_error_retention` formats cutoffs in Python).
     result.replay_batches = store.prune_replay_batches(
         retention_days=policy.replay_batches_days,
         dry_run=dry_run,
-        now=current,
     )
     result.otel_events = store.prune_otel_events(
         retention_days=policy.otel_events_days,
         dry_run=dry_run,
-        now=current,
     )
 
     # Filesystem sweep — only the per-run directories grow over time.
@@ -205,17 +206,21 @@ def _sweep_run_artifacts(
                 size = _dir_size_bytes(child)
             except OSError:
                 size = 0
+            if dry_run:
+                # Preview path — count what WOULD be removed.
+                removed_count += 1
+                removed_bytes += size
+                continue
+            try:
+                shutil.rmtree(child)
+            except OSError:
+                # The user is responsible for fs-level perms; if a
+                # directory can't be removed, leave it and the
+                # operator's count, but don't claim we removed it.
+                # The sweep continues with the next candidate.
+                continue
             removed_count += 1
             removed_bytes += size
-            if not dry_run:
-                try:
-                    shutil.rmtree(child)
-                except OSError:
-                    # The user is responsible for fs-level perms;
-                    # surface the count we attempted, swallow the
-                    # individual failure rather than abort the sweep
-                    # halfway through.
-                    pass
     return removed_count, removed_bytes
 
 

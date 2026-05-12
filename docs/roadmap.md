@@ -660,7 +660,8 @@ work speculatively. · **ETA when revived:** 3 days each (~1 week total)
 ### Plan
 
 1. `retrace data retention apply` — purges replay batches + failures
-   older than N days (configurable per project).
+   older than N days (install-global TTLs in `config.yaml`;
+   per-project overrides explicitly deferred — see below).
 2. `retrace data backup --to <path>` — sqlite + data dir tarball.
 3. Cron in Docker Compose. *(left for ops docs — the CLI is the
    primitive; how a self-host operator schedules it is their call.)*

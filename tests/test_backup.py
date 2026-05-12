@@ -137,6 +137,31 @@ def test_backup_with_missing_data_dir(tmp_path):
     assert "retrace.db" in restore_listing(out)
 
 
+def test_backup_excludes_live_db_from_data_dir(tmp_path):
+    """The DB lives at `data_dir/retrace.db`. We must NOT include
+    the raw file in the recursive data_dir add — only the consistent
+    snapshot. (CodeRabbit major finding on PR #138.)"""
+    db_path, data_dir = _seed_install(tmp_path)
+    out = tmp_path / "snapshot.tar.gz"
+    create_backup(db_path=db_path, data_dir=data_dir, output_path=out)
+    entries = restore_listing(out)
+    # `retrace.db` at the archive root (the consistent snapshot) —
+    # but NOT a second `data/data/retrace.db` from the recursive add.
+    assert "retrace.db" in entries
+    assert not any(e.endswith("data/retrace.db") for e in entries)
+
+
+def test_backup_excludes_output_path_when_under_data_dir(tmp_path):
+    """If the user writes the tarball UNDER `data_dir`, we must
+    skip it — otherwise the recursive add would try to pack the
+    in-progress archive into itself."""
+    db_path, data_dir = _seed_install(tmp_path)
+    out = data_dir / "snapshot.tar.gz"
+    create_backup(db_path=db_path, data_dir=data_dir, output_path=out)
+    entries = restore_listing(out)
+    assert not any("snapshot.tar.gz" in e for e in entries)
+
+
 def test_result_to_dict_round_trips(tmp_path):
     db_path, data_dir = _seed_install(tmp_path)
     out = tmp_path / "snapshot.tar.gz"
