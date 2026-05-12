@@ -122,14 +122,41 @@ def tester_baseline_accept(spec_id: str, config_path: Path, run_dir: Path) -> No
     required=True,
     help="Path to a tester run directory to compare against the baseline.",
 )
-def tester_baseline_compare(spec_id: str, config_path: Path, run_dir: Path) -> None:
+@click.option(
+    "--mode",
+    type=click.Choice(["auto", "perceptual", "sha256"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help=(
+        "`auto` uses perceptual diff if the `[image]` extra is installed, "
+        "sha256 otherwise. `perceptual` requires `pip install retrace[image]`."
+    ),
+)
+@click.option(
+    "--threshold",
+    type=float,
+    default=0.95,
+    show_default=True,
+    help="SSIM floor below which a screenshot counts as changed (perceptual mode only).",
+)
+def tester_baseline_compare(
+    spec_id: str,
+    config_path: Path,
+    run_dir: Path,
+    mode: str,
+    threshold: float,
+) -> None:
     """Compare a run's screenshots to the spec's baseline.
 
     Writes `*-diff.png` artifacts into the run directory for any
-    mismatched screenshot. The auto-repro classifier treats those as a
-    confirmed-bug signal, so `retrace qa auto` will pick them up.
+    mismatched screenshot. In perceptual mode, the diff is an
+    annotated overlay highlighting the regions that changed; in
+    sha256 mode (no `[image]` extra installed), it's a copy of the
+    current image. The auto-repro classifier treats either as a
+    confirmed-bug signal, so `retrace qa auto` picks them up.
     """
     from retrace.visual_baseline import compare_run_to_baseline
+    from retrace.visual_perceptual import PerceptualDepsMissing
 
     cfg = load_config(config_path)
     try:
@@ -137,7 +164,11 @@ def tester_baseline_compare(spec_id: str, config_path: Path, run_dir: Path) -> N
             data_dir=cfg.run.data_dir,
             spec_id=spec_id,
             run_dir=run_dir,
+            mode=mode.lower(),
+            threshold=threshold,
         )
+    except PerceptualDepsMissing as exc:
+        raise click.ClickException(str(exc)) from exc
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(
@@ -150,6 +181,9 @@ def tester_baseline_compare(spec_id: str, config_path: Path, run_dir: Path) -> N
                 "diffs": result.diffs,
                 "baseline_dir": result.baseline_dir,
                 "run_dir": result.run_dir,
+                "mode": result.mode,
+                "threshold": result.threshold,
+                "ssim_scores": result.ssim_scores,
             },
             indent=2,
         )

@@ -8,14 +8,16 @@ half that *produces* those artifacts:
     known-good run as the new baseline for that spec.
   - `compare_run_to_baseline(spec_id, run_dir, data_dir)` walks the run
     dir's `*.png` artifacts, looks up the matching baseline image for
-    each one, and emits a `<name>-diff.png` whenever the bytes don't
-    match.
+    each one, and emits a `<name>-diff.png` whenever the screenshots
+    don't match.
 
-We deliberately stay byte-comparison (sha256) rather than introducing
-Pillow + perceptual diffing as a hard dep — the existing classifier
-treats *any* diff artifact as confirmation, so a perfect-pixel match
-gate is the right starting wedge. Future work: optional Pillow extra
-for SSIM and an annotated diff image.
+**Comparison mode (P1.2):** if the `[image]` extra is installed
+(Pillow + numpy), comparisons run through `visual_perceptual.perceptual_diff`
+which uses SSIM with a configurable threshold and produces an
+annotated diff PNG that highlights the regions that actually changed.
+Without the extra, we fall back to sha256 byte equality — same
+behavior as before. The auto-repro classifier already treats any
+`*-diff*.png` as a confirmed-failure signal so it works either way.
 
 The baseline layout is intentionally flat and predictable:
 
@@ -28,7 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -70,6 +72,11 @@ class BaselineCompareResult:
     diffs: list[str]            # paths of generated *-diff.png artifacts
     baseline_dir: str
     run_dir: str
+    # P1.2 — track which mode actually ran and per-screenshot SSIM
+    # scores so callers can surface "this run is 0.97 — borderline".
+    mode: str = "sha256"        # "sha256" | "perceptual"
+    threshold: float = 1.0
+    ssim_scores: dict[str, float] = field(default_factory=dict)
 
 
 def _iter_screenshots(directory: Path) -> Iterable[Path]:
@@ -117,19 +124,51 @@ def compare_run_to_baseline(
     data_dir: Path,
     spec_id: str,
     run_dir: Path,
+    threshold: float = 0.95,
+    mode: str = "auto",
 ) -> BaselineCompareResult:
     """Compare each screenshot in `run_dir` to its baseline counterpart.
 
     Uses the screenshot's relative path under `run_dir` as the key so
     name collisions across subdirectories can't fake a match. On a
-    mismatch we copy the *current* screenshot to `<name>-diff.png`
-    next to it; the auto-repro classifier already treats any
-    `*-diff*.png` as a confirmed-failure signal.
+    mismatch we write `<name>-diff.png` next to the current image; the
+    auto-repro classifier already treats any `*-diff*.png` as a
+    confirmed-failure signal.
+
+    `mode`:
+      - `"auto"` (default): use perceptual diff when the `[image]`
+        extra is installed; sha256 byte equality otherwise.
+      - `"perceptual"`: force perceptual; raises if the extra is missing.
+      - `"sha256"`: force byte equality.
+
+    `threshold` is the SSIM floor below which a comparison counts as
+    a regression. Only used in perceptual mode.
     """
+    # Local import keeps the dep optional at module-import time.
+    from retrace.visual_perceptual import (
+        PerceptualDepsMissing,
+        is_available as _perceptual_available,
+        perceptual_diff,
+    )
+
+    resolved_mode = mode
+    if resolved_mode == "auto":
+        resolved_mode = "perceptual" if _perceptual_available() else "sha256"
+    if resolved_mode == "perceptual" and not _perceptual_available():
+        raise PerceptualDepsMissing(
+            "compare_run_to_baseline(mode='perceptual') requires the "
+            "`[image]` extra: `pip install 'retrace[image]'`."
+        )
+    if resolved_mode not in {"perceptual", "sha256"}:
+        raise ValueError(
+            f"invalid mode: {mode!r} (expected 'auto' / 'perceptual' / 'sha256')"
+        )
+
     baseline_dir = baseline_dir_for_spec(data_dir, spec_id)
     new: list[str] = []
     unchanged: list[str] = []
     diffs: list[str] = []
+    ssim_scores: dict[str, float] = {}
     compared = 0
     for current in _iter_screenshots(run_dir):
         compared += 1
@@ -138,12 +177,34 @@ def compare_run_to_baseline(
         if not ref.exists():
             new.append(str(current))
             continue
-        if _hash(current) == _hash(ref):
-            unchanged.append(str(current))
-            continue
         diff_path = current.with_name(current.stem + "-diff.png")
-        shutil.copy2(current, diff_path)
-        diffs.append(str(diff_path))
+        if resolved_mode == "perceptual":
+            result = perceptual_diff(
+                ref, current,
+                threshold=threshold,
+                diff_path=diff_path,
+            )
+            ssim_scores[str(current)] = result.ssim
+            if result.changed:
+                # `perceptual_diff` already wrote the annotated PNG.
+                diffs.append(str(diff_path))
+            else:
+                # Identical-enough: delete the annotated artifact we
+                # just wrote — it adds noise on a clean run.
+                try:
+                    diff_path.unlink(missing_ok=True)
+                except OSError:  # pragma: no cover - exotic FS
+                    pass
+                unchanged.append(str(current))
+        else:
+            # sha256 fallback — same byte-equality behaviour as before
+            # P1.2. We still write a `*-diff.png` artifact (copy of the
+            # current) on mismatch so the auto-repro classifier fires.
+            if _hash(current) == _hash(ref):
+                unchanged.append(str(current))
+                continue
+            shutil.copy2(current, diff_path)
+            diffs.append(str(diff_path))
     return BaselineCompareResult(
         spec_id=spec_id,
         compared=compared,
@@ -152,6 +213,9 @@ def compare_run_to_baseline(
         diffs=diffs,
         baseline_dir=str(baseline_dir),
         run_dir=str(run_dir),
+        mode=resolved_mode,
+        threshold=threshold,
+        ssim_scores=ssim_scores,
     )
 
 
