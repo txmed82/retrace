@@ -155,11 +155,34 @@ class WrappedCursor:
 
     @property
     def lastrowid(self) -> int | None:
-        # psycopg doesn't expose lastrowid uniformly — INTEGER PRIMARY
-        # KEY AUTOINCREMENT becomes BIGSERIAL on PG, and you fetch the
-        # generated id via `RETURNING id`. Callers that need lastrowid
-        # for an autoincrement insert have to switch to RETURNING.
-        return None
+        # psycopg doesn't populate `cursor.lastrowid` for `BIGSERIAL`
+        # inserts the way sqlite3 does. The PG-native equivalent for
+        # the existing `int(cur.lastrowid or 0)` call-sites (which
+        # all INSERT into tables with `BIGSERIAL PRIMARY KEY` —
+        # translated from `INTEGER PRIMARY KEY AUTOINCREMENT`) is
+        # `SELECT lastval()`, which returns the most recent sequence
+        # value used in this session. It's session-local, transaction-
+        # safe, and matches sqlite3's semantics for the patterns we
+        # actually use.
+        #
+        # We execute `lastval()` on the same psycopg cursor we just
+        # ran the INSERT on. That overwrites the cursor's description
+        # and result set — fine for the lastrowid read-then-discard
+        # pattern in storage.py. If the caller wanted to keep using
+        # the cursor for further `.fetchone()` calls after reading
+        # `lastrowid`, that pattern doesn't appear in the codebase.
+        if self._dialect == "postgres":
+            try:
+                self._cur.execute("SELECT lastval()")
+                row = self._cur.fetchone()
+                return int(row[0]) if row else None
+            except Exception:
+                # `lastval()` raises `ObjectNotInPrerequisiteState`
+                # when no sequence has been used in this session,
+                # which means the prior statement was either a non-
+                # sequence INSERT or wasn't an INSERT at all.
+                return None
+        return getattr(self._cur, "lastrowid", None)
 
     @property
     def rowcount(self) -> int:

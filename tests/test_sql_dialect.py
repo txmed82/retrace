@@ -275,3 +275,70 @@ def test_wrapped_connection_context_manager_rolls_back_on_error():
             raise RuntimeError("boom")
     assert fake.rolled_back is True
     assert fake.committed is False
+
+
+class _SeqCursor(_FakeCursor):
+    """A cursor that models psycopg's `lastval()` — returns the last
+    sequence value queued via `seed_lastval(n)`. Raises if no seed."""
+
+    def __init__(self):
+        super().__init__()
+        self._lastval: int | None = None
+
+    def seed_lastval(self, value: int | None) -> None:
+        self._lastval = value
+
+    def execute(self, sql: str, params=()):
+        super().execute(sql, params)
+        if "lastval()" in sql.lower():
+            if self._lastval is None:
+                raise RuntimeError("ObjectNotInPrerequisiteState: lastval is not yet defined")
+            self.fetched.append((self._lastval,))
+
+
+class _SeqConn(_FakeConn):
+    def __init__(self):
+        super().__init__()
+        self.cur = _SeqCursor()
+
+
+def test_lastrowid_uses_pg_lastval():
+    """On Postgres, `cursor.lastrowid` resolves via `SELECT lastval()` —
+    the sequence-value equivalent for BIGSERIAL inserts. Regression
+    for the P1.5 PG smoke failure where `int(cur.lastrowid or 0)`
+    silently returned 0 because psycopg doesn't fill `lastrowid`."""
+    fake = _SeqConn()
+    fake.cur.seed_lastval(42)
+    conn = WrappedConnection(fake, dialect="postgres")
+    cur = conn.execute("INSERT INTO x VALUES (?)", (1,))
+    assert cur.lastrowid == 42
+
+
+def test_lastrowid_returns_none_when_no_sequence_used():
+    """If no sequence has been touched, `lastval()` raises — we
+    return `None` (which `int(... or 0)` turns into 0, matching the
+    pre-existing storage code path)."""
+    fake = _SeqConn()
+    # No seed_lastval → execute("SELECT lastval()") raises.
+    conn = WrappedConnection(fake, dialect="postgres")
+    cur = conn.execute("UPDATE x SET y = 1")
+    assert cur.lastrowid is None
+
+
+def test_lastrowid_passthrough_on_sqlite_dialect():
+    """For sqlite the wrapper just exposes the underlying cursor's
+    native `lastrowid` (so wrapping a real sqlite3 cursor still
+    works as a drop-in)."""
+
+    class _SqliteShapedCursor(_FakeCursor):
+        lastrowid = 7
+
+    class _SqliteShapedConn(_FakeConn):
+        def __init__(self):
+            super().__init__()
+            self.cur = _SqliteShapedCursor()
+
+    fake = _SqliteShapedConn()
+    conn = WrappedConnection(fake, dialect="sqlite")
+    cur = conn.execute("INSERT INTO x VALUES (?)", (1,))
+    assert cur.lastrowid == 7
