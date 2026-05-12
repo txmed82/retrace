@@ -94,7 +94,7 @@ Every roadmap item below uses the same dev loop. Don't skip steps.
 |---|---|
 | **Now (this week)** | P0.1 LLM-powered PR review · P0.2 Python SDK · P0.3 GitHub Actions templates · P0.4 Browser SDK breadcrumbs |
 | **Next (weeks 2–3)** | P1.1 Real-time alerts · P1.2 Perceptual visual diff · P1.3 Diff-aware affected tests · P1.4 API tester env profiles UI |
-| **Later (month 2+)** | P1.5 Postgres adapter · P2.1 GitLab + Bitbucket integration · P2.2 Rate limiting + sampling · P2.3 Retention + backups · P2.4 Multi-tenancy + audit log |
+| **Later (month 2+)** | P2.2 Rate limiting + sampling · P2.3 Retention + backups · P2.4 Multi-tenancy + audit log (P1.5 ✅ done, P2.1 deferred — GitHub-only at launch) |
 
 ---
 
@@ -559,7 +559,7 @@ routes the PR touches.
 
 ## P1.4 — API tester env profiles UI + request recording
 
-**Status:** PARTIAL DONE 2026-05-12 · **PR:** #134 ships the contract-diff piece (`retrace tester api-diff`); env-profile UI + `tester record` deferred to a follow-up. · **Owner:** Claude
+**Status:** DONE 2026-05-12 · **PRs:** #134 (contract-diff `retrace tester api-diff`) + this PR (env-profile management CLI + HAR-import recorder). Browser-based request-builder UI deferred to a polish PR once we have signal from real users. · **Owner:** Claude
 
 ### OSS to study
 
@@ -612,7 +612,9 @@ self-host teams will want Postgres.
 
 ## P2.1 — GitLab + Bitbucket integration
 
-**Status:** NOT STARTED · **ETA:** 3 days each (~1 week total)
+**Status:** DEFERRED — GitHub-only at launch. Revisit once there's a real
+user on GitLab or Bitbucket; not worth the ~1 week of provider-abstraction
+work speculatively. · **ETA when revived:** 3 days each (~1 week total)
 
 ### OSS to study
 
@@ -746,7 +748,8 @@ EOF
 | 2026-05-12 | P1.3 Diff-aware affected-test selection — new `pr_review.affected_api_specs(analysis, specs_dir)` intersects API spec URL paths with the PR's affected flows under an equality + strict-prefix matching rule (`/api/login` does NOT match `/api/login-history`). `retrace review --run-affected-tests` extended with `--include-api/--no-include-api`; JSON output + PR comment body carry `affected_api_test_results`. 11 new tests. | #133 |
 | 2026-05-12 | P1.4 (partial) OpenAPI contract diff — new `retrace tester api-diff --new --old` emits breaking-vs-safe contract changes across two OpenAPI / Swagger documents (operation removed, required-request-field added, response-schema field removed, success-status removed, enum-value removed). Each breaking change files a `qa_incident` (`--no-file-incidents` to opt out). One-level `$ref` resolution; deterministic ordering. 24 new tests. Env-profile UI + `tester record` deferred. | #134 |
 | 2026-05-12 | P1.5 (foundation) Postgres adapter chassis — new `retrace.storage_backend` module with `Backend` Protocol + `SqliteBackend` + `PostgresBackend` stub + URL factory. `Storage(...)` accepts `sqlite:///`, bare paths, and rejects `postgresql://` with a clean `NotImplementedError` pointing at this slice. `[postgres]` extra reserves `psycopg[binary]>=3.2`. Per-table migration ordering documented for follow-up PRs. 27 new tests; existing Storage behavior unchanged. | #135 |
-| 2026-05-12 | P1.5 (full) Postgres adapter — real `PostgresBackend.connect()` via psycopg3, SQL dialect translation at execute time (`?` → `%s`, `datetime('now', ?)` → ISO-text `to_char(now() + interval)`, `INSERT OR IGNORE` → `INSERT ... ON CONFLICT DO NOTHING`), portable SCHEMA via `sql_schema.translate_schema` (`AUTOINCREMENT` → `BIGSERIAL`, ISO-text defaults). `Storage(postgresql://...)` works end-to-end. CI Postgres service container runs gated smoke tests covering `alert_routes`/`alert_dispatches`/`llm_pr_reviews` round-trips. 18 new tests (translation + WrappedConnection + schema translator + PG smoke). | this PR |
+| 2026-05-12 | P1.5 (full) Postgres adapter — real `PostgresBackend.connect()` via psycopg3, SQL dialect translation at execute time (`?` → `%s`, `datetime('now', ?)` → ISO-text `to_char(now() + interval)`, `INSERT OR IGNORE` → `INSERT ... ON CONFLICT DO NOTHING`), portable SCHEMA via `sql_schema.translate_schema` (`AUTOINCREMENT` → `BIGSERIAL`, ISO-text defaults). `Storage(postgresql://...)` works end-to-end. CI Postgres service container runs gated smoke tests covering `alert_routes`/`alert_dispatches`/`llm_pr_reviews` round-trips. 18 new tests (translation + WrappedConnection + schema translator + PG smoke). | #136 |
+| 2026-05-12 | P1.4 (finish) env-profile management CLI + HAR import recorder — new `retrace tester env list/show/yaml` (read-only against `config.yaml`; emits paste-ready stanzas, never overwrites the hand-edited file). New `retrace tester record --har` ingests a browser DevTools HAR export into one APITestSpec per matching request (sensitive headers stripped, JSON bodies structured, `--include-host`/`--include-method`/`--exclude-path` filters). P2.1 GitLab/Bitbucket deferred — GitHub-only at launch. 41 new tests. | this PR |
 
 > Append a row whenever an item changes status or a new item is
 > added. Keep newest at the bottom.
