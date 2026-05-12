@@ -62,6 +62,12 @@ INGEST_RATE_LIMITS: dict[str, tuple[int, int]] = {
     "sentry": (600, 60),
     "monitoring": (300, 60),
     "source_maps": (30, 60),
+    # OTel logs/traces — high-volume by design (every span is a row),
+    # so we run the same ceiling as replay rather than the tighter
+    # monitoring webhook quota. Operators with bursty OTel traffic
+    # should tune via the existing `consume_ingest_rate_limit` knobs
+    # if they hit the limit on legitimate load.
+    "otel": (600, 60),
 }
 HOSTED_ONBOARDING_SCOPES = (
     "ingest",
@@ -1469,6 +1475,21 @@ def _handler(
             environment_id = str(params.get("environment_id") or "").strip()
             if not environment_id:
                 _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            # Rate limit *before* reading the body — a flooded client
+            # shouldn't get to spend our bandwidth uploading a payload
+            # we're about to reject. Identity is the service-token id
+            # so different tokens for the same project don't share a
+            # bucket (operators sometimes split tokens per host).
+            decision = _consume_rate_limit(
+                store,
+                project_id=token.project_id,
+                environment_id=environment_id,
+                bucket="otel",
+                identity=token.id,
+            )
+            if not decision.allowed:
+                _rate_limited_response(self, bucket="otel", decision=decision)
                 return
             try:
                 length = int(self.headers.get("Content-Length") or "0")
