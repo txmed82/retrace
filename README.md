@@ -805,6 +805,32 @@ except Exception:
 
 Full walkthrough: [`docs/python-sdk.md`](docs/python-sdk.md).
 
+## Storage backend (SQLite default, Postgres optional)
+
+Retrace stores everything in SQLite by default — the file lives at
+`data/retrace.db` (or wherever `config.yaml` points). SQLite is
+fine to ~100k events/day. Past that, point `Storage` at a Postgres
+instance:
+
+```bash
+pip install 'retrace[postgres]'   # adds psycopg3
+
+# Use a `postgresql://` URL anywhere a path was accepted:
+RETRACE_DB="postgresql://user:pass@db.example.com:5432/retrace" \
+  retrace api serve
+```
+
+How it works: `Storage(...)` detects the URL scheme and routes to a
+`Backend` implementation (`SqliteBackend` or `PostgresBackend`). Both
+implementations expose the same connection surface; SQL translation
+happens at execute time so existing sqlite3-flavored queries
+(`?` placeholders, `datetime('now', ?)`, `INSERT OR IGNORE`) work
+against Postgres unchanged. Schema DDL goes through a similar
+translator (`AUTOINCREMENT` → `BIGSERIAL`, ISO-text timestamp
+defaults). CI runs the full storage smoke against a `postgres:16-alpine`
+service container — see [`docs/study-notes/postgres-backend.md`](docs/study-notes/postgres-backend.md)
+for the design.
+
 ## GitHub Actions
 
 Three drop-in composite actions live under

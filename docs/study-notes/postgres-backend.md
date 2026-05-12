@@ -1,3 +1,47 @@
+# Study note: Postgres backend (P1.5)
+
+## Update — 2026-05-12 follow-up PR
+
+P1.5 is now **done in full**, not just foundation. Rather than
+slice 7 tables across 7 PRs as originally planned, the follow-up
+PR shipped a **SQL translation layer** that rewrites SQLite-flavored
+SQL to Postgres at execute time. That means the 290+
+`conn.execute("... ? ...")` call sites in the existing 7,346-line
+Storage class **don't change** — they all flow through
+`WrappedConnection.execute()` which calls `translate_sql()` first.
+
+Translations covered:
+
+| SQLite shape                     | Postgres rewrite                                   |
+|----------------------------------|----------------------------------------------------|
+| `?`                              | `%s`                                               |
+| `datetime('now', ?)`             | `to_char((now()+(?::text)::interval) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US')` |
+| `datetime('now')`                | Same `to_char(...)` form, no param                 |
+| `INSERT OR IGNORE`               | `INSERT ... ON CONFLICT DO NOTHING`                |
+| `INTEGER PRIMARY KEY AUTOINCREMENT` (DDL) | `BIGSERIAL PRIMARY KEY`                   |
+| `DEFAULT (datetime('now'))` (DDL) | ISO-text `to_char(...)` default                   |
+
+The ISO-text approach for timestamps is the key trick: PG won't
+implicitly cast `timestamptz` → `text`, so we never produce a
+`timestamptz` for our existing `created_at TEXT` columns. Instead
+both the column default AND the comparison expressions produce
+ISO-8601 UTC strings. ISO-8601 lexicographic order matches
+chronological order, so `created_at >= datetime('now', '-300 seconds')`
+keeps working as a TEXT range scan.
+
+Migration scope reduced from 7 per-table slices to one
+translation layer + one schema translator. The 7 slices on the
+plan below are now **polish opportunities** — surface a dialect
+issue from real-world data, add a regex to the translator, repeat
+— rather than per-table refactors.
+
+CI: new `postgres-smoke` job runs the smoke-test module
+(`tests/test_postgres_smoke.py`) against a `postgres:16-alpine`
+service container. The job is required by the `cd-ghcr` publish
+gate.
+
+---
+
 # Study note: Postgres backend chassis (P1.5 foundation)
 
 **Studied 2026-05-12.**

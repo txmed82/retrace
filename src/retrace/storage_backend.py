@@ -241,17 +241,13 @@ class SqliteBackend:
 
 
 class PostgresBackend:
-    """Stub Postgres backend.
+    """Real Postgres backend.
 
-    `postgresql://...` URLs are accepted by `parse_storage_url` so
-    callers can configure a future Postgres install today. Until the
-    follow-up table-slice PRs land, every method raises
-    `NotImplementedError` with a pointer to the roadmap item.
-
-    Why ship the stub now: it lets users get a clear "Postgres is on
-    the roadmap, not yet implemented — slice #1 coming in PR N" error
-    instead of a confusing `sqlite3.OperationalError` when they
-    point Retrace at Postgres.
+    `connect()` opens a psycopg3 connection wrapped in
+    `sql_dialect.WrappedConnection` so it quacks like a
+    `sqlite3.Connection`. Every `.execute()` runs the SQL through
+    `translate_sql()` first, which handles `?` → `%s`,
+    `datetime('now', ?)`, `INSERT OR IGNORE`, etc.
 
     The `psycopg` import is deferred to `connect()` so a stock
     `import retrace.storage_backend` works without the `[postgres]`
@@ -269,20 +265,25 @@ class PostgresBackend:
             raise ValueError("PostgresBackend DSN missing database name")
         self.dsn = dsn
 
-    def connect(self) -> Any:  # pragma: no cover - stub
+    def connect(self) -> Any:
         try:
-            import psycopg  # noqa: F401  (availability check only)
-        except ImportError as exc:
-            raise NotImplementedError(
+            import psycopg
+        except ImportError as exc:  # pragma: no cover - install hint
+            raise ImportError(
                 "PostgresBackend requires `pip install 'retrace[postgres]'`. "
-                "The Postgres backend is the P1.5 roadmap item; only the URL "
-                "scheme is accepted today — implementation lands in follow-up "
-                "table-slice PRs."
+                "Install `psycopg[binary]>=3.2` and retry."
             ) from exc
-        raise NotImplementedError(
-            "PostgresBackend.connect is not yet implemented. See "
-            "`docs/roadmap.md` P1.5 for the per-table migration plan."
+        from retrace.sql_dialect import WrappedConnection
+
+        conn = psycopg.connect(
+            host=self.dsn.host,
+            port=self.dsn.port or 5432,
+            user=self.dsn.user or None,
+            password=self.dsn.password or None,
+            dbname=self.dsn.database,
+            autocommit=False,
         )
+        return WrappedConnection(conn, dialect="postgres")
 
     def placeholder(self) -> str:
         return "%s"

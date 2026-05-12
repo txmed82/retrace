@@ -245,11 +245,12 @@ def test_storage_accepts_pathlib_path(tmp_path: Path):
     assert (tmp_path / "y.db").exists()
 
 
-def test_storage_rejects_postgres_url_cleanly(tmp_path: Path):
-    """Until per-table slices ship, `postgresql://...` raises a
-    clean `NotImplementedError` pointing at the roadmap — not a
-    `sqlite3.OperationalError` mystery."""
+def test_storage_accepts_postgres_url_at_construct_time(tmp_path: Path):
+    """P1.5 finished: Storage now accepts Postgres URLs. The actual
+    connect happens lazily on the first `_conn()` call; if the
+    server isn't running, that's a `psycopg.OperationalError` —
+    a real network error, not a construct-time refusal."""
     from retrace.storage import Storage
 
-    with pytest.raises(NotImplementedError, match="P1.5 roadmap"):
-        Storage("postgresql://user:pass@localhost:5432/retrace")
+    store = Storage("postgresql://user:pass@localhost:5432/retrace")
+    assert store.backend_name == "postgres"
