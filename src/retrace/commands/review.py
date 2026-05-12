@@ -100,6 +100,17 @@ _PR_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
     ),
 )
 @click.option(
+    "--include-api/--no-include-api",
+    "include_api",
+    default=True,
+    show_default=True,
+    help=(
+        "When `--run-affected-tests` is set, also run any API tester specs "
+        "whose URL routes intersect the PR's affected flows (P1.3). UI specs "
+        "still run via the existing path; this strictly adds API coverage."
+    ),
+)
+@click.option(
     "--llm/--no-llm",
     "use_llm",
     default=None,
@@ -139,6 +150,7 @@ def review_command(
     file_incidents: bool,
     post_comment: bool,
     run_affected_tests: bool,
+    include_api: bool,
     use_llm: Optional[bool],
     llm_self_critique: bool,
     as_json: bool,
@@ -197,11 +209,17 @@ def review_command(
         )
 
     affected_test_results: list[dict[str, Any]] = []
+    affected_api_specs_list: list[dict[str, Any]] = []
     if run_affected_tests:
         affected_test_results = _run_affected_tests(
             cfg=cfg,
             analysis=analysis,
         )
+        if include_api:
+            affected_api_specs_list = _run_affected_api_tests(
+                cfg=cfg,
+                analysis=analysis,
+            )
 
     # LLM review (P0.1). Default on iff the user has configured an
     # LLM in config.yaml. Falls back to an empty result on error.
@@ -237,6 +255,7 @@ def review_command(
             analysis=analysis,
             incidents_filed=incidents_filed,
             affected_test_results=affected_test_results,
+            affected_api_test_results=affected_api_specs_list,
             llm_result=llm_result,
         )
 
@@ -244,6 +263,10 @@ def review_command(
         payload = analysis.to_dict()
         payload["incidents_filed"] = incidents_filed
         payload["affected_test_results"] = affected_test_results
+        # P1.3 — API specs whose routes the PR touches. Always emitted
+        # so consumers can tell "we tried but found nothing" from "we
+        # didn't try" via the `--include-api/--no-include-api` flag.
+        payload["affected_api_test_results"] = affected_api_specs_list
         payload["posted_comment_url"] = posted_comment_url
         payload["llm_review"] = llm_result.to_dict()
         click.echo(json.dumps(payload, indent=2))
@@ -255,6 +278,7 @@ def review_command(
         pr_number=pr_number,
         incidents_filed=incidents_filed,
         affected_test_results=affected_test_results,
+        affected_api_test_results=affected_api_specs_list,
         posted_comment_url=posted_comment_url,
         llm_result=llm_result,
     )
@@ -561,12 +585,98 @@ def _run_affected_tests(*, cfg: Any, analysis: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _run_affected_api_tests(*, cfg: Any, analysis: Any) -> list[dict[str, Any]]:
+    """P1.3 — run API specs whose URL routes intersect the PR's
+    affected flows.
+
+    Mirrors `_run_affected_tests` semantics: cap at 6 unique specs,
+    swallow per-spec exceptions, return JSON-ish dicts.
+    """
+    from retrace.api_testing import (
+        api_runs_dir_for_data_dir,
+        api_specs_dir_for_data_dir,
+        load_api_spec,
+        run_api_spec,
+    )
+    from retrace.pr_review import affected_api_specs
+
+    specs_dir = api_specs_dir_for_data_dir(cfg.run.data_dir)
+    runs_dir = api_runs_dir_for_data_dir(cfg.run.data_dir)
+    try:
+        candidates = affected_api_specs(analysis=analysis, specs_dir=specs_dir)
+    except Exception as exc:  # pragma: no cover - defensive
+        # Don't pretend "no matches" — surface the failure as an
+        # explicit error row so users can distinguish a real failure
+        # from an empty-match result. (CodeRabbit Major catch on PR #133.)
+        return [
+            {
+                "spec_id": "",
+                "kind": "api",
+                "status": "error",
+                "summary": f"failed to select affected API specs: {exc}",
+                "matched_flows": [],
+            }
+        ]
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for cand in candidates:
+        if cand.spec_id in seen:
+            continue
+        if len(seen) >= 6:
+            break
+        seen.add(cand.spec_id)
+        try:
+            spec = load_api_spec(specs_dir, cand.spec_id)
+        except FileNotFoundError:
+            out.append({
+                "spec_id": cand.spec_id,
+                "kind": "api",
+                "status": "missing",
+                "summary": "spec file not found",
+                "matched_flows": cand.matched_flows,
+            })
+            continue
+        except Exception as exc:
+            out.append({
+                "spec_id": cand.spec_id,
+                "kind": "api",
+                "status": "error",
+                "summary": str(exc),
+                "matched_flows": cand.matched_flows,
+            })
+            continue
+        try:
+            result = run_api_spec(spec=spec, runs_dir=runs_dir)
+        except Exception as exc:
+            out.append({
+                "spec_id": cand.spec_id,
+                "kind": "api",
+                "status": "error",
+                "summary": str(exc),
+                "matched_flows": cand.matched_flows,
+            })
+            continue
+        out.append({
+            "spec_id": cand.spec_id,
+            "spec_name": cand.spec_name,
+            "kind": "api",
+            "method": cand.method,
+            "route_path": cand.route_path,
+            "matched_flows": cand.matched_flows,
+            "status": "pass" if getattr(result, "ok", False) else "fail",
+            "summary": getattr(result, "status", "") or "",
+            "run_dir": str(getattr(result, "run_dir", "") or ""),
+        })
+    return out
+
+
 def _format_comment_body(
     *,
     analysis: Any,
     incidents_filed: list[str],
     affected_test_results: list[dict[str, Any]],
     llm_result: Optional[LLMReviewResult] = None,
+    affected_api_test_results: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     """Render the PR comment body. Uses `build_pr_review_comment_plan` as
     the trusted summary and tacks on QA-specific additions."""
@@ -597,6 +707,26 @@ def _format_comment_body(
             icon = "✅" if r.get("status") == "pass" else ("❌" if r.get("status") == "fail" else "⚠️")
             name = r.get("spec_name") or r.get("spec_id", "?")
             lines.append(f"- {icon} `{r.get('spec_id', '')}` — {name}  _{r.get('status', '')}_")
+    # P1.3 — affected API specs (diff-aware selection).
+    if affected_api_test_results:
+        passes = sum(1 for r in affected_api_test_results if r.get("status") == "pass")
+        fails = sum(1 for r in affected_api_test_results if r.get("status") == "fail")
+        errors = sum(1 for r in affected_api_test_results if r.get("status") not in {"pass", "fail"})
+        lines.append("")
+        lines.append(
+            f"### Retrace API tests — ran {len(affected_api_test_results)} affected: "
+            f"{passes} pass / {fails} fail / {errors} error"
+        )
+        for r in affected_api_test_results:
+            icon = "✅" if r.get("status") == "pass" else ("❌" if r.get("status") == "fail" else "⚠️")
+            name = r.get("spec_name") or r.get("spec_id", "?")
+            route = r.get("route_path", "")
+            method = r.get("method", "")
+            route_suffix = f"  ({method} {route})" if route else ""
+            lines.append(
+                f"- {icon} `{r.get('spec_id', '')}` — {name}{route_suffix}  "
+                f"_{r.get('status', '')}_"
+            )
     lines.append("")
     lines.append("_Posted by `retrace review --post-comment`._")
     return "\n".join(lines).rstrip() + "\n"
@@ -609,6 +739,7 @@ def _post_pr_comment(
     analysis: Any,
     incidents_filed: list[str],
     affected_test_results: list[dict[str, Any]],
+    affected_api_test_results: Optional[list[dict[str, Any]]] = None,
     llm_result: Optional[LLMReviewResult] = None,
 ) -> str:
     if not shutil.which("gh"):
@@ -619,6 +750,7 @@ def _post_pr_comment(
         analysis=analysis,
         incidents_filed=incidents_filed,
         affected_test_results=affected_test_results,
+        affected_api_test_results=affected_api_test_results,
         llm_result=llm_result,
     )
     # `gh pr comment` doesn't dedupe; we leave de-duplication to the
@@ -650,6 +782,7 @@ def _render_human(
     pr_number: int,
     incidents_filed: list[str],
     affected_test_results: list[dict[str, Any]] | None = None,
+    affected_api_test_results: list[dict[str, Any]] | None = None,
     posted_comment_url: str = "",
     llm_result: Optional[LLMReviewResult] = None,
 ) -> None:
@@ -727,6 +860,19 @@ def _render_human(
         for r in affected_test_results:
             icon = "✓" if r.get("status") == "pass" else ("✗" if r.get("status") == "fail" else "·")
             click.echo(f"  {icon} {r.get('spec_id', '')}  {r.get('spec_name', '')}  ({r.get('status', '')})")
+
+    if affected_api_test_results:
+        click.echo("")
+        click.echo(f"Ran {len(affected_api_test_results)} affected API spec(s):")
+        for r in affected_api_test_results:
+            icon = "✓" if r.get("status") == "pass" else ("✗" if r.get("status") == "fail" else "·")
+            method = r.get("method", "")
+            route = r.get("route_path", "")
+            route_suffix = f"  ({method} {route})" if route else ""
+            click.echo(
+                f"  {icon} {r.get('spec_id', '')}  {r.get('spec_name', '')}"
+                f"{route_suffix}  ({r.get('status', '')})"
+            )
 
     if posted_comment_url:
         click.echo("")

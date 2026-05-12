@@ -6,6 +6,7 @@ import shlex
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from retrace.matching.routes import RouteDefinition, load_route_manifest
 from retrace.storage import FailureRow, FailureTestLinkRow, Storage
@@ -92,6 +93,27 @@ class MissingTestRecommendation:
     files: list[str]
     reason: str
     command: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class AffectedAPISpec:
+    """P1.3 — an API tester spec whose route intersects an affected
+    flow on the PR.
+
+    Produced by `affected_api_specs(analysis, specs_dir)`. The CLI
+    `--include-api` flag uses it to run only the API specs whose
+    routes the PR actually touches, instead of the whole API suite.
+    """
+
+    spec_id: str
+    spec_name: str
+    method: str
+    route_path: str        # parsed path component (e.g. `/api/login`)
+    matched_flows: list[str]
+    command: str           # `retrace tester api-run <spec_id>`
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -496,6 +518,115 @@ def recommend_missing_tests(
                 )
             )
     return missing
+
+
+def affected_api_specs(
+    *,
+    analysis: PRReviewAnalysis,
+    specs_dir: Path,
+    spec_loader=None,
+) -> list[AffectedAPISpec]:
+    """P1.3 — return API tester specs whose routes intersect this PR.
+
+    Inputs:
+      `analysis` — the result of `analyze_pr_diff(...)`. We use
+        `analysis.affected_flows` filtered to `kind=="api"`.
+      `specs_dir` — directory containing API spec JSON files (the
+        same one `retrace tester api-run` reads from).
+      `spec_loader` — optional injection for tests; if `None`, calls
+        `api_testing.list_api_specs(specs_dir)`.
+
+    Matching:
+      For each API spec, we extract the URL's path component and
+      strip any trailing slash. A spec matches an affected flow if
+      either:
+        - the spec path EQUALS the flow's name, or
+        - the flow's name is a strict path-prefix of the spec path
+          (so `/api/users` covers `/api/users/42`).
+      We do NOT do substring matching — `/api/login` should not
+      match `/api/login-history`. The strict-prefix rule with a `/`
+      delimiter handles that correctly.
+
+    Returns:
+      One `AffectedAPISpec` per matching spec, sorted by spec_id for
+      determinism. Specs with no matching flow are not returned.
+    """
+    api_flow_names = sorted(
+        {flow.name for flow in analysis.affected_flows if flow.kind == "api"},
+    )
+    if not api_flow_names:
+        return []
+
+    if spec_loader is None:
+        from retrace.api_testing import list_api_specs as _list
+        spec_loader = lambda: _list(specs_dir)  # noqa: E731
+
+    out: list[AffectedAPISpec] = []
+    seen_ids: set[str] = set()
+    for spec in spec_loader():
+        spec_path = _extract_url_path(spec.url)
+        if not spec_path:
+            continue
+        matched = _matching_flows(spec_path=spec_path, flow_names=api_flow_names)
+        if not matched:
+            continue
+        if spec.spec_id in seen_ids:
+            continue
+        seen_ids.add(spec.spec_id)
+        out.append(
+            AffectedAPISpec(
+                spec_id=spec.spec_id,
+                spec_name=spec.name,
+                method=str(spec.method or "GET").upper(),
+                route_path=spec_path,
+                matched_flows=matched,
+                command=f"retrace tester api-run {shlex.quote(spec.spec_id)}",
+            )
+        )
+    return sorted(out, key=lambda s: s.spec_id)
+
+
+def _extract_url_path(url: str) -> str:
+    """Return the URL's path component with leading slash + no
+    trailing slash. Handles full URLs, bare paths, and `${VAR}/path`
+    env-substitution shapes."""
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    # Drop a `${BASE_URL}/...` prefix down to its tail; we only care
+    # about the path. Treat the env-var as if it were a host.
+    if raw.startswith("${") and "}" in raw:
+        raw = raw.split("}", 1)[1]
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    path = parsed.path if parsed.path else raw
+    if not path:
+        return ""
+    path = "/" + path.lstrip("/")
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+    return path
+
+
+def _matching_flows(*, spec_path: str, flow_names: list[str]) -> list[str]:
+    """Return the subset of `flow_names` that match `spec_path` under
+    the equality / strict-path-prefix rule."""
+    spec_norm = spec_path.rstrip("/") or "/"
+    matched: list[str] = []
+    for name in flow_names:
+        if not name:
+            continue
+        flow_norm = "/" + name.lstrip("/")
+        flow_norm = flow_norm.rstrip("/") or "/"
+        if spec_norm == flow_norm:
+            matched.append(name)
+            continue
+        # Strict prefix: spec begins with `flow + "/"`.
+        if spec_norm.startswith(flow_norm + "/"):
+            matched.append(name)
+    return matched
 
 
 def _routes_for_changed_file(
