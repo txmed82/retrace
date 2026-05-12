@@ -41,6 +41,15 @@ _DT_DEFAULT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))` — SQLite ISO-8601
+# millisecond timestamp default. We translate the exact format string
+# we actually use; if a future schema adds a different strftime format,
+# extend this regex (or switch to a real parser).
+_STRFTIME_ISO_MS_DEFAULT_RE = re.compile(
+    r"DEFAULT\s+\(\s*strftime\(\s*'%Y-%m-%dT%H:%M:%fZ'\s*,\s*'now'\s*\)\s*\)",
+    re.IGNORECASE,
+)
+
 
 def translate_schema(sql: str, *, dialect: str) -> str:
     """Rewrite the SQLite schema string for the target dialect.
@@ -54,13 +63,18 @@ def translate_schema(sql: str, *, dialect: str) -> str:
 
     out = sql
     out = _AUTOINCREMENT_RE.sub("BIGSERIAL PRIMARY KEY", out)
-    # `DEFAULT (datetime('now'))` → `DEFAULT (to_char(now() AT TIME
-    # ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US'))` — produces an
-    # ISO-8601 UTC string compatible with `datetime.fromisoformat`.
+    # `DEFAULT (datetime('now'))` → ISO-8601 microsecond UTC string.
     # PG won't implicitly cast `timestamptz` → `text` for a
-    # `TEXT DEFAULT` column, so this explicit ISO format matters.
+    # `TEXT DEFAULT` column, so the explicit ISO format matters.
     out = _DT_DEFAULT_RE.sub(
         "DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US'))",
+        out,
+    )
+    # `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))` → ISO-8601
+    # millisecond UTC string ending in `Z`. SQLite's `%f` is
+    # `SS.SSS` (seconds + fractional), which maps to PG `SS.MS`.
+    out = _STRFTIME_ISO_MS_DEFAULT_RE.sub(
+        "DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))",
         out,
     )
     return out

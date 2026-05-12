@@ -105,6 +105,27 @@ def test_schema_translate_datetime_default():
     assert "to_char" in out
 
 
+def test_schema_translate_strftime_iso_default():
+    """`DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))` — SQLite's
+    ISO-8601 millisecond default. Regression for the PG smoke
+    failure on PR #136: I'd only translated `datetime('now')` but
+    missed `strftime(...)` which produces the same kind of value
+    with explicit millisecond precision.
+    """
+    schema = (
+        "CREATE TABLE x (created_at TEXT NOT NULL DEFAULT "
+        "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))"
+    )
+    out = translate_schema(schema, dialect="postgres")
+    assert "strftime" not in out
+    assert "to_char" in out
+    # Trailing `Z` literal must survive — clients depend on the
+    # ISO suffix to recognize UTC.
+    assert '"Z"' in out
+    # Format string must use millisecond precision (SQLite's `%f`).
+    assert "MS" in out
+
+
 def test_schema_sqlite_dialect_is_no_op():
     schema = "CREATE TABLE x (id INTEGER PRIMARY KEY AUTOINCREMENT)"
     assert translate_schema(schema, dialect="sqlite") == schema
