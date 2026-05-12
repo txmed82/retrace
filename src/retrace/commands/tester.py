@@ -10,6 +10,7 @@ from typing import Any, Optional
 import click
 import yaml
 
+from retrace.api_har_import import import_har, import_summary, looks_like_har
 from retrace.api_suites import (
     api_suites_dir_for_data_dir,
     list_api_suites,
@@ -1836,3 +1837,263 @@ def tester_runs(config_path: Path, limit: int) -> None:
         click.echo("No tester runs found.")
         return
     click.echo(json.dumps(runs, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# P1.4 — env-profile management CLI
+#
+# `config.yaml` is a hand-edited user file. We deliberately do NOT
+# write back to it from the CLI (preserves comments / formatting /
+# secret-handling that hand-edits depend on). Instead:
+#
+#   - `env list` / `env show` read it
+#   - `env yaml` emits a paste-ready YAML stanza for the user to
+#     drop into `tester.env_profiles.<name>:` themselves
+#
+# This matches how Sentry / pyproject-style configs are managed:
+# read-from-CLI, write-by-hand.
+# ---------------------------------------------------------------------------
+
+
+@tester_group.group("env")
+def tester_env_group() -> None:
+    """Manage tester env profiles (base URL, headers env, overrides)."""
+
+
+@tester_env_group.command("list")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def tester_env_list(config_path: Path) -> None:
+    """List configured env profiles (redacted preview).
+
+    Wraps each preview with its `name` — `validate_profiles` strips
+    the profile name out, but for the CLI the name is the most
+    useful piece of info."""
+    defaults = _tester_defaults(config_path)
+    raw_profiles = (defaults.get("env_profiles") or {}) if isinstance(defaults, dict) else {}
+    if not isinstance(raw_profiles, dict):
+        raise click.ClickException("tester.env_profiles must be an object")
+    items: list[dict[str, Any]] = []
+    for name in sorted(raw_profiles):
+        try:
+            resolved = resolve_env_profile(defaults, str(name))
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        items.append({"name": resolved.name, **resolved.redacted_preview})
+    click.echo(json.dumps(items, indent=2, sort_keys=True))
+
+
+@tester_env_group.command("show")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.argument("name")
+def tester_env_show(config_path: Path, name: str) -> None:
+    """Show one env profile (redacted preview)."""
+    try:
+        resolved = resolve_env_profile(_tester_defaults(config_path), name)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(resolved.redacted_preview, indent=2, sort_keys=True))
+
+
+@tester_env_group.command("yaml")
+@click.option("--name", required=True, help="Profile name (the key under env_profiles).")
+@click.option("--api-base-url", default="", help="Base URL prepended to relative spec URLs.")
+@click.option("--app-url", default="", help="UI test base URL (browser harness).")
+@click.option("--headers-env", default="", help="Env var name that holds the JSON headers map.")
+@click.option(
+    "--override",
+    "overrides",
+    multiple=True,
+    help="Extra env override KEY=VALUE (repeatable).",
+)
+def tester_env_yaml(
+    name: str,
+    api_base_url: str,
+    app_url: str,
+    headers_env: str,
+    overrides: tuple[str, ...],
+) -> None:
+    """Emit a YAML stanza to paste into `config.yaml`.
+
+    The CLI does not write `config.yaml` itself — paste this under
+    `tester.env_profiles.<name>:` (creating that block if needed).
+    """
+    if not name.strip():
+        raise click.ClickException("--name is required")
+    env_overrides: dict[str, str] = {}
+    for item in overrides:
+        if "=" not in item:
+            raise click.ClickException(
+                f"--override must be KEY=VALUE, got: {item!r}"
+            )
+        key, _, value = item.partition("=")
+        key = key.strip()
+        if not key:
+            raise click.ClickException(f"--override key cannot be empty: {item!r}")
+        env_overrides[key] = value
+    profile: dict[str, Any] = {}
+    if api_base_url.strip():
+        profile["api_base_url"] = api_base_url.strip()
+    if app_url.strip():
+        profile["app_url"] = app_url.strip()
+    if headers_env.strip():
+        profile["headers_env"] = headers_env.strip()
+    if env_overrides:
+        profile["env_overrides"] = env_overrides
+    if not profile:
+        raise click.ClickException(
+            "Provide at least one of --api-base-url / --app-url / "
+            "--headers-env / --override"
+        )
+    stanza = {"tester": {"env_profiles": {name.strip(): profile}}}
+    click.echo(yaml.safe_dump(stanza, sort_keys=False).rstrip())
+
+
+# ---------------------------------------------------------------------------
+# P1.4 — `retrace tester record` — HAR import
+#
+# DevTools → Network → Save all as HAR → `retrace tester record
+# --har capture.har`. One APITestSpec per matching request.
+# ---------------------------------------------------------------------------
+
+
+@tester_group.command("record")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--har",
+    "har_path",
+    required=True,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    help="HAR file exported from browser DevTools.",
+)
+@click.option(
+    "--include-host",
+    "include_hosts",
+    multiple=True,
+    help="Only keep requests whose host matches (glob, repeatable).",
+)
+@click.option(
+    "--include-method",
+    "include_methods",
+    multiple=True,
+    help="Only keep methods (case-insensitive, repeatable).",
+)
+@click.option(
+    "--exclude-path",
+    "exclude_paths",
+    multiple=True,
+    help="Drop requests whose URL path matches (glob, repeatable).",
+)
+@click.option(
+    "--env-profile",
+    default="",
+    help="Attach this env profile name to every created spec.",
+)
+@click.option(
+    "--name-prefix",
+    default="",
+    help="String prepended to every spec name.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print what would be created; do not write spec files.",
+)
+def tester_record(
+    config_path: Path,
+    har_path: Path,
+    include_hosts: tuple[str, ...],
+    include_methods: tuple[str, ...],
+    exclude_paths: tuple[str, ...],
+    env_profile: str,
+    name_prefix: str,
+    dry_run: bool,
+) -> None:
+    """Import a HAR (HTTP Archive) into API test specs.
+
+    The recording flow: open DevTools in your browser, click around
+    the app the way you normally would, then File → Save all as HAR.
+    Run this command on the saved file to convert each matching
+    request into a regression-ready API test spec.
+
+    Sensitive headers (Authorization, Cookie, X-API-Key, ...) are
+    stripped at import time. Re-attach them via `--env-profile` or
+    `auth_profile` on the spec.
+    """
+    text = Path(har_path).read_text(encoding="utf-8")
+    if not looks_like_har(text):
+        raise click.ClickException(
+            f"{har_path}: does not look like a HAR file (expected a "
+            "`log: { entries: [...] }` envelope)."
+        )
+    try:
+        har = json.loads(text)
+    except ValueError as exc:
+        raise click.ClickException(f"{har_path}: invalid JSON: {exc}") from exc
+
+    if env_profile.strip():
+        # Fail fast if the named profile doesn't exist — surface the
+        # config bug before we write any spec files.
+        try:
+            resolve_env_profile(_tester_defaults(config_path), env_profile.strip())
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    spec_params = import_har(
+        har,
+        include_hosts=include_hosts,
+        include_methods=include_methods,
+        exclude_paths=exclude_paths,
+        env_profile=env_profile.strip(),
+        name_prefix=name_prefix,
+    )
+    summary = import_summary(har, spec_params)
+
+    if dry_run:
+        click.echo(
+            json.dumps(
+                {
+                    "summary": summary,
+                    "specs": [
+                        {"name": p["name"], "method": p["method"], "url": p["url"]}
+                        for p in spec_params
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+
+    if not spec_params:
+        click.echo(json.dumps({"summary": summary, "created": []}, indent=2))
+        return
+
+    cfg = load_config(config_path)
+    specs_dir = api_specs_dir_for_data_dir(cfg.run.data_dir)
+    created: list[str] = []
+    for params in spec_params:
+        spec = create_api_spec(specs_dir=specs_dir, **params)
+        created.append(spec.spec_id)
+    click.echo(
+        json.dumps(
+            {"summary": {**summary, "created": len(created)}, "created": created},
+            indent=2,
+        )
+    )
