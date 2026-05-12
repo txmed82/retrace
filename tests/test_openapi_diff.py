@@ -330,6 +330,59 @@ def test_load_openapi_rejects_non_object_root(tmp_path: Path):
         load_openapi(spec)
 
 
+def test_load_openapi_normalizes_yaml_parse_errors_to_valueerror(tmp_path: Path):
+    """Regression for CodeRabbit Major on PR #134: a malformed YAML
+    document must raise `ValueError` (so the CLI wrapper surfaces a
+    `ClickException` instead of a YAMLError stack trace)."""
+    spec = tmp_path / "bad.yaml"
+    # Tab-after-key + unclosed brace = a YAMLError.
+    spec.write_text("openapi: '3.0'\npaths:\n  /a: {{{ \n")
+    with pytest.raises(ValueError, match="Failed to parse"):
+        load_openapi(spec)
+
+
+def test_load_openapi_normalizes_json_parse_errors_to_valueerror(tmp_path: Path):
+    """Same regression for JSON inputs."""
+    spec = tmp_path / "bad.json"
+    spec.write_text("{ this isn't json")
+    with pytest.raises(ValueError, match="Failed to parse"):
+        load_openapi(spec)
+
+
+def test_swagger2_body_parameter_diff_is_detected():
+    """Regression for CodeRabbit Major on PR #134: Swagger 2.x uses
+    `parameters: [{in: "body", schema: {...}}]` instead of OpenAPI 3's
+    `requestBody`. The diff must detect required-field changes against
+    this older shape too."""
+    old_op = {
+        "parameters": [
+            {
+                "in": "body",
+                "name": "user",
+                "schema": {"type": "object", "properties": {"name": {"type": "string"}}},
+            }
+        ]
+    }
+    new_op = {
+        "parameters": [
+            {
+                "in": "body",
+                "name": "user",
+                "schema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                },
+            }
+        ]
+    }
+    old = {"swagger": "2.0", "paths": {"/u": {"post": old_op}}}
+    new = {"swagger": "2.0", "paths": {"/u": {"post": new_op}}}
+    diff = diff_openapi_documents(old=old, new=new)
+    assert [c.kind for c in diff.breaking] == ["required_request_field_added"]
+    assert diff.breaking[0].field_path == "request.body.name"
+
+
 # ---------------------------------------------------------------------------
 # ContractChange title surface
 # ---------------------------------------------------------------------------

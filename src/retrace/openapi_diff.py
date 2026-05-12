@@ -403,17 +403,30 @@ def _diff_enum(
 
 
 def _request_schema(doc: dict[str, Any], op: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Best-effort request-body schema lookup. Prefers
-    `application/json`; falls back to the first content type."""
+    """Best-effort request-body schema lookup.
+
+    OpenAPI 3: `requestBody.content[<media>].schema`. Prefers
+    `application/json`; falls back to the first content type.
+
+    Swagger 2: body parameters live in `parameters: [{in: "body",
+    schema: {...}}]`. Falls back to that when `requestBody` is absent.
+    (CodeRabbit Major catch on PR #134.)
+    """
     rb = op.get("requestBody")
-    if not isinstance(rb, dict):
+    if isinstance(rb, dict):
+        content = rb.get("content") if isinstance(rb.get("content"), dict) else {}
+        if "application/json" in content:
+            return _resolve_schema(doc, content["application/json"].get("schema"))
+        for media in content.values():
+            if isinstance(media, dict) and "schema" in media:
+                return _resolve_schema(doc, media["schema"])
         return None
-    content = rb.get("content") if isinstance(rb.get("content"), dict) else {}
-    if "application/json" in content:
-        return _resolve_schema(doc, content["application/json"].get("schema"))
-    for media in content.values():
-        if isinstance(media, dict) and "schema" in media:
-            return _resolve_schema(doc, media["schema"])
+    # Swagger 2 fallback.
+    params = op.get("parameters")
+    if isinstance(params, list):
+        for p in params:
+            if isinstance(p, dict) and str(p.get("in")) == "body" and "schema" in p:
+                return _resolve_schema(doc, p.get("schema"))
     return None
 
 
@@ -491,14 +504,24 @@ def _dict_or_empty(value: Any) -> dict[str, Any]:
 
 
 def load_openapi(path: Path) -> dict[str, Any]:
-    """Load an OpenAPI / Swagger document from JSON or YAML."""
+    """Load an OpenAPI / Swagger document from JSON or YAML.
+
+    Parse errors (malformed JSON or YAML) are normalized to `ValueError`
+    so the CLI wrapper can surface a clean `ClickException` instead of
+    a stack trace. (CodeRabbit Major catch on PR #134.)
+    """
     import yaml
 
     raw = Path(path).read_text(encoding="utf-8")
-    if Path(path).suffix.lower() == ".json":
-        data = json.loads(raw)
-    else:
-        data = yaml.safe_load(raw)
+    try:
+        if Path(path).suffix.lower() == ".json":
+            data = json.loads(raw)
+        else:
+            data = yaml.safe_load(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse OpenAPI document at {path}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Failed to parse OpenAPI document at {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError(f"OpenAPI document at {path} must be a YAML/JSON object")
     if "openapi" not in data and "swagger" not in data:

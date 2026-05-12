@@ -1273,8 +1273,11 @@ def tester_api_diff(
             pid = pid or workspace.project_id
             eid = eid or workspace.environment_id
         # Cap at `--limit` to avoid filing 1000 incidents on a
-        # full-rewrite spec.
-        for change in diff.breaking[: max(1, int(limit))]:
+        # full-rewrite spec. `--limit 0` truly disables filing —
+        # caller can still see the diff via `--json`. (CodeRabbit
+        # Major catch on PR #134.)
+        max_to_file = max(0, int(limit))
+        for change in diff.breaking[:max_to_file]:
             try:
                 public_id = sync_qa_incident_from_pr_review_finding(
                     store=store,
