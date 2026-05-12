@@ -1,0 +1,174 @@
+name: "Retrace PR review"
+description: >-
+  Run Retrace's PR analyzer (templated review + optional LLM review) on the
+  current pull request and post the result as a PR comment. Drops the LLM
+  call entirely when no LLM key is configured, so the templated review
+  (changed-file map, affected flows, prior-failure links, missing tests)
+  still ships value with zero secrets.
+
+# `composite` actions run as a sequence of shell steps in the consumer's
+# workflow runner — no Docker. Keeps cold start fast.
+inputs:
+  pr-number:
+    description: "Pull request number to review."
+    required: false
+    default: ${{ github.event.pull_request.number || github.event.number }}
+  repo:
+    description: "owner/name of the PR's repository."
+    required: false
+    default: ${{ github.repository }}
+  post-comment:
+    description: "Post the review as a PR comment. `true` (default) requires `pull-requests: write`."
+    required: false
+    default: "true"
+  run-affected-tests:
+    description: "Also run any Retrace tester specs that cover the affected flows. Slow on big PRs; off by default."
+    required: false
+    default: "false"
+  use-llm:
+    description: >-
+      `auto` (default) runs the LLM review iff the consumer set
+      `llm-api-key`. `on` forces it (errors without a key). `off` disables.
+    required: false
+    default: "auto"
+  llm-self-critique:
+    description: "Run the optional self-critique pass (one extra LLM call when there's overflow)."
+    required: false
+    default: "false"
+  python-version:
+    description: "Python version for the runner. 3.11 matches our main CI matrix."
+    required: false
+    default: "3.11"
+  retrace-ref:
+    description: >-
+      Git ref of the txmed82/retrace repo to install retrace from. Pin to a
+      tag for stability (e.g. `v0.1.0`) once we ship tagged releases.
+    required: false
+    default: "main"
+  llm-provider:
+    description: "`openai_compatible` (default), `anthropic`, or `openrouter`. Sets the `llm.provider` field in the temp config."
+    required: false
+    default: "openai_compatible"
+  llm-base-url:
+    description: "LLM base URL. Required when `use-llm` is `on` or `auto+key`. Empty disables the LLM call."
+    required: false
+    default: ""
+  llm-model:
+    description: "LLM model name (e.g. `gpt-4o-mini`, `claude-sonnet-4-20250514`)."
+    required: false
+    default: ""
+  llm-api-key:
+    description: >-
+      LLM API key. Pass as `${{ secrets.RETRACE_LLM_API_KEY }}`. Treated as
+      a secret — never echoed.
+    required: false
+    default: ""
+  working-directory:
+    description: "Working directory containing the checked-out repo (for route detection)."
+    required: false
+    default: "."
+
+outputs:
+  comment-url:
+    description: "URL of the posted PR comment, when `post-comment=true` and a real PR ref was supplied."
+    value: ${{ steps.review.outputs.comment-url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "${{ inputs.pr-number }}" ]; then
+          echo "::error::pr-number is empty. Trigger this action on `pull_request` events or set it explicitly."
+          exit 1
+        fi
+        if [ "${{ inputs.use-llm }}" = "on" ] && [ -z "${{ inputs.llm-base-url }}" ]; then
+          echo "::error::use-llm=on requires llm-base-url + llm-api-key."
+          exit 1
+        fi
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install retrace
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Pin retrace to the requested ref. We install from a git ref
+        # rather than PyPI until we publish.
+        python -m pip install --upgrade pip
+        python -m pip install "retrace[dev] @ git+https://github.com/txmed82/retrace@${{ inputs.retrace-ref }}"
+
+    - name: Write minimal config.yaml
+      shell: bash
+      env:
+        RETRACE_LLM_API_KEY: ${{ inputs.llm-api-key }}
+      run: |
+        set -euo pipefail
+        # Composite actions can't read consumer-side secrets directly,
+        # so we receive the key via input and hand it to retrace via a
+        # temp config file. The file lives only on the runner FS.
+        cat >config.retrace-action.yaml <<'EOF'
+        posthog:
+          host: ""
+          project_id: ""
+        llm:
+          provider: ${{ inputs.llm-provider }}
+          base_url: ${{ inputs.llm-base-url }}
+          model: ${{ inputs.llm-model }}
+        run:
+          data_dir: ${{ runner.temp }}/retrace-data
+        EOF
+        # Append the API key with `printf` so YAML special chars in the
+        # key (e.g. colons in some provider keys) don't break parsing.
+        if [ -n "${RETRACE_LLM_API_KEY}" ]; then
+          {
+            printf '  api_key: '
+            printf '%s\n' "${RETRACE_LLM_API_KEY}" | python -c 'import json,sys; print(json.dumps(sys.stdin.read().rstrip("\n")))'
+          } >>config.retrace-action.yaml
+        fi
+        mkdir -p "${{ runner.temp }}/retrace-data"
+
+    - name: Run retrace review
+      id: review
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        args=(
+          --config "${{ github.workspace }}/config.retrace-action.yaml"
+          --pr "https://github.com/${{ inputs.repo }}/pull/${{ inputs.pr-number }}"
+          --repo "${{ inputs.repo }}"
+          --repo-path "${{ inputs.working-directory }}"
+          --json
+        )
+        if [ "${{ inputs.post-comment }}" = "true" ]; then
+          args+=(--post-comment)
+        fi
+        if [ "${{ inputs.run-affected-tests }}" = "true" ]; then
+          args+=(--run-affected-tests)
+        fi
+        case "${{ inputs.use-llm }}" in
+          on)  args+=(--llm) ;;
+          off) args+=(--no-llm) ;;
+          # auto: don't pass either flag; retrace decides based on config.
+        esac
+        if [ "${{ inputs.llm-self-critique }}" = "true" ]; then
+          args+=(--llm-self-critique)
+        fi
+        # Capture JSON output so we can surface the comment URL as a
+        # step output.
+        retrace review "${args[@]}" >review.json
+        comment_url="$(python -c 'import json; print(json.load(open("review.json")).get("posted_comment_url",""))')"
+        echo "comment-url=${comment_url}" >>"$GITHUB_OUTPUT"
+        echo "::notice::Retrace PR review complete${comment_url:+ — $comment_url}"
+
+branding:
+  icon: "git-pull-request"
+  color: "purple"

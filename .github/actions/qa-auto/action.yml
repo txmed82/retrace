@@ -1,0 +1,145 @@
+name: "Retrace qa auto"
+description: >-
+  Run `retrace qa auto` against the repo: pick the highest-priority open
+  QA incident (or the one named via `incident-id`), auto-generate a UI
+  test that reproduces it, and open a draft fix PR.
+
+  Designed for `workflow_dispatch` triggers — operator-driven. The
+  composite action just installs retrace and shells out to the CLI; the
+  killer-demo flow lives in `retrace qa auto`.
+
+inputs:
+  repo:
+    description: "Connected repo (owner/name) — same as the running workflow's repo by default."
+    required: false
+    default: ${{ github.repository }}
+  incident-id:
+    description: >-
+      Specific QA incident public id (e.g. `INC-AB12CD`). When empty,
+      `retrace qa auto` picks the highest-priority open incident.
+    required: false
+    default: ""
+  project-id:
+    description: "Restrict next-incident selection to this project id (multi-workspace stores)."
+    required: false
+    default: ""
+  environment-id:
+    description: "Restrict next-incident selection to this environment id."
+    required: false
+    default: ""
+  base-branch:
+    description: "Branch to open the fix PR against. Empty = repo default."
+    required: false
+    default: ""
+  app-url:
+    description: "App URL the generated UI test should target."
+    required: false
+    default: ""
+  execution-engine:
+    description: "`harness` (default, requires browser-harness), `native`, or `auto`."
+    required: false
+    default: "harness"
+  apply-with:
+    description: "Optionally invoke a local coding agent: '', `auto`, `claude`, or `codex`."
+    required: false
+    default: ""
+  draft:
+    description: "Open the PR as draft."
+    required: false
+    default: "true"
+  no-pr:
+    description: "Skip opening the PR; just produce the fix prompt."
+    required: false
+    default: "false"
+  python-version:
+    description: "Python version."
+    required: false
+    default: "3.11"
+  retrace-ref:
+    description: "Git ref of the txmed82/retrace repo to install from."
+    required: false
+    default: "main"
+  working-directory:
+    description: "Path to the checked-out repo."
+    required: false
+    default: "."
+
+outputs:
+  incident-id:
+    description: "Public id of the incident that was worked on."
+    value: ${{ steps.run.outputs.incident-id }}
+  pr-url:
+    description: "URL of the fix PR (empty if `no-pr=true` or the agent didn't open one)."
+    value: ${{ steps.run.outputs.pr-url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install retrace
+      shell: bash
+      run: |
+        set -euo pipefail
+        python -m pip install --upgrade pip
+        python -m pip install "retrace[dev] @ git+https://github.com/txmed82/retrace@${{ inputs.retrace-ref }}"
+
+    - name: Run retrace qa auto
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        args=(--repo "${{ inputs.repo }}")
+        if [ -n "${{ inputs.incident-id }}" ]; then
+          args+=(--id "${{ inputs.incident-id }}")
+        fi
+        if [ -n "${{ inputs.project-id }}" ]; then
+          args+=(--project-id "${{ inputs.project-id }}")
+        fi
+        if [ -n "${{ inputs.environment-id }}" ]; then
+          args+=(--environment-id "${{ inputs.environment-id }}")
+        fi
+        if [ -n "${{ inputs.base-branch }}" ]; then
+          args+=(--base "${{ inputs.base-branch }}")
+        fi
+        if [ -n "${{ inputs.app-url }}" ]; then
+          args+=(--app-url "${{ inputs.app-url }}")
+        fi
+        args+=(--engine "${{ inputs.execution-engine }}")
+        if [ -n "${{ inputs.apply-with }}" ]; then
+          args+=(--apply "${{ inputs.apply-with }}")
+        fi
+        if [ "${{ inputs.draft }}" = "true" ]; then
+          args+=(--draft)
+        else
+          args+=(--ready)
+        fi
+        if [ "${{ inputs.no-pr }}" = "true" ]; then
+          args+=(--no-pr)
+        fi
+        # `qa auto` emits informational output on stdout and the PR URL
+        # (when it opens one) on a final line shaped `PR: <url>`. We
+        # tee both to a log so the consumer can inspect.
+        set -o pipefail
+        retrace qa auto "${args[@]}" 2>&1 | tee qa-auto.log
+        # Best-effort capture of the PR URL; if not present, output stays empty.
+        pr_url=$(grep -Eo 'https://github.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+' qa-auto.log | tail -n 1 || true)
+        echo "pr-url=${pr_url}" >>"$GITHUB_OUTPUT"
+        # Incident id passthrough — explicit if the operator set it,
+        # otherwise grep the log for the first INC-... we see.
+        if [ -n "${{ inputs.incident-id }}" ]; then
+          echo "incident-id=${{ inputs.incident-id }}" >>"$GITHUB_OUTPUT"
+        else
+          inc_id=$(grep -Eo 'INC-[A-Z0-9]+' qa-auto.log | head -n 1 || true)
+          echo "incident-id=${inc_id}" >>"$GITHUB_OUTPUT"
+        fi
+
+branding:
+  icon: "tool"
+  color: "purple"
