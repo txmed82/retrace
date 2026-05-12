@@ -163,10 +163,19 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
   // dropped on overflow. We attach a copy to every "exception" event
   // so the server-side `monitoring_ingest` can promote them to
   // `IncidentEvidence.console_excerpts` / `network_failures`.
-  const maxBreadcrumbs = Math.max(
-    1,
-    Math.min(500, options.maxBreadcrumbs ?? DEFAULT_MAX_BREADCRUMBS),
-  );
+  //
+  // Defensive normalization: `maxBreadcrumbs?: number` accepts anything
+  // from the host, including `NaN` / `Infinity` / negative values. If
+  // `NaN` slipped through, `breadcrumbs.length > NaN` is always false
+  // and the ring would grow without bound. (CodeRabbit Major catch on
+  // PR #130.)
+  const requestedMaxBreadcrumbs = options.maxBreadcrumbs;
+  const normalizedMaxBreadcrumbs =
+    typeof requestedMaxBreadcrumbs === "number" &&
+    Number.isFinite(requestedMaxBreadcrumbs)
+      ? Math.trunc(requestedMaxBreadcrumbs)
+      : DEFAULT_MAX_BREADCRUMBS;
+  const maxBreadcrumbs = Math.max(1, Math.min(500, normalizedMaxBreadcrumbs));
   const breadcrumbs: RetraceBreadcrumb[] = [];
 
   // Best-effort deep clone — `structuredClone` is available in all
@@ -438,7 +447,7 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
         data: {
           tagName: targetDesc.tagName,
           testIdValue: targetDesc.testIdValue,
-          url: globalThis.location?.href,
+          url: sanitizeBreadcrumbUrl(globalThis.location?.href || ""),
         },
       });
     };
@@ -463,11 +472,16 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
     const lastUrlRef = { value: globalThis.location?.href || "" };
     const recordNav = (to: string, from: string, trigger: string) => {
       if (!to || to === from) return;
+      // Sanitize URLs so query-string tokens (e.g. `?reset_token=…`)
+      // and fragments don't end up in the breadcrumb metadata.
+      // (CodeRabbit Major catch on PR #130.)
+      const safeFrom = sanitizeBreadcrumbUrl(from);
+      const safeTo = sanitizeBreadcrumbUrl(to);
       addBreadcrumbInternal({
         category: "navigation",
-        message: `${from || "—"} → ${to}`,
+        message: `${safeFrom || "—"} → ${safeTo}`,
         level: "info",
-        data: { from, to, trigger },
+        data: { from: safeFrom, to: safeTo, trigger },
       });
     };
     const wrapHistoryMethod = (
@@ -534,7 +548,7 @@ export function init(options: RetraceBrowserOptions): RetraceClient {
           category: "console",
           message: serialized.join(" "),
           level: level === "warn" ? "warning" : level,
-          data: { url: globalThis.location?.href },
+          data: { url: sanitizeBreadcrumbUrl(globalThis.location?.href || "") },
         });
         originals[level]?.(...data);
       };

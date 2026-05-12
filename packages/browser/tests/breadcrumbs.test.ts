@@ -272,6 +272,49 @@ describe("exception event payload", () => {
   });
 });
 
+describe("page URL sanitization in breadcrumb data", () => {
+  it("strips query / fragment from location.href in click breadcrumbs", () => {
+    // Regression for CodeRabbit Major on PR #130: page URLs stored on
+    // breadcrumb `data` previously carried the full `location.href`
+    // including `?token=…` and `#fragment`.
+    window.history.replaceState({}, "", "/checkout?reset_token=sk-LEAK#step2");
+    try {
+      const client = init({ apiKey: FAKE_KEY, autoStart: true });
+      try {
+        const btn = document.createElement("button");
+        btn.textContent = "Pay";
+        document.body.appendChild(btn);
+        btn.click();
+        const click = client.getBreadcrumbs().find((b) => b.category === "ui.click");
+        expect(click).toBeDefined();
+        const url = String(click!.data?.url ?? "");
+        expect(url).not.toContain("sk-LEAK");
+        expect(url).not.toContain("#step2");
+        expect(url).toContain("/checkout");
+      } finally {
+        client.stop();
+      }
+    } finally {
+      window.history.replaceState({}, "", "/");
+    }
+  });
+
+  it("strips query / fragment from navigation `from` and `to`", () => {
+    const client = init({ apiKey: FAKE_KEY, autoStart: true });
+    try {
+      window.history.pushState({}, "", "/users/42?token=secret&utm=ig#tab=billing");
+      const nav = client.getBreadcrumbs().find((b) => b.category === "navigation");
+      expect(nav).toBeDefined();
+      expect(String(nav!.data?.to)).not.toContain("token=secret");
+      expect(String(nav!.data?.to)).not.toContain("#tab=billing");
+      expect(String(nav!.data?.to)).toContain("/users/42");
+    } finally {
+      client.stop();
+      window.history.replaceState({}, "", "/");
+    }
+  });
+});
+
 describe("breadcrumb data deep-clone", () => {
   it("nested mutation after capture does not rewrite historical entries", () => {
     const client = init({ apiKey: FAKE_KEY, autoStart: false });
@@ -308,6 +351,40 @@ describe("addBreadcrumb manual API", () => {
       });
     } finally {
       client.stop();
+    }
+  });
+
+  it("falls back to default when maxBreadcrumbs is NaN/Infinity/non-finite", () => {
+    // Regression for CodeRabbit Major on PR #130: `Math.max(1,
+    // Math.min(500, NaN))` is NaN, and `breadcrumbs.length > NaN`
+    // is always false — so the ring would have grown unbounded.
+    const nanClient = init({
+      apiKey: FAKE_KEY,
+      autoStart: false,
+      maxBreadcrumbs: NaN,
+    });
+    try {
+      for (let i = 0; i < 100; i += 1) {
+        nanClient.addBreadcrumb({ message: `m${i}` });
+      }
+      // Falls back to default = 50.
+      expect(nanClient.getBreadcrumbs().length).toBe(50);
+    } finally {
+      nanClient.stop();
+    }
+    const infClient = init({
+      apiKey: FAKE_KEY,
+      autoStart: false,
+      maxBreadcrumbs: Infinity,
+    });
+    try {
+      for (let i = 0; i < 600; i += 1) {
+        infClient.addBreadcrumb({ message: `m${i}` });
+      }
+      // Same fallback path.
+      expect(infClient.getBreadcrumbs().length).toBe(50);
+    } finally {
+      infClient.stop();
     }
   });
 
