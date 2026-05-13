@@ -71,10 +71,18 @@ class LocalReplayBlobStore:
             delete=False,
             suffix=".tmp",
         ) as tmp:
-            tmp.write(serialized)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        Path(tmp.name).replace(path)
+            try:
+                tmp.write(serialized)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            except:
+                Path(tmp.name).unlink(missing_ok=True)
+                raise
+        try:
+            Path(tmp.name).replace(path)
+        except:
+            Path(tmp.name).unlink(missing_ok=True)
+            raise
         return key
 
     def read_events(self, key: str) -> list[dict[str, Any]]:
