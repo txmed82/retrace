@@ -68,6 +68,11 @@ INGEST_RATE_LIMITS: dict[str, tuple[int, int]] = {
     # should tune via the existing `consume_ingest_rate_limit` knobs
     # if they hit the limit on legitimate load.
     "otel": (600, 60),
+    # P3.6 (scaffold) — server-side replay sessions are captured at
+    # the failure moment (one per SSR exception, not a stream), so
+    # expected volume is much lower than browser replay. Tight
+    # default; operators with high failure rates can tune.
+    "server_replay": (120, 60),
 }
 HOSTED_ONBOARDING_SCOPES = (
     "ingest",
@@ -947,6 +952,9 @@ def _handler(
             if parsed.path == "/api/github/webhook":
                 self._handle_github_webhook()
                 return
+            if parsed.path == "/api/sdk/server-replay":
+                self._handle_server_replay_ingest(parsed.query)
+                return
             if parsed.path != "/api/sdk/replay":
                 _json_response(self, 404, {"error": "not_found"})
                 return
@@ -1539,6 +1547,131 @@ def _handler(
                 )
                 return
             _json_response(self, 202, result.to_dict())
+
+        def _handle_server_replay_ingest(self, query: str) -> None:
+            """P3.6 (scaffold) — accept a single server-side replay
+            session record.
+
+            Payload shape (JSON):
+                {
+                    "session_id": "...",
+                    "request": {
+                        "method": "GET",
+                        "path": "/api/checkout",
+                        "headers": {...},
+                        "body": "..."
+                    },
+                    "response": {
+                        "status": 500,
+                        "headers": {...}
+                    },
+                    "rendered_html": "...",   // optional snippet
+                    "runtime": "node-20",     // optional
+                    "occurred_at_ms": 0,      // optional; defaults to now
+                    "error_summary": "...",   // optional
+                    "metadata": {...}         // optional
+                }
+
+            The capture middleware that produces this payload is
+            deferred — see `docs/roadmap.md` P3.6. This endpoint
+            exists today so that middleware has a defined seam to
+            ship against, and so the ingest path can be hardened /
+            rate-limited / tested before SDK work begins.
+            """
+            replay_query = _query_dict(query)
+            sdk_key = authenticate_sdk_key(
+                store, _extract_replay_sdk_key(self.headers, replay_query)
+            )
+            if sdk_key is None:
+                _json_response(
+                    self,
+                    401,
+                    {
+                        "error": "unauthorized",
+                        "message": "Missing or invalid SDK key.",
+                    },
+                )
+                return
+            decision = _consume_rate_limit(
+                store,
+                project_id=sdk_key.project_id,
+                environment_id=sdk_key.environment_id,
+                bucket="server_replay",
+                identity=sdk_key.id,
+            )
+            if not decision.allowed:
+                _rate_limited_response(self, bucket="server_replay", decision=decision)
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length <= 0:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            if length > MAX_REPLAY_BODY_BYTES:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            body = self.rfile.read(length)
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                _json_response(self, 400, {"error": "invalid_json"})
+                return
+            if not isinstance(payload, dict):
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            request_block = payload.get("request") or {}
+            response_block = payload.get("response") or {}
+            if not isinstance(request_block, dict) or not isinstance(
+                response_block, dict
+            ):
+                _json_response(
+                    self,
+                    400,
+                    {
+                        "error": "invalid_payload",
+                        "message": "`request` and `response` must be objects.",
+                    },
+                )
+                return
+            try:
+                row_id = store.insert_server_replay_session(
+                    project_id=sdk_key.project_id,
+                    environment_id=sdk_key.environment_id,
+                    session_id=str(payload.get("session_id") or ""),
+                    request_method=str(request_block.get("method") or ""),
+                    request_path=str(request_block.get("path") or ""),
+                    request_headers=request_block.get("headers") or {},
+                    request_body_text=str(request_block.get("body") or ""),
+                    response_status=int(response_block.get("status") or 0),
+                    response_headers=response_block.get("headers") or {},
+                    rendered_html_snippet=str(payload.get("rendered_html") or ""),
+                    runtime=str(payload.get("runtime") or ""),
+                    occurred_at_ms=int(payload.get("occurred_at_ms") or 0),
+                    error_summary=str(payload.get("error_summary") or ""),
+                    metadata=payload.get("metadata") or {},
+                )
+            except (TypeError, ValueError) as exc:
+                _json_response(
+                    self,
+                    400,
+                    {"error": "invalid_payload", "message": str(exc)},
+                )
+                return
+            except Exception:
+                logger.exception("Unhandled server-replay ingest error")
+                _json_response(
+                    self,
+                    500,
+                    {
+                        "error": "internal_error",
+                        "message": "An internal server error occurred.",
+                    },
+                )
+                return
+            _json_response(self, 202, {"id": row_id, "accepted": 1})
 
         def _handle_list_replays(self, query: str) -> None:
             token = _require_service_token(
