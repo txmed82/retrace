@@ -6,6 +6,7 @@ import sys
 
 import click
 
+from retrace import __version__
 from retrace.commands.api import api_group
 from retrace.commands.data import data_group
 from retrace.commands.demo import demo_group
@@ -30,6 +31,13 @@ from retrace.storage import Storage
 
 
 @click.group()
+@click.version_option(
+    __version__,
+    "-V",
+    "--version",
+    prog_name="retrace",
+    message="%(prog)s %(version)s",
+)
 def main() -> None:
     """Retrace — find the bugs your users hit."""
 
