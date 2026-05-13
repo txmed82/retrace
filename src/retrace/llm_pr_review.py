@@ -83,6 +83,12 @@ class LLMReviewResult:
     chunks: int = 0
     diff_too_large: bool = False
     error: str = ""
+    # P3.5 cost-visibility fields. Estimated chars/4 from the
+    # redacted prompt + response text — directionally correct, not
+    # audit-grade. See `retrace.llm_pricing` for the price table.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated_cost_usd: float = 0.0
 
     @property
     def is_empty(self) -> bool:
@@ -112,6 +118,9 @@ class LLMReviewResult:
             "chunks": self.chunks,
             "diff_too_large": self.diff_too_large,
             "error": self.error,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "estimated_cost_usd": self.estimated_cost_usd,
         }
 
     def to_markdown(self) -> str:
@@ -773,6 +782,40 @@ def llm_review(
         chunk_results.append(_coerce_result(raw, model=llm_client.cfg.model))
 
     merged = _merge_results(chunk_results, model=llm_client.cfg.model)
+
+    # P3.5 — estimate token usage and dollar cost from the prompt
+    # text we sent and the response text we got back. chars/4 is
+    # directionally correct; real provider `usage` blocks would
+    # require deeper plumbing into the LLM client surface (other
+    # callers don't need it). See `retrace.llm_pricing`.
+    from retrace.llm_pricing import (
+        estimate_cost_usd as _estimate_cost_usd,
+        estimate_tokens_from_text as _estimate_tokens_from_text,
+    )
+
+    prompt_tokens = (
+        _estimate_tokens_from_text(_SYSTEM_PROMPT)
+        + _estimate_tokens_from_text(safe_diff)
+        + _estimate_tokens_from_text(hint)
+    )
+    response_text = " ".join(
+        [merged.summary]
+        + list(merged.walkthrough)
+        + [s.body + " " + s.suggested_code for s in merged.inline_suggestions]
+        + list(merged.risk_notes)
+    )
+    response_tokens = _estimate_tokens_from_text(response_text)
+    estimated_cost = _estimate_cost_usd(
+        model=merged.model,
+        input_tokens=prompt_tokens,
+        output_tokens=response_tokens,
+    )
+    merged = replace(
+        merged,
+        input_tokens=prompt_tokens,
+        output_tokens=response_tokens,
+        estimated_cost_usd=estimated_cost,
+    )
 
     # (1) Line-validity filter against the redacted diff (the same lines
     # the LLM saw).

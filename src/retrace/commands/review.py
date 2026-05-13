@@ -523,6 +523,9 @@ def _persist_llm_review(
             risk_notes=list(llm_result.risk_notes),
             suggestions=[s.to_dict() for s in llm_result.inline_suggestions],
             paths=paths,
+            input_tokens=llm_result.input_tokens,
+            output_tokens=llm_result.output_tokens,
+            estimated_cost_usd=llm_result.estimated_cost_usd,
         )
     except Exception:  # pragma: no cover - defensive
         # Persistence failure shouldn't break the review surface.
