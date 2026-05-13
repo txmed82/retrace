@@ -5,6 +5,9 @@ from typing import Any
 
 from retrace.detectors.base import (
     Signal,
+    _is_click,
+    _target_attrs,
+    _truthy_attr,
     event_data,
     event_timestamp_ms,
     iter_with_url,
@@ -16,21 +19,11 @@ WINDOW_MS = 1000
 MIN_CLICKS = 3
 
 
-def _target_attrs(e: dict[str, Any]) -> dict[str, Any]:
-    target = event_data(e).get("target")
-    if not isinstance(target, dict):
-        return {}
-    attrs = target.get("attributes")
-    return attrs if isinstance(attrs, dict) else {}
-
-
 def _is_disabled_explained(e: dict[str, Any]) -> bool:
     attrs = _target_attrs(e)
-    disabled = (
-        "disabled" in attrs
-        and str(attrs.get("disabled") or "").strip().lower()
-        in {"", "1", "true", "disabled", "yes"}
-    ) or str(attrs.get("aria-disabled") or "").strip().lower() == "true"
+    disabled = ("disabled" in attrs and _truthy_attr(attrs.get("disabled"))) or str(
+        attrs.get("aria-disabled") or ""
+    ).strip().lower() == "true"
     if not disabled:
         return False
     explanation = (
@@ -40,13 +33,6 @@ def _is_disabled_explained(e: dict[str, Any]) -> bool:
         or attrs.get("data-tooltip")
     )
     return bool(str(explanation or "").strip())
-
-
-def _is_click(e: dict[str, Any]) -> bool:
-    if e.get("type") != 3:
-        return False
-    data = event_data(e)
-    return data.get("source") == 2 and data.get("type") == 2
 
 
 @dataclass

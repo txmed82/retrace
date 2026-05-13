@@ -1,59 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
-
-from retrace.detectors.base import (
-    Signal,
-    event_data,
-    event_timestamp_ms,
-    iter_with_url,
-    register,
-)
+from retrace.detectors.base import NetworkDetectorBase, register
 
 
-_IGNORED_STATUSES = {401}
+_IGNORED_STATUSES = frozenset({401})
 
 
-@dataclass
-class Network4xxDetector:
-    name: str = "network_4xx"
-
-    def detect(self, session_id: str, events: list[dict[str, Any]]) -> list[Signal]:
-        out: list[Signal] = []
-        for url, e in iter_with_url(events):
-            if e.get("type") != 6:
-                continue
-            data = event_data(e)
-            if "network" not in str(data.get("plugin", "")):
-                continue
-            payload = data.get("payload")
-            if not isinstance(payload, dict):
-                payload = {}
-            status = payload.get("status_code") or payload.get("status")
-            if not isinstance(status, int) or not 400 <= status < 500:
-                continue
-            if status in _IGNORED_STATUSES:
-                continue
-            out.append(
-                Signal(
-                    session_id=session_id,
-                    detector=self.name,
-                    timestamp_ms=event_timestamp_ms(e),
-                    url=url,
-                    details={
-                        "status": status,
-                        "request_url": payload.get("url", ""),
-                        "method": payload.get("method", "GET"),
-                        "trace": payload.get("trace")
-                        if isinstance(payload.get("trace"), dict)
-                        else {},
-                    },
-                    confidence="medium",
-                    reason_codes=("network_4xx.status_4xx",),
-                )
-            )
-        return out
+class Network4xxDetector(NetworkDetectorBase):
+    def __init__(self) -> None:
+        super().__init__(
+            name="network_4xx",
+            status_min=400,
+            status_max=500,
+            reason_code="network_4xx.status_4xx",
+            confidence="medium",
+            ignored_statuses=_IGNORED_STATUSES,
+        )
 
 
 detector = register(Network4xxDetector())

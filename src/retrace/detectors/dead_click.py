@@ -5,6 +5,10 @@ from typing import Any
 
 from retrace.detectors.base import (
     Signal,
+    _is_benign_click,
+    _is_click,
+    _is_dom_mutation,
+    _is_network,
     event_data,
     event_timestamp_ms,
     iter_with_url,
@@ -13,55 +17,6 @@ from retrace.detectors.base import (
 
 
 FOLLOWUP_WINDOW_MS = 2000
-
-
-def _target_attrs(e: dict[str, Any]) -> dict[str, Any]:
-    target = event_data(e).get("target")
-    if not isinstance(target, dict):
-        return {}
-    attrs = target.get("attributes")
-    return attrs if isinstance(attrs, dict) else {}
-
-
-def _truthy_attr(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value or "").strip().lower() in {"", "1", "true", "disabled", "yes"}
-
-
-def _is_benign_click(e: dict[str, Any]) -> bool:
-    attrs = _target_attrs(e)
-    if "disabled" in attrs and _truthy_attr(attrs.get("disabled")):
-        return True
-    if str(attrs.get("aria-disabled") or "").strip().lower() == "true":
-        return True
-    if str(attrs.get("data-retrace-ignore") or "").strip().lower() == "true":
-        return True
-    href = str(attrs.get("href") or "").strip().lower().rstrip(";")
-    if href in {"#", "javascript:void(0)", "javascript:"}:
-        return True
-    return False
-
-
-def _is_click(e: dict[str, Any]) -> bool:
-    if e.get("type") != 3:
-        return False
-    d = event_data(e)
-    return d.get("source") == 2 and d.get("type") == 2
-
-
-def _is_dom_mutation(e: dict[str, Any]) -> bool:
-    if e.get("type") != 3:
-        return False
-    d = event_data(e)
-    return d.get("source") == 0
-
-
-def _is_network(e: dict[str, Any]) -> bool:
-    if e.get("type") != 6:
-        return False
-    d = event_data(e)
-    return "network" in str(d.get("plugin", ""))
 
 
 @dataclass
