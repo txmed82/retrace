@@ -787,6 +787,44 @@ ON llm_pr_reviews(created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_llm_pr_reviews_pr
 ON llm_pr_reviews(repo, pr_number);
+
+-- P3.1: flake quarantine.
+--
+-- `tester_spec_run_outcomes` is a rolling window of the most-recent
+-- run outcomes per spec. We prune to ~20 rows per spec because the
+-- auto-quarantine and auto-release heuristics only need to look at
+-- recent history; the long-term run record lives in `runs/` on disk.
+--
+-- `tester_spec_quarantine` is the per-spec current state — a row
+-- exists for any spec that's been observed at least once. `status`
+-- is `active` (default) or `quarantined`. Once quarantined, the
+-- `_persist_harness_failure` path in `commands/tester.py` skips
+-- the `qa_incident` filing so an intermittent spec doesn't keep
+-- re-escalating the same flake.
+
+CREATE TABLE IF NOT EXISTS tester_spec_run_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    spec_id TEXT NOT NULL,
+    run_id TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL,
+    recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_tester_spec_run_outcomes_spec_recent
+ON tester_spec_run_outcomes(spec_id, recorded_at DESC);
+
+CREATE TABLE IF NOT EXISTS tester_spec_quarantine (
+    spec_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'active',
+    quarantine_reason TEXT NOT NULL DEFAULT '',
+    quarantined_at TEXT NOT NULL DEFAULT '',
+    released_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_tester_spec_quarantine_status
+ON tester_spec_quarantine(status);
 """
 
 
@@ -7462,6 +7500,321 @@ class Storage:
             if len(out) >= limit:
                 break
         return out
+
+    # ---------------------------------------------------------------
+    # P3.1 — flake quarantine.
+    #
+    # Two surfaces:
+    #   * `record_tester_run_outcome(spec_id, outcome)` — call after
+    #     every tester run. Appends to the rolling outcome window
+    #     and re-evaluates whether the spec should auto-quarantine
+    #     or auto-release. Returns the resulting status.
+    #   * `is_spec_quarantined(spec_id)` — fast read used by the
+    #     incident-filing gate.
+    # ---------------------------------------------------------------
+
+    _RUN_OUTCOME_WINDOW = 20
+    _QUARANTINE_FAILURE_WINDOW_HOURS = 24
+    _RELEASE_PASS_STREAK = 5
+
+    def record_tester_run_outcome(
+        self,
+        *,
+        spec_id: str,
+        run_id: str,
+        outcome: str,
+    ) -> str:
+        """Append a tester-run outcome and re-evaluate quarantine.
+
+        `outcome` is `"pass"` or `"fail"`. Anything else is treated
+        as `"fail"` so an unrecognised value never silently drops
+        out of the heuristic (e.g. a future `"flaky"` classification
+        that should count as failure for quarantine purposes).
+
+        Auto-quarantine: a `pass → fail → pass` pattern within 24h
+        on a currently-active spec flips it to `quarantined`.
+        Auto-release: 5 consecutive passes on a currently-
+        quarantined spec flips it back to `active`.
+
+        Returns the resulting status (`"active"` or `"quarantined"`).
+        """
+        clean_spec = spec_id.strip()
+        if not clean_spec:
+            return "active"
+        normalized = "pass" if str(outcome or "").strip().lower() == "pass" else "fail"
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO tester_spec_run_outcomes (spec_id, run_id, outcome)
+                VALUES (?, ?, ?)
+                """,
+                (clean_spec, run_id or "", normalized),
+            )
+            # Prune the rolling window — keep only the most-recent
+            # _RUN_OUTCOME_WINDOW rows per spec so the table doesn't
+            # grow without bound on long-lived installs.
+            conn.execute(
+                """
+                DELETE FROM tester_spec_run_outcomes
+                WHERE spec_id = ?
+                  AND id NOT IN (
+                    SELECT id FROM tester_spec_run_outcomes
+                    WHERE spec_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                  )
+                """,
+                (clean_spec, clean_spec, self._RUN_OUTCOME_WINDOW),
+            )
+            # Snapshot current state + recent outcomes for the
+            # heuristic decisions below.
+            current = conn.execute(
+                "SELECT status FROM tester_spec_quarantine WHERE spec_id = ?",
+                (clean_spec,),
+            ).fetchone()
+            current_status = (
+                str(current["status"]) if current is not None else "active"
+            )
+            recent = conn.execute(
+                """
+                SELECT outcome, recorded_at FROM tester_spec_run_outcomes
+                WHERE spec_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (clean_spec, self._RELEASE_PASS_STREAK),
+            ).fetchall()
+            new_status = current_status
+            reason = ""
+            # Auto-release: 5 consecutive passes when quarantined.
+            if current_status == "quarantined" and len(recent) >= self._RELEASE_PASS_STREAK:
+                if all(str(r["outcome"]) == "pass" for r in recent):
+                    new_status = "active"
+                    reason = (
+                        f"auto-released after {self._RELEASE_PASS_STREAK} "
+                        "consecutive passes"
+                    )
+            # Auto-quarantine: pass → fail → pass within 24h on an
+            # active spec. We look at the most-recent 3 outcomes.
+            if current_status == "active":
+                three = conn.execute(
+                    """
+                    SELECT outcome, recorded_at FROM tester_spec_run_outcomes
+                    WHERE spec_id = ?
+                    ORDER BY id DESC
+                    LIMIT 3
+                    """,
+                    (clean_spec,),
+                ).fetchall()
+                if len(three) == 3:
+                    outs = [str(r["outcome"]) for r in three]
+                    # most-recent first → [pass, fail, pass] reading right-to-left
+                    # is the pass→fail→pass pattern. Equivalently:
+                    if outs[0] == "pass" and outs[1] == "fail" and outs[2] == "pass":
+                        # Time-bound to a single 24h window so an old
+                        # pass / new pass with a months-old fail in
+                        # between doesn't trip the heuristic.
+                        first = self._dt(three[2]["recorded_at"])
+                        last = self._dt(three[0]["recorded_at"])
+                        # `_dt` returns either naive or TZ-aware
+                        # depending on whether the stored timestamp
+                        # had a `+00:00` suffix. SQLite's
+                        # `datetime('now')` default is naive. Coerce
+                        # to UTC-aware so the subtraction works
+                        # regardless of which storage path wrote the
+                        # row.
+                        if first and first.tzinfo is None:
+                            first = first.replace(tzinfo=timezone.utc)
+                        if last and last.tzinfo is None:
+                            last = last.replace(tzinfo=timezone.utc)
+                        if first and last and (
+                            last - first
+                        ).total_seconds() <= self._QUARANTINE_FAILURE_WINDOW_HOURS * 3600:
+                            new_status = "quarantined"
+                            reason = "auto-quarantined: pass→fail→pass within 24h"
+            if new_status != current_status:
+                self._write_quarantine_state(
+                    conn,
+                    spec_id=clean_spec,
+                    status=new_status,
+                    reason=reason,
+                )
+            elif current is None:
+                # First-ever outcome for this spec — seed an
+                # `active` row so `list_quarantined_specs` and
+                # `release_spec_quarantine` have a stable target.
+                self._write_quarantine_state(
+                    conn, spec_id=clean_spec, status="active", reason=""
+                )
+        return new_status
+
+    def is_spec_quarantined(self, spec_id: str) -> bool:
+        clean = spec_id.strip()
+        if not clean:
+            return False
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT status FROM tester_spec_quarantine WHERE spec_id = ?",
+                (clean,),
+            ).fetchone()
+        return bool(row is not None and str(row["status"]) == "quarantined")
+
+    def list_quarantined_specs(self) -> list[dict[str, Any]]:
+        """Currently-quarantined specs with their reason + timestamp."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT spec_id, status, quarantine_reason, quarantined_at,
+                       released_at, updated_at
+                FROM tester_spec_quarantine
+                WHERE status = 'quarantined'
+                ORDER BY quarantined_at DESC
+                """
+            ).fetchall()
+        return [
+            {
+                "spec_id": str(row["spec_id"]),
+                "status": str(row["status"]),
+                "quarantine_reason": str(row["quarantine_reason"] or ""),
+                "quarantined_at": str(row["quarantined_at"] or ""),
+                "released_at": str(row["released_at"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+            }
+            for row in rows
+        ]
+
+    def force_quarantine_spec(self, *, spec_id: str, reason: str = "") -> None:
+        """Manual override — operator decided a spec is flaky and
+        wants it off the qa_incident escalation path even though the
+        auto-quarantine heuristic hasn't tripped yet."""
+        clean = spec_id.strip()
+        if not clean:
+            raise ValueError("spec_id is required")
+        with self._conn() as conn:
+            self._write_quarantine_state(
+                conn,
+                spec_id=clean,
+                status="quarantined",
+                reason=(reason.strip() or "manual"),
+            )
+
+    def release_spec_quarantine(self, *, spec_id: str, reason: str = "") -> None:
+        clean = spec_id.strip()
+        if not clean:
+            raise ValueError("spec_id is required")
+        with self._conn() as conn:
+            self._write_quarantine_state(
+                conn,
+                spec_id=clean,
+                status="active",
+                reason=(reason.strip() or "manual"),
+            )
+
+    def quarantine_status(self, spec_id: str) -> dict[str, Any]:
+        """Full status row for the `quarantine show` CLI."""
+        clean = spec_id.strip()
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT spec_id, status, quarantine_reason, quarantined_at,
+                       released_at, created_at, updated_at
+                FROM tester_spec_quarantine
+                WHERE spec_id = ?
+                """,
+                (clean,),
+            ).fetchone()
+            outcomes = conn.execute(
+                """
+                SELECT outcome, run_id, recorded_at FROM tester_spec_run_outcomes
+                WHERE spec_id = ?
+                ORDER BY id DESC
+                LIMIT 10
+                """,
+                (clean,),
+            ).fetchall()
+        if row is None:
+            return {
+                "spec_id": clean,
+                "status": "active",
+                "quarantine_reason": "",
+                "quarantined_at": "",
+                "released_at": "",
+                "recent_outcomes": [],
+            }
+        return {
+            "spec_id": str(row["spec_id"]),
+            "status": str(row["status"]),
+            "quarantine_reason": str(row["quarantine_reason"] or ""),
+            "quarantined_at": str(row["quarantined_at"] or ""),
+            "released_at": str(row["released_at"] or ""),
+            "recent_outcomes": [
+                {
+                    "outcome": str(o["outcome"]),
+                    "run_id": str(o["run_id"] or ""),
+                    "recorded_at": str(o["recorded_at"] or ""),
+                }
+                for o in outcomes
+            ],
+        }
+
+    def _write_quarantine_state(
+        self,
+        conn: Any,
+        *,
+        spec_id: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        """Upsert helper for the quarantine state row.
+
+        `quarantined_at` is set when transitioning to `quarantined`;
+        `released_at` is set when transitioning to `active`. We
+        preserve the original quarantined_at across releases so the
+        history of recent quarantines is recoverable.
+        """
+        existing = conn.execute(
+            "SELECT status, quarantined_at FROM tester_spec_quarantine WHERE spec_id = ?",
+            (spec_id,),
+        ).fetchone()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if existing is None:
+            quarantined_at = now_iso if status == "quarantined" else ""
+            released_at = now_iso if status == "active" else ""
+            conn.execute(
+                """
+                INSERT INTO tester_spec_quarantine
+                    (spec_id, status, quarantine_reason,
+                     quarantined_at, released_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (spec_id, status, reason, quarantined_at, released_at, now_iso),
+            )
+            return
+        # Existing row — only stamp transitions, preserve the
+        # pre-existing quarantined_at when toggling back to active so
+        # an audit trail survives.
+        new_quarantined_at = (
+            now_iso
+            if status == "quarantined" and existing["status"] != "quarantined"
+            else str(existing["quarantined_at"] or "")
+        )
+        new_released_at = (
+            now_iso
+            if status == "active" and existing["status"] != "active"
+            else ""
+        )
+        conn.execute(
+            """
+            UPDATE tester_spec_quarantine
+            SET status = ?,
+                quarantine_reason = ?,
+                quarantined_at = ?,
+                released_at = ?,
+                updated_at = ?
+            WHERE spec_id = ?
+            """,
+            (status, reason, new_quarantined_at, new_released_at, now_iso, spec_id),
+        )
 
     def next_open_qa_incident(
         self,
