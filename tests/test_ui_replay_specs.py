@@ -770,7 +770,7 @@ def test_create_sdk_key_payload_reports_creation_error(
     store.init_schema()
 
     with patch(
-        "retrace.commands.ui.create_sdk_key",
+        "retrace.commands.ui_payloads.create_sdk_key",
         side_effect=RuntimeError("database locked"),
     ):
         payload, status = _create_sdk_key_payload(store=store)
@@ -1374,7 +1374,7 @@ def test_verify_resolved_issues_payload_marks_failed_specs_regressed(
             execution_engine="native",
         )
 
-    monkeypatch.setattr("retrace.commands.ui.run_spec", fake_run_spec)
+    monkeypatch.setattr("retrace.commands.ui_payloads.run_spec", fake_run_spec)
 
     payload, status = _verify_resolved_issues_payload(
         store=store,
@@ -1431,7 +1431,7 @@ def test_verify_resolved_issues_payload_marks_passing_ui_spec_verified(
             execution_engine="native",
         )
 
-    monkeypatch.setattr("retrace.commands.ui.run_spec", fake_run_spec)
+    monkeypatch.setattr("retrace.commands.ui_payloads.run_spec", fake_run_spec)
 
     payload, status = _verify_resolved_issues_payload(
         store=store,
@@ -1499,7 +1499,7 @@ def test_verify_resolved_issues_payload_runs_linked_api_specs(
             run_dir=str(tmp_path / "api_run_passed"),
         )
 
-    monkeypatch.setattr("retrace.commands.ui.run_api_spec", fake_run_api_spec)
+    monkeypatch.setattr("retrace.commands.ui_payloads.run_api_spec", fake_run_api_spec)
 
     payload, status = _verify_resolved_issues_payload(
         store=store,
