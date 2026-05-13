@@ -1603,9 +1603,20 @@ def tester_run(
         cwd=config_path.parent,
     )
     failure_metadata: dict[str, str] = {}
+    quarantine_status: str = ""
     try:
         store = Storage(cfg.run.data_dir / "retrace.db")
         store.init_schema()
+        # P3.1: record run outcome and re-evaluate flake quarantine
+        # BEFORE deciding whether to file an incident. This is the
+        # single gate — if the spec is currently quarantined, the
+        # failure still goes into `failure_test_link` for audit, but
+        # the qa_incident escalation is skipped.
+        quarantine_status = store.record_tester_run_outcome(
+            spec_id=result.spec_id,
+            run_id=result.run_id,
+            outcome="pass" if result.ok else "fail",
+        )
         link_id = _single_failure_test_link_id(store, result.spec_id)
         if link_id:
             store.update_failure_test_link_run(
@@ -1613,7 +1624,11 @@ def tester_run(
                 run_result=result,
                 link_id=link_id,
             )
-        if not result.ok and result.execution_engine == "harness":
+        if (
+            not result.ok
+            and result.execution_engine == "harness"
+            and not store.is_spec_quarantined(result.spec_id)
+        ):
             failure_metadata = _persist_harness_failure(
                 store=store,
                 result=result,
@@ -1653,6 +1668,9 @@ def tester_run(
                 "repair_task_id": failure_metadata.get("repair_task_id", ""),
                 "artifacts": result.artifacts,
                 "assertion_results": result.assertion_results,
+                # P3.1 — surfaced so CI tooling can see "incident
+                # not filed because the spec is quarantined."
+                "quarantine_status": quarantine_status,
             },
             indent=2,
         )
@@ -1837,6 +1855,113 @@ def tester_runs(config_path: Path, limit: int) -> None:
         click.echo("No tester runs found.")
         return
     click.echo(json.dumps(runs, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# P3.2 — `retrace tester run-all` (parallel runner).
+#
+# Per-spec isolation is already provided by the existing
+# `run_spec` (subprocess + per-run artifact dir). Parallelism here
+# is the orchestration layer: pick the specs to run, kick off N at
+# once via a thread pool, surface a summary.
+# ---------------------------------------------------------------------------
+
+
+@tester_group.command("run-all")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--workers",
+    default=4,
+    show_default=True,
+    type=click.IntRange(min=1, max=64),
+    help="Worker thread count (each thread runs one spec at a time).",
+)
+@click.option(
+    "--match",
+    default="",
+    help="fnmatch glob filtered against spec_id AND spec name. Empty = run all.",
+)
+@click.option(
+    "--retries",
+    default=None,
+    type=int,
+    help="Override retries per spec.",
+)
+@click.argument("spec_ids", nargs=-1)
+def tester_run_all(
+    config_path: Path,
+    workers: int,
+    match: str,
+    retries: Optional[int],
+    spec_ids: tuple[str, ...],
+) -> None:
+    """Run multiple tester specs concurrently.
+
+    Examples:
+
+    \b
+      retrace tester run-all --workers 4
+      retrace tester run-all --match "login*"
+      retrace tester run-all --workers 8 spec_a spec_b spec_c
+    """
+    from retrace.tester_pool import run_specs_parallel, select_specs
+
+    cfg = load_config(config_path)
+    defaults = _tester_defaults(config_path)
+    retries_v = (
+        max(0, int(retries))
+        if retries is not None
+        else max(0, int(defaults.get("max_retries") or 1))
+    )
+    specs = select_specs(
+        data_dir=cfg.run.data_dir,
+        match_pattern=match,
+        spec_ids=list(spec_ids) if spec_ids else None,
+    )
+    if not specs:
+        click.echo(
+            json.dumps(
+                {"total": 0, "ok": 0, "fail": 0, "skipped": 0, "results": []},
+                indent=2,
+            )
+        )
+        return
+    result = run_specs_parallel(
+        specs,
+        data_dir=cfg.run.data_dir,
+        cwd=config_path.parent,
+        workers=workers,
+        max_retries=retries_v,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "total": result.total,
+                "ok": result.ok_count,
+                "fail": result.fail_count,
+                "skipped": result.skipped_count,
+                "duration_seconds": result.duration_seconds,
+                "results": [
+                    {
+                        "spec_id": r.spec_id,
+                        "run_id": r.run_id,
+                        "ok": r.ok,
+                        "status": r.status,
+                        "exit_code": r.exit_code,
+                        "run_dir": r.run_dir,
+                    }
+                    for r in result.per_spec
+                ],
+            },
+            indent=2,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2108,3 +2233,103 @@ def tester_record(
             indent=2,
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# P3.1 — Flake quarantine CLI.
+#
+# Operators can inspect / override the auto-quarantine state. The
+# heuristic runs after every spec run inside `_persist_harness_failure`'s
+# gate (`Storage.record_tester_run_outcome` + `is_spec_quarantined`).
+# ---------------------------------------------------------------------------
+
+
+@tester_group.group("quarantine")
+def tester_quarantine_group() -> None:
+    """Inspect and override the flake-quarantine state."""
+
+
+@tester_quarantine_group.command("list")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def tester_quarantine_list(config_path: Path) -> None:
+    """List specs that are currently quarantined."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    click.echo(json.dumps(store.list_quarantined_specs(), indent=2, sort_keys=True))
+
+
+@tester_quarantine_group.command("show")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.argument("spec_id")
+def tester_quarantine_show(config_path: Path, spec_id: str) -> None:
+    """Print current state + recent run outcomes for one spec."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    click.echo(
+        json.dumps(store.quarantine_status(spec_id), indent=2, sort_keys=True)
+    )
+
+
+@tester_quarantine_group.command("force")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--reason", default="", help="Optional note recorded with the override.")
+@click.argument("spec_id")
+def tester_quarantine_force(config_path: Path, reason: str, spec_id: str) -> None:
+    """Force a spec into quarantine ahead of the auto-heuristic."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    try:
+        store.force_quarantine_spec(spec_id=spec_id, reason=reason)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(store.quarantine_status(spec_id), indent=2, sort_keys=True)
+    )
+
+
+@tester_quarantine_group.command("release")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--reason", default="", help="Optional note recorded with the override.")
+@click.argument("spec_id")
+def tester_quarantine_release(
+    config_path: Path, reason: str, spec_id: str
+) -> None:
+    """Manually release a spec from quarantine."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    try:
+        store.release_spec_quarantine(spec_id=spec_id, reason=reason)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(store.quarantine_status(spec_id), indent=2, sort_keys=True)
+    )
+
