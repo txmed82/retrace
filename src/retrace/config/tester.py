@@ -1,5 +1,13 @@
 # STAGE: plan-c-stub — Native UI tester configuration.
-# FUTURE: Expand auth profiles to support OAuth2, cookie-based, and multi-step flows.
+#
+# Plan C scope: GitHub code matching + AI fix prompts for Retrace findings.
+# The tester module provides auth/env profiles for automated browser-based
+# verification of fix candidates in real application environments.
+#
+# FUTURE:
+#   - Expand auth profiles to support OAuth2, cookie-based, and multi-step flows.
+#   - Add TesterRunConfig for per-run settings (timeouts, retries, screenshots).
+#   - Add TesterResult model for structured test outcomes.
 from __future__ import annotations
 
 from typing import Any, Literal
