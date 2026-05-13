@@ -1858,6 +1858,113 @@ def tester_runs(config_path: Path, limit: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# P3.2 — `retrace tester run-all` (parallel runner).
+#
+# Per-spec isolation is already provided by the existing
+# `run_spec` (subprocess + per-run artifact dir). Parallelism here
+# is the orchestration layer: pick the specs to run, kick off N at
+# once via a thread pool, surface a summary.
+# ---------------------------------------------------------------------------
+
+
+@tester_group.command("run-all")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--workers",
+    default=4,
+    show_default=True,
+    type=click.IntRange(min=1, max=64),
+    help="Worker thread count (each thread runs one spec at a time).",
+)
+@click.option(
+    "--match",
+    default="",
+    help="fnmatch glob filtered against spec_id AND spec name. Empty = run all.",
+)
+@click.option(
+    "--retries",
+    default=None,
+    type=int,
+    help="Override retries per spec.",
+)
+@click.argument("spec_ids", nargs=-1)
+def tester_run_all(
+    config_path: Path,
+    workers: int,
+    match: str,
+    retries: Optional[int],
+    spec_ids: tuple[str, ...],
+) -> None:
+    """Run multiple tester specs concurrently.
+
+    Examples:
+
+    \b
+      retrace tester run-all --workers 4
+      retrace tester run-all --match "login*"
+      retrace tester run-all --workers 8 spec_a spec_b spec_c
+    """
+    from retrace.tester_pool import run_specs_parallel, select_specs
+
+    cfg = load_config(config_path)
+    defaults = _tester_defaults(config_path)
+    retries_v = (
+        max(0, int(retries))
+        if retries is not None
+        else max(0, int(defaults.get("max_retries") or 1))
+    )
+    specs = select_specs(
+        data_dir=cfg.run.data_dir,
+        match_pattern=match,
+        spec_ids=list(spec_ids) if spec_ids else None,
+    )
+    if not specs:
+        click.echo(
+            json.dumps(
+                {"total": 0, "ok": 0, "fail": 0, "skipped": 0, "results": []},
+                indent=2,
+            )
+        )
+        return
+    result = run_specs_parallel(
+        specs,
+        data_dir=cfg.run.data_dir,
+        cwd=config_path.parent,
+        workers=workers,
+        max_retries=retries_v,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "total": result.total,
+                "ok": result.ok_count,
+                "fail": result.fail_count,
+                "skipped": result.skipped_count,
+                "duration_seconds": result.duration_seconds,
+                "results": [
+                    {
+                        "spec_id": r.spec_id,
+                        "run_id": r.run_id,
+                        "ok": r.ok,
+                        "status": r.status,
+                        "exit_code": r.exit_code,
+                        "run_dir": r.run_dir,
+                    }
+                    for r in result.per_spec
+                ],
+            },
+            indent=2,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # P1.4 — env-profile management CLI
 #
 # `config.yaml` is a hand-edited user file. We deliberately do NOT
