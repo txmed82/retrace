@@ -8,6 +8,7 @@ import click
 
 from retrace import __version__
 from retrace.commands.api import api_group
+from retrace.commands.cost import cost_group
 from retrace.commands.data import data_group
 from retrace.commands.demo import demo_group
 from retrace.commands.digest import digest_command
@@ -102,3 +103,4 @@ main.add_command(qa_group)
 main.add_command(review_command)
 main.add_command(monitor_group)
 main.add_command(data_group)
+main.add_command(cost_group)

@@ -779,6 +779,14 @@ CREATE TABLE IF NOT EXISTS llm_pr_reviews (
     risk_notes_json TEXT NOT NULL DEFAULT '[]',
     suggestions_json TEXT NOT NULL DEFAULT '[]',
     paths_json TEXT NOT NULL DEFAULT '[]',
+    -- P3.5 cost-visibility columns. Estimated server-side from
+    -- input/output text length (chars/4 heuristic) rather than
+    -- real provider `usage` blocks today — directionally correct,
+    -- and avoids invasive plumbing into the LLM client surface
+    -- that other call sites don't need.
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -1535,6 +1543,28 @@ class Storage:
             if "precedence" not in cols_alert_rules:
                 conn.execute(
                     "ALTER TABLE app_error_alert_rules ADD COLUMN precedence INTEGER NOT NULL DEFAULT 0"
+                )
+            # P3.5: backfill the cost-visibility columns onto old DBs.
+            # Default 0 / 0.0 means historical rows show as "unknown
+            # cost" in the summary CLI (which is honest — we didn't
+            # capture tokens for those runs).
+            cols_llm_reviews = [
+                r["name"]
+                for r in conn.execute(
+                    "PRAGMA table_info(llm_pr_reviews)"
+                ).fetchall()
+            ]
+            if "input_tokens" not in cols_llm_reviews:
+                conn.execute(
+                    "ALTER TABLE llm_pr_reviews ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0"
+                )
+            if "output_tokens" not in cols_llm_reviews:
+                conn.execute(
+                    "ALTER TABLE llm_pr_reviews ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0"
+                )
+            if "estimated_cost_usd" not in cols_llm_reviews:
+                conn.execute(
+                    "ALTER TABLE llm_pr_reviews ADD COLUMN estimated_cost_usd REAL NOT NULL DEFAULT 0.0"
                 )
             conn.execute(
                 """
@@ -7420,6 +7450,9 @@ class Storage:
         risk_notes: list[str],
         suggestions: list[dict],
         paths: list[str],
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        estimated_cost_usd: float = 0.0,
     ) -> int:
         """Persist one LLM review run so future reviews can reference it.
 
@@ -7427,14 +7460,21 @@ class Storage:
         if you call `retrace review --post-comment` twice on the same
         PR, you get two rows, and `list_llm_pr_reviews_for_paths`
         returns the most recent first.
+
+        P3.5: `input_tokens` / `output_tokens` / `estimated_cost_usd`
+        are estimated by `llm_pr_review` from the prompt/response text
+        length (chars/4 heuristic) and the static price table in
+        `retrace.llm_pricing`. Defaults of 0 keep this argument
+        optional for older call sites and historical rows.
         """
         with self._conn() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO llm_pr_reviews
                     (repo, pr_number, model, summary, risk_notes_json,
-                     suggestions_json, paths_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     suggestions_json, paths_json,
+                     input_tokens, output_tokens, estimated_cost_usd)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     repo or "",
@@ -7444,6 +7484,9 @@ class Storage:
                     json.dumps(list(risk_notes or [])),
                     json.dumps(list(suggestions or [])),
                     json.dumps(list(paths or [])),
+                    max(0, int(input_tokens or 0)),
+                    max(0, int(output_tokens or 0)),
+                    max(0.0, float(estimated_cost_usd or 0.0)),
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -7679,6 +7722,62 @@ class Storage:
                 "quarantined_at": str(row["quarantined_at"] or ""),
                 "released_at": str(row["released_at"] or ""),
                 "updated_at": str(row["updated_at"] or ""),
+            }
+            for row in rows
+        ]
+
+    def list_llm_pr_review_costs(
+        self,
+        *,
+        since_days: int = 7,
+        group_by: str = "model",
+    ) -> list[dict[str, Any]]:
+        """Aggregate LLM-PR-review costs for the cost-summary CLI.
+
+        `group_by` is `"model"`, `"repo"`, or `"pr"`. The total /
+        per-group counts come from the `input_tokens`,
+        `output_tokens`, `estimated_cost_usd` columns added in P3.5.
+
+        Returns a list of dicts shaped:
+          `{"group": <name>, "reviews": N, "input_tokens": ...,
+            "output_tokens": ..., "estimated_cost_usd": ...}`
+        sorted by `estimated_cost_usd` descending.
+        """
+        since = max(1, int(since_days))
+        if group_by == "model":
+            group_col = "model"
+            group_expr = "model"
+        elif group_by == "repo":
+            group_col = "repo"
+            group_expr = "repo"
+        elif group_by == "pr":
+            group_col = "pr"
+            group_expr = "repo || '#' || CAST(pr_number AS TEXT)"
+        else:
+            raise ValueError(f"unknown group_by: {group_by!r}")
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    {group_expr} AS group_key,
+                    COUNT(*) AS reviews,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(estimated_cost_usd), 0.0) AS estimated_cost_usd
+                FROM llm_pr_reviews
+                WHERE created_at >= datetime('now', ?)
+                GROUP BY {group_expr}
+                ORDER BY estimated_cost_usd DESC, group_key ASC
+                """,
+                (f"-{since} days",),
+            ).fetchall()
+        return [
+            {
+                group_col: str(row["group_key"] or ""),
+                "reviews": int(row["reviews"] or 0),
+                "input_tokens": int(row["input_tokens"] or 0),
+                "output_tokens": int(row["output_tokens"] or 0),
+                "estimated_cost_usd": float(row["estimated_cost_usd"] or 0.0),
             }
             for row in rows
         ]
