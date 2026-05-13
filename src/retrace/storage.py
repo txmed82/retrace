@@ -795,6 +795,46 @@ ON llm_pr_reviews(created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_llm_pr_reviews_pr
 ON llm_pr_reviews(repo, pr_number);
+
+-- P3.6 (scaffold): server-side replay.
+--
+-- rrweb captures only what runs in the browser. SSR exceptions
+-- (the page that 500ed before hydration), backend-only services,
+-- and request/response cycles outside the browser have no replay
+-- story today. This table is the **storage seam** for the
+-- eventual Node/Python capture middleware to write into; the
+-- middleware itself is deferred until a real SSR-replay user
+-- surfaces demand.
+--
+-- A "session" here is a single captured request/response with an
+-- optional rendered-HTML snippet at the failure moment. Not a
+-- continuous DOM stream like browser replay — that primitive is
+-- too heavy server-side.
+CREATE TABLE IF NOT EXISTS server_replay_sessions (
+    id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    request_method TEXT NOT NULL DEFAULT '',
+    request_path TEXT NOT NULL DEFAULT '',
+    request_headers_json TEXT NOT NULL DEFAULT '{}',
+    request_body_text TEXT NOT NULL DEFAULT '',
+    response_status INTEGER NOT NULL DEFAULT 0,
+    response_headers_json TEXT NOT NULL DEFAULT '{}',
+    rendered_html_snippet TEXT NOT NULL DEFAULT '',
+    runtime TEXT NOT NULL DEFAULT '',
+    occurred_at_ms INTEGER NOT NULL DEFAULT 0,
+    error_summary TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_server_replay_sessions_scope_time
+ON server_replay_sessions(project_id, environment_id, occurred_at_ms DESC);
+
+CREATE INDEX IF NOT EXISTS idx_server_replay_sessions_path
+ON server_replay_sessions(project_id, environment_id, request_path, occurred_at_ms DESC);
 """
 
 
@@ -6019,6 +6059,122 @@ class Storage:
                 ORDER BY sequence
                 """,
                 (project_id, environment_id, session_id),
+            ).fetchall()
+
+    # ---------------------------------------------------------------
+    # P3.6 — server-side replay (scaffold).
+    #
+    # Storage seam for the eventual Node / Python capture
+    # middleware. The middleware itself is intentionally NOT in
+    # scope here — building Node + Python capture without a real
+    # SSR-replay user is the speculative-bloat trap. These methods
+    # exist so the ingest endpoint has a place to write to and
+    # tests can pin the storage round-trip.
+    # ---------------------------------------------------------------
+
+    def insert_server_replay_session(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        session_id: str,
+        request_method: str,
+        request_path: str,
+        request_headers: Optional[dict[str, Any]] = None,
+        request_body_text: str = "",
+        response_status: int = 0,
+        response_headers: Optional[dict[str, Any]] = None,
+        rendered_html_snippet: str = "",
+        runtime: str = "",
+        occurred_at_ms: int = 0,
+        error_summary: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> str:
+        """Persist a single server-replay session record.
+
+        Returns the inserted row id. Sensitive request/response
+        headers should be redacted BEFORE this method is called —
+        no automatic redaction here, since the caller (capture
+        middleware) is the only side that knows what to keep.
+        """
+        row_id = self._id("ssr")
+        public_id = self._public_id(
+            "ssr",
+            project_id,
+            environment_id,
+            session_id,
+            request_method,
+            request_path,
+            int(occurred_at_ms),
+        )
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO server_replay_sessions
+                    (id, public_id, project_id, environment_id, session_id,
+                     request_method, request_path, request_headers_json,
+                     request_body_text, response_status, response_headers_json,
+                     rendered_html_snippet, runtime, occurred_at_ms,
+                     error_summary, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row_id,
+                    public_id,
+                    project_id,
+                    environment_id,
+                    session_id or "",
+                    str(request_method or "").upper(),
+                    request_path or "",
+                    json.dumps(dict(request_headers or {}), sort_keys=True),
+                    request_body_text or "",
+                    int(response_status or 0),
+                    json.dumps(dict(response_headers or {}), sort_keys=True),
+                    rendered_html_snippet or "",
+                    runtime or "",
+                    int(occurred_at_ms or 0),
+                    error_summary or "",
+                    json.dumps(dict(metadata or {}), sort_keys=True),
+                ),
+            )
+        return row_id
+
+    def get_server_replay_session(self, row_id: str) -> Optional[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM server_replay_sessions WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+
+    def list_server_replay_sessions(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        limit: int = 25,
+        path_prefix: str = "",
+    ) -> list[sqlite3.Row]:
+        clean_limit = max(1, min(500, int(limit)))
+        with self._conn() as conn:
+            if path_prefix:
+                return conn.execute(
+                    """
+                    SELECT * FROM server_replay_sessions
+                    WHERE project_id = ? AND environment_id = ?
+                      AND request_path LIKE ?
+                    ORDER BY occurred_at_ms DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (project_id, environment_id, f"{path_prefix}%", clean_limit),
+                ).fetchall()
+            return conn.execute(
+                """
+                SELECT * FROM server_replay_sessions
+                WHERE project_id = ? AND environment_id = ?
+                ORDER BY occurred_at_ms DESC, id DESC
+                LIMIT ?
+                """,
+                (project_id, environment_id, clean_limit),
             ).fetchall()
 
     def _events_for_replay_batch(self, batch: sqlite3.Row) -> list[dict[str, Any]]:
