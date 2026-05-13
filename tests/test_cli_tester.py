@@ -277,7 +277,40 @@ tester:
     )
     assert spec_payload["auth_profile"] == "api-jwt"
     assert spec_payload["env_profile"] == "local-api"
+    assert spec_payload["url"] == "/api/private"
     assert "test-token" not in json.dumps(spec_payload)
+
+
+def test_tester_profiles_outputs_redacted_shared_profiles(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "config.yaml").write_text(
+        _CONFIG_YAML
+        + """
+tester:
+  auth_profiles:
+    api-jwt:
+      mode: jwt
+      jwt_env: RETRACE_API_JWT
+  env_profiles:
+    local-api:
+      api_base_url: http://127.0.0.1:3000
+      env_overrides:
+        FEATURE_FLAG: enabled
+"""
+    )
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["tester", "profiles"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["auth_profiles"][0]["jwt_env"] == "[secret-env]"
+    assert payload["env_profiles"][0]["api_base_url"] == "http://127.0.0.1:3000"
+    assert payload["env_profiles"][0]["env_overrides"]["FEATURE_FLAG"] == "[secret-env]"
+    assert "RETRACE_API_JWT" not in result.output
+    assert "enabled" not in result.output
 
 
 def test_create_suite_run_generates_accepts_and_runs_draft_specs(
@@ -357,12 +390,69 @@ tester:
         )
 
         draft_id = draft_specs[0]["spec_id"]
+        review = runner.invoke(main, ["tester", "review-spec", draft_id])
+        assert review.exit_code == 0, review.output
+        review_payload = json.loads(review.output)
+        assert review_payload["review_summary"]["draft_status"] == "draft"
+        assert "edit-draft" in review_payload["review_summary"]["recommended_command"]
+
+        edited_steps = tmp_path / "edited-steps.json"
+        edited_steps.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "open-signup",
+                        "action": "navigate",
+                        "url": app_url,
+                    }
+                ]
+            )
+        )
+        edited_assertions = tmp_path / "edited-assertions.json"
+        edited_assertions.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "page-loads",
+                        "type": "status_code",
+                        "expected_status": 200,
+                    }
+                ]
+            )
+        )
         accepted = runner.invoke(
             main,
-            ["tester", "accept-draft", draft_id, "--name", "Accepted draft"],
+            [
+                "tester",
+                "edit-draft",
+                draft_id,
+                "--name",
+                "Accepted draft",
+                "--steps-file",
+                str(edited_steps),
+                "--assertions-file",
+                str(edited_assertions),
+                "--review-note",
+                "Replaced generated journey with stable smoke path.",
+                "--accept",
+            ],
         )
         assert accepted.exit_code == 0, accepted.output
         assert '"draft_status": "accepted"' in accepted.output
+        assert '"exact_steps"' in accepted.output
+        accepted_spec = json.loads((specs_dir / f"{draft_id}.json").read_text())
+        assert accepted_spec["exact_steps"][0]["id"] == "open-signup"
+        assert accepted_spec["assertions"][0]["id"] == "page-loads"
+        assert accepted_spec["fixtures"]["review_notes"] == [
+            "Replaced generated journey with stable smoke path."
+        ]
+        assert accepted_spec["fixtures"]["last_review_edit"]["fields"] == [
+            "assertions",
+            "draft_status",
+            "exact_steps",
+            "name",
+            "review_notes",
+        ]
         accepted_again = runner.invoke(main, ["tester", "accept-draft", draft_id])
         assert accepted_again.exit_code != 0
         assert "not an unaccepted draft" in accepted_again.output

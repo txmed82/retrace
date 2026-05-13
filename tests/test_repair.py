@@ -449,6 +449,96 @@ def test_repair_bundle_carries_ui_failure_backend_trace_ids(tmp_path: Path) -> N
     ]
 
 
+def test_repair_bundle_adds_stored_otel_events_for_ui_failure_trace(
+    tmp_path: Path,
+) -> None:
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+    network_path = tmp_path / "network.json"
+    network_path.write_text(
+        json.dumps(
+            [
+                {
+                    "url": "https://app.example/api/checkout",
+                    "status": 500,
+                    "headers": {
+                        "traceparent": f"00-{trace_id}-00f067aa0ba902b7-01"
+                    },
+                }
+            ]
+        )
+    )
+
+    store.append_otel_event(
+        project_id="proj_1",
+        environment_id="env_1",
+        signal_type="log",
+        trace_id=trace_id,
+        span_id="00f067aa0ba902b7",
+        severity="ERROR",
+        body=(
+            "checkout handler failed Authorization: Bearer raw-secret-token "
+            "Authorization: Basic raw-basic-token for dev@example.com"
+        ),
+        occurred_at_ms=1_700_000_000_000,
+        attributes={"service.name": "api", "api_key": "sk_live_secret"},
+    )
+    store.append_otel_event(
+        project_id="proj_1",
+        environment_id="env_1",
+        signal_type="span",
+        trace_id=trace_id,
+        span_id="00f067aa0ba902b7",
+        name="POST /api/checkout",
+        occurred_at_ms=1_700_000_000_001,
+        attributes={"http.route": "/api/checkout"},
+    )
+
+    class Result:
+        run_id = "ui_run_1"
+        spec_id = "checkout_ui"
+        ok = False
+        exit_code = 1
+        status = "failed"
+        error = "Checkout button produced a 500."
+        failure_classification = "app_bug"
+        execution_engine = "harness"
+        flaky = False
+        flake_reason = ""
+        artifacts = [
+            {
+                "artifact_id": "browser-harness-network",
+                "artifact_type": "network_output",
+                "path": str(network_path),
+            }
+        ]
+        assertion_results = []
+
+    failure_id = store.upsert_failure(
+        canonical_failure_from_test_run(
+            project_id="proj_1",
+            environment_id="env_1",
+            run_result=Result(),
+            spec_name="Checkout UI",
+        )
+    )
+
+    bundle = build_repair_bundle(store, failure_id)
+
+    log_items = bundle.backend_context["logs"]["items"]
+    assert [item["type"] for item in log_items] == ["otel_log", "otel_span"]
+    payload_text = json.dumps([item["untrusted_payload"] for item in log_items])
+    assert "checkout handler failed" in payload_text
+    assert "POST /api/checkout" in payload_text
+    assert "raw-secret-token" not in payload_text
+    assert "raw-basic-token" not in payload_text
+    assert "sk_live_secret" not in payload_text
+    assert "dev@example.com" not in payload_text
+    assert "Bearer [redacted-token]" in payload_text
+    assert "Basic [redacted-token]" in payload_text
+
+
 def test_repair_bundle_infers_explainable_linked_validation_commands(
     tmp_path: Path,
 ) -> None:

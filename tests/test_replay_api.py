@@ -9,7 +9,9 @@ from pathlib import Path
 from threading import Thread
 
 from click.testing import CliRunner
+import pytest
 
+import retrace.commands.api as api_module
 from retrace.commands.api import _handler
 from retrace.cli import main
 from retrace.replay_api import (
@@ -493,6 +495,149 @@ run:
     )
 
 
+def test_api_onboard_hosted_outputs_manifest(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        f"""
+posthog:
+  host: https://us.i.posthog.com
+  project_id: "1"
+llm:
+  provider: openai_compatible
+  base_url: http://localhost:8080/v1
+  model: test
+run:
+  data_dir: {tmp_path / "data"}
+  output_dir: {tmp_path / "reports"}
+"""
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "api",
+            "onboard-hosted",
+            "--config",
+            str(cfg),
+            "--project",
+            "Web",
+            "--api-base-url",
+            "https://retrace.example.com",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    onboarding = payload["onboarding"]
+    credentials = onboarding["credentials"]
+    assert onboarding["workspace"]["api_base_url"] == "https://retrace.example.com"
+    assert credentials["browser_sdk_key"].startswith("rtpk_")
+    assert credentials["service_token"].startswith("rtst_")
+    assert "source_maps:write" in credentials["service_token_scopes"]
+    assert credentials["sentry_dsn"].startswith(
+        f"https://{credentials['browser_sdk_key']}@retrace.example.com/"
+    )
+    assert "/api/sdk/replay" in onboarding["endpoints"]["replay_ingest"]
+    assert "@retrace/browser" in onboarding["snippets"]["browser_sdk_install"]
+    assert "retention" in onboarding["snippets"]["retention_cron"]
+    assert "github_actions_source_maps" in onboarding["snippets"]
+    verification = onboarding["verification"]
+    assert [step["id"] for step in verification["ordered_steps"]] == [
+        "health",
+        "source_maps",
+        "alert_rule",
+        "monitoring_smoke",
+        "app_errors",
+        "retention",
+    ]
+    assert verification["release"] == "$GITHUB_SHA"
+    assert "source_maps:write" in verification["required_scopes"]
+    smoke_step = next(
+        step
+        for step in verification["ordered_steps"]
+        if step["id"] == "monitoring_smoke"
+    )
+    assert "retrace-onboarding-smoke-1" in smoke_step["command"]
+    assert smoke_step["expect"]["status"] == 202
+    source_maps_step = next(
+        step for step in verification["ordered_steps"] if step["id"] == "source_maps"
+    )
+    assert source_maps_step["expect"]["status"] == 202
+    assert source_maps_step["expect"]["json_contains"]["source_map"][
+        "release"
+    ] == "$GITHUB_SHA"
+    alert_step = next(
+        step for step in verification["ordered_steps"] if step["id"] == "alert_rule"
+    )
+    assert alert_step["expect"]["status"] == 202
+    assert alert_step["expect"]["json_contains"] == {"rule": {"action": "alert"}}
+    retention_step = next(
+        step for step in verification["ordered_steps"] if step["id"] == "retention"
+    )
+    assert retention_step["expect"]["status"] == 202
+    gha = onboarding["snippets"]["github_actions_source_maps"]
+    assert "${{ secrets.RETRACE_SERVICE_TOKEN }}" in gha
+    assert credentials["service_token"] not in gha
+
+
+def test_hosted_onboarding_endpoint_requires_admin_and_creates_manifest(
+    tmp_path: Path,
+) -> None:
+    store, _key, workspace = _store(tmp_path)
+    weak = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Read only",
+        scopes=["app_errors:read"],
+    )
+    admin = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name="Admin",
+        scopes=["admin"],
+    )
+
+    with _running_replay_api_server(store) as server:
+        port = server.server_address[1]
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        body = json.dumps({"api_base_url": "https://retrace.example.com"}).encode()
+        conn.request(
+            "POST",
+            f"/api/onboarding/hosted?environment_id={workspace.environment_id}",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {weak.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        weak_response = conn.getresponse()
+        weak_payload = json.loads(weak_response.read().decode("utf-8"))
+        conn.request(
+            "POST",
+            f"/api/onboarding/hosted?environment_id={workspace.environment_id}",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {admin.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        admin_response = conn.getresponse()
+        admin_payload = json.loads(admin_response.read().decode("utf-8"))
+        conn.close()
+
+    assert weak_response.status == 403
+    assert weak_payload["error"] == "forbidden"
+    assert admin_response.status == 201
+    onboarding = admin_payload["onboarding"]
+    assert onboarding["credentials"]["browser_sdk_key"].startswith("rtpk_")
+    assert onboarding["credentials"]["service_token"].startswith("rtst_")
+    assert onboarding["endpoints"]["app_errors"].endswith(
+        f"/api/app-errors?environment_id={workspace.environment_id}"
+    )
+    assert onboarding["verification"]["ordered_steps"][0]["id"] == "health"
+    assert onboarding["verification"]["ordered_steps"][-1]["id"] == "retention"
+
+
 def test_api_rejects_oversized_content_length_before_reading(tmp_path: Path) -> None:
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
@@ -529,6 +674,34 @@ def test_api_rejects_negative_content_length_before_reading(tmp_path: Path) -> N
             payload = json.loads(response.read())
             assert response.status == 400
             assert payload["error"] == "invalid_content_length"
+
+
+def test_api_rate_limits_replay_ingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(api_module.INGEST_RATE_LIMITS, "replay", (1, 60))
+    store, key, _workspace = _store(tmp_path)
+
+    with _running_replay_api_server(store) as server:
+        with closing(
+            HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+        ) as conn:
+            for sequence in (0, 1):
+                body = json.dumps(
+                    {
+                        "sessionId": "sess-rate",
+                        "sequence": sequence,
+                        "events": [{"type": 4, "data": {"href": "https://example.com"}}],
+                    }
+                ).encode()
+                conn.request("POST", "/api/sdk/replay", body=body, headers={"x-retrace-key": key})
+                response = conn.getresponse()
+                payload = json.loads(response.read())
+
+    assert response.status == 429
+    assert payload["error"] == "rate_limited"
+    assert response.getheader("Retry-After")
+    assert response.getheader("X-RateLimit-Remaining") == "0"
 
 
 def test_api_cors_preflight_for_replay_ingest(tmp_path: Path) -> None:

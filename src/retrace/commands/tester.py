@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,12 @@ from typing import Any, Optional
 import click
 import yaml
 
+from retrace.api_har_import import import_har, import_summary, looks_like_har
+from retrace.api_suites import (
+    api_suites_dir_for_data_dir,
+    list_api_suites,
+    load_api_suite,
+)
 from retrace.api_testing import (
     api_runs_dir_for_data_dir,
     api_specs_dir_for_data_dir,
@@ -27,6 +34,12 @@ from retrace.replay_specs import (
     generate_spec_from_replay_issue,
 )
 from retrace.storage import Storage
+from retrace.test_profiles import (
+    apply_api_profiles,
+    resolve_auth_profile,
+    resolve_env_profile,
+    validate_profiles,
+)
 from retrace.tester import (
     DEFAULT_APP_URL,
     DEFAULT_HARNESS_COMMAND,
@@ -51,11 +64,279 @@ def tester_group() -> None:
     """Browser Harness-first local UI tester workflows."""
 
 
+@tester_group.group("baseline")
+def tester_baseline_group() -> None:
+    """Manage visual-regression baselines for tester specs."""
+
+
+@tester_baseline_group.command("accept")
+@click.argument("spec_id")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--run-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="Path to the tester run directory whose screenshots become the new baseline.",
+)
+def tester_baseline_accept(spec_id: str, config_path: Path, run_dir: Path) -> None:
+    """Promote a run's screenshots to the spec's baseline."""
+    from retrace.visual_baseline import accept_baseline
+
+    cfg = load_config(config_path)
+    try:
+        result = accept_baseline(
+            data_dir=cfg.run.data_dir,
+            spec_id=spec_id,
+            run_dir=run_dir,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(
+            {
+                "spec_id": result.spec_id,
+                "baseline_dir": result.baseline_dir,
+                "accepted": result.accepted_files,
+            },
+            indent=2,
+        )
+    )
+
+
+@tester_baseline_group.command("compare")
+@click.argument("spec_id")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--run-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="Path to a tester run directory to compare against the baseline.",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["auto", "perceptual", "sha256"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help=(
+        "`auto` uses perceptual diff if the `[image]` extra is installed, "
+        "sha256 otherwise. `perceptual` requires `pip install retrace[image]`."
+    ),
+)
+@click.option(
+    "--threshold",
+    type=float,
+    default=0.95,
+    show_default=True,
+    help="SSIM floor below which a screenshot counts as changed (perceptual mode only).",
+)
+def tester_baseline_compare(
+    spec_id: str,
+    config_path: Path,
+    run_dir: Path,
+    mode: str,
+    threshold: float,
+) -> None:
+    """Compare a run's screenshots to the spec's baseline.
+
+    Writes `*-diff.png` artifacts into the run directory for any
+    mismatched screenshot. In perceptual mode, the diff is an
+    annotated overlay highlighting the regions that changed; in
+    sha256 mode (no `[image]` extra installed), it's a copy of the
+    current image. The auto-repro classifier treats either as a
+    confirmed-bug signal, so `retrace qa auto` picks them up.
+    """
+    from retrace.visual_baseline import compare_run_to_baseline
+    from retrace.visual_perceptual import PerceptualDepsMissing
+
+    cfg = load_config(config_path)
+    try:
+        result = compare_run_to_baseline(
+            data_dir=cfg.run.data_dir,
+            spec_id=spec_id,
+            run_dir=run_dir,
+            mode=mode.lower(),
+            threshold=threshold,
+        )
+    except PerceptualDepsMissing as exc:
+        raise click.ClickException(str(exc)) from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(
+            {
+                "spec_id": result.spec_id,
+                "compared": result.compared,
+                "unchanged": result.unchanged,
+                "new": result.new,
+                "diffs": result.diffs,
+                "baseline_dir": result.baseline_dir,
+                "run_dir": result.run_dir,
+                "mode": result.mode,
+                "threshold": result.threshold,
+                "ssim_scores": result.ssim_scores,
+            },
+            indent=2,
+        )
+    )
+
+
+@tester_baseline_group.command("list")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def tester_baseline_list(config_path: Path) -> None:
+    """List spec baselines on disk."""
+    from retrace.visual_baseline import list_baselines
+
+    cfg = load_config(config_path)
+    items = list_baselines(cfg.run.data_dir)
+    click.echo(json.dumps(items, indent=2))
+
+
 def _tester_defaults(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         return {}
     raw = yaml.safe_load(config_path.read_text()) or {}
     return (raw.get("tester") or {}) if isinstance(raw, dict) else {}
+
+
+@tester_group.command("profiles")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def tester_profiles(config_path: Path) -> None:
+    """Validate shared auth/env profiles and print a redacted preview."""
+    try:
+        payload = validate_profiles(_tester_defaults(config_path))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+@tester_group.command("review-spec")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--kind",
+    type=click.Choice(["ui", "api"], case_sensitive=False),
+    default="ui",
+    show_default=True,
+)
+@click.argument("spec_id")
+def tester_review_spec(config_path: Path, kind: str, spec_id: str) -> None:
+    """Print review/edit metadata for a generated UI or API test spec."""
+    cfg = load_config(config_path)
+    if kind.lower() == "api":
+        spec = load_api_spec(api_specs_dir_for_data_dir(cfg.run.data_dir), spec_id)
+        payload = {
+            "kind": "api",
+            "spec_id": spec.spec_id,
+            "name": spec.name,
+            "method": spec.method,
+            "url": spec.url,
+            "route_path": _route_path_for_review(spec.url),
+            "auth_profile": spec.auth_profile,
+            "env_profile": spec.env_profile,
+            "request_count": len(spec.steps) if spec.steps else 1,
+            "steps": spec.steps,
+            "assertions": {
+                "expected_status": spec.expected_status,
+                "json": spec.json_assertions,
+                "schema": spec.schema_assertions,
+            },
+            "api_regression": spec.fixtures.get("api_regression", {}),
+            "fixture_notes": spec.fixtures.get("fixture_notes", []),
+        }
+    else:
+        spec = load_spec(specs_dir_for_data_dir(cfg.run.data_dir), spec_id)
+        generation = spec.fixtures.get("generation", {})
+        review = generation.get("review", {})
+        payload = {
+            "kind": "ui",
+            "spec_id": spec.spec_id,
+            "name": spec.name,
+            "app_url": spec.app_url,
+            "auth_profile": spec.auth_profile,
+            "execution_engine": spec.execution_engine,
+            "quality": generation.get("quality", {}),
+            "review": review,
+            "review_summary": _ui_review_summary(spec=spec, review=review),
+            "steps": spec.exact_steps,
+            "assertions": spec.assertions,
+            "known_gaps": generation.get("known_gaps", []),
+            "api_regression_candidate": generation.get("api_regression_candidate", {}),
+        }
+    click.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _ui_review_summary(*, spec: Any, review: Any) -> dict[str, Any]:
+    review_steps = review.get("steps", []) if isinstance(review, dict) else []
+    review_assertions = review.get("assertions", []) if isinstance(review, dict) else []
+    needs_locator = [
+        str(item.get("id") or "")
+        for item in review_steps
+        if isinstance(item, dict) and item.get("needs_locator")
+    ]
+    needs_test_data = [
+        str(item.get("id") or "")
+        for item in review_steps
+        if isinstance(item, dict) and item.get("needs_test_data")
+    ]
+    needs_assertion_review = [
+        str(item.get("id") or "")
+        for item in review_assertions
+        if isinstance(item, dict) and item.get("needs_review")
+    ]
+    blocking_items = [
+        *[f"step:{item}:locator" for item in needs_locator if item],
+        *[f"step:{item}:test_data" for item in needs_test_data if item],
+        *[f"assertion:{item}:review" for item in needs_assertion_review if item],
+    ]
+    draft_status = str(dict(spec.fixtures or {}).get("draft_status") or "")
+    return {
+        "draft_status": draft_status,
+        "step_count": len(spec.exact_steps or []),
+        "assertion_count": len(spec.assertions or []),
+        "blocking_items": blocking_items,
+        "recommended_command": (
+            f"retrace tester edit-draft {spec.spec_id} --steps-file steps.json "
+            "--assertions-file assertions.json --accept"
+            if draft_status == "draft"
+            else ""
+        ),
+    }
+
+
+def _route_path_for_review(url: str) -> str:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    return parsed.path or url
 
 
 def _json_option(value: str, *, label: str, default: Any) -> Any:
@@ -68,37 +349,32 @@ def _json_option(value: str, *, label: str, default: Any) -> Any:
         raise click.ClickException(f"{label} must be valid JSON: {exc}") from exc
 
 
+def _json_file(path: Path, *, label: str) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise click.ClickException(f"{label} could not be read: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise click.ClickException(f"{label} must be UTF-8 encoded JSON: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"{label} must contain valid JSON: {exc}") from exc
+
+
+def _json_object_list(value: Any, *, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise click.ClickException(f"{label} must be a JSON list of objects")
+    return [dict(item) for item in value]
+
+
 def _auth_profile(defaults: dict[str, Any], name: str) -> dict[str, Any]:
-    profiles = defaults.get("auth_profiles") or {}
     if not name:
         return {}
-    if not isinstance(profiles, dict) or name not in profiles:
-        raise click.ClickException(f"unknown auth profile: {name}")
-    profile = profiles.get(name) or {}
-    if not isinstance(profile, dict):
-        raise click.ClickException(f"auth profile must be an object: {name}")
-    forbidden = {"password", "jwt", "token", "headers", "headers_json"}
-    leaked: list[str] = []
-
-    def scan_secret_keys(value: Any, path: str = "") -> None:
-        if isinstance(value, dict):
-            for key, nested in value.items():
-                key_s = str(key)
-                child_path = f"{path}.{key_s}" if path else key_s
-                if key_s in forbidden:
-                    leaked.append(child_path)
-                scan_secret_keys(nested, child_path)
-        elif isinstance(value, list):
-            for idx, item in enumerate(value):
-                scan_secret_keys(item, f"{path}[{idx}]")
-
-    scan_secret_keys(profile)
-    if leaked:
-        raise click.ClickException(
-            "auth profile must reference env vars, not secret values: "
-            + ", ".join(sorted(leaked))
-        )
-    return profile
+    try:
+        resolve_auth_profile(defaults, name)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    profiles = defaults.get("auth_profiles") or {}
+    return dict(profiles.get(name) or {})
 
 
 def _profile_setup_steps(profile: dict[str, Any]) -> list[dict[str, Any]]:
@@ -118,18 +394,14 @@ def _profile_browser_settings(profile: dict[str, Any]) -> dict[str, Any]:
 
 
 def _env_profile(defaults: dict[str, Any], name: str) -> dict[str, Any]:
-    profiles = defaults.get("env_profiles") or {}
     if not name:
         return {}
-    if not isinstance(profiles, dict) or name not in profiles:
-        raise click.ClickException(f"unknown env profile: {name}")
-    profile = profiles.get(name) or {}
-    if not isinstance(profile, dict):
-        raise click.ClickException(f"env profile must be an object: {name}")
-    env_overrides = profile.get("env_overrides") or {}
-    if not isinstance(env_overrides, dict):
-        raise click.ClickException("env profile env_overrides must be an object")
-    return dict(profile)
+    try:
+        resolve_env_profile(defaults, name)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    profiles = defaults.get("env_profiles") or {}
+    return dict(profiles.get(name) or {})
 
 
 def _apply_api_profiles(
@@ -139,32 +411,15 @@ def _apply_api_profiles(
     auth_profile_name: str = "",
     env_profile_name: str = "",
 ) -> Any:
-    auth_name = auth_profile_name.strip() or str(getattr(spec, "auth_profile", "") or "")
-    env_name = env_profile_name.strip() or str(getattr(spec, "env_profile", "") or "")
-    if auth_name:
-        profile = _auth_profile(defaults, auth_name)
-        mode = str(profile.get("mode") or "headers").strip().lower()
-        if mode == "jwt":
-            spec.auth = {"type": "bearer", "token_env": str(profile.get("jwt_env") or "")}
-        elif mode == "headers":
-            spec.auth = {"type": "headers", "headers_env": str(profile.get("headers_env") or "")}
-        elif mode == "form":
-            raise click.ClickException("API tests do not support form auth profiles")
-        else:
-            raise click.ClickException(f"unsupported API auth profile mode: {mode}")
-        spec.auth_profile = auth_name
-    if env_name:
-        profile = _env_profile(defaults, env_name)
-        env_overrides = profile.get("env_overrides") or {}
-        spec.env_overrides = {
-            **{str(k): str(v) for k, v in dict(env_overrides).items()},
-            **{str(k): str(v) for k, v in dict(spec.env_overrides or {}).items()},
-        }
-        api_base_url = str(profile.get("api_base_url") or "").strip()
-        if api_base_url and spec.url.startswith("/"):
-            spec.url = api_base_url.rstrip("/") + "/" + spec.url.lstrip("/")
-        spec.env_profile = env_name
-    return spec
+    try:
+        return apply_api_profiles(
+            spec,
+            defaults=defaults,
+            auth_profile_name=auth_profile_name,
+            env_profile_name=env_profile_name,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _single_failure_test_link_id(store: Storage, spec_id: str) -> str:
@@ -519,6 +774,120 @@ def tester_accept_draft(
     )
 
 
+@tester_group.command("edit-draft")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.argument("spec_id")
+@click.option("--name", default="", help="Optional edited spec name.")
+@click.option("--prompt", default="", help="Optional edited spec prompt.")
+@click.option("--app-url", default="", help="Optional edited app URL.")
+@click.option(
+    "--steps-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="JSON file containing edited exact_steps.",
+)
+@click.option(
+    "--assertions-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="JSON file containing edited assertions.",
+)
+@click.option(
+    "--review-note",
+    "review_notes",
+    multiple=True,
+    help="Reviewer note to persist on the draft.",
+)
+@click.option("--accept", is_flag=True, default=False, help="Accept the draft after editing.")
+def tester_edit_draft(
+    config_path: Path,
+    spec_id: str,
+    name: str,
+    prompt: str,
+    app_url: str,
+    steps_file: Optional[Path],
+    assertions_file: Optional[Path],
+    review_notes: tuple[str, ...],
+    accept: bool,
+) -> None:
+    """Edit generated UI draft steps/assertions before acceptance."""
+    cfg = load_config(config_path)
+    specs_dir = specs_dir_for_data_dir(cfg.run.data_dir)
+    spec = load_spec(specs_dir, spec_id)
+    if dict(spec.fixtures or {}).get("draft_status") != "draft":
+        raise click.ClickException("Spec is not an unaccepted draft.")
+    changed_fields: list[str] = []
+    edited_name = name.strip()
+    if edited_name and edited_name != spec.name:
+        spec.name = edited_name
+        changed_fields.append("name")
+    edited_prompt = prompt.strip()
+    if edited_prompt and edited_prompt != spec.prompt:
+        spec.prompt = edited_prompt
+        changed_fields.append("prompt")
+    edited_app_url = app_url.strip()
+    if edited_app_url and edited_app_url != spec.app_url:
+        spec.app_url = edited_app_url
+        changed_fields.append("app_url")
+    if steps_file is not None:
+        spec.exact_steps = _json_object_list(
+            _json_file(steps_file, label="steps-file"),
+            label="steps-file",
+        )
+        changed_fields.append("exact_steps")
+    if assertions_file is not None:
+        spec.assertions = _json_object_list(
+            _json_file(assertions_file, label="assertions-file"),
+            label="assertions-file",
+        )
+        changed_fields.append("assertions")
+    spec.fixtures = dict(spec.fixtures or {})
+    notes = [
+        str(item).strip()
+        for item in list(spec.fixtures.get("review_notes", []) or [])
+        if str(item).strip()
+    ]
+    new_notes = [str(item).strip() for item in review_notes if str(item).strip()]
+    if new_notes:
+        notes.extend(new_notes)
+        spec.fixtures["review_notes"] = notes
+        changed_fields.append("review_notes")
+    spec.fixtures["reviewed_at"] = now_iso()
+    if accept:
+        spec.fixtures["draft_status"] = "accepted"
+        spec.fixtures.setdefault("accepted_at", now_iso())
+        changed_fields.append("draft_status")
+    if changed_fields:
+        spec.fixtures["last_review_edit"] = {
+            "edited_at": now_iso(),
+            "fields": sorted(set(changed_fields)),
+        }
+    spec.updated_at = now_iso()
+    validate_spec(spec)
+    save_spec(specs_dir, spec)
+    click.echo(
+        json.dumps(
+            {
+                "ok": True,
+                "spec_id": spec.spec_id,
+                "draft_status": spec.fixtures.get("draft_status", ""),
+                "accepted": bool(accept),
+                "changed_fields": sorted(set(changed_fields)),
+                "step_count": len(spec.exact_steps or []),
+                "assertion_count": len(spec.assertions or []),
+                "review_notes": spec.fixtures.get("review_notes", []),
+            },
+            indent=2,
+        )
+    )
+
+
 @tester_group.command("list")
 @click.option(
     "--config",
@@ -587,25 +956,21 @@ def tester_api_create(
 ) -> None:
     cfg = load_config(config_path)
     defaults = _tester_defaults(config_path)
-    profile_auth = _auth_profile(defaults, auth_profile.strip()) if auth_profile.strip() else {}
     auth = (
         {"type": "bearer", "token_env": auth_bearer_env.strip()}
         if auth_bearer_env.strip()
         else {}
     )
-    if profile_auth and not auth:
-        mode = str(profile_auth.get("mode") or "headers").strip().lower()
-        if mode == "jwt":
-            auth = {"type": "bearer", "token_env": str(profile_auth.get("jwt_env") or "")}
-        elif mode == "headers":
-            auth = {"type": "headers", "headers_env": str(profile_auth.get("headers_env") or "")}
-        else:
-            raise click.ClickException("API specs support jwt and headers auth profiles")
-    env_profile_data = _env_profile(defaults, env_profile.strip()) if env_profile.strip() else {}
-    final_url = url
-    api_base_url = str(env_profile_data.get("api_base_url") or "").strip()
-    if api_base_url and final_url.startswith("/"):
-        final_url = api_base_url.rstrip("/") + "/" + final_url.lstrip("/")
+    if auth_profile.strip() and not auth:
+        try:
+            resolved_auth = resolve_auth_profile(defaults, auth_profile.strip())
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if resolved_auth.mode == "form":
+            raise click.ClickException("API specs support jwt, headers, and none auth profiles")
+        auth = dict(resolved_auth.auth)
+    if env_profile.strip():
+        _env_profile(defaults, env_profile.strip())
     parsed_json_assertions = []
     for item in json_assertions:
         parsed = _json_option(item, label="json-assertion", default={})
@@ -620,7 +985,7 @@ def tester_api_create(
         specs_dir=api_specs_dir_for_data_dir(cfg.run.data_dir),
         name=name,
         method=method,
-        url=final_url,
+        url=url,
         query=_json_option(query_json, label="query-json", default={}),
         headers=_json_option(headers_json, label="headers-json", default={}),
         body=_json_option(body_json, label="body-json", default=None),
@@ -671,6 +1036,13 @@ def tester_api_list(config_path: Path) -> None:
     default=None,
     help="Local repo path for route-based repair file scoring.",
 )
+@click.option(
+    "--log-path",
+    "log_paths",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Backend log file to attach when lines match API trace IDs.",
+)
 @click.option("--auth-profile", default="", help="Auth profile override for this run.")
 @click.option("--env-profile", default="", help="Environment profile override for this run.")
 @click.argument("spec_id")
@@ -679,6 +1051,7 @@ def tester_api_run(
     project_id: str,
     environment_id: str,
     repo_path: Optional[Path],
+    log_paths: tuple[Path, ...],
     auth_profile: str,
     env_profile: str,
     spec_id: str,
@@ -706,6 +1079,7 @@ def tester_api_run(
                 project_id=project_id.strip() or workspace.project_id,
                 environment_id=environment_id.strip() or workspace.environment_id,
                 repo_path=repo_path,
+                log_paths=list(log_paths),
             )
             failure_metadata = {
                 "canonical_failure_id": persisted.failure_id,
@@ -766,6 +1140,7 @@ def tester_api_import_openapi(
     result = import_openapi_specs(
         openapi_path=openapi_path,
         specs_dir=api_specs_dir_for_data_dir(cfg.run.data_dir),
+        suites_dir=api_suites_dir_for_data_dir(cfg.run.data_dir),
         base_url=effective_base_url,
         path_filter=path_filter,
         method_filter=method_filter,
@@ -778,10 +1153,225 @@ def tester_api_import_openapi(
                 "created": [spec.spec_id for spec in result.specs],
                 "created_count": len(result.specs),
                 "skipped": result.skipped,
+                "suite_id": result.suite.suite_id if result.suite else "",
+                "suite_path": str(
+                    api_suites_dir_for_data_dir(cfg.run.data_dir)
+                    / f"{result.suite.suite_id}.json"
+                )
+                if result.suite
+                else "",
+                "quality_report": result.quality_report or {},
             },
             indent=2,
         )
     )
+
+
+@tester_group.command("api-diff")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--new",
+    "new_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Path to the new OpenAPI / Swagger document (JSON or YAML).",
+)
+@click.option(
+    "--old",
+    "old_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Path to the previous OpenAPI document — typically `git show HEAD:openapi.yaml > /tmp/old.yaml`.",
+)
+@click.option(
+    "--file-incidents/--no-file-incidents",
+    default=True,
+    show_default=True,
+    help=(
+        "File one `qa_incident` per breaking change so they ride the "
+        "same `qa list` / `qa auto` rails as everything else. Safe "
+        "additions never produce incidents."
+    ),
+)
+@click.option("--project-id", default="")
+@click.option("--environment-id", default="")
+@click.option(
+    "--repo",
+    "repo",
+    default="",
+    help="Optional `owner/name`. Recorded on each filed incident so the QA queue can attribute the contract regression to a deploy.",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=50,
+    show_default=True,
+    help="Cap incidents filed per run. Breaking changes beyond this still appear in the JSON output.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False)
+@click.option(
+    "--fail-on-breaking/--no-fail-on-breaking",
+    default=True,
+    show_default=True,
+    help="Exit non-zero when any breaking change is detected. Set `--no-fail-on-breaking` for CI consumers that prefer a status query over an exit code.",
+)
+def tester_api_diff(
+    config_path: Path,
+    new_path: Path,
+    old_path: Path,
+    file_incidents: bool,
+    project_id: str,
+    environment_id: str,
+    repo: str,
+    limit: int,
+    as_json: bool,
+    fail_on_breaking: bool,
+) -> None:
+    """Compare two OpenAPI / Swagger documents and surface breaking changes.
+
+    Breaking-change kinds:
+      - operation_removed
+      - required_request_field_added
+      - response_schema_field_removed
+      - success_status_removed
+      - enum_value_removed
+
+    Each breaking change can become a `qa_incident` (off-switch:
+    `--no-file-incidents`) so the existing repair flow handles
+    contract regressions alongside replay / UI / API-test failures.
+    """
+    from retrace.openapi_diff import (
+        diff_openapi_documents,
+        load_openapi,
+    )
+    from retrace.qa_incident_bridge import (
+        sync_qa_incident_from_pr_review_finding,
+    )
+
+    try:
+        old_doc = load_openapi(old_path)
+        new_doc = load_openapi(new_path)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    diff = diff_openapi_documents(old=old_doc, new=new_doc)
+
+    incidents_filed: list[str] = []
+    if file_incidents and diff.has_breaking:
+        cfg = load_config(config_path)
+        store = Storage(cfg.run.data_dir / "retrace.db")
+        store.init_schema()
+        pid = (project_id or "").strip()
+        eid = (environment_id or "").strip()
+        if not pid or not eid:
+            workspace = store.ensure_workspace(project_name="Default")
+            pid = pid or workspace.project_id
+            eid = eid or workspace.environment_id
+        # Cap at `--limit` to avoid filing 1000 incidents on a
+        # full-rewrite spec. `--limit 0` truly disables filing —
+        # caller can still see the diff via `--json`. (CodeRabbit
+        # Major catch on PR #134.)
+        max_to_file = max(0, int(limit))
+        for change in diff.breaking[:max_to_file]:
+            try:
+                public_id = sync_qa_incident_from_pr_review_finding(
+                    store=store,
+                    project_id=pid,
+                    environment_id=eid,
+                    title=change.title,
+                    summary=change.detail
+                    or f"{change.method} {change.path}: {change.kind}",
+                    repo=repo or "",
+                    pr_number=0,
+                    files=[],
+                    suspected_cause=change.kind,
+                    severity="high",
+                )
+            except Exception:  # pragma: no cover - defensive
+                continue
+            if public_id:
+                incidents_filed.append(public_id)
+
+    payload = {
+        **diff.to_dict(),
+        "breaking_count": len(diff.breaking),
+        "safe_count": len(diff.safe),
+        "incidents_filed": incidents_filed,
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        click.echo(
+            f"Breaking changes: {len(diff.breaking)}  "
+            f"Safe changes: {len(diff.safe)}"
+        )
+        for change in diff.breaking[:40]:
+            click.echo(f"  ✗ [{change.kind}] {change.title}")
+            if change.field_path:
+                click.echo(f"      field: {change.field_path}")
+            if change.detail:
+                click.echo(f"      note:  {change.detail}")
+        if diff.safe and not diff.breaking:
+            click.echo("")
+            click.echo("Safe additions:")
+            for change in diff.safe[:20]:
+                click.echo(f"  ✓ [{change.kind}] {change.title}")
+        if incidents_filed:
+            click.echo("")
+            click.echo(f"Filed {len(incidents_filed)} qa_incident(s):")
+            for pid_ in incidents_filed:
+                click.echo(f"  • {pid_}")
+
+    if fail_on_breaking and diff.has_breaking:
+        sys.exit(2)
+
+
+@tester_group.command("api-suite-list")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def tester_api_suite_list(config_path: Path) -> None:
+    cfg = load_config(config_path)
+    suites = list_api_suites(api_suites_dir_for_data_dir(cfg.run.data_dir))
+    if not suites:
+        click.echo("No API suites found.")
+        return
+    for suite in suites:
+        click.echo(
+            "\t".join(
+                [
+                    suite.suite_id,
+                    suite.source,
+                    str(len(suite.spec_ids)),
+                    suite.name,
+                ]
+            )
+        )
+
+
+@tester_group.command("api-suite-show")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.argument("suite_id")
+def tester_api_suite_show(config_path: Path, suite_id: str) -> None:
+    cfg = load_config(config_path)
+    suite = load_api_suite(api_suites_dir_for_data_dir(cfg.run.data_dir), suite_id)
+    click.echo(json.dumps(suite.__dict__, indent=2))
 
 
 @tester_group.command("show")
@@ -1013,9 +1603,20 @@ def tester_run(
         cwd=config_path.parent,
     )
     failure_metadata: dict[str, str] = {}
+    quarantine_status: str = ""
     try:
         store = Storage(cfg.run.data_dir / "retrace.db")
         store.init_schema()
+        # P3.1: record run outcome and re-evaluate flake quarantine
+        # BEFORE deciding whether to file an incident. This is the
+        # single gate — if the spec is currently quarantined, the
+        # failure still goes into `failure_test_link` for audit, but
+        # the qa_incident escalation is skipped.
+        quarantine_status = store.record_tester_run_outcome(
+            spec_id=result.spec_id,
+            run_id=result.run_id,
+            outcome="pass" if result.ok else "fail",
+        )
         link_id = _single_failure_test_link_id(store, result.spec_id)
         if link_id:
             store.update_failure_test_link_run(
@@ -1023,7 +1624,11 @@ def tester_run(
                 run_result=result,
                 link_id=link_id,
             )
-        if not result.ok and result.execution_engine == "harness":
+        if (
+            not result.ok
+            and result.execution_engine == "harness"
+            and not store.is_spec_quarantined(result.spec_id)
+        ):
             failure_metadata = _persist_harness_failure(
                 store=store,
                 result=result,
@@ -1063,6 +1668,9 @@ def tester_run(
                 "repair_task_id": failure_metadata.get("repair_task_id", ""),
                 "artifacts": result.artifacts,
                 "assertion_results": result.assertion_results,
+                # P3.1 — surfaced so CI tooling can see "incident
+                # not filed because the spec is quarantined."
+                "quarantine_status": quarantine_status,
             },
             indent=2,
         )
@@ -1247,3 +1855,481 @@ def tester_runs(config_path: Path, limit: int) -> None:
         click.echo("No tester runs found.")
         return
     click.echo(json.dumps(runs, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# P3.2 — `retrace tester run-all` (parallel runner).
+#
+# Per-spec isolation is already provided by the existing
+# `run_spec` (subprocess + per-run artifact dir). Parallelism here
+# is the orchestration layer: pick the specs to run, kick off N at
+# once via a thread pool, surface a summary.
+# ---------------------------------------------------------------------------
+
+
+@tester_group.command("run-all")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--workers",
+    default=4,
+    show_default=True,
+    type=click.IntRange(min=1, max=64),
+    help="Worker thread count (each thread runs one spec at a time).",
+)
+@click.option(
+    "--match",
+    default="",
+    help="fnmatch glob filtered against spec_id AND spec name. Empty = run all.",
+)
+@click.option(
+    "--retries",
+    default=None,
+    type=int,
+    help="Override retries per spec.",
+)
+@click.argument("spec_ids", nargs=-1)
+def tester_run_all(
+    config_path: Path,
+    workers: int,
+    match: str,
+    retries: Optional[int],
+    spec_ids: tuple[str, ...],
+) -> None:
+    """Run multiple tester specs concurrently.
+
+    Examples:
+
+    \b
+      retrace tester run-all --workers 4
+      retrace tester run-all --match "login*"
+      retrace tester run-all --workers 8 spec_a spec_b spec_c
+    """
+    from retrace.tester_pool import run_specs_parallel, select_specs
+
+    cfg = load_config(config_path)
+    defaults = _tester_defaults(config_path)
+    retries_v = (
+        max(0, int(retries))
+        if retries is not None
+        else max(0, int(defaults.get("max_retries") or 1))
+    )
+    specs = select_specs(
+        data_dir=cfg.run.data_dir,
+        match_pattern=match,
+        spec_ids=list(spec_ids) if spec_ids else None,
+    )
+    if not specs:
+        click.echo(
+            json.dumps(
+                {"total": 0, "ok": 0, "fail": 0, "skipped": 0, "results": []},
+                indent=2,
+            )
+        )
+        return
+    result = run_specs_parallel(
+        specs,
+        data_dir=cfg.run.data_dir,
+        cwd=config_path.parent,
+        workers=workers,
+        max_retries=retries_v,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "total": result.total,
+                "ok": result.ok_count,
+                "fail": result.fail_count,
+                "skipped": result.skipped_count,
+                "duration_seconds": result.duration_seconds,
+                "results": [
+                    {
+                        "spec_id": r.spec_id,
+                        "run_id": r.run_id,
+                        "ok": r.ok,
+                        "status": r.status,
+                        "exit_code": r.exit_code,
+                        "run_dir": r.run_dir,
+                    }
+                    for r in result.per_spec
+                ],
+            },
+            indent=2,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1.4 — env-profile management CLI
+#
+# `config.yaml` is a hand-edited user file. We deliberately do NOT
+# write back to it from the CLI (preserves comments / formatting /
+# secret-handling that hand-edits depend on). Instead:
+#
+#   - `env list` / `env show` read it
+#   - `env yaml` emits a paste-ready YAML stanza for the user to
+#     drop into `tester.env_profiles.<name>:` themselves
+#
+# This matches how Sentry / pyproject-style configs are managed:
+# read-from-CLI, write-by-hand.
+# ---------------------------------------------------------------------------
+
+
+@tester_group.group("env")
+def tester_env_group() -> None:
+    """Manage tester env profiles (base URL, headers env, overrides)."""
+
+
+@tester_env_group.command("list")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def tester_env_list(config_path: Path) -> None:
+    """List configured env profiles (redacted preview).
+
+    Wraps each preview with its `name` — `validate_profiles` strips
+    the profile name out, but for the CLI the name is the most
+    useful piece of info."""
+    defaults = _tester_defaults(config_path)
+    raw_profiles = (defaults.get("env_profiles") or {}) if isinstance(defaults, dict) else {}
+    if not isinstance(raw_profiles, dict):
+        raise click.ClickException("tester.env_profiles must be an object")
+    items: list[dict[str, Any]] = []
+    for name in sorted(raw_profiles):
+        try:
+            resolved = resolve_env_profile(defaults, str(name))
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        items.append({"name": resolved.name, **resolved.redacted_preview})
+    click.echo(json.dumps(items, indent=2, sort_keys=True))
+
+
+@tester_env_group.command("show")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.argument("name")
+def tester_env_show(config_path: Path, name: str) -> None:
+    """Show one env profile (redacted preview)."""
+    try:
+        resolved = resolve_env_profile(_tester_defaults(config_path), name)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(resolved.redacted_preview, indent=2, sort_keys=True))
+
+
+@tester_env_group.command("yaml")
+@click.option("--name", required=True, help="Profile name (the key under env_profiles).")
+@click.option("--api-base-url", default="", help="Base URL prepended to relative spec URLs.")
+@click.option("--app-url", default="", help="UI test base URL (browser harness).")
+@click.option("--headers-env", default="", help="Env var name that holds the JSON headers map.")
+@click.option(
+    "--override",
+    "overrides",
+    multiple=True,
+    help="Extra env override KEY=VALUE (repeatable).",
+)
+def tester_env_yaml(
+    name: str,
+    api_base_url: str,
+    app_url: str,
+    headers_env: str,
+    overrides: tuple[str, ...],
+) -> None:
+    """Emit a YAML stanza to paste into `config.yaml`.
+
+    The CLI does not write `config.yaml` itself — paste this under
+    `tester.env_profiles.<name>:` (creating that block if needed).
+    """
+    if not name.strip():
+        raise click.ClickException("--name is required")
+    env_overrides: dict[str, str] = {}
+    for item in overrides:
+        if "=" not in item:
+            raise click.ClickException(
+                f"--override must be KEY=VALUE, got: {item!r}"
+            )
+        key, _, value = item.partition("=")
+        key = key.strip()
+        if not key:
+            raise click.ClickException(f"--override key cannot be empty: {item!r}")
+        env_overrides[key] = value
+    profile: dict[str, Any] = {}
+    if api_base_url.strip():
+        profile["api_base_url"] = api_base_url.strip()
+    if app_url.strip():
+        profile["app_url"] = app_url.strip()
+    if headers_env.strip():
+        profile["headers_env"] = headers_env.strip()
+    if env_overrides:
+        profile["env_overrides"] = env_overrides
+    if not profile:
+        raise click.ClickException(
+            "Provide at least one of --api-base-url / --app-url / "
+            "--headers-env / --override"
+        )
+    stanza = {"tester": {"env_profiles": {name.strip(): profile}}}
+    click.echo(yaml.safe_dump(stanza, sort_keys=False).rstrip())
+
+
+# ---------------------------------------------------------------------------
+# P1.4 — `retrace tester record` — HAR import
+#
+# DevTools → Network → Save all as HAR → `retrace tester record
+# --har capture.har`. One APITestSpec per matching request.
+# ---------------------------------------------------------------------------
+
+
+@tester_group.command("record")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option(
+    "--har",
+    "har_path",
+    required=True,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    help="HAR file exported from browser DevTools.",
+)
+@click.option(
+    "--include-host",
+    "include_hosts",
+    multiple=True,
+    help="Only keep requests whose host matches (glob, repeatable).",
+)
+@click.option(
+    "--include-method",
+    "include_methods",
+    multiple=True,
+    help="Only keep methods (case-insensitive, repeatable).",
+)
+@click.option(
+    "--exclude-path",
+    "exclude_paths",
+    multiple=True,
+    help="Drop requests whose URL path matches (glob, repeatable).",
+)
+@click.option(
+    "--env-profile",
+    default="",
+    help="Attach this env profile name to every created spec.",
+)
+@click.option(
+    "--name-prefix",
+    default="",
+    help="String prepended to every spec name.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print what would be created; do not write spec files.",
+)
+def tester_record(
+    config_path: Path,
+    har_path: Path,
+    include_hosts: tuple[str, ...],
+    include_methods: tuple[str, ...],
+    exclude_paths: tuple[str, ...],
+    env_profile: str,
+    name_prefix: str,
+    dry_run: bool,
+) -> None:
+    """Import a HAR (HTTP Archive) into API test specs.
+
+    The recording flow: open DevTools in your browser, click around
+    the app the way you normally would, then File → Save all as HAR.
+    Run this command on the saved file to convert each matching
+    request into a regression-ready API test spec.
+
+    Sensitive headers (Authorization, Cookie, X-API-Key, ...) are
+    stripped at import time. Re-attach them via `--env-profile` or
+    `auth_profile` on the spec.
+    """
+    try:
+        text = Path(har_path).read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # HAR files are JSON, which is text. If the bytes aren't
+        # valid UTF-8 the user pointed at a binary or a HAR exported
+        # with an unusual encoding — surface a clean message rather
+        # than a stack trace.
+        raise click.ClickException(
+            f"{har_path}: file is not valid UTF-8 text: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise click.ClickException(f"{har_path}: cannot read file: {exc}") from exc
+    if not looks_like_har(text):
+        raise click.ClickException(
+            f"{har_path}: does not look like a HAR file (expected a "
+            "`log: { entries: [...] }` envelope)."
+        )
+    try:
+        har = json.loads(text)
+    except ValueError as exc:
+        raise click.ClickException(f"{har_path}: invalid JSON: {exc}") from exc
+
+    if env_profile.strip():
+        # Fail fast if the named profile doesn't exist — surface the
+        # config bug before we write any spec files.
+        try:
+            resolve_env_profile(_tester_defaults(config_path), env_profile.strip())
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    spec_params = import_har(
+        har,
+        include_hosts=include_hosts,
+        include_methods=include_methods,
+        exclude_paths=exclude_paths,
+        env_profile=env_profile.strip(),
+        name_prefix=name_prefix,
+    )
+    summary = import_summary(har, spec_params)
+
+    if dry_run:
+        click.echo(
+            json.dumps(
+                {
+                    "summary": summary,
+                    "specs": [
+                        {"name": p["name"], "method": p["method"], "url": p["url"]}
+                        for p in spec_params
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+
+    if not spec_params:
+        click.echo(json.dumps({"summary": summary, "created": []}, indent=2))
+        return
+
+    cfg = load_config(config_path)
+    specs_dir = api_specs_dir_for_data_dir(cfg.run.data_dir)
+    created: list[str] = []
+    for params in spec_params:
+        spec = create_api_spec(specs_dir=specs_dir, **params)
+        created.append(spec.spec_id)
+    click.echo(
+        json.dumps(
+            {"summary": {**summary, "created": len(created)}, "created": created},
+            indent=2,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# P3.1 — Flake quarantine CLI.
+#
+# Operators can inspect / override the auto-quarantine state. The
+# heuristic runs after every spec run inside `_persist_harness_failure`'s
+# gate (`Storage.record_tester_run_outcome` + `is_spec_quarantined`).
+# ---------------------------------------------------------------------------
+
+
+@tester_group.group("quarantine")
+def tester_quarantine_group() -> None:
+    """Inspect and override the flake-quarantine state."""
+
+
+@tester_quarantine_group.command("list")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+def tester_quarantine_list(config_path: Path) -> None:
+    """List specs that are currently quarantined."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    click.echo(json.dumps(store.list_quarantined_specs(), indent=2, sort_keys=True))
+
+
+@tester_quarantine_group.command("show")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.argument("spec_id")
+def tester_quarantine_show(config_path: Path, spec_id: str) -> None:
+    """Print current state + recent run outcomes for one spec."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    click.echo(
+        json.dumps(store.quarantine_status(spec_id), indent=2, sort_keys=True)
+    )
+
+
+@tester_quarantine_group.command("force")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--reason", default="", help="Optional note recorded with the override.")
+@click.argument("spec_id")
+def tester_quarantine_force(config_path: Path, reason: str, spec_id: str) -> None:
+    """Force a spec into quarantine ahead of the auto-heuristic."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    try:
+        store.force_quarantine_spec(spec_id=spec_id, reason=reason)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(store.quarantine_status(spec_id), indent=2, sort_keys=True)
+    )
+
+
+@tester_quarantine_group.command("release")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--reason", default="", help="Optional note recorded with the override.")
+@click.argument("spec_id")
+def tester_quarantine_release(
+    config_path: Path, reason: str, spec_id: str
+) -> None:
+    """Manually release a spec from quarantine."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    try:
+        store.release_spec_quarantine(spec_id=spec_id, reason=reason)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(store.quarantine_status(spec_id), indent=2, sort_keys=True)
+    )
+

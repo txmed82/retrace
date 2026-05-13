@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "retrace-sdk"
+version = "0.1.0"
+description = "Python SDK for Retrace — capture exceptions, breadcrumbs, and context from your backend"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Retrace" }]
+requires-python = ">=3.9"
+keywords = ["retrace", "error-monitoring", "observability", "qa", "debugging"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Bug Tracking",
+    "Topic :: Software Development :: Quality Assurance",
+]
+# Standard library only at runtime — no `urllib3`, no `httpx`. Keeps the
+# install tiny and avoids version skew with the host app.
+dependencies = []
+
+[project.optional-dependencies]
+fastapi = ["fastapi>=0.100", "starlette>=0.27"]
+flask = ["flask>=2.0"]
+django = ["django>=4.0"]
+test = [
+    "pytest>=7",
+    "fastapi>=0.100",
+    "starlette>=0.27",
+    "httpx>=0.24",  # for the FastAPI TestClient
+    "flask>=2.0",
+    "django>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/txmed82/retrace"
+Repository = "https://github.com/txmed82/retrace"
+Issues = "https://github.com/txmed82/retrace/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["retrace_sdk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    # Django emits a few deprecation warnings on the no-settings path
+    # we use to exercise the integration. Silence them so the SDK
+    # suite stays signal-only.
+    "ignore::DeprecationWarning:django.*",
+]
+markers = [
+    "e2e: end-to-end test that requires the main `retrace` package installed",
+]

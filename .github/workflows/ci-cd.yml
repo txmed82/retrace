@@ -39,6 +39,71 @@ jobs:
       - name: Tests
         run: pytest -q
 
+  e2e-tests:
+    # P3.3 — end-to-end / dogfood tests. Already run as part of
+    # the main `ci` job's `pytest -q`, but a dedicated job
+    # surfaces the e2e signal independently — a flaky e2e
+    # doesn't make the unit-test signal ambiguous, and the merge
+    # queue can gate on this separately.
+    name: End-to-end tests
+    runs-on: ubuntu-latest
+    needs: ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv pip install --system -e ".[dev]"
+
+      - name: Run end-to-end tests
+        run: pytest tests/e2e/ -v
+
+  postgres-smoke:
+    name: Postgres smoke
+    runs-on: ubuntu-latest
+    needs: ci
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: retrace_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies (with postgres extra)
+        run: uv pip install --system -e ".[dev,postgres]"
+
+      - name: Run Postgres smoke tests
+        env:
+          RETRACE_POSTGRES_TEST_URL: postgresql://postgres:postgres@localhost:5432/retrace_test
+        run: pytest tests/test_postgres_smoke.py -q
+
   docker-build:
     name: Build Docker Image
     runs-on: ubuntu-latest
@@ -80,6 +145,47 @@ jobs:
         working-directory: packages/browser
         run: npm run build
 
+      - name: Run browser SDK tests
+        working-directory: packages/browser
+        run: npm test
+
+  python-sdk-tests:
+    name: Python SDK Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install retrace-sdk with test extras
+        working-directory: packages/python-sdk
+        run: uv pip install --system -e ".[test]"
+
+      - name: Run SDK tests (no e2e, no main retrace dep)
+        working-directory: packages/python-sdk
+        run: pytest tests -q -m 'not e2e' --ignore=tests/test_e2e_ingest.py
+
+      # Run the e2e test on one matrix entry where the main package is
+      # also installed — it validates the SDK's envelope against the
+      # real ingest pipeline.
+      - name: Install main retrace package for e2e
+        if: matrix.python-version == '3.11'
+        run: uv pip install --system -e ".[dev]"
+
+      - name: Run SDK e2e test
+        if: matrix.python-version == '3.11'
+        run: pytest packages/python-sdk/tests/test_e2e_ingest.py -q
+
   playwright-runner:
     name: Playwright Runner Tests
     runs-on: ubuntu-latest
@@ -107,7 +213,7 @@ jobs:
   cd-ghcr:
     name: Publish Docker Image (GHCR)
     runs-on: ubuntu-latest
-    needs: [ci, docker-build, browser-sdk, playwright-runner]
+    needs: [ci, docker-build, browser-sdk, playwright-runner, python-sdk-tests, postgres-smoke, e2e-tests]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     permissions:
       contents: read

@@ -6,14 +6,21 @@ import sys
 
 import click
 
+from retrace import __version__
 from retrace.commands.api import api_group
+from retrace.commands.cost import cost_group
+from retrace.commands.data import data_group
 from retrace.commands.demo import demo_group
 from retrace.commands.digest import digest_command
 from retrace.commands.doctor import doctor_command
 from retrace.commands.github import github_group
+from retrace.commands.qa import qa_group
 from retrace.commands.init import init_command
 from retrace.commands.mcp import mcp_group
+from retrace.commands.monitor import monitor_group
+from retrace.commands.quickstart import quickstart_command
 from retrace.commands.repair import repair_group
+from retrace.commands.review import review_command
 from retrace.commands.suggest_fixes import suggest_fixes_command
 from retrace.commands.tester import tester_group
 from retrace.commands.ui import ui_command
@@ -25,6 +32,13 @@ from retrace.storage import Storage
 
 
 @click.group()
+@click.version_option(
+    __version__,
+    "-V",
+    "--version",
+    prog_name="retrace",
+    message="%(prog)s %(version)s",
+)
 def main() -> None:
     """Retrace — find the bugs your users hit."""
 
@@ -74,6 +88,7 @@ def run(config_path: Path) -> None:
 
 
 main.add_command(init_command)
+main.add_command(quickstart_command)
 main.add_command(doctor_command)
 main.add_command(github_group)
 main.add_command(suggest_fixes_command)
@@ -84,3 +99,8 @@ main.add_command(api_group)
 main.add_command(digest_command)
 main.add_command(demo_group)
 main.add_command(repair_group)
+main.add_command(qa_group)
+main.add_command(review_command)
+main.add_command(monitor_group)
+main.add_command(data_group)
+main.add_command(cost_group)

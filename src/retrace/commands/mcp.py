@@ -7,8 +7,11 @@ from typing import Any
 
 import click
 
+from retrace.auto_fix import propose_fix_for_incident
+from retrace.auto_repro import reproduce_incident
 from retrace.commands.api import _build_enricher
 from retrace.config import load_config
+from retrace.qa_incidents import Incident
 from retrace.replay_core import process_queued_replay_jobs
 from retrace.storage import Storage
 from retrace.tester import (
@@ -110,6 +113,79 @@ def _tools() -> list[dict[str, Any]]:
                     "app_url": {"type": "string"},
                     "start_command": {"type": "string"},
                     "retries": {"type": "integer"},
+                },
+            },
+        },
+        # ---- Unified QA Incident surface ----
+        # These tools surface the same `qa_incidents` view that
+        # `retrace qa list/show/reproduce/fix/auto` uses, so editor
+        # agents (Cursor / Claude Desktop) can drive the killer demo
+        # without shelling out.
+        {
+            "name": "retrace.list_qa_incidents",
+            "description": (
+                "List unified QA incidents (replay, UI test, API test, "
+                "error monitor, PR review) in priority order."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "config": {"type": "string"},
+                    "status": {"type": "string"},
+                    "project_id": {"type": "string"},
+                    "environment_id": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+            },
+        },
+        {
+            "name": "retrace.get_qa_incident",
+            "description": "Fetch a single QA incident by id or public id (INC-XXXXXX).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["incident_id"],
+                "properties": {
+                    "config": {"type": "string"},
+                    "incident_id": {"type": "string"},
+                },
+            },
+        },
+        {
+            "name": "retrace.reproduce_qa_incident",
+            "description": (
+                "Auto-generate a UI test that reproduces a QA incident, "
+                "then run it via Browser Harness."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "required": ["incident_id"],
+                "properties": {
+                    "config": {"type": "string"},
+                    "incident_id": {"type": "string"},
+                    "app_url": {"type": "string"},
+                    "harness_command": {"type": "string"},
+                    "execution_engine": {"type": "string"},
+                },
+            },
+        },
+        {
+            "name": "retrace.fix_qa_incident",
+            "description": (
+                "Build a fix prompt for a QA incident and open a draft PR "
+                "(or just produce the prompt with --no-open-pr)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "required": ["incident_id", "repo"],
+                "properties": {
+                    "config": {"type": "string"},
+                    "incident_id": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "repo_path": {"type": "string"},
+                    "base_branch": {"type": "string"},
+                    "open_pr": {"type": "boolean"},
+                    "draft": {"type": "boolean"},
+                    "apply_with_agent": {"type": "string"},
                 },
             },
         },
@@ -237,7 +313,97 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         )
         return {"ok": result.ok, "result": result.__dict__}
 
+    # ----- Unified QA Incident handlers -----
+
+    if name == "retrace.list_qa_incidents":
+        limit = max(1, min(int(args.get("limit", 25) or 25), 200))
+        rows = store.list_qa_incidents(
+            project_id=str(args.get("project_id", "") or "") or None,
+            environment_id=str(args.get("environment_id", "") or "") or None,
+            status=str(args.get("status", "") or "") or None,
+            limit=limit,
+        )
+        return {
+            "count": len(rows),
+            "incidents": [_qa_incident_summary(Incident.from_row(r)) for r in rows],
+        }
+
+    if name == "retrace.get_qa_incident":
+        incident_id = str(args.get("incident_id", "")).strip()
+        if not incident_id:
+            raise ValueError("incident_id is required")
+        row = store.get_qa_incident(incident_id)
+        if row is None:
+            return {"found": False}
+        return {"found": True, "incident": Incident.from_row(row).to_row()}
+
+    if name == "retrace.reproduce_qa_incident":
+        incident_id = str(args.get("incident_id", "")).strip()
+        if not incident_id:
+            raise ValueError("incident_id is required")
+        outcome = reproduce_incident(
+            store=store,
+            data_dir=cfg.run.data_dir,
+            incident_id=incident_id,
+            app_url=str(args.get("app_url", "") or ""),
+            harness_command=str(args.get("harness_command", "") or ""),
+            execution_engine=str(args.get("execution_engine", "harness") or "harness").lower(),
+        )
+        return outcome.as_dict()
+
+    if name == "retrace.fix_qa_incident":
+        incident_id = str(args.get("incident_id", "")).strip()
+        repo_full_name = str(args.get("repo", "")).strip()
+        if not incident_id:
+            raise ValueError("incident_id is required")
+        if not repo_full_name:
+            raise ValueError("repo is required (owner/name)")
+        repo = store.get_github_repo(repo_full_name)
+        if repo is None:
+            raise ValueError(
+                f"repo not connected: {repo_full_name}. "
+                f"Run `retrace github connect --repo {repo_full_name}` first."
+            )
+        repo_path_arg = str(args.get("repo_path", "") or "").strip()
+        effective_repo_path = (
+            Path(repo_path_arg) if repo_path_arg
+            else (Path(repo.local_path) if repo.local_path else None)
+        )
+        if effective_repo_path is None:
+            raise ValueError(
+                "No local repo path. Pass `repo_path` or connect the repo "
+                "with --local-path."
+            )
+        outcome = propose_fix_for_incident(
+            store=store,
+            incident_id=incident_id,
+            repo_full_name=repo_full_name,
+            repo_path=effective_repo_path,
+            base_branch=str(args.get("base_branch", "") or repo.default_branch or "main"),
+            open_pr=bool(args.get("open_pr", True)),
+            draft=bool(args.get("draft", True)),
+            apply_with_agent=str(args.get("apply_with_agent", "") or ""),
+        )
+        return outcome.as_dict()
+
     raise ValueError(f"Unknown tool: {name}")
+
+
+def _qa_incident_summary(inc: Incident) -> dict[str, Any]:
+    """Compact summary an editor agent can scan quickly."""
+    return {
+        "public_id": inc.public_id,
+        "title": inc.title,
+        "severity": inc.severity,
+        "status": inc.status,
+        "primary_source_kind": inc.primary_source_kind,
+        "affected_users": inc.affected_users,
+        "affected_count": inc.affected_count,
+        "repro_status": inc.repro_status,
+        "fix_status": inc.fix_status,
+        "fix_pr_url": inc.fix_pr_url,
+        "updated_at": inc.updated_at,
+    }
 
 
 def _send(obj: dict[str, Any]) -> None:

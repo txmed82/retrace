@@ -30,8 +30,10 @@ FailureSourceType = Literal[
 
 _STATUS_MAP = {
     "new": "new",
+    "triaged": "triaged",
     "ongoing": "triaged",
     "unresolved": "triaged",
+    "in_progress": "in_progress",
     "ticket_created": "in_progress",
     "resolved": "resolved",
     "verified": "resolved",
@@ -302,7 +304,7 @@ def canonical_failure_from_api_run(
             "error": error,
             "artifacts": list(getattr(run_result, "artifacts", []) or []),
             "assertion_results": assertion_results,
-            "trace_ids": _api_trace_ids_from_spec(spec),
+            "trace_ids": _api_trace_ids_from_spec_and_run(spec, run_result),
         },
     )
 
@@ -395,6 +397,23 @@ def _api_trace_ids_from_spec(spec: Any) -> list[str]:
         if item and item not in out:
             out.append(item)
     return out
+
+
+def _api_trace_ids_from_spec_and_run(spec: Any, run_result: Any) -> list[str]:
+    out: list[str] = []
+    for value in _api_trace_ids_from_spec(spec):
+        _append_trace_id(str(value or ""), out)
+    for artifact in list(getattr(run_result, "artifacts", []) or []):
+        if not isinstance(artifact, dict):
+            continue
+        artifact_type = str(artifact.get("artifact_type") or "")
+        if artifact_type not in {"api_request", "api_response", "api_run_summary"}:
+            continue
+        payload = _artifact_payload(str(artifact.get("path") or ""))
+        _collect_trace_ids(payload, out)
+        if len(out) >= 10:
+            break
+    return out[:10]
 
 
 def _trace_ids_from_run_artifacts(run_result: Any) -> list[str]:

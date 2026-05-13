@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from retrace import api_testing
 from retrace.api_testing import (
     api_runs_dir_for_data_dir,
     api_specs_dir_for_data_dir,
@@ -14,7 +15,9 @@ from retrace.api_testing import (
     persist_api_failure,
     run_api_spec,
 )
+from retrace.repair import build_repair_bundle
 from retrace.storage import Storage
+from retrace.test_profiles import apply_api_profiles
 
 
 class _APIHandler(BaseHTTPRequestHandler):
@@ -26,6 +29,10 @@ class _APIHandler(BaseHTTPRequestHandler):
             )
             self.send_response(500)
             self.send_header("Content-Type", "application/json")
+            self.send_header(
+                "traceparent",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -186,9 +193,11 @@ def test_api_spec_runs_with_auth_assertions_and_redacted_artifacts(
         thread.join(timeout=2)
 
     assert result.ok is True
+    assert result.failure_classification == "passed"
     assert result.status_code == 200
     assert any(item["artifact_type"] == "api_request" for item in result.artifacts)
     assert any(item["artifact_type"] == "api_response" for item in result.artifacts)
+    assert any(item["artifact_type"] == "api_run_summary" for item in result.artifacts)
     request_artifact = next(
         item for item in result.artifacts if item["artifact_type"] == "api_request"
     )
@@ -229,10 +238,56 @@ def test_api_spec_reports_failed_json_assertion(tmp_path: Path) -> None:
         thread.join(timeout=2)
 
     assert result.ok is False
+    assert result.failure_classification == "assertion_failure"
     assert any(
         item["assertion_id"] == "bad" and item["ok"] is False
         for item in result.assertion_results
     )
+    summary_artifact = next(
+        item for item in result.artifacts if item["artifact_type"] == "api_run_summary"
+    )
+    summary = json.loads(Path(summary_artifact["path"]).read_text())
+    assert summary["failure_classification"] == "assertion_failure"
+    assert summary["route_path"] == "/api/health"
+
+
+def test_api_spec_expected_4xx_json_assertion_failure_is_assertion_failure(
+    tmp_path: Path,
+) -> None:
+    server, base_url, thread = _server_url()
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Expected unauthorized assertion failure",
+            method="GET",
+            url=f"{base_url}/api/private",
+            expected_status=401,
+            json_assertions=[
+                {"id": "bad-msg", "path": "$.error", "equals": "different"}
+            ],
+        )
+
+        result = run_api_spec(
+            spec=spec,
+            runs_dir=api_runs_dir_for_data_dir(tmp_path),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is False
+    assert result.failure_classification == "assertion_failure"
+    assert any(
+        item["assertion_id"] == "bad-msg" and item["ok"] is False
+        for item in result.assertion_results
+    )
+    summary_artifact = next(
+        item for item in result.artifacts if item["artifact_type"] == "api_run_summary"
+    )
+    summary = json.loads(Path(summary_artifact["path"]).read_text())
+    assert summary["failure_classification"] == "assertion_failure"
+    assert summary["route_path"] == "/api/private"
 
 
 def test_api_spec_runs_request_sequence_with_extracted_values(
@@ -285,6 +340,192 @@ def test_api_spec_runs_request_sequence_with_extracted_values(
     assert sum(item["artifact_type"] == "api_request" for item in result.artifacts) == 2
 
 
+def test_api_sequence_repair_bundle_keeps_each_request_response_step(
+    tmp_path: Path,
+) -> None:
+    server, base_url, thread = _server_url()
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Failing cart sequence",
+            method="GET",
+            url=f"{base_url}/api/health",
+            steps=[
+                {
+                    "id": "step-2",
+                    "method": "POST",
+                    "url": f"{base_url}/api/cart",
+                    "body": {"cartId": 42},
+                    "expected_status": 201,
+                    "extract": [{"name": "cart_id", "path": "$.received.cartId"}],
+                },
+                {
+                    "id": "step-10",
+                    "method": "PATCH",
+                    "url": f"{base_url}/api/cart/{{{{ vars.cart_id }}}}",
+                    "expected_status": 201,
+                },
+            ],
+        )
+
+        result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is False
+    store = Storage(tmp_path / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(project_name="Default")
+    persisted = persist_api_failure(
+        store=store,
+        spec=spec,
+        result=result,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+    )
+
+    bundle = build_repair_bundle(store, persisted.failure_id)
+    pairs = bundle.backend_context["request_response"]
+
+    assert [item["step_id"] for item in pairs] == ["step-2", "step-10"]
+    assert pairs[0]["request"]["artifact"]["method"] == "POST"
+    assert pairs[0]["request"]["artifact"]["body"] == {"cartId": 42}
+    assert pairs[0]["response"]["artifact"]["status_code"] == 201
+    assert pairs[1]["request"]["artifact"]["method"] == "PATCH"
+    assert pairs[1]["request"]["artifact"]["url"] == f"{base_url}/api/cart/42"
+    assert pairs[1]["response"]["artifact"]["status_code"] == 200
+
+
+def test_api_env_profile_supplies_runtime_headers_without_persisting_secret(
+    tmp_path: Path, monkeypatch
+) -> None:
+    server, base_url, thread = _server_url()
+    monkeypatch.setenv(
+        "RETRACE_PROFILE_HEADERS",
+        json.dumps({"Authorization": "Bearer test-token"}),
+    )
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Private env headers API",
+            method="GET",
+            url="/api/private",
+            env_profile="local-api",
+            expected_status=200,
+        )
+        spec = apply_api_profiles(
+            spec,
+            defaults={
+                "env_profiles": {
+                    "local-api": {
+                        "api_base_url": base_url,
+                        "headers_env": "RETRACE_PROFILE_HEADERS",
+                    }
+                }
+            },
+        )
+
+        result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is True
+    assert spec.url == f"{base_url}/api/private"
+    assert spec.headers_env == "RETRACE_PROFILE_HEADERS"
+    spec_text = (api_specs_dir_for_data_dir(tmp_path) / f"{spec.spec_id}.json").read_text()
+    assert "test-token" not in spec_text
+    request_artifact = next(
+        item for item in result.artifacts if item["artifact_type"] == "api_request"
+    )
+    request_payload = json.loads(Path(request_artifact["path"]).read_text())
+    assert request_payload["headers"]["Authorization"] == "[redacted]"
+
+
+def test_api_headers_env_reports_invalid_json_cleanly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    server, base_url, thread = _server_url()
+    monkeypatch.setenv("RETRACE_PROFILE_HEADERS", "not-json")
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Invalid env headers API",
+            method="GET",
+            url=f"{base_url}/api/private",
+            headers_env="RETRACE_PROFILE_HEADERS",
+            expected_status=200,
+        )
+
+        result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is False
+    assert result.failure_classification == "network_error"
+    assert (
+        result.error
+        == "auth failure: headers env var RETRACE_PROFILE_HEADERS must be valid JSON"
+    )
+
+
+def test_api_traceparent_rejects_malformed_extra_segments() -> None:
+    assert (
+        api_testing._trace_id_from_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra"
+        )
+        == ""
+    )
+
+
+def test_api_env_profile_applies_base_url_to_sequence_steps(tmp_path: Path) -> None:
+    server, base_url, thread = _server_url()
+    try:
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Relative cart sequence",
+            method="GET",
+            url="/api/health",
+            env_profile="local-api",
+            steps=[
+                {
+                    "id": "create-cart",
+                    "method": "POST",
+                    "url": "/api/cart",
+                    "body": {"cartId": 42},
+                    "expected_status": 201,
+                    "extract": [{"name": "cart_id", "path": "$.received.cartId"}],
+                },
+                {
+                    "id": "update-cart",
+                    "method": "PATCH",
+                    "url": "/api/cart/{{ vars.cart_id }}",
+                    "expected_status": 200,
+                    "json_assertions": [{"path": "$.cartId", "equals": 42}],
+                },
+            ],
+        )
+        spec = apply_api_profiles(
+            spec,
+            defaults={"env_profiles": {"local-api": {"api_base_url": base_url}}},
+        )
+
+        result = run_api_spec(spec=spec, runs_dir=api_runs_dir_for_data_dir(tmp_path))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.ok is True
+    assert spec.steps[0]["url"] == f"{base_url}/api/cart"
+    assert spec.steps[1]["url"] == f"{base_url}/api/cart/{{{{ vars.cart_id }}}}"
+
+
 def test_failed_api_run_creates_failure_evidence_and_repair_task(
     tmp_path: Path,
 ) -> None:
@@ -294,6 +535,20 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
         "router.get('/api/checkout/:cartId', checkoutHandler);"
     )
     server, base_url, thread = _server_url()
+    log_path = tmp_path / "backend.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "INFO unrelated trace_id=abc",
+                (
+                    "ERROR trace_id=4bf92f3577b34da6a3ce929d0e0e4736 "
+                    "Authorization: Bearer raw-secret-token "
+                    "Authorization: Basic raw-basic-token "
+                    "api_key=sk_live_secret checkout handler failed for dev@example.com"
+                ),
+            ]
+        )
+    )
     try:
         spec = create_api_spec(
             specs_dir=api_specs_dir_for_data_dir(tmp_path),
@@ -301,6 +556,11 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
             method="GET",
             url=f"{base_url}/api/checkout/42",
             expected_status=200,
+            fixtures={
+                "api_regression": {
+                    "trace_ids": ["4BF92F3577B34DA6A3CE929D0E0E4736"]
+                }
+            },
         )
         run = run_api_spec(
             spec=spec,
@@ -312,6 +572,15 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
         thread.join(timeout=2)
 
     assert run.ok is False
+    assert run.failure_classification == "server_error"
+    summary_artifact = next(
+        item for item in run.artifacts if item["artifact_type"] == "api_run_summary"
+    )
+    summary = json.loads(Path(summary_artifact["path"]).read_text())
+    assert summary["trace_ids"] == ["4bf92f3577b34da6a3ce929d0e0e4736"]
+    assert summary["requests"][0]["trace_ids"] == [
+        "4bf92f3577b34da6a3ce929d0e0e4736"
+    ]
     store = Storage(tmp_path / "retrace.db")
     store.init_schema()
     workspace = store.ensure_workspace(project_name="Default")
@@ -323,6 +592,7 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
         project_id=workspace.project_id,
         environment_id=workspace.environment_id,
         repo_path=repo,
+        log_paths=[log_path],
     )
 
     failure = store.get_failure(
@@ -334,16 +604,21 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
     assert failure.source_type == "test_run"
     assert failure.source_external_id.startswith("api:")
     assert failure.linked_repair_task_id == persisted.repair_task_id
+    assert failure.metadata["trace_ids"] == ["4bf92f3577b34da6a3ce929d0e0e4736"]
     evidence = store.list_failure_evidence(failure_id=persisted.failure_id)
     assert {item.evidence_type for item in evidence} >= {
         "api_request",
         "api_response",
+        "backend_log",
         "test_transcript",
     }
     evidence_text = json.dumps([item.payload for item in evidence])
     assert "dev@example.com" not in evidence_text
     assert "555-123-4567" not in evidence_text
     assert "123 Main Street" not in evidence_text
+    assert "raw-secret-token" not in evidence_text
+    assert "raw-basic-token" not in evidence_text
+    assert "sk_live_secret" not in evidence_text
     repair = store.get_repair_task(persisted.repair_task_id)
     assert repair is not None
     assert repair.likely_files == ["server/routes/checkout.ts"]
@@ -352,4 +627,30 @@ def test_failed_api_run_creates_failure_evidence_and_repair_task(
     assert f"URL: `{base_url}/api/checkout/42`" in prompt
     assert "Expected status: `200`" in prompt
     assert "Actual status: `500`" in prompt
+    assert "Failure classification: `server_error`" in prompt
     assert "dev@example.com" not in prompt
+    bundle = build_repair_bundle(store, persisted.failure_id)
+    assert bundle.backend_context["logs"]["trace_ids"] == [
+        "4bf92f3577b34da6a3ce929d0e0e4736"
+    ]
+    backend_log_item = next(
+        item
+        for item in bundle.backend_context["logs"]["items"]
+        if item["type"] == "backend_log"
+    )
+    log_payload = backend_log_item["untrusted_payload"]
+    assert "checkout handler failed" in log_payload["lines"][0]
+    assert "INFO unrelated trace_id=abc" not in json.dumps(log_payload)
+    assert "dev@example.com" not in json.dumps(log_payload)
+    assert "raw-secret-token" not in json.dumps(log_payload)
+    assert "raw-basic-token" not in json.dumps(log_payload)
+    assert "sk_live_secret" not in json.dumps(log_payload)
+    assert "Basic [redacted-token]" in log_payload["lines"][0]
+    assert "Bearer [redacted-token]" in log_payload["lines"][0]
+
+
+def test_api_log_matching_rejects_short_trace_ids(tmp_path: Path) -> None:
+    log_path = tmp_path / "backend.log"
+    log_path.write_text("ERROR trace_id=abc unrelated failure\n")
+
+    assert api_testing._matching_log_lines(path=log_path, trace_ids=["abc"]) == []

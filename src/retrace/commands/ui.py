@@ -13,15 +13,17 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import click
 import httpx
 import yaml
 
+from retrace.api_suites import api_suites_dir_for_data_dir, list_api_suites, load_api_suite
 from retrace.api_testing import (
     api_runs_dir_for_data_dir,
     api_specs_dir_for_data_dir,
+    list_api_specs,
     load_api_spec,
     run_api_spec,
 )
@@ -51,9 +53,12 @@ from retrace.tester import (
     list_specs,
     load_run_summaries,
     load_spec,
+    now_iso,
     run_spec,
     runs_dir_for_data_dir,
+    save_spec,
     specs_dir_for_data_dir,
+    validate_spec,
 )
 
 logger = logging.getLogger(__name__)
@@ -771,6 +776,12 @@ def _issue_workflow_payload(issue: dict[str, Any]) -> dict[str, Any]:
     status = str(issue.get("status") or "")
     coverage_states = [str(link.get("coverage_state") or "") for link in test_links]
     latest_statuses = [str(link.get("latest_run_status") or "") for link in test_links]
+    api_links = [
+        link
+        for link in test_links
+        if "api" in str(link.get("source") or "").lower()
+        or "/api-tests/" in str(link.get("spec_path") or "")
+    ]
     if not test_links:
         coverage_state = "not_covered"
     elif "covered_failing" in coverage_states:
@@ -822,11 +833,76 @@ def _issue_workflow_payload(issue: dict[str, Any]) -> dict[str, Any]:
         primary_label = "Run linked tests"
         primary_action = "run_tests"
 
+    blockers: list[str] = []
+    recommended_actions: list[dict[str, str]] = []
+    capture_blocked = False
+    if not timeline_count:
+        capture_blocked = True
+        blockers.append("No normalized evidence timeline is available.")
+    if not reproduction_count and not replay_count:
+        capture_blocked = True
+        blockers.append("No replay or reproduction steps are linked.")
+    if not test_links:
+        blockers.append("No regression test covers this issue yet.")
+        recommended_actions.append(
+            {
+                "action": "generate_replay_spec",
+                "label": "Generate UI regression",
+                "reason": "Create an editable UI test from replay evidence.",
+            }
+        )
+    if api_call_count and not api_links:
+        recommended_actions.append(
+            {
+                "action": "generate_api_regression",
+                "label": "Generate API regression",
+                "reason": "A failed network call is present without API coverage.",
+            }
+        )
+    if test_links and coverage_state == "covered_failing" and not repair_task:
+        recommended_actions.append(
+            {
+                "action": "generate_repair",
+                "label": "Generate repair task",
+                "reason": "A linked regression still fails and needs repair context.",
+            }
+        )
+    if status == "resolved" and coverage_state != "covered_passing":
+        recommended_actions.append(
+            {
+                "action": "verify_resolved",
+                "label": "Verify resolved issue",
+                "reason": "Resolved issues should pass linked UI/API regressions.",
+            }
+        )
+    if test_links and not latest_statuses:
+        recommended_actions.append(
+            {
+                "action": "run_tests",
+                "label": "Run linked tests",
+                "reason": "Coverage exists but has no recorded run result.",
+            }
+        )
+    readiness = "ready_for_repair"
+    if capture_blocked:
+        readiness = "needs_capture"
+    elif not test_links:
+        readiness = "needs_test"
+    elif coverage_state == "covered_passing":
+        readiness = "verified"
+    elif coverage_state == "covered_failing" and repair_task:
+        readiness = "repair_ready"
+    elif coverage_state == "covered_failing":
+        readiness = "needs_repair_task"
+
     return {
         "coverage_state": coverage_state,
         "latest_run_statuses": latest_statuses,
         "primary_action": primary_action,
         "primary_label": primary_label,
+        "readiness": readiness,
+        "blockers": blockers,
+        "recommended_actions": recommended_actions,
         "stage_states": stages,
         "counts": {
             "timeline": timeline_count,
@@ -834,8 +910,101 @@ def _issue_workflow_payload(issue: dict[str, Any]) -> dict[str, Any]:
             "replays": replay_count,
             "api_calls": api_call_count,
             "tests": len(test_links),
+            "api_tests": len(api_links),
             "repair_tasks": 1 if repair_task else 0,
         },
+    }
+
+
+def _issue_evidence_stitching_payload(issue: dict[str, Any]) -> dict[str, Any]:
+    timeline = issue.get("timeline") if isinstance(issue.get("timeline"), list) else []
+    api_calls = issue.get("api_calls") if isinstance(issue.get("api_calls"), list) else []
+    test_links = issue.get("test_links") if isinstance(issue.get("test_links"), list) else []
+    repair_task = issue.get("repair_task") if isinstance(issue.get("repair_task"), dict) else None
+    api_links = [
+        link
+        for link in test_links
+        if "api" in str(link.get("source") or "").lower()
+        or "/api-tests/" in str(link.get("spec_path") or "")
+    ]
+    trace_ids: set[str] = set()
+    source_map_states: list[dict[str, Any]] = []
+    for call in api_calls:
+        trace = call.get("trace") if isinstance(call, dict) else {}
+        if isinstance(trace, dict):
+            for value in trace.values():
+                if isinstance(value, str) and value.strip():
+                    trace_ids.add(value.strip())
+                elif isinstance(value, list):
+                    trace_ids.update(str(item).strip() for item in value if str(item).strip())
+    for event in timeline:
+        payload = event.get("payload") if isinstance(event, dict) else {}
+        if not isinstance(payload, dict):
+            continue
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        for key in ("trace_id", "trace_ids"):
+            value = payload.get(key, metadata.get(key))
+            if isinstance(value, str) and value.strip():
+                trace_ids.add(value.strip())
+            elif isinstance(value, list):
+                trace_ids.update(str(item).strip() for item in value if str(item).strip())
+        evidence_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        frames = evidence_payload.get("stack_frames") if isinstance(evidence_payload, dict) else []
+        if not isinstance(frames, list):
+            frames = []
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            source_map_states.append(
+                {
+                    "filename": str(frame.get("filename") or frame.get("source") or ""),
+                    "source_mapped": bool(frame.get("source_mapped")),
+                    "reason": str(frame.get("source_map_reason") or ""),
+                    "status": str(frame.get("source_map_status") or ""),
+                }
+            )
+    stages = [
+        {
+            "id": "frontend_replay",
+            "label": "Frontend replay",
+            "status": "complete" if timeline else "missing",
+            "detail": f"{len(timeline)} timeline event(s), {len(issue.get('sessions') or [])} replay(s)",
+        },
+        {
+            "id": "network_api",
+            "label": "Network/API evidence",
+            "status": "complete" if api_calls else "missing",
+            "detail": f"{len(api_calls)} failed API call(s), {len(api_links)} linked API regression(s)",
+        },
+        {
+            "id": "backend_trace",
+            "label": "Backend trace/log bridge",
+            "status": "complete" if trace_ids else "missing",
+            "detail": f"{len(trace_ids)} trace id(s)",
+        },
+        {
+            "id": "source_maps",
+            "label": "Source map context",
+            "status": "complete"
+            if any(item.get("source_mapped") for item in source_map_states)
+            else ("partial" if source_map_states else "missing"),
+            "detail": f"{len(source_map_states)} stack frame mapping result(s)",
+        },
+        {
+            "id": "repair_context",
+            "label": "Repair context",
+            "status": "complete" if repair_task else "missing",
+            "detail": str((repair_task or {}).get("public_id") or (repair_task or {}).get("id") or ""),
+        },
+    ]
+    return {
+        "status": "complete"
+        if all(stage["status"] == "complete" for stage in stages)
+        else "partial",
+        "stages": stages,
+        "trace_ids": sorted(trace_ids),
+        "api_regression_spec_ids": [str(link.get("spec_id") or "") for link in api_links],
+        "source_map_frames": source_map_states[:10],
     }
 
 
@@ -1021,6 +1190,7 @@ def _to_replay_dashboard_payload(store: Storage) -> dict[str, Any]:
                 repair_tasks[0] if repair_tasks else None
             )
         payload["workflow"] = _issue_workflow_payload(payload)
+        payload["evidence_stitching"] = _issue_evidence_stitching_payload(payload)
         issues.append(payload)
     sessions = []
     for row in store.list_recent_replay_sessions(limit=50):
@@ -1594,6 +1764,352 @@ def _github_repos_payload(store: Storage) -> dict[str, Any]:
     }
 
 
+def _api_suites_payload(data_dir: Path) -> dict[str, Any]:
+    suites = []
+    for suite in list_api_suites(api_suites_dir_for_data_dir(data_dir)):
+        warnings = suite.import_summary.get("quality_warnings")
+        if not isinstance(warnings, dict):
+            warnings = {}
+        warning_count = sum(
+            len(value) for value in warnings.values() if isinstance(value, list)
+        )
+        suites.append(
+            {
+                "suite_id": suite.suite_id,
+                "name": suite.name,
+                "source": suite.source,
+                "spec_count": len(suite.spec_ids),
+                "spec_ids": suite.spec_ids,
+                "auth_profile": suite.auth_profile,
+                "env_profile": suite.env_profile,
+                "filters": suite.filters,
+                "import_summary": suite.import_summary,
+                "operation_count": len(suite.operations),
+                "operations": suite.operations[:25],
+                "skipped_count": len(suite.skipped),
+                "skipped": suite.skipped[:25],
+                "quality_warning_count": warning_count,
+                "metadata": suite.metadata,
+                "created_at": suite.created_at,
+                "updated_at": suite.updated_at,
+            }
+        )
+    return {"suites": suites}
+
+
+def _api_specs_payload(data_dir: Path) -> dict[str, Any]:
+    specs = []
+    for spec in list_api_specs(api_specs_dir_for_data_dir(data_dir)):
+        fixtures = dict(spec.fixtures or {})
+        specs.append(
+            {
+                "spec_id": spec.spec_id,
+                "name": spec.name,
+                "method": spec.method,
+                "url": spec.url,
+                "auth_profile": spec.auth_profile,
+                "env_profile": spec.env_profile,
+                "expected_status": spec.expected_status,
+                "request_count": len(spec.steps) if spec.steps else 1,
+                "json_assertion_count": len(spec.json_assertions),
+                "schema_assertion_count": len(spec.schema_assertions),
+                "source": str(fixtures.get("source") or ""),
+                "issue_public_id": str(fixtures.get("issue_public_id") or ""),
+                "operation_id": str(fixtures.get("operation_id") or ""),
+                "openapi_path": str(fixtures.get("openapi_path") or ""),
+                "created_at": spec.created_at,
+                "updated_at": spec.updated_at,
+            }
+        )
+    return {"specs": specs}
+
+
+def _hosted_onboarding_readiness_payload(
+    *,
+    store: Storage,
+    data_dir: Path,
+    settings: dict[str, Any],
+    checks: dict[str, Any],
+) -> dict[str, Any]:
+    sdk_keys = store.list_sdk_keys(include_revoked=False, limit=10)
+    replay_sessions = store.list_recent_replay_sessions(limit=10)
+    replay_issues = store.list_recent_replay_issues(limit=10)
+    fallback_workspace = store.ensure_workspace(project_name="Default")
+    if replay_issues:
+        project_id = str(replay_issues[0]["project_id"])
+        environment_id = str(replay_issues[0]["environment_id"])
+    elif sdk_keys:
+        project_id = sdk_keys[0].project_id
+        environment_id = sdk_keys[0].environment_id
+    else:
+        project_id = fallback_workspace.project_id
+        environment_id = fallback_workspace.environment_id
+    ui_specs = list_specs(specs_dir_for_data_dir(data_dir))
+    api_specs = list_api_specs(api_specs_dir_for_data_dir(data_dir))
+    api_suites = list_api_suites(api_suites_dir_for_data_dir(data_dir))
+    source_maps = store.list_recent_source_maps(
+        project_id=project_id,
+        environment_id=environment_id,
+        limit=10,
+    )
+    alert_rules = store.list_app_error_alert_rules(
+        project_id=project_id,
+        environment_id=environment_id,
+        limit=10,
+    )
+    test_links = store.list_all_failure_test_links()
+    repair_tasks = store.list_repair_tasks(limit=10)
+    steps = [
+        {
+            "id": "settings",
+            "label": "Configure hosted settings",
+            "status": "complete"
+            if settings.get("tester_app_url") and checks.get("replay_api", {}).get("reachable") is True
+            else "current",
+            "detail": f"Replay API: {checks.get('replay_api', {}).get('detail') or 'not checked'}",
+            "action": "Save settings and run retrace api serve",
+        },
+        {
+            "id": "capture_key",
+            "label": "Create browser capture key",
+            "status": "complete" if sdk_keys else "current",
+            "detail": f"{len(sdk_keys)} active browser SDK key(s)",
+            "action": "Create SDK Key",
+        },
+        {
+            "id": "capture_smoke",
+            "label": "Verify replay capture",
+            "status": "complete" if replay_sessions or replay_issues else "blocked",
+            "detail": f"{len(replay_sessions)} recent first-party replay session(s)",
+            "action": "Send a smoke replay from the instrumented app",
+        },
+        {
+            "id": "issue_grouping",
+            "label": "Process captured errors into issues",
+            "status": "complete" if replay_issues else "blocked",
+            "detail": f"{len(replay_issues)} recent replay issue(s)",
+            "action": "Process Queued Replays",
+        },
+        {
+            "id": "ui_tests",
+            "label": "Generate and review UI regressions",
+            "status": "complete" if ui_specs and test_links else "current",
+            "detail": f"{len(ui_specs)} UI spec(s), {sum(1 for spec in ui_specs if dict(spec.fixtures or {}).get('draft_status') == 'draft')} draft(s)",
+            "action": "Generate regression tests from issues",
+        },
+        {
+            "id": "api_tests",
+            "label": "Import or generate API coverage",
+            "status": "complete" if api_suites or api_specs else "current",
+            "detail": f"{len(api_suites)} API suite(s), {len(api_specs)} API spec(s)",
+            "action": "Import OpenAPI or generate API regression",
+        },
+        {
+            "id": "monitoring",
+            "label": "Harden monitoring",
+            "status": "complete" if source_maps and alert_rules else "current",
+            "detail": f"{len(source_maps)} source map upload(s), {len(alert_rules)} alert rule(s)",
+            "action": "Upload source maps and create alert rules",
+        },
+        {
+            "id": "repair_loop",
+            "label": "Create repair-ready context",
+            "status": "complete" if repair_tasks else "blocked",
+            "detail": f"{len(repair_tasks)} repair task(s)",
+            "action": "Generate fix prompts from a failing issue",
+        },
+    ]
+    complete = sum(1 for step in steps if step["status"] == "complete")
+    return {
+        "workspace": {
+            "project_id": project_id,
+            "environment_id": environment_id,
+        },
+        "ready": complete == len(steps),
+        "complete": complete,
+        "total": len(steps),
+        "steps": steps,
+        "counts": {
+            "sdk_keys": len(sdk_keys),
+            "replay_sessions": len(replay_sessions),
+            "replay_issues": len(replay_issues),
+            "ui_specs": len(ui_specs),
+            "api_specs": len(api_specs),
+            "api_suites": len(api_suites),
+            "source_maps": len(source_maps),
+            "alert_rules": len(alert_rules),
+            "test_links": len(test_links),
+            "repair_tasks": len(repair_tasks),
+        },
+    }
+
+
+def _run_api_spec_payload(*, data_dir: Path, spec_id: str) -> tuple[dict[str, Any], int]:
+    clean_spec_id = spec_id.strip()
+    if not clean_spec_id:
+        return {"ok": False, "error": "spec_id is required"}, 400
+    try:
+        spec = load_api_spec(api_specs_dir_for_data_dir(data_dir), clean_spec_id)
+    except Exception:
+        return {"ok": False, "error": f"API spec not found: {clean_spec_id}"}, 404
+    result = run_api_spec(
+        spec=spec,
+        runs_dir=api_runs_dir_for_data_dir(data_dir),
+    )
+    return {"ok": result.ok, "result": result.__dict__}, 200 if result.ok else 400
+
+
+def _run_api_suite_payload(*, data_dir: Path, suite_id: str) -> tuple[dict[str, Any], int]:
+    clean_suite_id = suite_id.strip()
+    if not clean_suite_id:
+        return {"ok": False, "error": "suite_id is required"}, 400
+    try:
+        suite = load_api_suite(api_suites_dir_for_data_dir(data_dir), clean_suite_id)
+    except Exception:
+        return {"ok": False, "error": f"API suite not found: {clean_suite_id}"}, 404
+    results: list[dict[str, Any]] = []
+    for spec_id in suite.spec_ids:
+        try:
+            spec = load_api_spec(api_specs_dir_for_data_dir(data_dir), spec_id)
+            result = run_api_spec(
+                spec=spec,
+                runs_dir=api_runs_dir_for_data_dir(data_dir),
+            )
+            results.append(
+                {
+                    "spec_id": spec.spec_id,
+                    "name": spec.name,
+                    "method": spec.method,
+                    "url": spec.url,
+                    "ok": result.ok,
+                    "status": result.status,
+                    "status_code": result.status_code,
+                    "elapsed_ms": result.elapsed_ms,
+                    "run_id": result.run_id,
+                    "failure_classification": result.failure_classification,
+                    "error": result.error,
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "spec_id": str(spec_id),
+                    "name": "",
+                    "method": "",
+                    "url": "",
+                    "ok": False,
+                    "status": "failed",
+                    "status_code": 0,
+                    "elapsed_ms": 0,
+                    "run_id": "",
+                    "failure_classification": "suite_error",
+                    "error": str(exc),
+                }
+            )
+    passed = sum(1 for item in results if bool(item.get("ok")))
+    failed = len(results) - passed
+    return {
+        "ok": failed == 0,
+        "suite_id": suite.suite_id,
+        "name": suite.name,
+        "total": len(results),
+        "passed": passed,
+        "failed": failed,
+        "results": results,
+    }, 200 if failed == 0 else 400
+
+
+def _json_object_list_payload(value: Any, *, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError(f"{label} must be a JSON list of objects")
+    return [dict(item) for item in value]
+
+
+def _edit_ui_draft_payload(
+    *,
+    data_dir: Path,
+    spec_id: str,
+    name: str = "",
+    prompt: str = "",
+    app_url: str = "",
+    steps: Any = None,
+    assertions: Any = None,
+    review_note: str = "",
+    accept: bool = False,
+) -> tuple[dict[str, Any], int]:
+    clean_spec_id = spec_id.strip()
+    if not clean_spec_id:
+        return {"ok": False, "error": "spec_id is required"}, 400
+    specs_dir = specs_dir_for_data_dir(data_dir)
+    try:
+        spec = load_spec(specs_dir, clean_spec_id)
+    except Exception:
+        return {"ok": False, "error": f"spec not found: {clean_spec_id}"}, 404
+    if dict(spec.fixtures or {}).get("draft_status") != "draft":
+        return {"ok": False, "error": "Spec is not an unaccepted draft."}, 409
+
+    changed_fields: list[str] = []
+    edited_name = name.strip()
+    if edited_name and edited_name != spec.name:
+        spec.name = edited_name
+        changed_fields.append("name")
+    edited_prompt = prompt.strip()
+    if edited_prompt and edited_prompt != spec.prompt:
+        spec.prompt = edited_prompt
+        changed_fields.append("prompt")
+    edited_app_url = app_url.strip()
+    if edited_app_url and edited_app_url != spec.app_url:
+        spec.app_url = edited_app_url
+        changed_fields.append("app_url")
+    try:
+        if steps is not None:
+            spec.exact_steps = _json_object_list_payload(steps, label="steps")
+            changed_fields.append("exact_steps")
+        if assertions is not None:
+            spec.assertions = _json_object_list_payload(assertions, label="assertions")
+            changed_fields.append("assertions")
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}, 400
+
+    spec.fixtures = dict(spec.fixtures or {})
+    notes = [
+        str(item).strip()
+        for item in list(spec.fixtures.get("review_notes", []) or [])
+        if str(item).strip()
+    ]
+    clean_note = review_note.strip()
+    if clean_note:
+        notes.append(clean_note)
+        spec.fixtures["review_notes"] = notes
+        changed_fields.append("review_notes")
+    spec.fixtures["reviewed_at"] = now_iso()
+    if accept:
+        spec.fixtures["draft_status"] = "accepted"
+        spec.fixtures.setdefault("accepted_at", now_iso())
+        changed_fields.append("draft_status")
+    if changed_fields:
+        spec.fixtures["last_review_edit"] = {
+            "edited_at": now_iso(),
+            "fields": sorted(set(changed_fields)),
+        }
+    spec.updated_at = now_iso()
+    try:
+        validate_spec(spec)
+        save_spec(specs_dir, spec)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 400
+    return {
+        "ok": True,
+        "spec": spec.__dict__,
+        "draft_status": spec.fixtures.get("draft_status", ""),
+        "accepted": bool(accept),
+        "changed_fields": sorted(set(changed_fields)),
+        "step_count": len(spec.exact_steps or []),
+        "assertion_count": len(spec.assertions or []),
+        "review_notes": spec.fixtures.get("review_notes", []),
+    }, 200
+
+
 def _connect_github_repo_payload(
     *,
     store: Storage,
@@ -1726,6 +2242,7 @@ _INDEX_HTML = """<!doctype html>
     .card h3 { margin:0 0 8px 0; font-size:13px; color:#93c5fd; text-transform:uppercase; letter-spacing:.08em; }
     .lbl { font-size:12px; color:var(--muted); margin-top:8px; }
     input { width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px; }
+    textarea { width:100%; min-height:120px; resize:vertical; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
     ul { margin:0; padding-left:18px; }
     li { margin: 6px 0; font-size:13px; }
     pre { white-space:pre-wrap; font-size:12px; background:#0b1220; border:1px solid #1f2937; padding:10px; border-radius:8px; max-height:360px; overflow:auto; }
@@ -1748,6 +2265,17 @@ _INDEX_HTML = """<!doctype html>
     .workflow-step strong { display:block; font-size:12px; margin-bottom:3px; }
     .workflow-step span { display:block; font-size:12px; color:var(--muted); }
     .workflow-action { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
+    .readiness-panel { border:1px solid #26364f; border-radius:8px; padding:10px; background:#0b1220; margin:10px 0 12px 0; }
+    .readiness-panel .row { display:flex; justify-content:space-between; gap:10px; align-items:center; }
+    .recommendation-list { margin-top:8px; }
+    .recommendation-list button { margin-right:6px; margin-top:4px; }
+    .suite-row { border-top:1px solid #1f2937; padding:10px 0; }
+    .suite-row:first-child { border-top:0; padding-top:0; }
+    .draft-editor { margin-top:12px; }
+    .draft-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .inventory-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px; }
+    .inventory-row { border-top:1px solid #1f2937; padding:9px 0; overflow-wrap:anywhere; }
+    .inventory-row:first-child { border-top:0; padding-top:0; }
     .ok { color:#86efac; } .bad { color:#fca5a5; }
     @media (max-width: 980px) {
       .app-shell { grid-template-columns: 1fr; height:auto; min-height:100vh; }
@@ -1755,7 +2283,7 @@ _INDEX_HTML = """<!doctype html>
       .nav-btn { display:inline-block; width:auto; margin-right:4px; }
       .rail { border-right:0; border-bottom:1px solid var(--line); max-height:42vh; }
       .main { padding:12px; }
-      .metric-grid, .detail-grid, .grid, .workflow-strip { grid-template-columns: 1fr; }
+      .metric-grid, .detail-grid, .grid, .workflow-strip, .draft-grid, .inventory-grid { grid-template-columns: 1fr; }
       .timeline-row { grid-template-columns: 1fr; }
     }
   </style>
@@ -1766,6 +2294,7 @@ _INDEX_HTML = """<!doctype html>
       <div class=\"brand\">Retrace QA</div>
       <button class=\"nav-btn active\" type=\"button\" data-view=\"dashboard\">Dashboard</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"issues\">Issues</button>
+      <button class=\"nav-btn\" type=\"button\" data-view=\"qa\">QA Incidents</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"replays\">Replays</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"findings\">Findings</button>
       <button class=\"nav-btn\" type=\"button\" data-view=\"tests\">Tests</button>
@@ -1798,6 +2327,24 @@ _INDEX_HTML = """<!doctype html>
         <div id=\"replaySessionsPanel\"></div>
         <div style=\"height:10px\"></div>
         <div class=\"rr\"><div id=\"firstPartyReplay\"><div class=\"empty\">Select a first-party replay session.</div></div></div>
+      </section>
+      <section class=\"view\" id=\"view-qa\">
+        <div class=\"view-head\">
+          <div><h2>QA Incidents</h2><div class=\"empty\">Unified queue across replay, UI test, API test, error monitor, and PR review.</div></div>
+          <div class=\"actions\">
+            <button class=\"btn\" id=\"qaRefreshBtn\" type=\"button\">Refresh</button>
+            <select class=\"btn\" id=\"qaSourceFilter\" title=\"Filter by source kind\">
+              <option value=\"\">All sources</option>
+              <option value=\"replay\">replay</option>
+              <option value=\"ui_test\">ui_test</option>
+              <option value=\"api_test\">api_test</option>
+              <option value=\"error_monitor\">error_monitor</option>
+              <option value=\"manual\">manual</option>
+            </select>
+          </div>
+        </div>
+        <div id=\"qaList\"><div class=\"empty\">Loading…</div></div>
+        <div id=\"qaDetail\" style=\"margin-top:18px\"></div>
       </section>
       <section class=\"view\" id=\"view-tests\"><div id=\"tester\"></div></section>
       <section class=\"view\" id=\"view-runs\"><div id=\"runsView\"></div></section>
@@ -1842,11 +2389,108 @@ _INDEX_HTML = """<!doctype html>
       document.querySelectorAll('.view').forEach(el => el.classList.toggle('active', el.id === `view-${view}`));
       document.querySelectorAll('.nav-btn').forEach(el => el.classList.toggle('active', el.dataset.view === view));
       const title = byId('railTitle');
-      if(title) title.textContent = view === 'findings' ? 'Report Findings' : 'Issues';
+      if(title) title.textContent = view === 'findings' ? 'Report Findings' : (view === 'qa' ? 'QA Incidents' : 'Issues');
       if(byId('issueWorkflowList')) byId('issueWorkflowList').style.display = view === 'findings' ? 'none' : '';
       if(byId('findings')) byId('findings').style.display = view === 'findings' ? '' : 'none';
+      if(view === 'qa'){ loadQaIncidents(); }
     }
     document.querySelectorAll('.nav-btn').forEach(el => el.addEventListener('click', () => switchView(el.dataset.view)));
+
+    function escapeHtml(s){
+      return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    // Whitelist URLs to `http(s):` so a tainted `fix_pr_url` can't smuggle
+    // `javascript:` into an anchor href.
+    function safeExternalUrl(raw){
+      const s = String(raw || '').trim();
+      if(!s) return '';
+      try {
+        const u = new URL(s);
+        return (u.protocol === 'http:' || u.protocol === 'https:') ? u.href : '';
+      } catch(e) { return ''; }
+    }
+    // Reduce class-name tokens to a safe alphabet so `tag-${src}` can't
+    // break out of the attribute.
+    function safeToken(raw){
+      return String(raw || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+    }
+    async function loadQaIncidents(){
+      const list = byId('qaList');
+      const detail = byId('qaDetail');
+      if(!list){ return; }
+      list.innerHTML = '<div class="empty">Loading…</div>';
+      if(detail) detail.innerHTML = '';
+      const filter = (byId('qaSourceFilter') || {}).value || '';
+      try {
+        const url = filter ? `/api/qa-incidents?source=${encodeURIComponent(filter)}` : '/api/qa-incidents';
+        const res = await fetch(url);
+        const data = await res.json();
+        const incidents = data.incidents || [];
+        if(!incidents.length){
+          list.innerHTML = '<div class="empty">No QA incidents yet. Try <code>retrace demo all</code> to seed every pillar.</div>';
+          return;
+        }
+        const rows = incidents.map(inc => {
+          const publicId = escapeHtml(inc.public_id || '');
+          const title = escapeHtml(inc.title || '');
+          const sev = escapeHtml(inc.severity || '-');
+          const status = escapeHtml(inc.status || '-');
+          const srcRaw = inc.primary_source_kind || '-';
+          const srcClass = safeToken(srcRaw);
+          const srcText = escapeHtml(srcRaw);
+          const fixUrl = safeExternalUrl(inc.fix_pr_url);
+          const fix = fixUrl
+            ? ` · <a href="${escapeHtml(fixUrl)}" target="_blank" rel="noopener noreferrer">PR</a>`
+            : '';
+          const affected = Number(inc.affected_users) || 0;
+          return `<div class="card" style="margin-bottom:8px"><div class="hdr"><strong>${publicId}</strong> &nbsp; <span class="tag tag-${srcClass}">${srcText}</span> &nbsp; <span>${title}</span></div><div class="empty">${sev} · ${status} · ${affected} user(s)${fix} · <a href="javascript:void(0)" data-qa-show="${publicId}">details</a></div></div>`;
+        }).join('');
+        list.innerHTML = rows;
+        list.querySelectorAll('[data-qa-show]').forEach(el => {
+          el.addEventListener('click', () => showQaIncident(el.dataset.qaShow));
+        });
+      } catch (err) {
+        list.innerHTML = `<div class="empty">Failed to load QA incidents: ${escapeHtml(String(err))}</div>`;
+      }
+    }
+    async function showQaIncident(publicId){
+      const detail = byId('qaDetail');
+      if(!detail) return;
+      detail.innerHTML = '<div class="empty">Loading…</div>';
+      try {
+        const res = await fetch(`/api/qa-incidents/${encodeURIComponent(publicId)}`);
+        if(!res.ok){
+          detail.innerHTML = `<div class="empty">Not found.</div>`;
+          return;
+        }
+        const data = await res.json();
+        const inc = data.incident || {};
+        const repro = (() => { try { return JSON.parse(inc.reproduction_json || '[]'); } catch(e) { return []; } })();
+        const evidence = (() => { try { return JSON.parse(inc.evidence_json || '{}'); } catch(e) { return {}; } })();
+        const steps = repro.map(s => `<li><strong>${escapeHtml(s.action || '?')}</strong> — ${escapeHtml(s.description || '')}</li>`).join('');
+        const fixUrl = safeExternalUrl(inc.fix_pr_url);
+        const fixUrlEsc = escapeHtml(fixUrl);
+        detail.innerHTML = `
+          <div class="card">
+            <h3>${escapeHtml(inc.public_id || '')}  ${escapeHtml(inc.title || '')}</h3>
+            <div class="empty">severity ${escapeHtml(inc.severity || '-')} · confidence ${escapeHtml(inc.confidence || '-')} · status ${escapeHtml(inc.status || '-')} · source ${escapeHtml(inc.primary_source_kind || '-')}</div>
+            ${inc.summary ? `<p>${escapeHtml(inc.summary)}</p>` : ''}
+            ${inc.suspected_cause ? `<p><em>Suspected cause:</em> ${escapeHtml(inc.suspected_cause)}</p>` : ''}
+            ${steps ? `<h4>Reproduction</h4><ol>${steps}</ol>` : ''}
+            ${evidence.top_stack_frame ? `<p><em>Top stack frame:</em> <code>${escapeHtml(evidence.top_stack_frame)}</code></p>` : ''}
+            ${fixUrl ? `<p><strong>Fix PR:</strong> <a href="${fixUrlEsc}" target="_blank" rel="noopener noreferrer">${fixUrlEsc}</a></p>` : ''}
+          </div>
+        `;
+      } catch (err) {
+        detail.innerHTML = `<div class="empty">Failed: ${escapeHtml(String(err))}</div>`;
+      }
+    }
+    document.addEventListener('click', (e) => {
+      if(e.target && e.target.id === 'qaRefreshBtn'){ loadQaIncidents(); }
+    });
+    document.addEventListener('change', (e) => {
+      if(e.target && e.target.id === 'qaSourceFilter'){ loadQaIncidents(); }
+    });
     window.addEventListener('hashchange', () => applyReplayHash(replayState.issues, replayState.sessions));
 
     function statusClass(value){
@@ -2120,14 +2764,16 @@ const retrace = init({
     }
 
     async function loadOnboarding(){
-      const [sRes, cRes, rRes] = await Promise.all([
+      const [sRes, cRes, rRes, readyRes] = await Promise.all([
         fetch('/api/settings'),
         fetch('/api/system-checks'),
         fetch('/api/github/repos'),
+        fetch('/api/onboarding/readiness'),
       ]);
       const settings = await sRes.json();
       const checks = await cRes.json();
       const repoData = await rRes.json();
+      const readiness = await readyRes.json();
       const repos = repoData.repos || [];
       const gh = checks.gh || {};
       const ph = checks.posthog || {};
@@ -2141,8 +2787,23 @@ const retrace = init({
       const repoRows = repos.map(r => `
         <li><code>${esc(r.repo_full_name)}</code> · provider=<code>${esc(r.provider || 'github')}</code> · branch=<code>${esc(r.default_branch || 'main')}</code>${r.local_path ? ` · path=<code>${esc(r.local_path)}</code>` : ''}</li>
       `).join('');
+      const readinessRows = (readiness.steps || []).map(step => `
+        <li>
+          <span class="${step.status === 'complete' ? 'ok' : (step.status === 'blocked' ? 'bad' : '')}">${esc(step.status)}</span>
+          · <strong>${esc(step.label)}</strong>
+          <br><span class="empty">${esc(step.detail || '')}</span>
+          <br><span class="empty">Next: ${esc(step.action || '')}</span>
+        </li>
+      `).join('');
       byId('onboarding').innerHTML = `
         <h3>Onboarding & Settings</h3>
+        <div class="readiness-panel">
+          <div class="row">
+            <div><strong>Hosted Readiness</strong><div class="empty">Capture, process, test, monitor, and repair loop setup.</div></div>
+            <code class="${readiness.ready ? 'ok' : ''}">${esc(readiness.complete || 0)}/${esc(readiness.total || 0)}</code>
+          </div>
+          ${readinessRows ? `<ul>${readinessRows}</ul>` : '<div class="empty">Readiness checks unavailable.</div>'}
+        </div>
         <form id=\"settingsForm\">
           <div class=\"lbl\">PostHog Host</div>
           <input id=\"phHost\" value=\"${esc(settings.posthog_host)}\" />
@@ -2480,19 +3141,61 @@ const retrace = init({
     }
 
     async function loadTesterPanel(){
-      const [specRes, runsRes, settingsRes] = await Promise.all([
+      const [specRes, runsRes, settingsRes, suitesRes, apiSpecRes] = await Promise.all([
         fetch('/api/tester/specs'),
         fetch('/api/tester/runs'),
         fetch('/api/settings'),
+        fetch('/api/api-suites'),
+        fetch('/api/api-specs'),
       ]);
       const specData = await specRes.json();
       const runData = await runsRes.json();
       const settings = await settingsRes.json();
+      const suiteData = await suitesRes.json();
+      const apiSpecData = await apiSpecRes.json();
       const specs = specData.specs || [];
       const runs = runData.runs || [];
+      const apiSuites = suiteData.suites || [];
+      const apiSpecs = apiSpecData.specs || [];
       const specOptions = specs.map(s =>
         `<option value="${esc(s.spec_id)}">${esc(s.name)} (${esc(s.mode)})</option>`
       ).join('');
+      const uiSpecRows = specs.map(s => {
+        const fixtures = s.fixtures || {};
+        const status = fixtures.draft_status || 'accepted';
+        const linkedIssue = fixtures.issue_public_id || '';
+        return `
+          <div class="inventory-row">
+            <button class="btn" type="button" data-select-ui-spec="${esc(s.spec_id)}">Select</button>
+            <code>${esc(s.spec_id)}</code> · ${esc(s.name || '')}
+            <br><span class="empty">status=<code>${esc(status)}</code> · engine=<code>${esc(s.execution_engine || '')}</code> · steps=<code>${esc((s.exact_steps || []).length)}</code> · assertions=<code>${esc((s.assertions || []).length)}</code>${linkedIssue ? ` · issue=<code>${esc(linkedIssue)}</code>` : ''}</span>
+          </div>
+        `;
+      }).join('');
+      const apiSpecRows = apiSpecs.map(s => `
+        <div class="inventory-row">
+          <button class="btn" type="button" data-run-api-management-spec="${esc(s.spec_id)}">Run</button>
+          <code>${esc(s.spec_id)}</code> · <code>${esc(s.method)}</code> ${esc(s.openapi_path || s.url || '')}
+          <br><span class="empty">expected=<code>${esc(s.expected_status)}</code> · source=<code>${esc(s.source || 'manual')}</code> · requests=<code>${esc(s.request_count)}</code> · assertions=<code>${esc((s.json_assertion_count || 0) + (s.schema_assertion_count || 0))}</code>${s.issue_public_id ? ` · issue=<code>${esc(s.issue_public_id)}</code>` : ''}${s.operation_id ? ` · op=<code>${esc(s.operation_id)}</code>` : ''}</span>
+        </div>
+      `).join('');
+      const draftSpecs = specs.filter(s => (s.fixtures || {}).draft_status === 'draft');
+      const draftOptions = draftSpecs.map(s =>
+        `<option value="${esc(s.spec_id)}">${esc(s.name)} · ${esc(s.spec_id)}</option>`
+      ).join('');
+      const suiteRows = apiSuites.map(s => {
+        const summary = s.import_summary || {};
+        const warnings = s.quality_warning_count || 0;
+        const operations = (s.operations || []).slice(0, 5).map(op => `<li><code>${esc(op.method)}</code> ${esc(op.path || op.url || '')}${op.operation_id ? ` · ${esc(op.operation_id)}` : ''}</li>`).join('');
+        return `
+          <div class="suite-row">
+            <div><button class="btn" type="button" data-run-api-suite="${esc(s.suite_id)}">Run Suite</button> <strong>${esc(s.name || s.suite_id)}</strong> <code>${esc(s.suite_id)}</code></div>
+            <div class="empty">source=<code>${esc(s.source)}</code> · specs=<code>${esc(s.spec_count)}</code> · operations=<code>${esc(s.operation_count)}</code> · skipped=<code>${esc(s.skipped_count)}</code> · warnings=<code class="${warnings ? 'bad' : 'ok'}">${esc(warnings)}</code></div>
+            <div class="empty">coverage=<code>${esc(summary.coverage_percent ?? 0)}%</code>${s.auth_profile ? ` · auth=<code>${esc(s.auth_profile)}</code>` : ''}${s.env_profile ? ` · env=<code>${esc(s.env_profile)}</code>` : ''}</div>
+            ${operations ? `<ul>${operations}</ul>` : ''}
+          </div>
+        `;
+      }).join('');
       const runRows = runs.map(r =>
         `<li><code>${esc(r.run_id || '')}</code> · ${r.ok ? '<span class="ok">ok</span>' : '<span class="bad">fail</span>'} · <code>${esc(r.status || '')}</code> · attempts=<code>${esc(r.attempts || 1)}</code>${r.failure_classification ? ` · class=<code>${esc(r.failure_classification)}</code>` : ''}${r.flake_reason ? ` · flake=<code>${esc(r.flake_reason)}</code>` : ''} · <code>${esc(r.spec_id || '')}</code><br><span class="empty">${esc(r.run_dir || '')}</span></li>`
       ).join('');
@@ -2526,6 +3229,57 @@ const retrace = init({
             <div id="linkedFailureTests"><div class="empty">Loading linked failures...</div></div>
           </div>
         </div>
+        <div class="card draft-editor">
+          <h3>Generated Draft Review</h3>
+          ${draftSpecs.length ? `
+            <div class="draft-grid">
+              <div>
+                <div class="lbl">Draft Spec</div>
+                <select id="draftSpecSelect" style="width:100%; background:#0b1220; border:1px solid #374151; color:#e5e7eb; border-radius:8px; padding:8px;">${draftOptions}</select>
+                <div class="lbl">Name</div>
+                <input id="draftName" value="" />
+                <div class="lbl">Prompt</div>
+                <textarea id="draftPrompt"></textarea>
+                <div class="lbl">App URL</div>
+                <input id="draftAppUrl" value="" />
+                <div class="lbl">Review Note</div>
+                <input id="draftReviewNote" value="" placeholder="What changed or what you verified" />
+                <div style="margin-top:8px">
+                  <button class="btn" id="saveDraftSpecBtn" type="button">Save Draft</button>
+                  <button class="btn" id="acceptDraftSpecBtn" type="button">Accept Draft</button>
+                  <button class="btn" id="runAcceptedDraftBtn" type="button">Run Accepted</button>
+                  <span class="empty" id="draftEditStatus"></span>
+                </div>
+              </div>
+              <div>
+                <div class="lbl">Steps JSON</div>
+                <textarea id="draftStepsJson"></textarea>
+                <div class="lbl">Assertions JSON</div>
+                <textarea id="draftAssertionsJson"></textarea>
+                <div class="empty" id="draftReviewSummary"></div>
+              </div>
+            </div>
+          ` : '<div class="empty">No generated drafts waiting for review.</div>'}
+        </div>
+        <div style="height:12px"></div>
+        <div class="inventory-grid">
+          <div class="card">
+            <h3>UI Spec Inventory</h3>
+            ${uiSpecRows || '<div class="empty">No UI specs yet.</div>'}
+          </div>
+          <div class="card">
+            <h3>API Spec Inventory</h3>
+            <div class="empty" id="apiManagementRunStatus"></div>
+            ${apiSpecRows || '<div class="empty">No API specs yet.</div>'}
+          </div>
+        </div>
+        <div style="height:12px"></div>
+        <div class="card">
+          <h3>API Suites</h3>
+          <div class="empty" id="apiSuiteRunStatus"></div>
+          <div id="apiSuiteRunMatrix"></div>
+          ${suiteRows || '<div class="empty">No API suites yet. Import an OpenAPI document with <code>retrace tester api-import-openapi</code>.</div>'}
+        </div>
       `;
       byId('runsView').innerHTML = `
         <div class="view-head"><div><h2>Runs</h2><div class="empty">Recent local tester results.</div></div></div>
@@ -2533,7 +3287,159 @@ const retrace = init({
       `;
       byId('testerCreateForm').addEventListener('submit', createTesterSpec);
       byId('runTesterBtn').addEventListener('click', runTesterSpec);
+      document.querySelectorAll('[data-select-ui-spec]').forEach(el => {
+        el.addEventListener('click', () => {
+          const select = byId('testerSpecSelect');
+          if(select) select.value = el.dataset.selectUiSpec;
+        });
+      });
+      document.querySelectorAll('[data-run-api-management-spec]').forEach(el => {
+        el.addEventListener('click', () => runManagedApiSpec(el.dataset.runApiManagementSpec));
+      });
+      document.querySelectorAll('[data-run-api-suite]').forEach(el => {
+        el.addEventListener('click', () => runManagedApiSuite(el.dataset.runApiSuite));
+      });
+      if(draftSpecs.length){
+        window.retraceDraftSpecs = draftSpecs;
+        byId('draftSpecSelect')?.addEventListener('change', renderSelectedDraftEditor);
+        byId('saveDraftSpecBtn')?.addEventListener('click', () => saveDraftSpec(false));
+        byId('acceptDraftSpecBtn')?.addEventListener('click', () => saveDraftSpec(true));
+        byId('runAcceptedDraftBtn')?.addEventListener('click', runAcceptedDraftSpec);
+        renderSelectedDraftEditor();
+      }
       renderLinkedFailureTests();
+    }
+
+    async function runManagedApiSpec(specId){
+      const status = byId('apiManagementRunStatus');
+      if(status) status.textContent = `Running ${specId}...`;
+      const res = await fetch('/api/api-spec/run', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({spec_id: specId}),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        const msg = data?.result?.error || data.error || 'API run failed';
+        if(status) status.textContent = `Failed: ${msg}`;
+        return;
+      }
+      if(status) status.textContent = `API passed: ${data.result.run_id}`;
+      await loadTesterPanel();
+    }
+
+    async function runManagedApiSuite(suiteId){
+      const status = byId('apiSuiteRunStatus');
+      const matrix = byId('apiSuiteRunMatrix');
+      if(status) status.textContent = `Running suite ${suiteId}...`;
+      if(matrix) matrix.innerHTML = '';
+      const res = await fetch('/api/api-suite/run', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({suite_id: suiteId}),
+      });
+      const data = await res.json();
+      const rows = (data.results || []).map(item => `
+        <li>
+          <code>${esc(item.spec_id)}</code> · <span class="${item.ok ? 'ok' : 'bad'}">${esc(item.status || (item.ok ? 'passed' : 'failed'))}</span>
+          ${item.status_code ? ` · status=<code>${esc(item.status_code)}</code>` : ''}
+          ${item.run_id ? ` · run=<code>${esc(item.run_id)}</code>` : ''}
+          ${item.error ? `<br><span class="bad">${esc(item.error)}</span>` : ''}
+        </li>
+      `).join('');
+      if(status) status.textContent = `${data.name || suiteId}: ${data.passed || 0}/${data.total || 0} passed`;
+      if(matrix) matrix.innerHTML = rows ? `<ul>${rows}</ul>` : '<div class="empty">No suite results.</div>';
+      if(!res.ok || !data.ok){
+        return;
+      }
+    }
+
+    function selectedDraftSpec(){
+      const id = byId('draftSpecSelect')?.value || '';
+      return (window.retraceDraftSpecs || []).find(s => s.spec_id === id) || null;
+    }
+
+    function renderSelectedDraftEditor(){
+      const spec = selectedDraftSpec();
+      if(!spec){ return; }
+      byId('draftName').value = spec.name || '';
+      byId('draftPrompt').value = spec.prompt || '';
+      byId('draftAppUrl').value = spec.app_url || '';
+      byId('draftStepsJson').value = JSON.stringify(spec.exact_steps || [], null, 2);
+      byId('draftAssertionsJson').value = JSON.stringify(spec.assertions || [], null, 2);
+      const fixtures = spec.fixtures || {};
+      const generation = fixtures.generation || {};
+      const review = generation.review || {};
+      const notes = fixtures.review_notes || [];
+      byId('draftReviewSummary').innerHTML = `
+        draft=<code>${esc(fixtures.draft_status || '')}</code> · steps=<code>${esc((spec.exact_steps || []).length)}</code> · assertions=<code>${esc((spec.assertions || []).length)}</code>
+        ${review.summary ? `<br>${esc(review.summary)}` : ''}
+        ${notes.length ? `<br>Notes: ${notes.map(item => `<code>${esc(item)}</code>`).join(' ')}` : ''}
+      `;
+      byId('draftEditStatus').textContent = '';
+    }
+
+    function parseDraftJson(id, label){
+      try {
+        const value = JSON.parse(byId(id).value || '[]');
+        if(!Array.isArray(value) || value.some(item => !item || typeof item !== 'object' || Array.isArray(item))){
+          throw new Error(`${label} must be a JSON list of objects`);
+        }
+        return value;
+      } catch(err) {
+        throw new Error(`${label}: ${err.message || err}`);
+      }
+    }
+
+    async function saveDraftSpec(accept=false){
+      const spec = selectedDraftSpec();
+      const status = byId('draftEditStatus');
+      if(!spec || !status){ return; }
+      let steps, assertions;
+      try {
+        steps = parseDraftJson('draftStepsJson', 'Steps');
+        assertions = parseDraftJson('draftAssertionsJson', 'Assertions');
+      } catch(err) {
+        status.textContent = err.message || String(err);
+        return;
+      }
+      status.textContent = accept ? 'Accepting...' : 'Saving...';
+      const res = await fetch('/api/tester/draft', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          spec_id: spec.spec_id,
+          name: byId('draftName').value,
+          prompt: byId('draftPrompt').value,
+          app_url: byId('draftAppUrl').value,
+          steps,
+          assertions,
+          review_note: byId('draftReviewNote').value,
+          accept,
+        }),
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok){
+        status.textContent = data.error || 'Draft update failed';
+        return;
+      }
+      status.textContent = accept
+        ? `Accepted ${data.spec.spec_id}`
+        : `Saved ${data.changed_fields.join(', ') || 'metadata'}`;
+      await loadTesterPanel();
+      if(accept){
+        const select = byId('testerSpecSelect');
+        if(select) select.value = data.spec.spec_id;
+      }
+    }
+
+    async function runAcceptedDraftSpec(){
+      const spec = selectedDraftSpec();
+      if(!spec){ return; }
+      await saveDraftSpec(true);
+      const select = byId('testerSpecSelect');
+      if(select) select.value = spec.spec_id;
+      await runTesterSpec();
     }
 
     async function processReplayJobs(){
@@ -2797,8 +3703,57 @@ const retrace = init({
       `;
     }
 
+    function renderEvidenceStitching(issue){
+      const stitching = issue.evidence_stitching || {};
+      const stages = stitching.stages || [];
+      const stageRows = stages.map(stage => `
+        <div class="workflow-step ${stage.status === 'complete' ? 'complete' : (stage.status === 'missing' ? 'blocked' : 'current')}">
+          <strong>${esc(stage.label)}</strong>
+          <span>${esc(stage.detail || '')}</span>
+        </div>
+      `).join('');
+      const traceRows = (stitching.trace_ids || []).map(id => `<code>${esc(id)}</code>`).join(' ');
+      const apiRows = (stitching.api_regression_spec_ids || []).filter(Boolean).map(id => `<code>${esc(id)}</code>`).join(' ');
+      const frameRows = (stitching.source_map_frames || []).map(frame => `
+        <li>
+          <code>${esc(frame.filename || 'frame')}</code> · ${frame.source_mapped ? '<span class="ok">mapped</span>' : '<span class="bad">unmapped</span>'}
+          ${frame.reason ? ` · <span class="empty">${esc(frame.reason)}</span>` : ''}
+        </li>
+      `).join('');
+      return `
+        <div class="workflow-strip">${stageRows}</div>
+        <div class="empty">Trace IDs: ${traceRows || 'none captured'}</div>
+        <div class="empty">API regression specs: ${apiRows || 'none linked'}</div>
+        ${frameRows ? `<ul>${frameRows}</ul>` : '<div class="empty">No source-map frame diagnostics in this issue timeline.</div>'}
+      `;
+    }
+
+    function renderIssueReadiness(issue){
+      const workflow = issue.workflow || {};
+      const blockers = workflow.blockers || [];
+      const actions = workflow.recommended_actions || [];
+      const blockerRows = blockers.map(item => `<li>${esc(item)}</li>`).join('');
+      const actionRows = actions.map(item => `
+        <div>
+          <button class="btn" type="button" data-workflow-action="${esc(item.action)}">${esc(item.label || item.action)}</button>
+          <span class="empty">${esc(item.reason || '')}</span>
+        </div>
+      `).join('');
+      return `
+        <div class="readiness-panel">
+          <div class="row">
+            <div><strong>QA Loop Status</strong><div class="empty">Capture → test → repair → verify across replay, UI, and API evidence.</div></div>
+            <code class="${workflow.readiness === 'verified' ? 'ok' : (blockers.length ? 'bad' : '')}">${esc(workflow.readiness || 'unknown')}</code>
+          </div>
+          ${blockerRows ? `<div class="lbl">Blockers</div><ul>${blockerRows}</ul>` : '<div class="empty" style="margin-top:8px">No blocking evidence gaps detected.</div>'}
+          ${actionRows ? `<div class="lbl">Recommended Actions</div><div class="recommendation-list">${actionRows}</div>` : ''}
+        </div>
+      `;
+    }
+
     function handleIssueWorkflowAction(issue, action){
       if(action === 'generate_replay_spec') return generateReplayIssueSpec(issue);
+      if(action === 'generate_api_regression') return generateReplayIssueApiSpec(issue);
       if(action === 'generate_repair') return generateReplayIssueFixPrompts(issue);
       if(action === 'verify_resolved') return verifyResolvedReplayIssues();
       if(action === 'review_timeline'){
@@ -2895,6 +3850,7 @@ const retrace = init({
         </div>
         <div class="empty" id="replayLifecycleStatus"></div>
         ${renderIssueWorkflow(issue)}
+        ${renderIssueReadiness(issue)}
         <div class="detail-grid">
           <div>
             <div class="card">
@@ -2906,6 +3862,8 @@ const retrace = init({
             </div>
             <div style="height:12px"></div>
             <div class="card">${renderIssueTimeline(issue)}</div>
+            <div style="height:12px"></div>
+            <div class="card"><h3>Evidence Stitching</h3>${renderEvidenceStitching(issue)}</div>
             <div style="height:12px"></div>
             <div class="card">
               <h3>Repair Task</h3>
@@ -3255,6 +4213,33 @@ def ui_command(
                 )
                 return
 
+            if path == "/api/onboarding/readiness":
+                s = current_settings(include_secrets=True)
+                checks = {
+                    "gh": _gh_checks(),
+                    "posthog": _posthog_check(
+                        s["posthog_host"],
+                        s["posthog_project_id"],
+                        s["posthog_api_key"],
+                    ),
+                    "llm": _llm_check(
+                        s["llm_provider"],
+                        s["llm_base_url"],
+                        s["llm_model"],
+                        s["llm_api_key"],
+                    ),
+                    "replay_api": _replay_api_check(),
+                }
+                self._json(
+                    _hosted_onboarding_readiness_payload(
+                        store=store,
+                        data_dir=data_dir,
+                        settings=s,
+                        checks=checks,
+                    )
+                )
+                return
+
             if path == "/api/findings":
                 rp = _latest_report(output_dir)
                 findings = _to_findings_payload(
@@ -3263,6 +4248,73 @@ def ui_command(
                     repo_full_name=repo_full_name,
                 )
                 self._json({"report_path": str(rp) if rp else "", "findings": findings})
+                return
+
+            if path == "/api/qa-incidents":
+                # Unified QA incident queue (replay/UI/API/monitor/review).
+                query_args = parse_qs(urlparse(self.path).query)
+                source_filter = (query_args.get("source") or [""])[0]
+                # Page through the unified queue and filter on the way so a
+                # filtered source whose matching rows fall outside the first
+                # 200 still surfaces.
+                rows: list = []
+                page_size = 200
+                offset = 0
+                while len(rows) < 200 and offset < 5000:
+                    page = store.list_qa_incidents(limit=page_size, offset=offset)
+                    if not page:
+                        break
+                    if source_filter:
+                        rows.extend(
+                            r for r in page if str(r["primary_source_kind"]) == source_filter
+                        )
+                    else:
+                        rows.extend(page)
+                    if len(page) < page_size:
+                        break
+                    offset += page_size
+                rows = rows[:200]
+                incidents = [
+                    {
+                        "public_id": str(r["public_id"]),
+                        "title": str(r["title"] or ""),
+                        "summary": str(r["summary"] or ""),
+                        "severity": str(r["severity"] or ""),
+                        "confidence": str(r["confidence"] or ""),
+                        "status": str(r["status"] or ""),
+                        "primary_source_kind": str(r["primary_source_kind"] or ""),
+                        "affected_users": int(r["affected_users"] or 0),
+                        "affected_count": int(r["affected_count"] or 0),
+                        "fix_pr_url": str(r["fix_pr_url"] or ""),
+                        "updated_at": str(r["updated_at"] or ""),
+                    }
+                    for r in rows
+                ]
+                self._json({"incidents": incidents, "count": len(incidents)})
+                return
+
+            if path.startswith("/api/qa-incidents/"):
+                public_id = path[len("/api/qa-incidents/"):]
+                if not re.match(r"^INC-[A-Z0-9]+$", public_id):
+                    self._json({"error": "invalid incident id"}, status=400)
+                    return
+                row = store.get_qa_incident(public_id)
+                if row is None:
+                    self._json({"error": "not found"}, status=404)
+                    return
+                # Project the row to a plain dict the frontend can consume.
+                incident = {
+                    key: (str(row[key]) if row[key] is not None else "")
+                    for key in row.keys()
+                }
+                # Cast known numeric columns.
+                for k in ("affected_count", "affected_users", "first_seen_ms", "last_seen_ms"):
+                    if k in incident:
+                        try:
+                            incident[k] = int(incident[k] or 0)
+                        except (TypeError, ValueError):
+                            incident[k] = 0
+                self._json({"incident": incident})
                 return
 
             if path == "/api/tester/specs":
@@ -3275,6 +4327,14 @@ def ui_command(
             if path == "/api/tester/runs":
                 runs = load_run_summaries(runs_dir_for_data_dir(data_dir), limit=20)
                 self._json({"runs": runs})
+                return
+
+            if path == "/api/api-suites":
+                self._json(_api_suites_payload(data_dir))
+                return
+
+            if path == "/api/api-specs":
+                self._json(_api_specs_payload(data_dir))
                 return
 
             if path == "/api/replay-dashboard":
@@ -3660,6 +4720,22 @@ def ui_command(
                 self._json({"ok": result.ok, "result": result.__dict__}, status=status)
                 return
 
+            if path == "/api/tester/draft":
+                body = self._read_json_body()
+                payload, status = _edit_ui_draft_payload(
+                    data_dir=data_dir,
+                    spec_id=str(body.get("spec_id", "")).strip(),
+                    name=str(body.get("name", "")).strip(),
+                    prompt=str(body.get("prompt", "")).strip(),
+                    app_url=str(body.get("app_url", "")).strip(),
+                    steps=body.get("steps") if "steps" in body else None,
+                    assertions=body.get("assertions") if "assertions" in body else None,
+                    review_note=str(body.get("review_note", "")).strip(),
+                    accept=bool(body.get("accept") or False),
+                )
+                self._json(payload, status=status)
+                return
+
             if path == "/api/replay-issue/spec":
                 body = self._read_json_body()
                 workspace = store.ensure_workspace(project_name="Default")
@@ -3719,6 +4795,24 @@ def ui_command(
                     store=store,
                     data_dir=data_dir,
                     spec_id=str(body.get("spec_id", "")).strip(),
+                )
+                self._json(payload, status=status)
+                return
+
+            if path == "/api/api-spec/run":
+                body = self._read_json_body()
+                payload, status = _run_api_spec_payload(
+                    data_dir=data_dir,
+                    spec_id=str(body.get("spec_id", "")).strip(),
+                )
+                self._json(payload, status=status)
+                return
+
+            if path == "/api/api-suite/run":
+                body = self._read_json_body()
+                payload, status = _run_api_suite_payload(
+                    data_dir=data_dir,
+                    suite_id=str(body.get("suite_id", "")).strip(),
                 )
                 self._json(payload, status=status)
                 return

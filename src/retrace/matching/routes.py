@@ -21,6 +21,33 @@ _ROUTE_CALL_RE = re.compile(
 )
 _NEXT_HANDLER_RE = re.compile(r"\bexport\s+(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE)\b")
 
+# Python frameworks
+#
+# FastAPI / Flask: `@app.get("/api/x")`, `@router.post("/api/x")`,
+# `@blueprint.put("/api/x")`. Same shape as JS, captured separately so
+# we can pre-filter by extension.
+_PY_ROUTE_DECORATOR_RE = re.compile(
+    r"@\s*(?:app|router|blueprint|bp)\s*\.\s*(get|post|put|patch|delete|head|options|websocket)\s*\(\s*['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
+# Flask classic: `@app.route("/api/x", methods=["POST"])` (with optional methods).
+_PY_FLASK_ROUTE_RE = re.compile(
+    r"@\s*(?:app|router|blueprint|bp)\s*\.\s*route\s*\(\s*['\"]([^'\"]+)['\"](?:\s*,\s*methods\s*=\s*\[([^\]]*)\])?",
+    re.IGNORECASE,
+)
+# Django urls.py: `path("api/x", ...)` or `re_path(r"^api/x$", ...)`.
+_PY_DJANGO_PATH_RE = re.compile(
+    r"\b(?:path|re_path)\s*\(\s*[rR]?['\"]([^'\"]+)['\"]",
+)
+
+# Ruby on Rails routes.rb: `get '/api/x'`, `post '/api/x', to: '...'`,
+# `resources :foo`, etc. We catch the verb forms; `resources`/`scope`
+# would need a much richer parser.
+_RB_RAILS_VERB_RE = re.compile(
+    r"^\s*(get|post|put|patch|delete|match)\s+['\"]([^'\"]+)['\"]",
+    re.MULTILINE | re.IGNORECASE,
+)
+
 
 def load_route_manifest(repo_path: Path) -> list[RouteDefinition]:
     routes: list[RouteDefinition] = []
@@ -116,39 +143,131 @@ def _source_file_for_manifest_target(repo_path: Path, target: str) -> str:
     return possible[-1] if possible else clean
 
 
+_SCANNABLE_EXTS = {
+    ".ts", ".tsx", ".js", ".jsx",
+    ".py",   # FastAPI / Flask / Django
+    ".rb",   # Rails
+}
+
+_SKIP_DIR_PARTS = {
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    ".tox",
+    ".pytest_cache",
+    "site-packages",
+    "vendor",         # ruby vendor/
+    ".bundle",
+}
+
+
 def _routes_from_source(repo_path: Path) -> list[RouteDefinition]:
     routes: list[RouteDefinition] = []
     for path in repo_path.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx"}:
+        if not path.is_file() or path.suffix.lower() not in _SCANNABLE_EXTS:
             continue
         parts = path.relative_to(repo_path).parts
-        if ".git" in parts or "node_modules" in parts or "dist" in parts:
+        if any(part in _SKIP_DIR_PARTS for part in parts):
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
         rel = path.relative_to(repo_path).as_posix()
-        for match in _ROUTE_CALL_RE.finditer(text):
-            routes.append(
-                RouteDefinition(
-                    method=match.group(1).upper(),
-                    route=_normalize_route(match.group(2)),
-                    file_path=rel,
+        suffix = path.suffix.lower()
+
+        if suffix in {".ts", ".tsx", ".js", ".jsx"}:
+            for match in _ROUTE_CALL_RE.finditer(text):
+                routes.append(
+                    RouteDefinition(
+                        method=match.group(1).upper(),
+                        route=_normalize_route(match.group(2)),
+                        file_path=rel,
+                    )
                 )
-            )
-        if "/api/" in rel or rel.startswith(("app/api/", "src/app/api/")):
-            route = _next_api_route_from_path(rel)
-            if route:
-                for match in _NEXT_HANDLER_RE.finditer(text):
+            if "/api/" in rel or rel.startswith(("app/api/", "src/app/api/")):
+                route = _next_api_route_from_path(rel)
+                if route:
+                    for match in _NEXT_HANDLER_RE.finditer(text):
+                        routes.append(
+                            RouteDefinition(
+                                method=match.group(1).upper(),
+                                route=route,
+                                file_path=rel,
+                                source="next_app_route",
+                            )
+                        )
+
+        elif suffix == ".py":
+            # FastAPI / Flask decorator form: @app.get("/api/x")
+            for match in _PY_ROUTE_DECORATOR_RE.finditer(text):
+                routes.append(
+                    RouteDefinition(
+                        method=match.group(1).upper(),
+                        route=_normalize_route(match.group(2)),
+                        file_path=rel,
+                        source="python_decorator",
+                    )
+                )
+            # Flask classic: @app.route("/api/x", methods=["POST"]) — emit
+            # one route per declared method; default to GET when methods
+            # isn't supplied (Flask's documented default).
+            for match in _PY_FLASK_ROUTE_RE.finditer(text):
+                methods_blob = (match.group(2) or "").strip()
+                if methods_blob:
+                    methods = [
+                        m.strip().strip("'\"").upper()
+                        for m in methods_blob.split(",")
+                        if m.strip().strip("'\"")
+                    ]
+                else:
+                    methods = ["GET"]
+                for verb in methods:
                     routes.append(
                         RouteDefinition(
-                            method=match.group(1).upper(),
-                            route=route,
+                            method=verb,
+                            route=_normalize_route(match.group(1)),
                             file_path=rel,
-                            source="next_app_route",
+                            source="flask_route",
                         )
                     )
+            # Django: urlpatterns = [path("api/x", ...), re_path(r"^api/x$", ...)]
+            # Match only inside files literally named urls.py — using
+            # endswith() would also accept `admin_urls.py` etc.
+            if path.name == "urls.py":
+                for match in _PY_DJANGO_PATH_RE.finditer(text):
+                    normalized = _normalize_django_route(match.group(1))
+                    routes.append(
+                        RouteDefinition(
+                            method="",  # django paths don't carry verb info
+                            route=normalized,
+                            file_path=rel,
+                            source="django_urlconf",
+                        )
+                    )
+
+        elif suffix == ".rb":
+            # Rails routes.rb — basename check (not endswith) so a file
+            # named `myroutes.rb` doesn't masquerade as a route file.
+            if path.name == "routes.rb":
+                for match in _RB_RAILS_VERB_RE.finditer(text):
+                    verb = match.group(1).upper()
+                    if verb == "MATCH":
+                        verb = ""  # match supports multiple verbs; leave blank.
+                    routes.append(
+                        RouteDefinition(
+                            method=verb,
+                            route=_normalize_route(match.group(2)),
+                            file_path=rel,
+                            source="rails_routes",
+                        )
+                    )
+
     return routes
 
 
@@ -169,6 +288,33 @@ def _next_api_route_from_path(rel: str) -> str:
 def _normalize_route(route: str) -> str:
     clean = route.strip().split("?", 1)[0].rstrip("/")
     return clean or "/"
+
+
+def _normalize_django_route(raw_route: str) -> str:
+    """Project Django path/re_path syntax onto the route shape `route_matches`
+    understands (`:id` placeholders).
+
+    Examples:
+      * `path("api/users/<int:pk>", ...)`         -> `/api/users/:pk`
+      * `path("api/users/<slug:name>", ...)`      -> `/api/users/:name`
+      * `re_path(r"^api/legacy/(?P<id>[0-9]+)$")` -> `/api/legacy/:id`
+
+    Without this, the manifest entry would still contain Django's raw
+    `<int:pk>` form, and `route_matches("/api/users/42")` would never
+    match — breaking route-to-file ownership for any dynamic Django
+    endpoint.
+    """
+    cleaned = raw_route.lstrip("^").rstrip("$")
+    # Order matters: `(?P<id>[0-9]+)` first so the surrounding parens
+    # and the `?` are consumed in one shot. Doing the bare `<id>`
+    # substitution first would leave a stray `?` that
+    # `_normalize_route`'s query-string strip then eats.
+    cleaned = re.sub(r"\(\?P<([^>]+)>[^)]*\)", r":\1", cleaned)
+    # `<int:pk>` / `<pk>` / `<slug:name>` -> `:pk` / `:name`
+    cleaned = re.sub(r"<(?:[^:>]+:)?([^>]+)>", r":\1", cleaned)
+    if not cleaned.startswith("/"):
+        cleaned = "/" + cleaned
+    return _normalize_route(cleaned)
 
 
 @functools.lru_cache(maxsize=256)

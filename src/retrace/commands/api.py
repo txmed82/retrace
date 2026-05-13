@@ -39,6 +39,7 @@ from retrace.replay_api import (
 )
 from retrace.replay_core import process_queued_replay_jobs
 from retrace.sdk_keys import (
+    authenticate_sdk_key,
     authenticate_service_token,
     create_sdk_key,
     create_service_token,
@@ -47,13 +48,40 @@ from retrace.sentry_compat import (
     MAX_SENTRY_BODY_BYTES,
     SentryCompatIngestError,
     build_sentry_dsn,
+    extract_sentry_ingest_key,
     ingest_sentry_compat_request,
 )
 from retrace.source_maps import upload_source_map
-from retrace.storage import Storage
+from retrace.storage import RateLimitDecision, Storage
 
 
 logger = logging.getLogger(__name__)
+
+INGEST_RATE_LIMITS: dict[str, tuple[int, int]] = {
+    "replay": (600, 60),
+    "sentry": (600, 60),
+    "monitoring": (300, 60),
+    "source_maps": (30, 60),
+    # OTel logs/traces — high-volume by design (every span is a row),
+    # so we run the same ceiling as replay rather than the tighter
+    # monitoring webhook quota. Operators with bursty OTel traffic
+    # should tune via the existing `consume_ingest_rate_limit` knobs
+    # if they hit the limit on legitimate load.
+    "otel": (600, 60),
+    # P3.6 (scaffold) — server-side replay sessions are captured at
+    # the failure moment (one per SSR exception, not a stream), so
+    # expected volume is much lower than browser replay. Tight
+    # default; operators with high failure rates can tune.
+    "server_replay": (120, 60),
+}
+HOSTED_ONBOARDING_SCOPES = (
+    "ingest",
+    "source_maps:write",
+    "app_errors:read",
+    "app_errors:write",
+    "issues:read",
+    "replay:read",
+)
 
 
 def _maybe_llm_client(cfg: Any, *, enabled: bool) -> LLMClient | None:
@@ -62,7 +90,13 @@ def _maybe_llm_client(cfg: Any, *, enabled: bool) -> LLMClient | None:
     return LLMClient(cfg.llm)
 
 
-def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
+def _json_response(
+    handler: BaseHTTPRequestHandler,
+    status: int,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+) -> None:
     data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     setattr(handler, "_retrace_response_status", status)
     handler.send_response(status)
@@ -70,6 +104,8 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
     trace_id = str(getattr(handler, "_retrace_trace_id", "") or "")
     if trace_id:
         handler.send_header("X-Retrace-Trace-Id", trace_id)
+    for name, value in (headers or {}).items():
+        handler.send_header(name, value)
     _cors_headers(handler)
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
@@ -79,6 +115,13 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
 def _cors_headers(handler: BaseHTTPRequestHandler) -> None:
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    handler.send_header(
+        "Access-Control-Expose-Headers",
+        (
+            "X-Retrace-Trace-Id, Retry-After, X-RateLimit-Limit, "
+            "X-RateLimit-Remaining, X-RateLimit-Reset, X-RateLimit-Window"
+        ),
+    )
     handler.send_header(
         "Access-Control-Allow-Headers",
         (
@@ -114,6 +157,76 @@ def _bearer_token(headers: Any) -> str:
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
     return ""
+
+
+def _header_value(headers: Any, name: str) -> str:
+    lname = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == lname:
+            return str(value)
+    return ""
+
+
+def _extract_replay_sdk_key(headers: Any, query: dict[str, str]) -> str:
+    direct = _header_value(headers, "x-retrace-key").strip()
+    if direct:
+        return direct
+    auth = _header_value(headers, "authorization").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return str(
+        query.get("key") or query.get("api_key") or query.get("apiKey") or ""
+    ).strip()
+
+
+def _rate_limit_headers(decision: RateLimitDecision) -> dict[str, str]:
+    return {
+        "Retry-After": str(decision.reset_after_seconds),
+        "X-RateLimit-Limit": str(decision.limit),
+        "X-RateLimit-Remaining": str(decision.remaining),
+        "X-RateLimit-Reset": str(decision.reset_after_seconds),
+        "X-RateLimit-Window": str(decision.window_seconds),
+    }
+
+
+def _rate_limited_response(
+    handler: BaseHTTPRequestHandler,
+    *,
+    bucket: str,
+    decision: RateLimitDecision,
+) -> None:
+    _json_response(
+        handler,
+        429,
+        {
+            "error": "rate_limited",
+            "message": f"{bucket} ingest rate limit exceeded.",
+            "limit": decision.limit,
+            "remaining": decision.remaining,
+            "retry_after_seconds": decision.reset_after_seconds,
+            "window_seconds": decision.window_seconds,
+        },
+        headers=_rate_limit_headers(decision),
+    )
+
+
+def _consume_rate_limit(
+    store: Storage,
+    *,
+    project_id: str,
+    environment_id: str,
+    bucket: str,
+    identity: str,
+) -> RateLimitDecision:
+    limit, window_seconds = INGEST_RATE_LIMITS[bucket]
+    return store.consume_ingest_rate_limit(
+        project_id=project_id,
+        environment_id=environment_id,
+        bucket=bucket,
+        identity=identity,
+        limit=limit,
+        window_seconds=window_seconds,
+    )
 
 
 def _require_service_token(
@@ -274,6 +387,20 @@ def _evidence_api_dict(evidence: Any) -> dict[str, Any]:
     }
 
 
+def _incident_lifecycle_event_api_dict(event: Any) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "incident_id": event.incident_id,
+        "from_status": event.from_status,
+        "to_status": event.to_status,
+        "actor_type": event.actor_type,
+        "actor_id": event.actor_id,
+        "reason": event.reason,
+        "metadata": dict(event.metadata or {}),
+        "created_at": _dt_api(event.created_at),
+    }
+
+
 def _repair_task_api_dict(task: Any) -> dict[str, Any]:
     return {
         "id": task.id,
@@ -295,6 +422,218 @@ def _repair_task_api_dict(task: Any) -> dict[str, Any]:
     }
 
 
+def _hosted_onboarding_manifest(
+    *,
+    base_url: str,
+    project_id: str,
+    environment_id: str,
+    sdk_key: str,
+    service_token: str,
+    service_token_scopes: Iterable[str],
+    release: str = "$GITHUB_SHA",
+    artifact_url: str = "https://cdn.example.com/assets/app.min.js",
+) -> dict[str, Any]:
+    clean_base_url = base_url.rstrip("/") or "http://127.0.0.1:8788"
+    clean_release = release.strip() or "$GITHUB_SHA"
+    clean_artifact_url = artifact_url.strip() or "https://cdn.example.com/assets/app.min.js"
+    sentry_dsn = build_sentry_dsn(
+        public_key=sdk_key,
+        base_url=clean_base_url,
+        project_id=project_id,
+    )
+    monitoring_webhook = (
+        f"{clean_base_url}/api/monitoring/webhook/sentry?environment_id={environment_id}"
+    )
+    source_map_endpoint = f"{clean_base_url}/api/source-maps?environment_id={environment_id}"
+    app_errors_endpoint = f"{clean_base_url}/api/app-errors?environment_id={environment_id}"
+    alert_rules_endpoint = (
+        f"{clean_base_url}/api/app-error-alert-rules?environment_id={environment_id}"
+    )
+    prune_endpoint = f"{clean_base_url}/api/app-errors/prune?environment_id={environment_id}"
+    health_endpoint = f"{clean_base_url}/healthz"
+    smoke_event_id = "retrace-onboarding-smoke-1"
+    source_map_upload = (
+        "curl -X POST "
+        f"'{source_map_endpoint}' "
+        f"-H 'Authorization: Bearer {service_token}' "
+        "-H 'Content-Type: application/json' "
+        f"-d '{{\"release\":\"{clean_release}\",\"artifact_url\":\"{clean_artifact_url}\",\"source_map\":{{\"version\":3,\"sources\":[\"src/app.ts\"],\"names\":[],\"mappings\":\"AAAA\"}}}}'"
+    )
+    monitoring_smoke = (
+        "curl -X POST "
+        f"'{monitoring_webhook}' "
+        f"-H 'Authorization: Bearer {service_token}' "
+        "-H 'Content-Type: application/json' "
+        f"-d '{{\"event\":{{\"event_id\":\"{smoke_event_id}\",\"title\":\"Retrace onboarding smoke error\",\"level\":\"error\",\"release\":\"{clean_release}\"}}}}'"
+    )
+    alert_rule_create = (
+        "curl -X POST "
+        f"'{alert_rules_endpoint}' "
+        f"-H 'Authorization: Bearer {service_token}' "
+        "-H 'Content-Type: application/json' "
+        "-d '{\"name\":\"Critical production errors\",\"action\":\"alert\",\"min_severity\":\"high\"}'"
+    )
+    retention_prune = (
+        "curl -X POST "
+        f"'{prune_endpoint}' "
+        f"-H 'Authorization: Bearer {service_token}' "
+        "-H 'Content-Type: application/json' "
+        "-d '{\"failure_retention_days\":90,\"evidence_retention_days\":90,\"source_map_retention_days\":30,\"rate_limit_retention_hours\":48}'"
+    )
+    return {
+        "workspace": {
+            "project_id": project_id,
+            "environment_id": environment_id,
+            "api_base_url": clean_base_url,
+        },
+        "credentials": {
+            "browser_sdk_key": sdk_key,
+            "service_token": service_token,
+            "service_token_scopes": [str(scope) for scope in service_token_scopes],
+            "sentry_dsn": sentry_dsn,
+        },
+        "endpoints": {
+            "replay_ingest": f"{clean_base_url}/api/sdk/replay",
+            "sentry_store": f"{clean_base_url}/api/sentry/{project_id}/store/",
+            "sentry_envelope": f"{clean_base_url}/api/sentry/{project_id}/envelope/",
+            "monitoring_webhook": monitoring_webhook,
+            "source_maps": source_map_endpoint,
+            "app_errors": app_errors_endpoint,
+            "app_error_alert_rules": alert_rules_endpoint,
+            "app_error_retention_prune": prune_endpoint,
+        },
+        "snippets": {
+            "browser_sdk_install": "npm install @retrace/browser",
+            "browser_sdk_init": (
+                "import { initRetrace } from '@retrace/browser';\n\n"
+                "initRetrace({\n"
+                f"  apiBaseUrl: '{clean_base_url}',\n"
+                f"  key: '{sdk_key}',\n"
+                "  captureConsole: true,\n"
+                "  captureNetwork: true,\n"
+                "  captureClicks: true,\n"
+                "});"
+            ),
+            "sentry_js_init": (
+                "import * as Sentry from '@sentry/browser';\n\n"
+                "Sentry.init({\n"
+                f"  dsn: '{sentry_dsn}',\n"
+                f"  release: '{clean_release}',\n"
+                "});"
+            ),
+            "monitoring_webhook_curl": (
+                monitoring_smoke
+            ),
+            "source_map_upload_curl": (
+                source_map_upload
+            ),
+            "alert_rule_curl": (
+                alert_rule_create
+            ),
+            "resolve_incident_curl": (
+                "curl -X POST "
+                f"'{clean_base_url}/api/app-errors/<incident_public_id>/lifecycle?environment_id={environment_id}' "
+                f"-H 'Authorization: Bearer {service_token}' "
+                "-H 'Content-Type: application/json' "
+                "-d '{\"action\":\"resolve\",\"reason\":\"fixed and verified\"}'"
+            ),
+            "retention_cron": (
+                retention_prune
+            ),
+            "github_actions_source_maps": (
+                "name: Upload Retrace source maps\n"
+                "on: [push]\n"
+                "jobs:\n"
+                "  upload-source-maps:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@v4\n"
+                "      - run: npm ci && npm run build\n"
+                "      - run: |\n"
+                "          curl -X POST "
+                f"'{source_map_endpoint}' \\\n"
+                "            -H 'Authorization: Bearer ${{ secrets.RETRACE_SERVICE_TOKEN }}' \\\n"
+                "            -H 'Content-Type: application/json' \\\n"
+                "            --data-binary @retrace-source-map-upload.json"
+            ),
+        },
+        "verification": {
+            "ordered_steps": [
+                {
+                    "id": "health",
+                    "label": "API health",
+                    "command": f"curl -fsS '{health_endpoint}'",
+                    "expect": {"status": 200, "json": {"ok": True}},
+                },
+                {
+                    "id": "source_maps",
+                    "label": "Upload source map for release",
+                    "command": source_map_upload,
+                    "expect": {
+                        "status": 202,
+                        "json_contains": {
+                            "source_map": {
+                                "release": clean_release,
+                                "artifact_url": clean_artifact_url,
+                            }
+                        },
+                    },
+                },
+                {
+                    "id": "alert_rule",
+                    "label": "Create high-severity alert rule",
+                    "command": alert_rule_create,
+                    "expect": {
+                        "status": 202,
+                        "json_contains": {"rule": {"action": "alert"}},
+                    },
+                },
+                {
+                    "id": "monitoring_smoke",
+                    "label": "Send monitoring smoke error",
+                    "command": monitoring_smoke,
+                    "expect": {
+                        "status": 202,
+                        "json_contains": {"results": [{"external_id": smoke_event_id}]},
+                    },
+                },
+                {
+                    "id": "app_errors",
+                    "label": "Confirm smoke incident is visible",
+                    "command": (
+                        f"curl -fsS '{app_errors_endpoint}' "
+                        f"-H 'Authorization: Bearer {service_token}'"
+                    ),
+                    "expect": {
+                        "status": 200,
+                        "json_path_hint": "$.incidents[?(@.latest_failure.source_external_id contains retrace-onboarding-smoke-1)]",
+                    },
+                },
+                {
+                    "id": "retention",
+                    "label": "Verify hosted retention prune endpoint",
+                    "command": retention_prune,
+                    "expect": {
+                        "status": 202,
+                        "json_contains": {"retention": {"environment_id": environment_id}},
+                    },
+                },
+            ],
+            "required_scopes": [str(scope) for scope in service_token_scopes],
+            "release": clean_release,
+            "artifact_url": clean_artifact_url,
+        },
+        "checklist": [
+            "Start the API with `retrace api serve --host 0.0.0.0 --port 8788` behind TLS.",
+            "Install the browser SDK or point Sentry-compatible clients at the DSN.",
+            "Upload source maps from CI for each release before or during deploy.",
+            "Create at least one alert rule for high-severity production errors.",
+            "Send the monitoring smoke webhook and confirm it appears in `GET /api/app-errors`.",
+            "Schedule the retention prune request daily for hosted cleanup.",
+        ],
+    }
+
+
 def _alert_rule_api_dict(rule: Any) -> dict[str, Any]:
     return {
         "id": rule.id,
@@ -312,6 +651,46 @@ def _alert_rule_api_dict(rule: Any) -> dict[str, Any]:
         "created_at": _dt_api(rule.created_at),
         "updated_at": _dt_api(rule.updated_at),
     }
+
+
+def _retention_result_api_dict(result: Any) -> dict[str, Any]:
+    return {
+        "dry_run": bool(result.dry_run),
+        "failure_retention_days": int(result.failure_retention_days),
+        "evidence_retention_days": int(result.evidence_retention_days),
+        "source_map_retention_days": int(result.source_map_retention_days),
+        "rate_limit_retention_hours": int(result.rate_limit_retention_hours),
+        "deleted": {
+            "failures": int(result.failures),
+            "evidence": int(result.evidence),
+            "incident_links": int(result.incident_links),
+            "incidents": int(result.incidents),
+            "source_maps": int(result.source_maps),
+            "rate_limit_rows": int(result.rate_limit_rows),
+        },
+    }
+
+
+def _optional_int(payload: dict[str, Any], key: str, default: int) -> int:
+    value = payload.get(key, None)
+    if value is None:
+        return default
+    return int(value)
+
+
+def _optional_bool(payload: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = payload.get(key, None)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ValueError(f"{key} must be a boolean")
 
 
 def _app_error_notification_payload(
@@ -504,7 +883,13 @@ def _handler(
                 parsed.path != "/api/sdk/replay"
                 and parsed.path != "/api/deploys"
                 and parsed.path != "/api/source-maps"
+                and parsed.path != "/api/onboarding/hosted"
                 and parsed.path != "/api/app-error-alert-rules"
+                and parsed.path != "/api/app-errors/prune"
+                and not (
+                    parsed.path.startswith("/api/app-errors/")
+                    and parsed.path.endswith("/lifecycle")
+                )
                 and not parsed.path.startswith("/api/otel/")
                 and not parsed.path.startswith("/api/sentry/")
                 and _sentry_ingest_path_parts(parsed.path) is None
@@ -536,6 +921,20 @@ def _handler(
             if parsed.path == "/api/app-error-alert-rules":
                 self._handle_upsert_app_error_alert_rule(parsed.query)
                 return
+            if parsed.path == "/api/app-errors/prune":
+                self._handle_prune_app_errors(parsed.query)
+                return
+            if parsed.path == "/api/onboarding/hosted":
+                self._handle_hosted_onboarding(parsed.query)
+                return
+            if parsed.path.startswith("/api/app-errors/") and parsed.path.endswith(
+                "/lifecycle"
+            ):
+                incident_id = parsed.path.removeprefix("/api/app-errors/")[
+                    : -len("/lifecycle")
+                ].strip("/")
+                self._handle_app_error_incident_lifecycle(incident_id, parsed.query)
+                return
             if parsed.path in {"/api/otel/v1/logs", "/api/otel/v1/traces"}:
                 self._handle_otel_ingest(parsed.path, parsed.query)
                 return
@@ -552,6 +951,9 @@ def _handler(
                 return
             if parsed.path == "/api/github/webhook":
                 self._handle_github_webhook()
+                return
+            if parsed.path == "/api/sdk/server-replay":
+                self._handle_server_replay_ingest(parsed.query)
                 return
             if parsed.path != "/api/sdk/replay":
                 _json_response(self, 404, {"error": "not_found"})
@@ -574,13 +976,37 @@ def _handler(
                     },
                 )
                 return
+            replay_query = _query_dict(parsed.query)
+            sdk_key = authenticate_sdk_key(
+                store, _extract_replay_sdk_key(self.headers, replay_query)
+            )
+            if sdk_key is None:
+                _json_response(
+                    self,
+                    401,
+                    {
+                        "error": "unauthorized",
+                        "message": "Missing or invalid SDK key.",
+                    },
+                )
+                return
+            decision = _consume_rate_limit(
+                store,
+                project_id=sdk_key.project_id,
+                environment_id=sdk_key.environment_id,
+                bucket="replay",
+                identity=sdk_key.id,
+            )
+            if not decision.allowed:
+                _rate_limited_response(self, bucket="replay", decision=decision)
+                return
             try:
                 body = self.rfile.read(length)
                 result = ingest_replay_request(
                     store=store,
                     headers={k: v for k, v in self.headers.items()},
                     body=body,
-                    query=_query_dict(parsed.query),
+                    query=replay_query,
                 )
                 _json_response(self, 202, result)
             except ReplayIngestError as exc:
@@ -625,14 +1051,54 @@ def _handler(
                 )
                 return
             body = self.rfile.read(length)
+            sentry_headers = {k: v for k, v in self.headers.items()}
+            sentry_query = _query_dict(query)
+            raw_sentry_key = extract_sentry_ingest_key(
+                headers=sentry_headers,
+                query=sentry_query,
+                body=body,
+                content_encoding=_header_value(self.headers, "content-encoding"),
+            )
+            if raw_sentry_key:
+                sdk_key = authenticate_sdk_key(store, raw_sentry_key)
+                if sdk_key is None:
+                    _json_response(
+                        self,
+                        401,
+                        {
+                            "error": "unauthorized",
+                            "message": "Missing or invalid Sentry SDK key.",
+                        },
+                    )
+                    return
+                if project_id and sdk_key.project_id != project_id:
+                    _json_response(
+                        self,
+                        403,
+                        {
+                            "error": "forbidden",
+                            "message": "SDK key does not belong to this project.",
+                        },
+                    )
+                    return
+                decision = _consume_rate_limit(
+                    store,
+                    project_id=sdk_key.project_id,
+                    environment_id=sdk_key.environment_id,
+                    bucket="sentry",
+                    identity=sdk_key.id,
+                )
+                if not decision.allowed:
+                    _rate_limited_response(self, bucket="sentry", decision=decision)
+                    return
             try:
                 result = ingest_sentry_compat_request(
                     store=store,
                     project_id=project_id,
                     endpoint=endpoint,
-                    headers={k: v for k, v in self.headers.items()},
+                    headers=sentry_headers,
                     body=body,
-                    query=_query_dict(query),
+                    query=sentry_query,
                 )
                 _dispatch_app_error_notifications(
                     sinks=notification_sinks,
@@ -691,6 +1157,16 @@ def _handler(
                         "message": "environment_id is required.",
                     },
                 )
+                return
+            decision = _consume_rate_limit(
+                store,
+                project_id=token.project_id,
+                environment_id=environment_id,
+                bucket="monitoring",
+                identity=f"{token.id}:{provider}",
+            )
+            if not decision.allowed:
+                _rate_limited_response(self, bucket="monitoring", decision=decision)
                 return
             try:
                 length = int(self.headers.get("Content-Length") or "0")
@@ -912,6 +1388,16 @@ def _handler(
             if not environment_id:
                 _json_response(self, 400, {"error": "missing_environment_id"})
                 return
+            decision = _consume_rate_limit(
+                store,
+                project_id=token.project_id,
+                environment_id=environment_id,
+                bucket="source_maps",
+                identity=token.id,
+            )
+            if not decision.allowed:
+                _rate_limited_response(self, bucket="source_maps", decision=decision)
+                return
             try:
                 length = int(self.headers.get("Content-Length") or "0")
             except ValueError:
@@ -998,6 +1484,21 @@ def _handler(
             if not environment_id:
                 _json_response(self, 400, {"error": "missing_environment_id"})
                 return
+            # Rate limit *before* reading the body — a flooded client
+            # shouldn't get to spend our bandwidth uploading a payload
+            # we're about to reject. Identity is the service-token id
+            # so different tokens for the same project don't share a
+            # bucket (operators sometimes split tokens per host).
+            decision = _consume_rate_limit(
+                store,
+                project_id=token.project_id,
+                environment_id=environment_id,
+                bucket="otel",
+                identity=token.id,
+            )
+            if not decision.allowed:
+                _rate_limited_response(self, bucket="otel", decision=decision)
+                return
             try:
                 length = int(self.headers.get("Content-Length") or "0")
             except ValueError:
@@ -1046,6 +1547,131 @@ def _handler(
                 )
                 return
             _json_response(self, 202, result.to_dict())
+
+        def _handle_server_replay_ingest(self, query: str) -> None:
+            """P3.6 (scaffold) — accept a single server-side replay
+            session record.
+
+            Payload shape (JSON):
+                {
+                    "session_id": "...",
+                    "request": {
+                        "method": "GET",
+                        "path": "/api/checkout",
+                        "headers": {...},
+                        "body": "..."
+                    },
+                    "response": {
+                        "status": 500,
+                        "headers": {...}
+                    },
+                    "rendered_html": "...",   // optional snippet
+                    "runtime": "node-20",     // optional
+                    "occurred_at_ms": 0,      // optional; defaults to now
+                    "error_summary": "...",   // optional
+                    "metadata": {...}         // optional
+                }
+
+            The capture middleware that produces this payload is
+            deferred — see `docs/roadmap.md` P3.6. This endpoint
+            exists today so that middleware has a defined seam to
+            ship against, and so the ingest path can be hardened /
+            rate-limited / tested before SDK work begins.
+            """
+            replay_query = _query_dict(query)
+            sdk_key = authenticate_sdk_key(
+                store, _extract_replay_sdk_key(self.headers, replay_query)
+            )
+            if sdk_key is None:
+                _json_response(
+                    self,
+                    401,
+                    {
+                        "error": "unauthorized",
+                        "message": "Missing or invalid SDK key.",
+                    },
+                )
+                return
+            decision = _consume_rate_limit(
+                store,
+                project_id=sdk_key.project_id,
+                environment_id=sdk_key.environment_id,
+                bucket="server_replay",
+                identity=sdk_key.id,
+            )
+            if not decision.allowed:
+                _rate_limited_response(self, bucket="server_replay", decision=decision)
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length <= 0:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            if length > MAX_REPLAY_BODY_BYTES:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            body = self.rfile.read(length)
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                _json_response(self, 400, {"error": "invalid_json"})
+                return
+            if not isinstance(payload, dict):
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            request_block = payload.get("request") or {}
+            response_block = payload.get("response") or {}
+            if not isinstance(request_block, dict) or not isinstance(
+                response_block, dict
+            ):
+                _json_response(
+                    self,
+                    400,
+                    {
+                        "error": "invalid_payload",
+                        "message": "`request` and `response` must be objects.",
+                    },
+                )
+                return
+            try:
+                row_id = store.insert_server_replay_session(
+                    project_id=sdk_key.project_id,
+                    environment_id=sdk_key.environment_id,
+                    session_id=str(payload.get("session_id") or ""),
+                    request_method=str(request_block.get("method") or ""),
+                    request_path=str(request_block.get("path") or ""),
+                    request_headers=request_block.get("headers") or {},
+                    request_body_text=str(request_block.get("body") or ""),
+                    response_status=int(response_block.get("status") or 0),
+                    response_headers=response_block.get("headers") or {},
+                    rendered_html_snippet=str(payload.get("rendered_html") or ""),
+                    runtime=str(payload.get("runtime") or ""),
+                    occurred_at_ms=int(payload.get("occurred_at_ms") or 0),
+                    error_summary=str(payload.get("error_summary") or ""),
+                    metadata=payload.get("metadata") or {},
+                )
+            except (TypeError, ValueError) as exc:
+                _json_response(
+                    self,
+                    400,
+                    {"error": "invalid_payload", "message": str(exc)},
+                )
+                return
+            except Exception:
+                logger.exception("Unhandled server-replay ingest error")
+                _json_response(
+                    self,
+                    500,
+                    {
+                        "error": "internal_error",
+                        "message": "An internal server error occurred.",
+                    },
+                )
+                return
+            _json_response(self, 202, {"id": row_id, "accepted": 1})
 
         def _handle_list_replays(self, query: str) -> None:
             token = _require_service_token(
@@ -1351,6 +1977,253 @@ def _handler(
                 {"rule": _alert_rule_api_dict(rule) if rule is not None else {"id": rule_id}},
             )
 
+        def _handle_hosted_onboarding(self, query: str) -> None:
+            token = _require_service_token(
+                self,
+                store,
+                scopes={"admin"},
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length < 0:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length > 64 * 1024:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            payload: dict[str, Any] = {}
+            if length:
+                try:
+                    decoded = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    _json_response(self, 400, {"error": "invalid_json"})
+                    return
+                if not isinstance(decoded, dict):
+                    _json_response(self, 400, {"error": "invalid_payload"})
+                    return
+                payload = decoded
+            raw_scopes = payload.get("service_token_scopes")
+            if raw_scopes is None:
+                service_token_scopes = list(HOSTED_ONBOARDING_SCOPES)
+            elif isinstance(raw_scopes, list) and all(
+                isinstance(item, str) and item.strip() for item in raw_scopes
+            ):
+                service_token_scopes = [str(item).strip() for item in raw_scopes]
+            else:
+                _json_response(self, 400, {"error": "invalid_service_token_scopes"})
+                return
+            sdk = create_sdk_key(
+                store,
+                project_id=token.project_id,
+                environment_id=environment_id,
+                name=str(payload.get("sdk_key_name") or "Hosted browser SDK"),
+            )
+            service = create_service_token(
+                store,
+                project_id=token.project_id,
+                name=str(payload.get("service_token_name") or "Hosted onboarding"),
+                scopes=service_token_scopes,
+            )
+            manifest = _hosted_onboarding_manifest(
+                base_url=str(payload.get("api_base_url") or "http://127.0.0.1:8788"),
+                project_id=token.project_id,
+                environment_id=environment_id,
+                sdk_key=sdk.key,
+                service_token=service.token,
+                service_token_scopes=service.scopes,
+                release=str(payload.get("release") or "$GITHUB_SHA"),
+                artifact_url=str(
+                    payload.get("artifact_url")
+                    or "https://cdn.example.com/assets/app.min.js"
+                ),
+            )
+            _json_response(self, 201, {"onboarding": manifest})
+
+        def _handle_prune_app_errors(self, query: str) -> None:
+            token = _require_service_token(
+                self,
+                store,
+                scopes={"app_errors:write", "admin"},
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length < 0:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length > 64 * 1024:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            payload: dict[str, Any] = {}
+            if length:
+                try:
+                    decoded = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    _json_response(self, 400, {"error": "invalid_json"})
+                    return
+                if not isinstance(decoded, dict):
+                    _json_response(self, 400, {"error": "invalid_payload"})
+                    return
+                payload = decoded
+            try:
+                result = store.prune_app_error_retention(
+                    project_id=token.project_id,
+                    environment_id=environment_id,
+                    failure_retention_days=_optional_int(
+                        payload, "failure_retention_days", 90
+                    ),
+                    evidence_retention_days=_optional_int(
+                        payload, "evidence_retention_days", 90
+                    ),
+                    source_map_retention_days=_optional_int(
+                        payload, "source_map_retention_days", 30
+                    ),
+                    rate_limit_retention_hours=_optional_int(
+                        payload, "rate_limit_retention_hours", 48
+                    ),
+                    dry_run=_optional_bool(payload, "dry_run"),
+                )
+            except (TypeError, ValueError) as exc:
+                _json_response(self, 400, {"error": "invalid_retention", "message": str(exc)})
+                return
+            except Exception:
+                logger.exception("Unhandled app-error retention prune error")
+                _json_response(
+                    self,
+                    500,
+                    {
+                        "error": "internal_error",
+                        "message": "An internal server error occurred.",
+                    },
+                )
+                return
+            _json_response(self, 202, {"retention": _retention_result_api_dict(result)})
+
+        def _handle_app_error_incident_lifecycle(
+            self, incident_id: str, query: str
+        ) -> None:
+            token = _require_service_token(
+                self,
+                store,
+                scopes={"app_errors:write", "admin"},
+            )
+            if token is None:
+                return
+            params = _query_dict(query)
+            environment_id = str(params.get("environment_id") or "").strip()
+            if not environment_id:
+                _json_response(self, 400, {"error": "missing_environment_id"})
+                return
+            incident_id = incident_id.strip()
+            if not incident_id:
+                _json_response(self, 404, {"error": "not_found"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                _json_response(self, 400, {"error": "invalid_content_length"})
+                return
+            if length <= 0:
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            if length > 64 * 1024:
+                _json_response(self, 413, {"error": "payload_too_large"})
+                return
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                _json_response(self, 400, {"error": "invalid_json"})
+                return
+            if not isinstance(payload, dict):
+                _json_response(self, 400, {"error": "invalid_payload"})
+                return
+            action = str(payload.get("action") or "").strip().lower()
+            status = str(payload.get("status") or "").strip().lower()
+            action_statuses = {
+                "resolve": "resolved",
+                "resolved": "resolved",
+                "ignore": "ignored",
+                "ignored": "ignored",
+                "reopen": "open",
+                "open": "open",
+                "triage": "triaged",
+                "triaged": "triaged",
+                "investigate": "investigating",
+                "investigating": "investigating",
+            }
+            if action and not status:
+                status = action_statuses.get(action, "")
+            if not status:
+                _json_response(self, 400, {"error": "missing_status"})
+                return
+            metadata = payload.get("metadata")
+            if metadata is not None and not isinstance(metadata, dict):
+                _json_response(self, 400, {"error": "invalid_metadata"})
+                return
+            try:
+                incident = store.transition_app_error_incident(
+                    project_id=token.project_id,
+                    environment_id=environment_id,
+                    incident_id=incident_id,
+                    status=status,
+                    actor_type=str(payload.get("actor_type") or "service_token"),
+                    actor_id=str(payload.get("actor_id") or token.name or token.id),
+                    reason=str(payload.get("reason") or ""),
+                    metadata=dict(metadata or {}),
+                )
+            except ValueError as exc:
+                message = str(exc)
+                if "unknown incident_id" in message:
+                    _json_response(self, 404, {"error": "not_found"})
+                    return
+                _json_response(
+                    self,
+                    400,
+                    {"error": "invalid_lifecycle_transition", "message": message},
+                )
+                return
+            failures = store.list_incident_failures(incident_id=incident.id)
+            events = store.list_incident_lifecycle_events(incident_id=incident.id)
+            _json_response(
+                self,
+                202,
+                {
+                    "project_id": token.project_id,
+                    "environment_id": environment_id,
+                    "incident": _incident_api_dict(
+                        store=store,
+                        incident=incident,
+                        failures=failures,
+                    ),
+                    "failures": [
+                        _failure_api_dict(failure, include_metadata=False)
+                        for failure in failures
+                    ],
+                    "lifecycle_events": [
+                        _incident_lifecycle_event_api_dict(event) for event in events
+                    ],
+                },
+            )
+
         def _handle_get_app_error_incident(self, incident_id: str, query: str) -> None:
             token = _require_service_token(
                 self,
@@ -1414,6 +2287,12 @@ def _handler(
                     ],
                     "evidence": [
                         _evidence_api_dict(evidence) for evidence in detail.evidence
+                    ],
+                    "lifecycle_events": [
+                        _incident_lifecycle_event_api_dict(event)
+                        for event in store.list_incident_lifecycle_events(
+                            incident_id=detail.incident.id
+                        )
                     ],
                     "repair_task": (
                         _repair_task_api_dict(detail.repair_task)
@@ -1531,6 +2410,80 @@ def api_create_service_token(
                 "project_id": workspace.project_id,
                 "token": created.token,
                 "scopes": created.scopes,
+            },
+            indent=2,
+        )
+    )
+
+
+@api_group.command("onboard-hosted")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=Path("config.yaml"),
+    show_default=True,
+)
+@click.option("--org", default="Local", show_default=True)
+@click.option("--project", "project_name", default="Default", show_default=True)
+@click.option("--environment", default="production", show_default=True)
+@click.option("--api-base-url", default="http://127.0.0.1:8788", show_default=True)
+@click.option("--sdk-key-name", default="Hosted browser SDK", show_default=True)
+@click.option("--service-token-name", default="Hosted onboarding", show_default=True)
+@click.option("--service-token-scope", "scopes", multiple=True)
+@click.option("--release", default="$GITHUB_SHA", show_default=True)
+@click.option(
+    "--artifact-url",
+    default="https://cdn.example.com/assets/app.min.js",
+    show_default=True,
+)
+def api_onboard_hosted(
+    config_path: Path,
+    org: str,
+    project_name: str,
+    environment: str,
+    api_base_url: str,
+    sdk_key_name: str,
+    service_token_name: str,
+    scopes: tuple[str, ...],
+    release: str,
+    artifact_url: str,
+) -> None:
+    """Create hosted/self-host onboarding credentials and integration snippets."""
+    cfg = load_config(config_path)
+    store = Storage(cfg.run.data_dir / "retrace.db")
+    store.init_schema()
+    workspace = store.ensure_workspace(
+        org_name=org,
+        project_name=project_name,
+        environment_name=environment,
+    )
+    sdk = create_sdk_key(
+        store,
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name=sdk_key_name,
+    )
+    service_scopes = list(scopes) if scopes else list(HOSTED_ONBOARDING_SCOPES)
+    service = create_service_token(
+        store,
+        project_id=workspace.project_id,
+        name=service_token_name,
+        scopes=service_scopes,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "onboarding": _hosted_onboarding_manifest(
+                    base_url=api_base_url,
+                    project_id=workspace.project_id,
+                    environment_id=workspace.environment_id,
+                    sdk_key=sdk.key,
+                    service_token=service.token,
+                    service_token_scopes=service.scopes,
+                    release=release,
+                    artifact_url=artifact_url,
+                )
             },
             indent=2,
         )
@@ -2280,6 +3233,21 @@ def api_verify_resolved(
 @click.option("--author", default="", help="Deploy author.")
 @click.option("--deployed-at-ms", default=0, type=int, help="Deploy timestamp in ms.")
 @click.option("--changed-file", "changed_files", multiple=True, help="Changed file path.")
+@click.option(
+    "--source-map-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Optional directory of source maps to upload as part of this deploy. "
+        "Pairs are inferred from filenames: foo.js.map -> foo.js. "
+        "Use --source-map-artifact-prefix to set the URL prefix."
+    ),
+)
+@click.option(
+    "--source-map-artifact-prefix",
+    default="",
+    help="URL prefix prepended to each source-map's artifact_url (e.g. https://cdn.example.com/static/).",
+)
 def api_record_deploy(
     config_path: Path,
     project_id: str,
@@ -2289,8 +3257,10 @@ def api_record_deploy(
     author: str,
     deployed_at_ms: int,
     changed_files: tuple[str, ...],
+    source_map_dir: Path | None,
+    source_map_artifact_prefix: str,
 ) -> None:
-    """Record a deploy marker and correlate recent failures."""
+    """Record a deploy marker and (optionally) auto-upload source maps."""
     cfg = load_config(config_path)
     store = Storage(cfg.run.data_dir / "retrace.db")
     store.init_schema()
@@ -2313,6 +3283,49 @@ def api_record_deploy(
         project_id=pid,
         environment_id=eid,
     )
+
+    uploaded_maps: list[dict] = []
+    skipped_maps: list[dict] = []
+    if source_map_dir is not None:
+        from retrace.source_maps import upload_source_map
+
+        prefix = (source_map_artifact_prefix or "").rstrip("/")
+        for path in sorted(source_map_dir.rglob("*.map")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                skipped_maps.append({"path": str(path), "reason": f"unreadable: {exc}"})
+                continue
+            if not isinstance(payload, dict):
+                skipped_maps.append({"path": str(path), "reason": "not a JSON object"})
+                continue
+            # foo.js.map -> foo.js for artifact_url
+            relative = path.relative_to(source_map_dir).as_posix()
+            generated = relative[:-4] if relative.endswith(".map") else relative
+            artifact_url = (
+                f"{prefix}/{generated}" if prefix else generated
+            )
+            try:
+                row = upload_source_map(
+                    store=store,
+                    project_id=pid,
+                    environment_id=eid,
+                    release=sha,
+                    dist="",
+                    artifact_url=artifact_url,
+                    source_map=payload,
+                )
+            except ValueError as exc:
+                skipped_maps.append({"path": str(path), "reason": str(exc)})
+                continue
+            uploaded_maps.append(
+                {
+                    "path": str(path),
+                    "artifact_url": row.artifact_url,
+                    "public_id": row.public_id,
+                }
+            )
+
     click.echo(
         json.dumps(
             {
@@ -2326,6 +3339,8 @@ def api_record_deploy(
                     {"failure_id": item.failure_id, "deploy_sha": item.deploy_sha}
                     for item in correlations
                 ],
+                "uploaded_source_maps": uploaded_maps,
+                "skipped_source_maps": skipped_maps,
             },
             indent=2,
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -11,7 +12,7 @@ from retrace.deploys import correlate_failure_to_deploy
 from retrace.evidence import EvidenceItem, evidence_dedupe_key
 from retrace.failures import canonical_failure_from_monitor_incident
 from retrace.incidents import group_failure_into_incident
-from retrace.source_maps import map_stack_frame
+from retrace.source_maps import diagnose_stack_frame_mapping, map_stack_frame
 from retrace.storage import Storage
 
 
@@ -131,6 +132,28 @@ def ingest_monitoring_webhook(
     evidence_id = store.append_failure_evidence(evidence)
     correlate_failure_to_deploy(store=store, failure_id=failure_id)
     incident = group_failure_into_incident(store=store, failure_id=failure_id)
+
+    # P1.1 — fan out to alert routes. Best-effort: any HTTP failure
+    # is logged + persisted on the dispatch row but never aborts the
+    # ingest pipeline.
+    try:
+        # Local import to avoid a circular dep (alert_dispatch imports
+        # MonitoringAlert from this module).
+        from retrace.alert_dispatch import dispatch_alert
+
+        dispatch_alert(
+            store=store,
+            project_id=project_id,
+            environment_id=environment_id,
+            alert=alert,
+            decision=rule_decision,
+        )
+    except Exception:  # pragma: no cover - defensive
+        # The dispatcher already swallows per-route errors; this is
+        # the belt-and-braces wrapper for the truly unexpected.
+        log = logging.getLogger(__name__)
+        log.exception("alert_dispatch raised unexpectedly; ignoring")
+
     return MonitoringIngestResult(
         provider=alert.provider,
         external_id=alert.external_id,
@@ -232,6 +255,9 @@ def _sentry_alert(
         external_id,
         event.get("fingerprint") or issue.get("fingerprint") or title,
     )
+    breadcrumb_trail = _breadcrumbs_from_sentry(event)
+    console_excerpts = _console_excerpts_from_breadcrumbs(breadcrumb_trail)
+    network_failures = _network_failures_from_breadcrumbs(breadcrumb_trail)
     metadata = {
         "external_id": external_id,
         "issue_id": _first_str(issue, "id", default=""),
@@ -246,6 +272,15 @@ def _sentry_alert(
         "dist": dist,
         "environment": _first_str(event, "environment", default=""),
         "grouping_fingerprint": grouping_fingerprint,
+        # Breadcrumbs flow from the browser SDK or any Sentry SDK with
+        # an `event.breadcrumbs.values` array. We promote the obvious
+        # signal classes (console / HTTP) into the `IncidentEvidence`
+        # fields the bridge already reads, and keep the raw trail in
+        # metadata so future consumers (e.g. the repair prompt) can
+        # see the full sequence.
+        "breadcrumbs": breadcrumb_trail,
+        "console_excerpts": console_excerpts,
+        "network_failures": network_failures,
     }
     return MonitoringAlert(
         provider="sentry",
@@ -504,7 +539,24 @@ def _apply_source_maps(
             column=colno,
         )
         if match is None:
-            mapped_frames.append(frame)
+            diagnostic = diagnose_stack_frame_mapping(
+                store=store,
+                project_id=project_id,
+                environment_id=environment_id,
+                release=release,
+                dist=dist,
+                generated_file=filename,
+                line=lineno,
+                column=colno,
+            )
+            mapped_frames.append(
+                {
+                    **frame,
+                    "source_map_status": diagnostic.status,
+                    "source_map_reason": diagnostic.reason,
+                    "source_map_diagnostic": diagnostic.to_dict(),
+                }
+            )
             continue
         mapped_frames.append(
             {
@@ -551,6 +603,134 @@ def _trace_ids_from_sentry(event: dict[str, Any]) -> list[str]:
             if str(item[0]) in {"trace_id", "traceId"}:
                 values.append(item[1])
     return _string_list([item for item in values if item])
+
+
+# Hard cap on stored breadcrumbs per failure. A hostile external event
+# can otherwise bloat `failure.metadata` (and downstream evidence JSON)
+# without bound. We keep the most recent N — same end-trail-first
+# bias as the Sentry SDK. (CodeRabbit Major catch on PR #130.)
+_BREADCRUMB_HARD_CAP = 500
+
+
+def _breadcrumbs_from_sentry(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize Sentry-style breadcrumbs to a clean list of dicts.
+
+    Sentry's wire shape is `event.breadcrumbs.values = [...]`, but
+    older SDKs and synthetic payloads sometimes send `breadcrumbs`
+    directly as a list. We handle both; entries that aren't dicts are
+    dropped. Hard-capped at `_BREADCRUMB_HARD_CAP` so a 50k-crumb
+    event can't bloat the failure row.
+    """
+    raw = event.get("breadcrumbs")
+    if isinstance(raw, dict):
+        items = raw.get("values")
+    else:
+        items = raw
+    if not isinstance(items, list):
+        return []
+    out: list[dict[str, Any]] = []
+    # Keep the most recent N — the SDKs prepend chronological order, so
+    # tail = newest.
+    for entry in items[-_BREADCRUMB_HARD_CAP:]:
+        if not isinstance(entry, dict):
+            continue
+        normalized: dict[str, Any] = {
+            "timestamp": entry.get("timestamp"),
+            "category": str(entry.get("category") or "default").strip(),
+            "message": str(entry.get("message") or "").strip(),
+            "level": str(entry.get("level") or "info").strip().lower(),
+        }
+        data = entry.get("data")
+        if isinstance(data, dict):
+            normalized["data"] = data
+        out.append(normalized)
+    return out
+
+
+def _sanitize_breadcrumb_url(raw: Any) -> str:
+    """Strip query, fragment, and credentials from a URL before it
+    lands in `failure.metadata` / `IncidentEvidence`. Query strings
+    routinely carry tokens, emails, and other PII. (CodeRabbit Major
+    catch on PR #130.)
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    raw_str = str(raw or "").strip()
+    if not raw_str:
+        return ""
+    try:
+        parts = urlsplit(raw_str)
+    except ValueError:
+        # Coarse strip when urlsplit can't parse.
+        return raw_str.split("?", 1)[0].split("#", 1)[0]
+    # Drop username:password embedded in netloc, if any.
+    host = parts.hostname or ""
+    if parts.port:
+        netloc = f"{host}:{parts.port}"
+    else:
+        netloc = host
+    cleaned = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    return cleaned or raw_str.split("?", 1)[0].split("#", 1)[0]
+
+
+def _console_excerpts_from_breadcrumbs(crumbs: list[dict[str, Any]]) -> list[str]:
+    """Pick console / log breadcrumbs out of the trail.
+
+    Mirrors the rule used in `auto_fix.py`: a short, ordered list of
+    strings that the repair prompt can quote verbatim.
+    """
+    out: list[str] = []
+    for c in crumbs:
+        category = str(c.get("category") or "").lower()
+        if category not in {"console", "log"}:
+            continue
+        message = str(c.get("message") or "").strip()
+        if not message:
+            continue
+        out.append(message[:500])
+        if len(out) >= 20:
+            break
+    return out
+
+
+def _network_failures_from_breadcrumbs(crumbs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pick failed HTTP-category breadcrumbs (status >= 400 or explicit
+    error) out of the trail.
+
+    Shape matches `IncidentEvidence.network_failures` in
+    `qa_incidents.py` so the bridge can ingest verbatim.
+    """
+    out: list[dict[str, Any]] = []
+    for c in crumbs:
+        category = str(c.get("category") or "").lower()
+        if category not in {"http", "fetch", "xhr"}:
+            continue
+        data = c.get("data") if isinstance(c.get("data"), dict) else {}
+        status = data.get("status_code") or data.get("status")
+        try:
+            status_int = int(status) if status is not None else 0
+        except (TypeError, ValueError):
+            status_int = 0
+        err = str(data.get("error") or "").strip()
+        if status_int < 400 and not err:
+            continue
+        entry: dict[str, Any] = {
+            "method": str(data.get("method") or "").upper() or "GET",
+            "url": _sanitize_breadcrumb_url(data.get("url")),
+        }
+        if status_int:
+            entry["status_code"] = status_int
+        if err:
+            entry["error"] = err
+        if data.get("duration_ms") is not None:
+            try:
+                entry["duration_ms"] = int(data["duration_ms"])
+            except (TypeError, ValueError):
+                pass
+        out.append(entry)
+        if len(out) >= 20:
+            break
+    return out
 
 
 def _safe_int(value: Any) -> int:

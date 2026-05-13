@@ -1,13 +1,15 @@
+"""Storage class - main database access layer."""
+
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 from uuid import uuid4
 import json
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Optional
 
 from retrace.evidence import (
     PROMPT_SAFE_REDACTION_STATES,
@@ -15,1039 +17,117 @@ from retrace.evidence import (
     evidence_dedupe_key,
     evidence_items_from_replay_issue,
 )
-from retrace.failures import CanonicalFailure, canonical_failure_from_replay_issue
+from retrace.failures import (
+    CanonicalFailure,
+    canonical_failure_from_replay_issue,
+    normalize_failure_status,
+)
 from retrace.repair import normalize_repair_task_status
 
-FAILURE_TEST_COVERAGE_STATES = (
-    "not_covered",
-    "covered_unverified",
-    "covered_passing",
-    "covered_failing",
-    "covered_flaky",
+from .helpers import (
+    _SEVERITY_ORDER,
+    _rollup_severity,
+    _string_values,
+    _normalize_github_review_run_status,
+    _normalize_app_error_incident_status,
+    _retention_interval,
+    FAILURE_TEST_COVERAGE_STATES,
+    INGEST_RATE_LIMIT_RETENTION_SECONDS,
+    INGEST_RATE_LIMIT_MAX_IDENTITIES_PER_BUCKET,
+    APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS,
 )
-
-GITHUB_REVIEW_RUN_STATUSES = ("queued", "running", "succeeded", "failed", "canceled")
-
-_SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-
-
-def _rollup_severity(values: list[str]) -> str:
-    highest = "medium"
-    highest_score = 0
-    for value in values:
-        severity = str(value or "medium").strip().lower()
-        score = _SEVERITY_ORDER.get(severity, 2)
-        if score > highest_score:
-            highest = severity if severity in _SEVERITY_ORDER else "medium"
-            highest_score = score
-    return highest
-
-
-def _string_values(value: object) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    text = str(value or "").strip()
-    return [text] if text else []
-
-
-def _normalize_github_review_run_status(value: str) -> str:
-    status = value.strip().lower()
-    if status not in GITHUB_REVIEW_RUN_STATUSES:
-        allowed = ", ".join(GITHUB_REVIEW_RUN_STATUSES)
-        raise ValueError(f"invalid github review run status: {value!r}; allowed: {allowed}")
-    return status
-
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    started_at TEXT NOT NULL,
-    duration_ms INTEGER NOT NULL,
-    distinct_id TEXT,
-    event_count INTEGER NOT NULL,
-    fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_at TEXT NOT NULL,
-    finished_at TEXT,
-    sessions_scanned INTEGER DEFAULT 0,
-    findings_count INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'running',
-    error TEXT
-);
-
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS github_repos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo_full_name TEXT NOT NULL UNIQUE,
-    default_branch TEXT NOT NULL,
-    remote_url TEXT NOT NULL DEFAULT '',
-    local_path TEXT NOT NULL DEFAULT '',
-    provider TEXT NOT NULL DEFAULT 'github',
-    connected_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS report_findings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    report_path TEXT NOT NULL,
-    finding_hash TEXT NOT NULL,
-    title TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    category TEXT NOT NULL,
-    session_url TEXT NOT NULL,
-    evidence_text TEXT NOT NULL DEFAULT '',
-    distinct_id TEXT NOT NULL DEFAULT '',
-    error_issue_ids_json TEXT NOT NULL DEFAULT '[]',
-    trace_ids_json TEXT NOT NULL DEFAULT '[]',
-    top_stack_frame TEXT NOT NULL DEFAULT '',
-    error_tracking_url TEXT NOT NULL DEFAULT '',
-    logs_url TEXT NOT NULL DEFAULT '',
-    first_error_ts_ms INTEGER NOT NULL DEFAULT 0,
-    last_error_ts_ms INTEGER NOT NULL DEFAULT 0,
-    regression_state TEXT NOT NULL DEFAULT 'new',
-    regression_occurrence_count INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(report_path, finding_hash)
-);
-
-CREATE TABLE IF NOT EXISTS finding_regression_status (
-    finding_hash TEXT PRIMARY KEY,
-    status TEXT NOT NULL DEFAULT 'new',
-    first_seen_report_path TEXT NOT NULL,
-    last_seen_report_path TEXT NOT NULL,
-    last_seen_report_seq INTEGER NOT NULL DEFAULT 0,
-    occurrence_count INTEGER NOT NULL DEFAULT 1,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS code_candidates (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    finding_id INTEGER NOT NULL,
-    repo_id INTEGER NOT NULL,
-    file_path TEXT NOT NULL,
-    symbol TEXT,
-    score REAL NOT NULL DEFAULT 0,
-    rationale_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS fix_prompts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    finding_id INTEGER NOT NULL,
-    repo_id INTEGER NOT NULL,
-    agent_target TEXT NOT NULL,
-    prompt_markdown TEXT NOT NULL,
-    prompt_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS organizations (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS projects (
-    id TEXT PRIMARY KEY,
-    org_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    slug TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(org_id, slug)
-);
-
-CREATE TABLE IF NOT EXISTS environments (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    slug TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, slug)
-);
-
-CREATE TABLE IF NOT EXISTS project_members (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    email TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'member',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, email)
-);
-
-CREATE TABLE IF NOT EXISTS sdk_keys (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    prefix TEXT NOT NULL,
-    key_hash TEXT NOT NULL UNIQUE,
-    last4 TEXT NOT NULL,
-    revoked_at TEXT,
-    last_used_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS service_tokens (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    token_hash TEXT NOT NULL UNIQUE,
-    scopes_json TEXT NOT NULL DEFAULT '[]',
-    revoked_at TEXT,
-    last_used_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS replay_sessions (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    stable_id TEXT NOT NULL,
-    public_id TEXT NOT NULL,
-    distinct_id TEXT NOT NULL DEFAULT '',
-    started_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL,
-    event_count INTEGER NOT NULL DEFAULT 0,
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    preview_json TEXT NOT NULL DEFAULT '{}',
-    status TEXT NOT NULL DEFAULT 'active',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, environment_id, stable_id)
-);
-
-CREATE TABLE IF NOT EXISTS replay_batches (
-    id TEXT PRIMARY KEY,
-    session_row_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    flush_type TEXT NOT NULL DEFAULT 'normal',
-    payload_json TEXT NOT NULL,
-    blob_backend TEXT NOT NULL DEFAULT '',
-    blob_key TEXT NOT NULL DEFAULT '',
-    event_count INTEGER NOT NULL DEFAULT 0,
-    received_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, environment_id, session_id, sequence)
-);
-
-CREATE TABLE IF NOT EXISTS replay_signals (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    detector TEXT NOT NULL,
-    timestamp_ms INTEGER NOT NULL,
-    url TEXT NOT NULL DEFAULT '',
-    details_json TEXT NOT NULL DEFAULT '{}',
-    details_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, environment_id, session_id, detector, timestamp_ms, details_hash)
-);
-
-CREATE TABLE IF NOT EXISTS signal_definitions (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    detector TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    run_mode TEXT NOT NULL DEFAULT 'replay_finalize',
-    thresholds_json TEXT NOT NULL DEFAULT '{}',
-    prompt_json TEXT NOT NULL DEFAULT '{}',
-    custom_definition TEXT NOT NULL DEFAULT '',
-    match_count INTEGER NOT NULL DEFAULT 0,
-    last_match_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, environment_id, detector)
-);
-
-CREATE TABLE IF NOT EXISTS failures (
-    id TEXT PRIMARY KEY,
-    public_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    source_type TEXT NOT NULL,
-    source_external_id TEXT NOT NULL,
-    fingerprint TEXT NOT NULL,
-    title TEXT NOT NULL DEFAULT '',
-    summary TEXT NOT NULL DEFAULT '',
-    severity TEXT NOT NULL DEFAULT 'medium',
-    confidence TEXT NOT NULL DEFAULT 'medium',
-    status TEXT NOT NULL DEFAULT 'new',
-    affected_users INTEGER NOT NULL DEFAULT 0,
-    affected_sessions INTEGER NOT NULL DEFAULT 0,
-    first_seen_ms INTEGER NOT NULL DEFAULT 0,
-    last_seen_ms INTEGER NOT NULL DEFAULT 0,
-    related_deploy_sha TEXT NOT NULL DEFAULT '',
-    related_pr_number INTEGER,
-    linked_tests_json TEXT NOT NULL DEFAULT '[]',
-    linked_repair_task_id TEXT NOT NULL DEFAULT '',
-    linked_external_thread_id TEXT NOT NULL DEFAULT '',
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, environment_id, source_type, source_external_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_failures_scope_status
-ON failures(project_id, environment_id, status, updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_failures_fingerprint
-ON failures(project_id, environment_id, fingerprint);
-
-CREATE TABLE IF NOT EXISTS failure_evidence (
-    id TEXT PRIMARY KEY,
-    failure_id TEXT NOT NULL,
-    evidence_type TEXT NOT NULL,
-    occurred_at_ms INTEGER NOT NULL DEFAULT 0,
-    source TEXT NOT NULL DEFAULT '',
-    redaction_state TEXT NOT NULL DEFAULT 'raw',
-    payload_json TEXT NOT NULL DEFAULT '{}',
-    artifact_path TEXT NOT NULL DEFAULT '',
-    dedupe_key TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_failure_evidence_failure_time
-ON failure_evidence(failure_id, occurred_at_ms, created_at);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_failure_evidence_dedupe
-ON failure_evidence(failure_id, dedupe_key)
-WHERE dedupe_key != '';
-
-CREATE TABLE IF NOT EXISTS incidents (
-    id TEXT PRIMARY KEY,
-    public_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    group_key TEXT NOT NULL,
-    title TEXT NOT NULL DEFAULT '',
-    summary TEXT NOT NULL DEFAULT '',
-    severity TEXT NOT NULL DEFAULT 'medium',
-    status TEXT NOT NULL DEFAULT 'open',
-    failure_count INTEGER NOT NULL DEFAULT 0,
-    evidence_count INTEGER NOT NULL DEFAULT 0,
-    repair_task_id TEXT NOT NULL DEFAULT '',
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, environment_id, group_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_incidents_scope_status
-ON incidents(project_id, environment_id, status, updated_at);
-
-CREATE TABLE IF NOT EXISTS incident_failures (
-    incident_id TEXT NOT NULL,
-    failure_id TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(incident_id, failure_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_incident_failures_failure
-ON incident_failures(failure_id, created_at);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_failures_one_incident_per_failure
-ON incident_failures(failure_id);
-
-CREATE TABLE IF NOT EXISTS app_error_alert_rules (
-    id TEXT PRIMARY KEY,
-    public_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    precedence INTEGER NOT NULL DEFAULT 0,
-    action TEXT NOT NULL DEFAULT 'alert',
-    min_severity TEXT NOT NULL DEFAULT '',
-    provider TEXT NOT NULL DEFAULT '',
-    title_contains TEXT NOT NULL DEFAULT '',
-    fingerprint_contains TEXT NOT NULL DEFAULT '',
-    route_contains TEXT NOT NULL DEFAULT '',
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, environment_id, name)
-);
-
-CREATE TABLE IF NOT EXISTS deploy_markers (
-    id TEXT PRIMARY KEY,
-    public_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    sha TEXT NOT NULL,
-    branch TEXT NOT NULL DEFAULT '',
-    author TEXT NOT NULL DEFAULT '',
-    deployed_at_ms INTEGER NOT NULL DEFAULT 0,
-    changed_files_json TEXT NOT NULL DEFAULT '[]',
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, environment_id, sha)
-);
-
-CREATE INDEX IF NOT EXISTS idx_deploy_markers_scope_time
-ON deploy_markers(project_id, environment_id, deployed_at_ms DESC);
-
-CREATE TABLE IF NOT EXISTS source_maps (
-    id TEXT PRIMARY KEY,
-    public_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    release TEXT NOT NULL,
-    dist TEXT NOT NULL DEFAULT '',
-    artifact_url TEXT NOT NULL,
-    source_map_json TEXT NOT NULL DEFAULT '{}',
-    uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, environment_id, release, dist, artifact_url)
-);
-
-CREATE INDEX IF NOT EXISTS idx_source_maps_scope_release
-ON source_maps(project_id, environment_id, release, dist, uploaded_at DESC);
-
-CREATE TABLE IF NOT EXISTS otel_events (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    signal_type TEXT NOT NULL,
-    trace_id TEXT NOT NULL DEFAULT '',
-    span_id TEXT NOT NULL DEFAULT '',
-    name TEXT NOT NULL DEFAULT '',
-    severity TEXT NOT NULL DEFAULT '',
-    body TEXT NOT NULL DEFAULT '',
-    occurred_at_ms INTEGER NOT NULL DEFAULT 0,
-    attributes_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_otel_events_trace
-ON otel_events(project_id, environment_id, trace_id, occurred_at_ms);
-
-CREATE INDEX IF NOT EXISTS idx_otel_events_signal
-ON otel_events(project_id, environment_id, signal_type, occurred_at_ms);
-
-CREATE TABLE IF NOT EXISTS failure_trace_map (
-    failure_id TEXT NOT NULL,
-    trace_id TEXT NOT NULL DEFAULT '',
-    span_id TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(failure_id, trace_id, span_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_failure_trace_map_trace
-ON failure_trace_map(trace_id, span_id, failure_id);
-
-CREATE INDEX IF NOT EXISTS idx_failure_trace_map_span
-ON failure_trace_map(span_id, failure_id);
-
-CREATE TABLE IF NOT EXISTS failure_test_links (
-    id TEXT PRIMARY KEY,
-    failure_id TEXT NOT NULL,
-    issue_id TEXT NOT NULL DEFAULT '',
-    issue_public_id TEXT NOT NULL DEFAULT '',
-    spec_id TEXT NOT NULL,
-    spec_name TEXT NOT NULL DEFAULT '',
-    spec_path TEXT NOT NULL DEFAULT '',
-    source TEXT NOT NULL DEFAULT 'manual',
-    coverage_state TEXT NOT NULL DEFAULT 'covered_unverified',
-    latest_run_id TEXT NOT NULL DEFAULT '',
-    latest_run_status TEXT NOT NULL DEFAULT '',
-    latest_run_classification TEXT NOT NULL DEFAULT '',
-    latest_run_ok INTEGER,
-    latest_run_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(failure_id, spec_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_failure_test_links_failure
-ON failure_test_links(failure_id, coverage_state, updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_failure_test_links_issue
-ON failure_test_links(issue_public_id, updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_failure_test_links_spec
-ON failure_test_links(spec_id, updated_at);
-
-CREATE TABLE IF NOT EXISTS repair_tasks (
-    id TEXT PRIMARY KEY,
-    public_id TEXT NOT NULL,
-    project_id TEXT NOT NULL DEFAULT '',
-    environment_id TEXT NOT NULL DEFAULT '',
-    failure_id TEXT NOT NULL,
-    source_type TEXT NOT NULL DEFAULT '',
-    source_external_id TEXT NOT NULL DEFAULT '',
-    title TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'open',
-    likely_files_json TEXT NOT NULL DEFAULT '[]',
-    prompt_artifacts_json TEXT NOT NULL DEFAULT '[]',
-    validation_commands_json TEXT NOT NULL DEFAULT '[]',
-    branch TEXT NOT NULL DEFAULT '',
-    pr_url TEXT NOT NULL DEFAULT '',
-    risk_notes TEXT NOT NULL DEFAULT '',
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(failure_id, project_id, environment_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_repair_tasks_status
-ON repair_tasks(status, updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_repair_tasks_source
-ON repair_tasks(source_type, source_external_id, project_id, environment_id);
-
-CREATE TABLE IF NOT EXISTS github_review_runs (
-    id TEXT PRIMARY KEY,
-    repo_full_name TEXT NOT NULL,
-    pr_number INTEGER NOT NULL,
-    installation_id TEXT NOT NULL DEFAULT '',
-    sender_login TEXT NOT NULL DEFAULT '',
-    comment_id TEXT NOT NULL DEFAULT '',
-    comment_url TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'queued',
-    trigger_phrase TEXT NOT NULL DEFAULT '@retrace review',
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_github_review_runs_repo_pr
-ON github_review_runs(repo_full_name, pr_number, updated_at);
-
-CREATE INDEX IF NOT EXISTS idx_github_review_runs_status
-ON github_review_runs(status, updated_at);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_github_review_runs_comment
-ON github_review_runs(repo_full_name, pr_number, comment_id)
-WHERE comment_id != '';
-
-CREATE TABLE IF NOT EXISTS repair_task_evidence (
-    repair_task_id TEXT NOT NULL,
-    evidence_id TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'supporting',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(repair_task_id, evidence_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_repair_task_evidence_task
-ON repair_task_evidence(repair_task_id, created_at);
-
-CREATE TABLE IF NOT EXISTS replay_issues (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    public_id TEXT NOT NULL,
-    fingerprint TEXT NOT NULL,
-    fingerprint_version INTEGER NOT NULL DEFAULT 1,
-    status TEXT NOT NULL DEFAULT 'new',
-    priority TEXT NOT NULL DEFAULT 'medium',
-    severity TEXT NOT NULL DEFAULT 'medium',
-    title TEXT NOT NULL DEFAULT '',
-    summary TEXT NOT NULL DEFAULT '',
-    likely_cause TEXT NOT NULL DEFAULT '',
-    reproduction_steps_json TEXT NOT NULL DEFAULT '[]',
-    confidence TEXT NOT NULL DEFAULT 'medium',
-    analysis_status TEXT NOT NULL DEFAULT '',
-    analysis_model TEXT NOT NULL DEFAULT '',
-    analysis_prompt_version TEXT NOT NULL DEFAULT '',
-    analysis_created_at TEXT,
-    analysis_error TEXT NOT NULL DEFAULT '',
-    evidence_json TEXT NOT NULL DEFAULT '{}',
-    signal_summary_json TEXT NOT NULL DEFAULT '{}',
-    affected_count INTEGER NOT NULL DEFAULT 0,
-    affected_users INTEGER NOT NULL DEFAULT 0,
-    representative_session_id TEXT NOT NULL DEFAULT '',
-    external_ticket_state TEXT NOT NULL DEFAULT '',
-    external_ticket_url TEXT NOT NULL DEFAULT '',
-    external_ticket_id TEXT NOT NULL DEFAULT '',
-    canonical_failure_id TEXT NOT NULL DEFAULT '',
-    distinct_id TEXT NOT NULL DEFAULT '',
-    error_issue_ids_json TEXT NOT NULL DEFAULT '[]',
-    trace_ids_json TEXT NOT NULL DEFAULT '[]',
-    top_stack_frame TEXT NOT NULL DEFAULT '',
-    error_tracking_url TEXT NOT NULL DEFAULT '',
-    logs_url TEXT NOT NULL DEFAULT '',
-    first_seen_ms INTEGER NOT NULL DEFAULT 0,
-    last_seen_ms INTEGER NOT NULL DEFAULT 0,
-    resolved_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(project_id, environment_id, fingerprint)
-);
-
-CREATE INDEX IF NOT EXISTS idx_replay_issues_public
-ON replay_issues(project_id, environment_id, public_id);
-
-CREATE TABLE IF NOT EXISTS replay_issue_sessions (
-    issue_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'supporting',
-    first_seen_ms INTEGER NOT NULL DEFAULT 0,
-    last_seen_ms INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(issue_id, session_id)
-);
-
-CREATE TABLE IF NOT EXISTS processing_jobs (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL,
-    environment_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    subject_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued',
-    payload_json TEXT NOT NULL DEFAULT '{}',
-    attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(kind, subject_id)
-);
-"""
-
-
-@dataclass
-class SessionMeta:
-    id: str
-    project_id: str
-    started_at: datetime
-    duration_ms: int
-    distinct_id: Optional[str]
-    event_count: int
-
-
-@dataclass
-class RunRow:
-    id: int
-    started_at: datetime
-    finished_at: Optional[datetime]
-    sessions_scanned: int
-    findings_count: int
-    status: str
-    error: Optional[str]
-
-
-@dataclass
-class GitHubRepoRow:
-    id: int
-    repo_full_name: str
-    default_branch: str
-    remote_url: str
-    local_path: str
-    provider: str
-    connected_at: datetime
-
-
-@dataclass
-class ReportFindingRow:
-    id: int
-    report_path: str
-    finding_hash: str
-    title: str
-    severity: str
-    category: str
-    session_url: str
-    evidence_text: str
-    distinct_id: str
-    error_issue_ids: list[str]
-    trace_ids: list[str]
-    top_stack_frame: str
-    error_tracking_url: str
-    logs_url: str
-    first_error_ts_ms: int
-    last_error_ts_ms: int
-    regression_state: str
-    regression_occurrence_count: int
-    created_at: datetime
-
-
-@dataclass
-class FixPromptRow:
-    id: int
-    finding_id: int
-    repo_id: int
-    agent_target: str
-    prompt_markdown: str
-    prompt_json: str
-    created_at: datetime
-
-
-@dataclass
-class WorkspaceIds:
-    org_id: str
-    project_id: str
-    environment_id: str
-
-
-@dataclass
-class SDKKeyRow:
-    id: str
-    project_id: str
-    environment_id: str
-    name: str
-    prefix: str
-    key_hash: str
-    last4: str
-    revoked_at: Optional[datetime]
-    last_used_at: Optional[datetime]
-    created_at: datetime
-
-
-@dataclass
-class ServiceTokenRow:
-    id: str
-    project_id: str
-    name: str
-    token_hash: str
-    scopes: list[str]
-    revoked_at: Optional[datetime]
-    last_used_at: Optional[datetime]
-    created_at: datetime
-
-
-@dataclass
-class SignalDefinitionRow:
-    id: str
-    project_id: str
-    environment_id: str
-    detector: str
-    enabled: bool
-    run_mode: str
-    thresholds: dict[str, Any]
-    prompt: dict[str, Any]
-    custom_definition: str
-    match_count: int
-    last_match_at: Optional[datetime]
-    created_at: datetime
-    updated_at: datetime
-
-
-@dataclass
-class FailureRow:
-    id: str
-    public_id: str
-    project_id: str
-    environment_id: str
-    source_type: str
-    source_external_id: str
-    fingerprint: str
-    title: str
-    summary: str
-    severity: str
-    confidence: str
-    status: str
-    affected_users: int
-    affected_sessions: int
-    first_seen_ms: int
-    last_seen_ms: int
-    related_deploy_sha: str
-    related_pr_number: Optional[int]
-    linked_tests: list[str]
-    linked_repair_task_id: str
-    linked_external_thread_id: str
-    metadata: dict[str, Any]
-    created_at: datetime
-    updated_at: datetime
-
-
-@dataclass
-class EvidenceRow:
-    id: str
-    failure_id: str
-    evidence_type: str
-    occurred_at_ms: int
-    source: str
-    redaction_state: str
-    payload: dict[str, Any]
-    artifact_path: str
-    dedupe_key: str
-    created_at: datetime
-
-    @property
-    def safe_for_prompts(self) -> bool:
-        return self.redaction_state in PROMPT_SAFE_REDACTION_STATES
-
-
-@dataclass
-class IncidentRow:
-    id: str
-    public_id: str
-    project_id: str
-    environment_id: str
-    group_key: str
-    title: str
-    summary: str
-    severity: str
-    status: str
-    failure_count: int
-    evidence_count: int
-    repair_task_id: str
-    metadata: dict[str, Any]
-    created_at: datetime
-    updated_at: datetime
-
-
-@dataclass
-class AppErrorAlertRuleRow:
-    id: str
-    public_id: str
-    project_id: str
-    environment_id: str
-    name: str
-    enabled: bool
-    precedence: int
-    action: str
-    min_severity: str
-    provider: str
-    title_contains: str
-    fingerprint_contains: str
-    route_contains: str
-    metadata: dict[str, Any]
-    created_at: datetime
-    updated_at: datetime
-
-
-@dataclass
-class DeployMarkerRow:
-    id: str
-    public_id: str
-    project_id: str
-    environment_id: str
-    sha: str
-    branch: str
-    author: str
-    deployed_at_ms: int
-    changed_files: list[str]
-    metadata: dict[str, Any]
-    created_at: datetime
-    updated_at: datetime
-
-
-@dataclass
-class SourceMapRow:
-    id: str
-    public_id: str
-    project_id: str
-    environment_id: str
-    release: str
-    dist: str
-    artifact_url: str
-    source_map: dict[str, Any]
-    uploaded_at: datetime
-
-
-@dataclass
-class OtelEventRow:
-    id: str
-    project_id: str
-    environment_id: str
-    signal_type: str
-    trace_id: str
-    span_id: str
-    name: str
-    severity: str
-    body: str
-    occurred_at_ms: int
-    attributes: dict[str, Any]
-    created_at: datetime
-
-
-@dataclass
-class FailureTestLinkRow:
-    id: str
-    failure_id: str
-    issue_id: str
-    issue_public_id: str
-    spec_id: str
-    spec_name: str
-    spec_path: str
-    source: str
-    coverage_state: str
-    latest_run_id: str
-    latest_run_status: str
-    latest_run_classification: str
-    latest_run_ok: Optional[bool]
-    latest_run_at: Optional[datetime]
-    created_at: datetime
-    updated_at: datetime
-
-
-@dataclass
-class RepairTaskRow:
-    id: str
-    public_id: str
-    project_id: str
-    environment_id: str
-    failure_id: str
-    source_type: str
-    source_external_id: str
-    title: str
-    status: str
-    likely_files: list[str]
-    prompt_artifacts: list[dict[str, Any]]
-    validation_commands: list[str]
-    branch: str
-    pr_url: str
-    risk_notes: str
-    metadata: dict[str, Any]
-    evidence_ids: list[str]
-    created_at: datetime
-    updated_at: datetime
-
-
-@dataclass
-class GitHubReviewRunRow:
-    id: str
-    repo_full_name: str
-    pr_number: int
-    installation_id: str
-    sender_login: str
-    comment_id: str
-    comment_url: str
-    status: str
-    trigger_phrase: str
-    metadata: dict[str, Any]
-    created_at: datetime
-    updated_at: datetime
-
-
-@dataclass
-class ReplayBatchResult:
-    session_row_id: str
-    batch_id: str
-    inserted: bool
-    event_count: int
-    processing_job_id: Optional[str] = None
-
-
-@dataclass
-class ReplayPlayback:
-    session: sqlite3.Row
-    batches: list[sqlite3.Row]
-    events: list[dict[str, Any]]
-
-
-@dataclass
-class ReplayIssueUpsertResult:
-    issue_id: str
-    public_id: str
-    inserted: bool
-    previous_status: str = ""
-    current_status: str = ""
-    previous_resolved_at: str = ""
-
-    @property
-    def regressed(self) -> bool:
-        return (
-            self.previous_status in {"resolved", "verified"}
-            and self.current_status == "regressed"
-        )
-
-
-@dataclass
-class ProcessingJobUpdateResult:
-    job_id: str
-    updated: bool
-
-
-class ReplayBlobStore(Protocol):
-    backend: str
-
-    def write_events(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        session_id: str,
-        sequence: int,
-        events: list[dict[str, object]],
-    ) -> str:
-        ...
-
-    def read_events(self, key: str) -> list[dict[str, Any]]:
-        ...
-
-
-class LocalReplayBlobStore:
-    backend = "local_filesystem"
-
-    def __init__(self, root: Path):
-        self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
-
-    @staticmethod
-    def _safe_part(value: object) -> str:
-        raw = str(value or "").strip()
-        safe = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in raw)
-        return safe or "default"
-
-    def write_events(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        session_id: str,
-        sequence: int,
-        events: list[dict[str, object]],
-    ) -> str:
-        key = "/".join(
-            [
-                self._safe_part(project_id),
-                self._safe_part(environment_id),
-                self._safe_part(session_id),
-                f"{int(sequence):012d}.json",
-            ]
-        )
-        path = (self.root / key).resolve()
-        root = self.root.resolve()
-        try:
-            path.relative_to(root)
-        except ValueError as exc:
-            raise ValueError("replay blob key escaped storage root") from exc
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(events, separators=(",", ":")) + "\n", encoding="utf-8")
-        return key
-
-    def read_events(self, key: str) -> list[dict[str, Any]]:
-        path = (self.root / key).resolve()
-        root = self.root.resolve()
-        try:
-            path.relative_to(root)
-        except ValueError as exc:
-            raise ValueError("replay blob key escaped storage root") from exc
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, list):
-            return []
-        return [item for item in payload if isinstance(item, dict)]
-
+from .schema import SCHEMA
+from .models import (
+    SessionMeta,
+    RunRow,
+    GitHubRepoRow,
+    ReportFindingRow,
+    FixPromptRow,
+    WorkspaceIds,
+    SDKKeyRow,
+    ServiceTokenRow,
+    SignalDefinitionRow,
+    FailureRow,
+    EvidenceRow,
+    IncidentRow,
+    IncidentLifecycleEventRow,
+    AppErrorAlertRuleRow,
+    AlertRouteRow,
+    RateLimitDecision,
+    AppErrorRetentionPruneResult,
+    DeployMarkerRow,
+    SourceMapRow,
+    OtelEventRow,
+    FailureTestLinkRow,
+    RepairTaskRow,
+    GitHubReviewRunRow,
+    ReplayBatchResult,
+    ReplayPlayback,
+    ReplayIssueUpsertResult,
+    ProcessingJobUpdateResult,
+)
+from .blob import ReplayBlobStore, LocalReplayBlobStore
 
 class Storage:
-    def __init__(self, path: Path, replay_blob_dir: Optional[Path] = None):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(
+        self,
+        path: Path | str,
+        replay_blob_dir: Optional[Path] = None,
+    ):
+        # P1.5: route to a Backend (`SqliteBackend` or `PostgresBackend`).
+        # The 290+ existing `conn.execute(...)` call sites keep their
+        # sqlite-flavored SQL — `WrappedConnection` translates at
+        # execute time (see `retrace.sql_dialect`).
+        from retrace.storage_backend import (
+            ParsedDsn,
+            SqliteBackend,
+            backend_from_url,
+            parse_storage_url,
+        )
+
+        if isinstance(path, str) and "://" in path:
+            dsn = parse_storage_url(path)
+            self._backend = backend_from_url(path)
+            if dsn.is_postgres():
+                # `self.path` stays defined for back-compat callers; it
+                # points at the database name so existing diagnostics
+                # don't crash on `str(self.path)`.
+                self.path = Path(f"postgres:{dsn.database}")
+            else:
+                self.path = Path(dsn.path)
+        else:
+            # Bare path → SQLite (back-compat).
+            self.path = Path(path)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._backend = SqliteBackend(ParsedDsn(scheme="sqlite", path=str(self.path)))
+
         self.replay_blob_store: ReplayBlobStore | None = (
             LocalReplayBlobStore(replay_blob_dir) if replay_blob_dir is not None else None
         )
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    @property
+    def backend_name(self) -> str:
+        """`"sqlite"` or `"postgres"` — useful for tests + diagnostics."""
+        return self._backend.name
+
+    def _conn(self):
+        """Return a connection wrapped with the sqlite3.Connection
+        surface — sqlite3-flavored SQL still works against Postgres
+        via the dialect translator in `retrace.sql_dialect`."""
+        return self._backend.connect()
 
     def init_schema(self) -> None:
+        from retrace.sql_schema import translate_schema
+
+        schema_sql = translate_schema(SCHEMA, dialect=self._backend.name)
         with self._conn() as conn:
-            conn.executescript(SCHEMA)
+            conn.executescript(schema_sql)
+            if self._backend.name != "sqlite":
+                # Postgres path: lightweight `PRAGMA table_info`-based
+                # migrations below don't apply — a fresh Postgres install
+                # gets the current schema from the CREATE TABLE block.
+                # SQLite-side, they catch up old DBs.
+                return
             # Lightweight migrations for existing DBs.
             cols_repo = [
                 r["name"]
@@ -1210,6 +290,57 @@ class Storage:
                 conn.execute(
                     "ALTER TABLE app_error_alert_rules ADD COLUMN precedence INTEGER NOT NULL DEFAULT 0"
                 )
+            # P3.5: backfill the cost-visibility columns onto old DBs.
+            # Default 0 / 0.0 means historical rows show as "unknown
+            # cost" in the summary CLI (which is honest — we didn't
+            # capture tokens for those runs).
+            cols_llm_reviews = [
+                r["name"]
+                for r in conn.execute(
+                    "PRAGMA table_info(llm_pr_reviews)"
+                ).fetchall()
+            ]
+            if "input_tokens" not in cols_llm_reviews:
+                conn.execute(
+                    "ALTER TABLE llm_pr_reviews ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0"
+                )
+            if "output_tokens" not in cols_llm_reviews:
+                conn.execute(
+                    "ALTER TABLE llm_pr_reviews ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0"
+                )
+            if "estimated_cost_usd" not in cols_llm_reviews:
+                conn.execute(
+                    "ALTER TABLE llm_pr_reviews ADD COLUMN estimated_cost_usd REAL NOT NULL DEFAULT 0.0"
+                )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS incident_lifecycle_events (
+                    id TEXT PRIMARY KEY,
+                    incident_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    environment_id TEXT NOT NULL,
+                    from_status TEXT NOT NULL DEFAULT '',
+                    to_status TEXT NOT NULL,
+                    actor_type TEXT NOT NULL DEFAULT '',
+                    actor_id TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_incident_lifecycle_events_incident_time
+                ON incident_lifecycle_events(incident_id, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_incident_lifecycle_events_scope_time
+                ON incident_lifecycle_events(project_id, environment_id, created_at)
+                """
+            )
             conn.execute("DROP INDEX IF EXISTS idx_app_error_alert_rules_scope")
             conn.execute(
                 """
@@ -1860,6 +991,47 @@ class Storage:
             ).fetchall()
         return [self._failure_from_row(row) for row in rows]
 
+    def update_failure_status(
+        self,
+        *,
+        failure_id: str,
+        status: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[FailureRow]:
+        clean_id = failure_id.strip()
+        clean_status = normalize_failure_status(status)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT metadata_json FROM failures WHERE id = ? OR public_id = ?",
+                (clean_id, clean_id),
+            ).fetchone()
+            if row is None:
+                return None
+            merged_metadata = dict(self._safe_json_obj(row["metadata_json"]))
+            if metadata:
+                merged_metadata.update(metadata)
+            try:
+                metadata_json = json.dumps(merged_metadata, sort_keys=True)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("failure metadata must be JSON-serializable") from exc
+            conn.execute(
+                """
+                UPDATE failures
+                SET status = ?,
+                    metadata_json = ?,
+                    updated_at = ?
+                WHERE id = ? OR public_id = ?
+                """,
+                (clean_status, metadata_json, now, clean_id, clean_id),
+            )
+            refreshed = conn.execute(
+                "SELECT * FROM failures WHERE id = ? OR public_id = ?",
+                (clean_id, clean_id),
+            ).fetchone()
+        return self._failure_from_row(refreshed) if refreshed is not None else None
+
     def _failure_from_row(self, row: sqlite3.Row) -> FailureRow:
         return FailureRow(
             id=str(row["id"]),
@@ -1998,6 +1170,7 @@ class Storage:
         severity: str = "medium",
         status: str = "open",
         metadata: Optional[dict[str, Any]] = None,
+        reopen_resolved: bool = False,
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
         incident_id = self._id("inc")
@@ -2006,7 +1179,16 @@ class Storage:
             metadata_json = json.dumps(metadata or {}, sort_keys=True)
         except (TypeError, ValueError) as exc:
             raise ValueError("incident metadata must be JSON-serializable") from exc
+        clean_status = _normalize_app_error_incident_status(status)
         with self._conn() as conn:
+            existing = conn.execute(
+                """
+                SELECT id, status
+                FROM incidents
+                WHERE project_id = ? AND environment_id = ? AND group_key = ?
+                """,
+                (project_id, environment_id, group_key),
+            ).fetchone()
             conn.execute(
                 """
                 INSERT INTO incidents
@@ -2017,7 +1199,11 @@ class Storage:
                     title = excluded.title,
                     summary = excluded.summary,
                     severity = excluded.severity,
-                    status = excluded.status,
+                    status = CASE
+                        WHEN incidents.status IN ('resolved', 'ignored') AND ? = 1
+                            THEN excluded.status
+                        ELSE incidents.status
+                    END,
                     metadata_json = excluded.metadata_json,
                     updated_at = excluded.updated_at
                 """,
@@ -2030,10 +1216,11 @@ class Storage:
                     title,
                     summary,
                     severity,
-                    status,
+                    clean_status,
                     metadata_json,
                     now,
                     now,
+                    1 if reopen_resolved else 0,
                 ),
             )
             row = conn.execute(
@@ -2045,6 +1232,40 @@ class Storage:
                 (project_id, environment_id, group_key),
             ).fetchone()
             assert row is not None
+            if (
+                existing is not None
+                and str(existing["status"] or "") in {"resolved", "ignored"}
+                and clean_status == "open"
+                and reopen_resolved
+            ):
+                self._append_incident_lifecycle_event(
+                    conn,
+                    incident_id=str(row["id"]),
+                    project_id=project_id,
+                    environment_id=environment_id,
+                    from_status=str(existing["status"] or ""),
+                    to_status="open",
+                    actor_type="system",
+                    actor_id="monitoring_ingest",
+                    reason="new matching app-error failure reopened the incident",
+                    metadata={"trigger": "ingest_regression"},
+                    created_at=now,
+                )
+                conn.execute(
+                    """
+                    UPDATE failures
+                    SET status = 'new',
+                        updated_at = ?
+                    WHERE id IN (
+                        SELECT failure_id
+                        FROM incident_failures
+                        WHERE incident_id = ?
+                    )
+                      AND source_type = 'monitor_incident'
+                      AND status IN ('resolved', 'ignored')
+                    """,
+                    (now, str(row["id"])),
+                )
             return str(row["id"])
 
     def link_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
@@ -2299,6 +1520,176 @@ class Storage:
             ).fetchall()
         return [self._evidence_from_row(row) for row in rows]
 
+    def transition_app_error_incident(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        incident_id: str,
+        status: str,
+        actor_type: str = "service_token",
+        actor_id: str = "",
+        reason: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> IncidentRow:
+        clean_status = _normalize_app_error_incident_status(status)
+        clean_actor_type = actor_type.strip()[:80] or "service_token"
+        clean_actor_id = actor_id.strip()[:200]
+        clean_reason = reason.strip()[:2000]
+        if metadata is None:
+            clean_metadata: dict[str, Any] = {}
+        elif isinstance(metadata, dict):
+            clean_metadata = metadata
+        else:
+            raise ValueError("lifecycle metadata must be a JSON object")
+        try:
+            metadata_json = json.dumps(clean_metadata, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("lifecycle metadata must be JSON-serializable") from exc
+        failure_status = APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS[clean_status]
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            incident = conn.execute(
+                """
+                SELECT *
+                FROM incidents
+                WHERE (id = ? OR public_id = ?)
+                  AND project_id = ?
+                  AND environment_id = ?
+                """,
+                (incident_id, incident_id, project_id, environment_id),
+            ).fetchone()
+            if incident is None:
+                raise ValueError(f"unknown incident_id: {incident_id}")
+            resolved_incident_id = str(incident["id"])
+            previous_status = str(incident["status"] or "")
+            incident_metadata = dict(self._safe_json_obj(incident["metadata_json"]))
+            incident_metadata.update(
+                {
+                    "last_lifecycle_actor_type": clean_actor_type,
+                    "last_lifecycle_actor_id": clean_actor_id,
+                    "last_lifecycle_reason": clean_reason,
+                    "last_lifecycle_at": now,
+                }
+            )
+            conn.execute(
+                """
+                UPDATE incidents
+                SET status = ?,
+                    metadata_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    clean_status,
+                    json.dumps(incident_metadata, sort_keys=True),
+                    now,
+                    resolved_incident_id,
+                ),
+            )
+            self._append_incident_lifecycle_event(
+                conn,
+                incident_id=resolved_incident_id,
+                project_id=project_id,
+                environment_id=environment_id,
+                from_status=previous_status,
+                to_status=clean_status,
+                actor_type=clean_actor_type,
+                actor_id=clean_actor_id,
+                reason=clean_reason,
+                metadata=clean_metadata,
+                metadata_json=metadata_json,
+                created_at=now,
+            )
+            conn.execute(
+                """
+                UPDATE failures
+                SET status = ?,
+                    updated_at = ?
+                WHERE id IN (
+                    SELECT failure_id
+                    FROM incident_failures
+                    WHERE incident_id = ?
+                )
+                  AND source_type = 'monitor_incident'
+                """,
+                (failure_status, now, resolved_incident_id),
+            )
+            self._refresh_incident_rollup(conn, incident_id=resolved_incident_id)
+            row = conn.execute(
+                """
+                SELECT *
+                FROM incidents
+                WHERE id = ?
+                """,
+                (resolved_incident_id,),
+            ).fetchone()
+            assert row is not None
+        return self._incident_from_row(row)
+
+    def list_incident_lifecycle_events(
+        self,
+        *,
+        incident_id: str,
+        limit: int = 100,
+    ) -> list[IncidentLifecycleEventRow]:
+        resolved_incident_id = self._resolve_incident_id(incident_id)
+        if not resolved_incident_id:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM incident_lifecycle_events
+                WHERE incident_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (resolved_incident_id, max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [self._incident_lifecycle_event_from_row(row) for row in rows]
+
+    def _append_incident_lifecycle_event(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        incident_id: str,
+        project_id: str,
+        environment_id: str,
+        from_status: str,
+        to_status: str,
+        actor_type: str,
+        actor_id: str,
+        reason: str,
+        metadata: Optional[dict[str, Any]] = None,
+        metadata_json: str = "",
+        created_at: str = "",
+    ) -> None:
+        if not metadata_json:
+            metadata_json = json.dumps(metadata or {}, sort_keys=True)
+        conn.execute(
+            """
+            INSERT INTO incident_lifecycle_events
+            (id, incident_id, project_id, environment_id, from_status, to_status,
+             actor_type, actor_id, reason, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self._id("ilc"),
+                incident_id,
+                project_id,
+                environment_id,
+                from_status,
+                to_status,
+                actor_type,
+                actor_id,
+                reason,
+                metadata_json,
+                created_at or datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
     def _resolve_incident_id(self, incident_id: str) -> str:
         with self._conn() as conn:
             row = conn.execute(
@@ -2367,6 +1758,23 @@ class Storage:
             metadata=dict(self._safe_json_obj(row["metadata_json"])),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    def _incident_lifecycle_event_from_row(
+        self, row: sqlite3.Row
+    ) -> IncidentLifecycleEventRow:
+        return IncidentLifecycleEventRow(
+            id=str(row["id"]),
+            incident_id=str(row["incident_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            from_status=str(row["from_status"] or ""),
+            to_status=str(row["to_status"] or ""),
+            actor_type=str(row["actor_type"] or ""),
+            actor_id=str(row["actor_id"] or ""),
+            reason=str(row["reason"] or ""),
+            metadata=dict(self._safe_json_obj(row["metadata_json"])),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
         )
 
     def upsert_app_error_alert_rule(
@@ -2485,6 +1893,25 @@ class Storage:
             ).fetchall()
         return [self._app_error_alert_rule_from_row(row) for row in rows]
 
+    def delete_app_error_alert_rule(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        name: str,
+    ) -> bool:
+        """Delete one alert rule by (project, env, name). Returns True if a
+        row was removed, False if nothing matched."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM app_error_alert_rules
+                WHERE project_id = ? AND environment_id = ? AND name = ?
+                """,
+                (project_id, environment_id, name.strip()),
+            )
+            return bool(cur.rowcount)
+
     def _app_error_alert_rule_from_row(
         self,
         row: sqlite3.Row,
@@ -2504,6 +1931,250 @@ class Storage:
             fingerprint_contains=str(row["fingerprint_contains"] or ""),
             route_contains=str(row["route_contains"] or ""),
             metadata=dict(self._safe_json_obj(row["metadata_json"])),
+            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    # ---- Alert routes (P1.1) -------------------------------------------
+
+    def upsert_alert_route(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        name: str,
+        target_kind: str,
+        target_url: str,
+        target_secret: str = "",
+        rule_name: str = "",
+        min_severity: str = "",
+        dedup_window_seconds: int = 300,
+        enabled: bool = True,
+    ) -> "AlertRouteRow":
+        """Insert or update one route by `(project, env, name)`."""
+        name = name.strip()
+        if not name:
+            raise ValueError("alert route name cannot be empty")
+        target_kind = target_kind.strip().lower()
+        if target_kind not in {"slack", "discord", "pagerduty", "webhook"}:
+            raise ValueError(
+                f"unsupported target_kind: {target_kind!r} "
+                "(expected slack/discord/pagerduty/webhook)"
+            )
+        target_url = target_url.strip()
+        if not target_url:
+            raise ValueError("alert route target_url cannot be empty")
+        # Validate `min_severity` + PagerDuty secret at write-time so
+        # we fail loudly on misconfig instead of silently producing
+        # 401s / wrong-rank dispatches at runtime. (CodeRabbit Major
+        # catch on PR #131.)
+        _ALLOWED_SEVERITIES = {"low", "medium", "high", "critical"}
+        clean_min_severity = min_severity.strip().lower()
+        if clean_min_severity and clean_min_severity not in _ALLOWED_SEVERITIES:
+            raise ValueError(
+                f"invalid min_severity: {min_severity!r} "
+                f"(allowed: {sorted(_ALLOWED_SEVERITIES)})"
+            )
+        clean_target_secret = target_secret.strip()
+        if target_kind == "pagerduty" and not clean_target_secret:
+            raise ValueError(
+                "pagerduty routes require target_secret "
+                "(the Events v2 routing key)"
+            )
+        with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT id, public_id FROM alert_routes "
+                "WHERE project_id = ? AND environment_id = ? AND name = ?",
+                (project_id, environment_id, name),
+            ).fetchone()
+            if existing is not None:
+                conn.execute(
+                    """
+                    UPDATE alert_routes
+                    SET enabled = ?, rule_name = ?, target_kind = ?,
+                        target_url = ?, target_secret = ?, min_severity = ?,
+                        dedup_window_seconds = ?, updated_at = datetime('now')
+                    WHERE id = ?
+                    """,
+                    (
+                        int(bool(enabled)),
+                        rule_name.strip(),
+                        target_kind,
+                        target_url,
+                        clean_target_secret,
+                        clean_min_severity,
+                        max(0, int(dedup_window_seconds)),
+                        existing["id"],
+                    ),
+                )
+                row_id = str(existing["id"])
+            else:
+                row_id = self._id("artr")
+                public_id = self._public_id(
+                    "ARTR", project_id, environment_id, name
+                )
+                conn.execute(
+                    """
+                    INSERT INTO alert_routes
+                        (id, public_id, project_id, environment_id, name,
+                         enabled, rule_name, target_kind, target_url,
+                         target_secret, min_severity, dedup_window_seconds)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row_id, public_id, project_id, environment_id, name,
+                        int(bool(enabled)), rule_name.strip(), target_kind,
+                        target_url, clean_target_secret,
+                        clean_min_severity,
+                        max(0, int(dedup_window_seconds)),
+                    ),
+                )
+            row = conn.execute(
+                "SELECT * FROM alert_routes WHERE id = ?", (row_id,)
+            ).fetchone()
+        return self._alert_route_from_row(row)
+
+    def list_alert_routes(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        enabled: Optional[bool] = None,
+        rule_name: Optional[str] = None,
+    ) -> list["AlertRouteRow"]:
+        params: list[object] = [project_id, environment_id]
+        where = "project_id = ? AND environment_id = ?"
+        if enabled is not None:
+            where += " AND enabled = ?"
+            params.append(int(bool(enabled)))
+        if rule_name is not None:
+            where += " AND (rule_name = ? OR rule_name = '')"
+            params.append(rule_name.strip())
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM alert_routes WHERE {where} "
+                "ORDER BY created_at ASC, id ASC",
+                params,
+            ).fetchall()
+        return [self._alert_route_from_row(r) for r in rows]
+
+    def get_alert_route(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        name: str,
+    ) -> Optional["AlertRouteRow"]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM alert_routes "
+                "WHERE project_id = ? AND environment_id = ? AND name = ?",
+                (project_id, environment_id, name.strip()),
+            ).fetchone()
+        return self._alert_route_from_row(row) if row is not None else None
+
+    def delete_alert_route(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        name: str,
+    ) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM alert_routes "
+                "WHERE project_id = ? AND environment_id = ? AND name = ?",
+                (project_id, environment_id, name.strip()),
+            )
+            return bool(cur.rowcount)
+
+    def record_alert_dispatch(
+        self,
+        *,
+        route_id: str,
+        project_id: str,
+        environment_id: str,
+        fingerprint: str,
+        status: str,
+        target_kind: str,
+        target_url: str,
+        payload: dict,
+        error: str = "",
+    ) -> int:
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO alert_dispatches
+                    (route_id, project_id, environment_id, fingerprint,
+                     status, error, target_kind, target_url, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    route_id, project_id, environment_id, fingerprint,
+                    status, error, target_kind, target_url,
+                    json.dumps(payload or {}),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def recent_alert_dispatch_for(
+        self,
+        *,
+        route_id: str,
+        fingerprint: str,
+        within_seconds: int,
+    ) -> Optional[sqlite3.Row]:
+        """Find a successful dispatch for this (route, fingerprint) pair
+        in the last `within_seconds` — used to dedup fast repeats."""
+        within_seconds = max(0, int(within_seconds))
+        if within_seconds <= 0:
+            return None
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM alert_dispatches
+                WHERE route_id = ?
+                  AND fingerprint = ?
+                  AND status = 'sent'
+                  AND created_at >= datetime('now', ?)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (route_id, fingerprint, f"-{within_seconds} seconds"),
+            ).fetchone()
+
+    def list_recent_alert_dispatches(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM alert_dispatches
+                WHERE project_id = ? AND environment_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (project_id, environment_id, max(1, min(int(limit), 500))),
+            ).fetchall()
+
+    def _alert_route_from_row(self, row: sqlite3.Row) -> "AlertRouteRow":
+        return AlertRouteRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            name=str(row["name"]),
+            enabled=bool(row["enabled"]),
+            rule_name=str(row["rule_name"] or ""),
+            target_kind=str(row["target_kind"]),
+            target_url=str(row["target_url"]),
+            target_secret=str(row["target_secret"] or ""),
+            min_severity=str(row["min_severity"] or ""),
+            dedup_window_seconds=int(row["dedup_window_seconds"] or 0),
             created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
             updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
         )
@@ -2878,6 +2549,30 @@ class Storage:
             ).fetchall()
         return [self._source_map_from_row(row) for row in rows]
 
+    def list_recent_source_maps(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        limit: int = 100,
+    ) -> list[SourceMapRow]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM source_maps
+                WHERE project_id = ? AND environment_id = ?
+                ORDER BY uploaded_at DESC
+                LIMIT ?
+                """,
+                (
+                    project_id,
+                    environment_id,
+                    max(1, min(int(limit), 500)),
+                ),
+            ).fetchall()
+        return [self._source_map_from_row(row) for row in rows]
+
     def _validate_source_map_payload(self, source_map: dict[str, Any]) -> None:
         if source_map.get("version") != 3:
             raise ValueError("source_map must be a supported Source Map v3 object")
@@ -2899,6 +2594,497 @@ class Storage:
         file_value = source_map.get("file")
         if file_value is not None and not isinstance(file_value, str):
             raise ValueError("source_map file must be a string when provided")
+
+    def consume_ingest_rate_limit(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        bucket: str,
+        identity: str,
+        limit: int,
+        window_seconds: int,
+        now_ms: Optional[int] = None,
+    ) -> RateLimitDecision:
+        clean_project = project_id.strip()
+        clean_environment = environment_id.strip()
+        clean_bucket = bucket.strip().lower()
+        clean_identity = identity.strip() or "anonymous"
+        clean_limit = max(1, int(limit))
+        clean_window_seconds = max(1, int(window_seconds))
+        current_ms = (
+            int(now_ms)
+            if now_ms is not None
+            else int(datetime.now(timezone.utc).timestamp() * 1000)
+        )
+        window_ms = clean_window_seconds * 1000
+        window_start_ms = current_ms - (current_ms % window_ms)
+        reset_after_seconds = max(
+            1, int(((window_start_ms + window_ms) - current_ms + 999) // 1000)
+        )
+        identity_hash = hashlib.sha256(
+            "\n".join(
+                [clean_project, clean_environment, clean_bucket, clean_identity]
+            ).encode("utf-8")
+        ).hexdigest()
+        row_id = self._id("rlim")
+        now = datetime.now(timezone.utc).isoformat()
+        cutoff = datetime.fromtimestamp(
+            (current_ms / 1000) - INGEST_RATE_LIMIT_RETENTION_SECONDS,
+            tz=timezone.utc,
+        ).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT window_start_ms, count
+                FROM ingest_rate_limits
+                WHERE project_id = ?
+                  AND environment_id = ?
+                  AND bucket = ?
+                  AND identity_hash = ?
+                  AND window_seconds = ?
+                """,
+                (
+                    clean_project,
+                    clean_environment,
+                    clean_bucket,
+                    identity_hash,
+                    clean_window_seconds,
+                ),
+            ).fetchone()
+            if row is None or int(row["window_start_ms"] or 0) != window_start_ms:
+                count = 1
+                conn.execute(
+                    """
+                    INSERT INTO ingest_rate_limits
+                    (id, project_id, environment_id, bucket, identity_hash,
+                     window_seconds, window_start_ms, count, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, environment_id, bucket, identity_hash, window_seconds)
+                    DO UPDATE SET
+                        window_start_ms = excluded.window_start_ms,
+                        count = excluded.count,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        row_id,
+                        clean_project,
+                        clean_environment,
+                        clean_bucket,
+                        identity_hash,
+                        clean_window_seconds,
+                        window_start_ms,
+                        count,
+                        now,
+                    ),
+                )
+            else:
+                previous_count = int(row["count"] or 0)
+                count = previous_count + 1
+                if count <= clean_limit:
+                    cursor = conn.execute(
+                        """
+                        UPDATE ingest_rate_limits
+                        SET count = count + 1, updated_at = ?
+                        WHERE project_id = ?
+                          AND environment_id = ?
+                          AND bucket = ?
+                          AND identity_hash = ?
+                          AND window_seconds = ?
+                          AND window_start_ms = ?
+                          AND count < ?
+                        """,
+                        (
+                            now,
+                            clean_project,
+                            clean_environment,
+                            clean_bucket,
+                            identity_hash,
+                            clean_window_seconds,
+                            window_start_ms,
+                            clean_limit,
+                        ),
+                    )
+                    if cursor.rowcount <= 0:
+                        count = clean_limit + 1
+            conn.execute(
+                """
+                DELETE FROM ingest_rate_limits
+                WHERE project_id = ?
+                  AND environment_id = ?
+                  AND bucket = ?
+                  AND updated_at < ?
+                """,
+                (clean_project, clean_environment, clean_bucket, cutoff),
+            )
+            conn.execute(
+                """
+                DELETE FROM ingest_rate_limits
+                WHERE id IN (
+                    SELECT id
+                    FROM ingest_rate_limits
+                    WHERE project_id = ?
+                      AND environment_id = ?
+                      AND bucket = ?
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (
+                    clean_project,
+                    clean_environment,
+                    clean_bucket,
+                    INGEST_RATE_LIMIT_MAX_IDENTITIES_PER_BUCKET,
+                ),
+            )
+            allowed = count <= clean_limit
+            remaining = max(0, clean_limit - count)
+        return RateLimitDecision(
+            allowed=allowed,
+            limit=clean_limit,
+            remaining=remaining,
+            reset_after_seconds=reset_after_seconds,
+            window_seconds=clean_window_seconds,
+        )
+
+    def prune_app_error_retention(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        failure_retention_days: int = 90,
+        evidence_retention_days: int = 90,
+        source_map_retention_days: int = 30,
+        rate_limit_retention_hours: int = 48,
+        dry_run: bool = False,
+        now: Optional[datetime] = None,
+    ) -> AppErrorRetentionPruneResult:
+        clean_project = project_id.strip()
+        clean_environment = environment_id.strip()
+        clean_failure_days = max(1, int(failure_retention_days))
+        clean_evidence_days = max(1, int(evidence_retention_days))
+        clean_source_map_days = max(1, int(source_map_retention_days))
+        clean_rate_limit_hours = max(1, int(rate_limit_retention_hours))
+        current = now or datetime.now(timezone.utc)
+        failure_cutoff_ms = int(
+            (current.timestamp() - (clean_failure_days * 24 * 60 * 60)) * 1000
+        )
+        evidence_cutoff = datetime.fromtimestamp(
+            current.timestamp() - (clean_evidence_days * 24 * 60 * 60),
+            tz=timezone.utc,
+        ).isoformat()
+        source_map_cutoff = datetime.fromtimestamp(
+            current.timestamp() - (clean_source_map_days * 24 * 60 * 60),
+            tz=timezone.utc,
+        ).isoformat()
+        rate_limit_cutoff = datetime.fromtimestamp(
+            current.timestamp() - (clean_rate_limit_hours * 60 * 60),
+            tz=timezone.utc,
+        ).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            failure_rows = conn.execute(
+                """
+                SELECT id
+                FROM failures
+                WHERE project_id = ?
+                  AND environment_id = ?
+                  AND source_type = 'monitor_incident'
+                  AND status IN ('resolved', 'ignored', 'verified')
+                  AND COALESCE(NULLIF(last_seen_ms, 0), first_seen_ms) < ?
+                """,
+                (clean_project, clean_environment, failure_cutoff_ms),
+            ).fetchall()
+            failure_ids = [str(row["id"]) for row in failure_rows]
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS tmp_prune_failures (id TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM tmp_prune_failures")
+            if failure_ids:
+                conn.executemany(
+                    "INSERT INTO tmp_prune_failures (id) VALUES (?)",
+                    [(failure_id,) for failure_id in failure_ids],
+                )
+            evidence_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM failure_evidence ev
+                    JOIN failures f ON f.id = ev.failure_id
+                    JOIN tmp_prune_failures pf ON pf.id = f.id
+                    WHERE f.project_id = ?
+                      AND f.environment_id = ?
+                      AND ev.created_at < ?
+                    """,
+                    (clean_project, clean_environment, evidence_cutoff),
+                ).fetchone()["count"]
+            )
+            source_map_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM source_maps
+                    WHERE project_id = ? AND environment_id = ? AND uploaded_at < ?
+                    """,
+                    (clean_project, clean_environment, source_map_cutoff),
+                ).fetchone()["count"]
+            )
+            rate_limit_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM ingest_rate_limits
+                    WHERE project_id = ? AND environment_id = ? AND updated_at < ?
+                    """,
+                    (clean_project, clean_environment, rate_limit_cutoff),
+                ).fetchone()["count"]
+            )
+            incident_link_count = 0
+            if failure_ids:
+                incident_link_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM incident_failures
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """,
+                    ).fetchone()["count"]
+                )
+            stale_incidents = conn.execute(
+                """
+                SELECT i.id
+                FROM incidents i
+                LEFT JOIN incident_failures inf
+                  ON inf.incident_id = i.id
+                 AND inf.failure_id NOT IN (SELECT id FROM tmp_prune_failures)
+                WHERE i.project_id = ?
+                  AND i.environment_id = ?
+                  AND inf.incident_id IS NULL
+                """,
+                (clean_project, clean_environment),
+            ).fetchall()
+            incident_count = len(stale_incidents)
+            if not dry_run:
+                conn.execute(
+                    """
+                    DELETE FROM repair_task_evidence
+                    WHERE evidence_id IN (
+                        SELECT ev.id
+                        FROM failure_evidence ev
+                        JOIN failures f ON f.id = ev.failure_id
+                        JOIN tmp_prune_failures pf ON pf.id = f.id
+                        WHERE f.project_id = ?
+                          AND f.environment_id = ?
+                          AND ev.created_at < ?
+                    )
+                    """,
+                    (clean_project, clean_environment, evidence_cutoff),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM failure_evidence
+                    WHERE id IN (
+                        SELECT ev.id
+                        FROM failure_evidence ev
+                        JOIN failures f ON f.id = ev.failure_id
+                        JOIN tmp_prune_failures pf ON pf.id = f.id
+                        WHERE f.project_id = ?
+                          AND f.environment_id = ?
+                          AND ev.created_at < ?
+                    )
+                    """,
+                    (clean_project, clean_environment, evidence_cutoff),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM source_maps
+                    WHERE project_id = ? AND environment_id = ? AND uploaded_at < ?
+                    """,
+                    (clean_project, clean_environment, source_map_cutoff),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM ingest_rate_limits
+                    WHERE project_id = ? AND environment_id = ? AND updated_at < ?
+                    """,
+                    (clean_project, clean_environment, rate_limit_cutoff),
+                )
+                affected_incident_ids = [
+                    str(row["incident_id"])
+                    for row in conn.execute(
+                        """
+                        SELECT DISTINCT incident_id
+                        FROM incident_failures
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
+                    ).fetchall()
+                ]
+                if failure_ids:
+                    conn.execute(
+                        """
+                        DELETE FROM incident_failures
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
+                    )
+                    conn.execute(
+                        """
+                        DELETE FROM failure_trace_map
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
+                    )
+                    conn.execute(
+                        """
+                        DELETE FROM failure_test_links
+                        WHERE failure_id IN (SELECT id FROM tmp_prune_failures)
+                        """
+                    )
+                    conn.execute(
+                        "DELETE FROM failures WHERE id IN (SELECT id FROM tmp_prune_failures)"
+                    )
+                stale_incidents = conn.execute(
+                    """
+                    SELECT i.id
+                    FROM incidents i
+                    LEFT JOIN incident_failures inf ON inf.incident_id = i.id
+                    WHERE i.project_id = ?
+                      AND i.environment_id = ?
+                      AND inf.incident_id IS NULL
+                    """,
+                    (clean_project, clean_environment),
+                ).fetchall()
+                incident_count = len(stale_incidents)
+                deleted_incident_ids: set[str] = set()
+                if stale_incidents:
+                    incident_ids = [str(row["id"]) for row in stale_incidents]
+                    deleted_incident_ids = set(incident_ids)
+                    conn.execute(
+                        "CREATE TEMP TABLE IF NOT EXISTS tmp_prune_incidents (id TEXT PRIMARY KEY)"
+                    )
+                    conn.execute("DELETE FROM tmp_prune_incidents")
+                    conn.executemany(
+                        "INSERT INTO tmp_prune_incidents (id) VALUES (?)",
+                        [(incident_id,) for incident_id in incident_ids],
+                    )
+                    conn.execute(
+                        "DELETE FROM incidents WHERE id IN (SELECT id FROM tmp_prune_incidents)"
+                    )
+                for incident_id in affected_incident_ids:
+                    if incident_id not in deleted_incident_ids:
+                        self._refresh_incident_rollup(conn, incident_id=incident_id)
+        return AppErrorRetentionPruneResult(
+            dry_run=bool(dry_run),
+            failure_retention_days=clean_failure_days,
+            evidence_retention_days=clean_evidence_days,
+            source_map_retention_days=clean_source_map_days,
+            rate_limit_retention_hours=clean_rate_limit_hours,
+            failures=len(failure_ids),
+            evidence=evidence_count,
+            incident_links=incident_link_count,
+            incidents=incident_count,
+            source_maps=source_map_count,
+            rate_limit_rows=rate_limit_count,
+        )
+
+    # ---------------------------------------------------------------
+    # P2.3 — global retention helpers.
+    #
+    # `prune_app_error_retention` above is scoped to a single
+    # (project, environment) and the app-error domain. These two
+    # helpers prune the high-volume "global" tables that grow
+    # regardless of which project they came from. They take the same
+    # `dry_run` / `now` parameters so callers can preview the cut.
+    # ---------------------------------------------------------------
+
+    def prune_replay_batches(
+        self,
+        *,
+        retention_days: int,
+        dry_run: bool = False,
+    ) -> int:
+        """Delete `replay_batches` rows older than `retention_days`.
+
+        Replay batches store the rrweb payload blobs — by far the
+        largest table by bytes in a healthy install. Pruning by
+        `received_at` is safe because nothing else references batch
+        rows by FK; orphaned `replay_sessions` rows are tiny and
+        retained for the lifecycle-event history.
+
+        The cutoff is computed DB-side via `datetime('now', ?)` so
+        it matches the column DEFAULT format under both SQLite and
+        Postgres (the P1.5 dialect layer translates the expression).
+        """
+        interval = _retention_interval(retention_days)
+        with self._conn() as conn:
+            count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM replay_batches
+                    WHERE received_at < datetime('now', ?)
+                    """,
+                    (interval,),
+                ).fetchone()["count"]
+            )
+            if not dry_run and count:
+                conn.execute(
+                    "DELETE FROM replay_batches WHERE received_at < datetime('now', ?)",
+                    (interval,),
+                )
+            return count
+
+    def prune_otel_events(
+        self,
+        *,
+        retention_days: int,
+        dry_run: bool = False,
+    ) -> int:
+        """Delete `otel_events` rows older than `retention_days`.
+
+        Pruned by `created_at` rather than `occurred_at_ms` because
+        a misconfigured collector that backfills with stale
+        timestamps could otherwise wipe fresh ingest. Server clock
+        is the source of truth here.
+        """
+        interval = _retention_interval(retention_days)
+        with self._conn() as conn:
+            count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM otel_events
+                    WHERE created_at < datetime('now', ?)
+                    """,
+                    (interval,),
+                ).fetchone()["count"]
+            )
+            if not dry_run and count:
+                conn.execute(
+                    "DELETE FROM otel_events WHERE created_at < datetime('now', ?)",
+                    (interval,),
+                )
+            return count
+
+    def project_environment_pairs(self) -> list[tuple[str, str]]:
+        """Return every (project_id, environment_id) pair that the
+        retention sweep needs to visit. Unions across `failures`,
+        `incidents`, `source_maps`, and `ingest_rate_limits` so a
+        scope with source-map uploads or rate-limit rows but no
+        failures yet doesn't get skipped."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT project_id, environment_id FROM failures
+                UNION
+                SELECT project_id, environment_id FROM incidents
+                UNION
+                SELECT project_id, environment_id FROM source_maps
+                UNION
+                SELECT project_id, environment_id FROM ingest_rate_limits
+                """
+            ).fetchall()
+        pairs = sorted(
+            (str(row["project_id"]), str(row["environment_id"])) for row in rows
+        )
+        return list(pairs)
 
     def _source_map_from_row(self, row: sqlite3.Row) -> SourceMapRow:
         return SourceMapRow(
@@ -3324,6 +3510,67 @@ class Storage:
             evidence_ids=[str(item["evidence_id"]) for item in evidence_rows],
         )
 
+    def update_repair_task_status(
+        self,
+        *,
+        repair_task_id: str,
+        status: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[RepairTaskRow]:
+        clean_id = repair_task_id.strip()
+        clean_status = normalize_repair_task_status(status)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT metadata_json
+                FROM repair_tasks
+                WHERE id = ? OR public_id = ?
+                """,
+                (clean_id, clean_id),
+            ).fetchone()
+            if row is None:
+                return None
+            merged_metadata = dict(self._safe_json_obj(row["metadata_json"]))
+            if metadata:
+                merged_metadata.update(metadata)
+            try:
+                metadata_json = json.dumps(merged_metadata, sort_keys=True)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("repair task metadata must be JSON-serializable") from exc
+            conn.execute(
+                """
+                UPDATE repair_tasks
+                SET status = ?,
+                    metadata_json = ?,
+                    updated_at = ?
+                WHERE id = ? OR public_id = ?
+                """,
+                (clean_status, metadata_json, now, clean_id, clean_id),
+            )
+            refreshed = conn.execute(
+                "SELECT * FROM repair_tasks WHERE id = ? OR public_id = ?",
+                (clean_id, clean_id),
+            ).fetchone()
+            evidence_rows = conn.execute(
+                """
+                SELECT evidence_id
+                FROM repair_task_evidence
+                WHERE repair_task_id = ?
+                ORDER BY created_at, evidence_id
+                """,
+                (str(refreshed["id"]) if refreshed is not None else clean_id,),
+            ).fetchall()
+        return (
+            self._repair_task_from_row(
+                refreshed,
+                evidence_ids=[str(item["evidence_id"]) for item in evidence_rows],
+            )
+            if refreshed is not None
+            else None
+        )
+
     def list_repair_tasks(
         self,
         *,
@@ -3637,6 +3884,34 @@ class Storage:
                 LIMIT ?
                 """,
                 params,
+            ).fetchall()
+        return [self._failure_test_link_from_row(row) for row in rows]
+
+    def list_all_failure_test_links(
+        self,
+        *,
+        failure_id: Optional[str] = None,
+        issue_public_id: Optional[str] = None,
+        spec_id: Optional[str] = None,
+    ) -> list[FailureTestLinkRow]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM failure_test_links
+                WHERE (? IS NULL OR failure_id = ?)
+                  AND (? IS NULL OR issue_public_id = ?)
+                  AND (? IS NULL OR spec_id = ?)
+                ORDER BY updated_at DESC, created_at DESC, id
+                """,
+                (
+                    failure_id,
+                    failure_id,
+                    issue_public_id,
+                    issue_public_id,
+                    spec_id,
+                    spec_id,
+                ),
             ).fetchall()
         return [self._failure_test_link_from_row(row) for row in rows]
 
@@ -4021,6 +4296,54 @@ class Storage:
             last_used_at=self._dt(r["last_used_at"]),
             created_at=self._dt(r["created_at"]) or datetime.now(timezone.utc),
         )
+
+    def list_sdk_keys(
+        self,
+        *,
+        project_id: str = "",
+        environment_id: str = "",
+        include_revoked: bool = False,
+        limit: int = 100,
+    ) -> list[SDKKeyRow]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if environment_id:
+            clauses.append("environment_id = ?")
+            params.append(environment_id)
+        if not include_revoked:
+            clauses.append("revoked_at IS NULL")
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, min(int(limit), 500)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, project_id, environment_id, name, prefix, key_hash, last4,
+                       revoked_at, last_used_at, created_at
+                FROM sdk_keys
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [
+            SDKKeyRow(
+                id=str(r["id"]),
+                project_id=str(r["project_id"]),
+                environment_id=str(r["environment_id"]),
+                name=str(r["name"]),
+                prefix=str(r["prefix"]),
+                key_hash=str(r["key_hash"]),
+                last4=str(r["last4"]),
+                revoked_at=self._dt(r["revoked_at"]),
+                last_used_at=self._dt(r["last_used_at"]),
+                created_at=self._dt(r["created_at"]) or datetime.now(timezone.utc),
+            )
+            for r in rows
+        ]
 
     def touch_sdk_key(self, key_id: str) -> None:
         with self._conn() as conn:
@@ -4480,6 +4803,122 @@ class Storage:
                 ORDER BY sequence
                 """,
                 (project_id, environment_id, session_id),
+            ).fetchall()
+
+    # ---------------------------------------------------------------
+    # P3.6 — server-side replay (scaffold).
+    #
+    # Storage seam for the eventual Node / Python capture
+    # middleware. The middleware itself is intentionally NOT in
+    # scope here — building Node + Python capture without a real
+    # SSR-replay user is the speculative-bloat trap. These methods
+    # exist so the ingest endpoint has a place to write to and
+    # tests can pin the storage round-trip.
+    # ---------------------------------------------------------------
+
+    def insert_server_replay_session(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        session_id: str,
+        request_method: str,
+        request_path: str,
+        request_headers: Optional[dict[str, Any]] = None,
+        request_body_text: str = "",
+        response_status: int = 0,
+        response_headers: Optional[dict[str, Any]] = None,
+        rendered_html_snippet: str = "",
+        runtime: str = "",
+        occurred_at_ms: int = 0,
+        error_summary: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> str:
+        """Persist a single server-replay session record.
+
+        Returns the inserted row id. Sensitive request/response
+        headers should be redacted BEFORE this method is called —
+        no automatic redaction here, since the caller (capture
+        middleware) is the only side that knows what to keep.
+        """
+        row_id = self._id("ssr")
+        public_id = self._public_id(
+            "ssr",
+            project_id,
+            environment_id,
+            session_id,
+            request_method,
+            request_path,
+            int(occurred_at_ms),
+        )
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO server_replay_sessions
+                    (id, public_id, project_id, environment_id, session_id,
+                     request_method, request_path, request_headers_json,
+                     request_body_text, response_status, response_headers_json,
+                     rendered_html_snippet, runtime, occurred_at_ms,
+                     error_summary, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row_id,
+                    public_id,
+                    project_id,
+                    environment_id,
+                    session_id or "",
+                    str(request_method or "").upper(),
+                    request_path or "",
+                    json.dumps(dict(request_headers or {}), sort_keys=True),
+                    request_body_text or "",
+                    int(response_status or 0),
+                    json.dumps(dict(response_headers or {}), sort_keys=True),
+                    rendered_html_snippet or "",
+                    runtime or "",
+                    int(occurred_at_ms or 0),
+                    error_summary or "",
+                    json.dumps(dict(metadata or {}), sort_keys=True),
+                ),
+            )
+        return row_id
+
+    def get_server_replay_session(self, row_id: str) -> Optional[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM server_replay_sessions WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+
+    def list_server_replay_sessions(
+        self,
+        *,
+        project_id: str,
+        environment_id: str,
+        limit: int = 25,
+        path_prefix: str = "",
+    ) -> list[sqlite3.Row]:
+        clean_limit = max(1, min(500, int(limit)))
+        with self._conn() as conn:
+            if path_prefix:
+                return conn.execute(
+                    """
+                    SELECT * FROM server_replay_sessions
+                    WHERE project_id = ? AND environment_id = ?
+                      AND request_path LIKE ?
+                    ORDER BY occurred_at_ms DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (project_id, environment_id, f"{path_prefix}%", clean_limit),
+                ).fetchall()
+            return conn.execute(
+                """
+                SELECT * FROM server_replay_sessions
+                WHERE project_id = ? AND environment_id = ?
+                ORDER BY occurred_at_ms DESC, id DESC
+                LIMIT ?
+                """,
+                (project_id, environment_id, clean_limit),
             ).fetchall()
 
     def _events_for_replay_batch(self, batch: sqlite3.Row) -> list[dict[str, Any]]:
@@ -5677,3 +6116,705 @@ class Storage:
             )
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # QA Incidents — the unified shape for replay/UI/API issues.
+    #
+    # Separate from the master `incidents` table (which tracks monitoring
+    # failure groupings + repair tasks). QA incidents own the
+    # auto-repro + auto-fix pipeline state.
+    # ------------------------------------------------------------------
+
+    def upsert_qa_incident(self, row: dict[str, Any]) -> tuple[str, bool]:
+        """Insert or update a QA incident keyed by (project, env, fingerprint).
+
+        Atomic upsert via SQLite's ``ON CONFLICT ... DO UPDATE`` so concurrent
+        ingesters can't both miss the existence check and race on the unique
+        constraint. Returns ``(incident_id, inserted)``.
+
+        Note: callers that need the **persisted** ``public_id`` should use
+        :meth:`upsert_qa_incident_returning` — the public_id is NOT in the
+        DO UPDATE clause, so on conflict the stored value differs from the
+        candidate one in ``row``. Returning a bare ``id`` here preserves
+        the prior signature for existing callers.
+        """
+        required = (
+            "id", "public_id", "project_id", "environment_id", "fingerprint",
+            "title", "summary", "suspected_cause", "severity", "confidence",
+            "status", "primary_source_kind", "sources_json", "reproduction_json",
+            "expected_outcome", "actual_outcome", "app_url", "evidence_json",
+            "affected_count", "affected_users", "first_seen_ms", "last_seen_ms",
+            "repro_status", "repro_spec_id", "repro_run_id", "repro_summary",
+            "fix_status", "fix_repo", "fix_branch", "fix_pr_url", "fix_prompt_path",
+            "created_at", "updated_at",
+        )
+        missing = [k for k in required if k not in row]
+        if missing:
+            raise ValueError(f"upsert_qa_incident missing keys: {missing}")
+
+        updatable = (
+            "title", "summary", "suspected_cause", "severity", "confidence",
+            "status", "primary_source_kind", "sources_json", "reproduction_json",
+            "expected_outcome", "actual_outcome", "app_url", "evidence_json",
+            "affected_count", "affected_users", "first_seen_ms", "last_seen_ms",
+            "repro_status", "repro_spec_id", "repro_run_id", "repro_summary",
+            "fix_status", "fix_repo", "fix_branch", "fix_pr_url", "fix_prompt_path",
+            "updated_at",
+        )
+
+        # These identifiers are derived from a fixed tuple (no untrusted
+        # input), so embedding them in the SQL text is safe; values stay
+        # parameterised.
+        cols = ", ".join(required)
+        placeholders = ", ".join(["?"] * len(required))
+        do_update = ", ".join(f"{k} = excluded.{k}" for k in updatable)
+
+        sql = (
+            f"INSERT INTO qa_incidents ({cols}) VALUES ({placeholders}) "
+            f"ON CONFLICT(project_id, environment_id, fingerprint) DO UPDATE SET {do_update} "
+            "RETURNING id, public_id"
+        )
+
+        with self._conn() as conn:
+            # Pre-check is advisory only — it informs the return value but the
+            # upsert itself remains atomic, so concurrent writers can't lose
+            # data. The narrow remaining race (two writers both see "not
+            # exists" and both report inserted=True) is benign: the stored
+            # row is correct either way.
+            existed = conn.execute(
+                """
+                SELECT 1 FROM qa_incidents
+                WHERE project_id = ? AND environment_id = ? AND fingerprint = ?
+                """,
+                (row["project_id"], row["environment_id"], row["fingerprint"]),
+            ).fetchone() is not None
+
+            cur = conn.execute(sql, tuple(row[k] for k in required))
+            res = cur.fetchone()
+            if res is None:
+                # Defensive — SQLite returns a row from RETURNING for both
+                # branches, but if a future driver swap broke that we'd
+                # rather raise than lie about persistence.
+                raise RuntimeError("upsert_qa_incident: no row returned from upsert")
+            return str(res["id"]), not existed
+
+    def upsert_qa_incident_returning(
+        self, row: dict[str, Any]
+    ) -> tuple[str, str, bool]:
+        """Same as :meth:`upsert_qa_incident` but returns the **persisted**
+        public_id too.
+
+        Use this from the bridge: on a fingerprint collision the existing
+        row keeps its original public_id (we never overwrite it), so the
+        candidate value baked into ``row["public_id"]`` is dropped. The
+        bridge surfaces these ids straight to the user (`retrace qa show
+        INC-...`), so returning the canonical one prevents dead references
+        on resync. Returns ``(incident_id, persisted_public_id, inserted)``.
+        """
+        incident_id, inserted = self.upsert_qa_incident(row)
+        with self._conn() as conn:
+            stored = conn.execute(
+                "SELECT public_id FROM qa_incidents WHERE id = ?",
+                (incident_id,),
+            ).fetchone()
+        if stored is None:  # pragma: no cover - upsert just wrote it
+            raise RuntimeError("upsert_qa_incident_returning: row vanished")
+        return incident_id, str(stored["public_id"]), inserted
+
+    def update_qa_incident_state(
+        self,
+        incident_id: str,
+        *,
+        status: Optional[str] = None,
+        repro_status: Optional[str] = None,
+        repro_spec_id: Optional[str] = None,
+        repro_run_id: Optional[str] = None,
+        repro_summary: Optional[str] = None,
+        fix_status: Optional[str] = None,
+        fix_repo: Optional[str] = None,
+        fix_branch: Optional[str] = None,
+        fix_pr_url: Optional[str] = None,
+        fix_prompt_path: Optional[str] = None,
+    ) -> bool:
+        """Partial update for the operational state of a QA incident."""
+        updates: list[tuple[str, Any]] = []
+        for key, val in (
+            ("status", status),
+            ("repro_status", repro_status),
+            ("repro_spec_id", repro_spec_id),
+            ("repro_run_id", repro_run_id),
+            ("repro_summary", repro_summary),
+            ("fix_status", fix_status),
+            ("fix_repo", fix_repo),
+            ("fix_branch", fix_branch),
+            ("fix_pr_url", fix_pr_url),
+            ("fix_prompt_path", fix_prompt_path),
+        ):
+            if val is not None:
+                updates.append((key, val))
+        if not updates:
+            return False
+        updates.append(("updated_at", datetime.now(timezone.utc).isoformat()))
+        sets = ", ".join(f"{k} = ?" for k, _ in updates)
+        with self._conn() as conn:
+            cur = conn.execute(
+                f"UPDATE qa_incidents SET {sets} WHERE id = ? OR public_id = ?",
+                tuple(v for _, v in updates) + (incident_id, incident_id),
+            )
+            return int(cur.rowcount) > 0
+
+    def get_qa_incident(self, incident_id_or_public: str) -> Optional[sqlite3.Row]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM qa_incidents WHERE id = ? OR public_id = ?",
+                (incident_id_or_public, incident_id_or_public),
+            ).fetchone()
+        return row
+
+    def list_qa_incidents(
+        self,
+        *,
+        project_id: Optional[str] = None,
+        environment_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[sqlite3.Row]:
+        where: list[str] = []
+        params: list[object] = []
+        if project_id:
+            where.append("project_id = ?")
+            params.append(project_id)
+        if environment_id:
+            where.append("environment_id = ?")
+            params.append(environment_id)
+        if status:
+            where.append("status = ?")
+            params.append(status)
+        sql = "SELECT * FROM qa_incidents"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY updated_at DESC, last_seen_ms DESC LIMIT ? OFFSET ?"
+        params.append(max(1, min(int(limit), 500)))
+        params.append(max(0, int(offset)))
+        with self._conn() as conn:
+            return conn.execute(sql, params).fetchall()
+
+    # ---- LLM PR reviews -------------------------------------------------
+
+    def add_llm_pr_review(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        model: str,
+        summary: str,
+        risk_notes: list[str],
+        suggestions: list[dict],
+        paths: list[str],
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        estimated_cost_usd: float = 0.0,
+    ) -> int:
+        """Persist one LLM review run so future reviews can reference it.
+
+        Returns the row id. The `(repo, pr_number)` pair is NOT unique —
+        if you call `retrace review --post-comment` twice on the same
+        PR, you get two rows, and `list_llm_pr_reviews_for_paths`
+        returns the most recent first.
+
+        P3.5: `input_tokens` / `output_tokens` / `estimated_cost_usd`
+        are estimated by `llm_pr_review` from the prompt/response text
+        length (chars/4 heuristic) and the static price table in
+        `retrace.llm_pricing`. Defaults of 0 keep this argument
+        optional for older call sites and historical rows.
+        """
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO llm_pr_reviews
+                    (repo, pr_number, model, summary, risk_notes_json,
+                     suggestions_json, paths_json,
+                     input_tokens, output_tokens, estimated_cost_usd)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    repo or "",
+                    int(pr_number or 0),
+                    model or "",
+                    summary or "",
+                    json.dumps(list(risk_notes or [])),
+                    json.dumps(list(suggestions or [])),
+                    json.dumps(list(paths or [])),
+                    max(0, int(input_tokens or 0)),
+                    max(0, int(output_tokens or 0)),
+                    max(0.0, float(estimated_cost_usd or 0.0)),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def list_llm_pr_reviews_for_paths(
+        self,
+        paths: list[str],
+        *,
+        repo: str = "",
+        exclude_pr_number: int = 0,
+        limit: int = 5,
+    ) -> list[sqlite3.Row]:
+        """Find recent LLM reviews touching any path in `paths`.
+
+        SQLite doesn't have a portable JSON-array-contains operator, so
+        we scan the most-recent N rows (cheap — capped by `limit * 6`)
+        and filter in Python. Good enough for the OSS scale we target.
+
+        Pass `exclude_pr_number` to filter out the PR we're currently
+        reviewing (otherwise the just-persisted review echoes back into
+        its own next-run prompt).
+        """
+        if not paths:
+            return []
+        wanted = {p for p in paths if p}
+        if not wanted:
+            return []
+        # Pull a window large enough to find `limit` matches in
+        # reasonable codebases; cap to keep this O(1).
+        scan_window = max(limit * 6, 30)
+        sql = "SELECT * FROM llm_pr_reviews"
+        clauses: list[str] = []
+        params: list[object] = []
+        if repo:
+            clauses.append("repo = ?")
+            params.append(repo)
+        if exclude_pr_number:
+            clauses.append("pr_number != ?")
+            params.append(int(exclude_pr_number))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(scan_window))
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        out: list[sqlite3.Row] = []
+        for r in rows:
+            try:
+                row_paths = set(json.loads(r["paths_json"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if row_paths & wanted:
+                out.append(r)
+            if len(out) >= limit:
+                break
+        return out
+
+    # ---------------------------------------------------------------
+    # P3.1 — flake quarantine.
+    #
+    # Two surfaces:
+    #   * `record_tester_run_outcome(spec_id, outcome)` — call after
+    #     every tester run. Appends to the rolling outcome window
+    #     and re-evaluates whether the spec should auto-quarantine
+    #     or auto-release. Returns the resulting status.
+    #   * `is_spec_quarantined(spec_id)` — fast read used by the
+    #     incident-filing gate.
+    # ---------------------------------------------------------------
+
+    _RUN_OUTCOME_WINDOW = 20
+    _QUARANTINE_FAILURE_WINDOW_HOURS = 24
+    _RELEASE_PASS_STREAK = 5
+
+    def record_tester_run_outcome(
+        self,
+        *,
+        spec_id: str,
+        run_id: str,
+        outcome: str,
+    ) -> str:
+        """Append a tester-run outcome and re-evaluate quarantine.
+
+        `outcome` is `"pass"` or `"fail"`. Anything else is treated
+        as `"fail"` so an unrecognised value never silently drops
+        out of the heuristic (e.g. a future `"flaky"` classification
+        that should count as failure for quarantine purposes).
+
+        Auto-quarantine: a `pass → fail → pass` pattern within 24h
+        on a currently-active spec flips it to `quarantined`.
+        Auto-release: 5 consecutive passes on a currently-
+        quarantined spec flips it back to `active`.
+
+        Returns the resulting status (`"active"` or `"quarantined"`).
+        """
+        clean_spec = spec_id.strip()
+        if not clean_spec:
+            return "active"
+        normalized = "pass" if str(outcome or "").strip().lower() == "pass" else "fail"
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO tester_spec_run_outcomes (spec_id, run_id, outcome)
+                VALUES (?, ?, ?)
+                """,
+                (clean_spec, run_id or "", normalized),
+            )
+            # Prune the rolling window — keep only the most-recent
+            # _RUN_OUTCOME_WINDOW rows per spec so the table doesn't
+            # grow without bound on long-lived installs.
+            conn.execute(
+                """
+                DELETE FROM tester_spec_run_outcomes
+                WHERE spec_id = ?
+                  AND id NOT IN (
+                    SELECT id FROM tester_spec_run_outcomes
+                    WHERE spec_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                  )
+                """,
+                (clean_spec, clean_spec, self._RUN_OUTCOME_WINDOW),
+            )
+            # Snapshot current state + recent outcomes for the
+            # heuristic decisions below.
+            current = conn.execute(
+                "SELECT status FROM tester_spec_quarantine WHERE spec_id = ?",
+                (clean_spec,),
+            ).fetchone()
+            current_status = (
+                str(current["status"]) if current is not None else "active"
+            )
+            recent = conn.execute(
+                """
+                SELECT outcome, recorded_at FROM tester_spec_run_outcomes
+                WHERE spec_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (clean_spec, self._RELEASE_PASS_STREAK),
+            ).fetchall()
+            new_status = current_status
+            reason = ""
+            # Auto-release: 5 consecutive passes when quarantined.
+            if current_status == "quarantined" and len(recent) >= self._RELEASE_PASS_STREAK:
+                if all(str(r["outcome"]) == "pass" for r in recent):
+                    new_status = "active"
+                    reason = (
+                        f"auto-released after {self._RELEASE_PASS_STREAK} "
+                        "consecutive passes"
+                    )
+            # Auto-quarantine: pass → fail → pass within 24h on an
+            # active spec. We look at the most-recent 3 outcomes.
+            if current_status == "active":
+                three = conn.execute(
+                    """
+                    SELECT outcome, recorded_at FROM tester_spec_run_outcomes
+                    WHERE spec_id = ?
+                    ORDER BY id DESC
+                    LIMIT 3
+                    """,
+                    (clean_spec,),
+                ).fetchall()
+                if len(three) == 3:
+                    outs = [str(r["outcome"]) for r in three]
+                    # most-recent first → [pass, fail, pass] reading right-to-left
+                    # is the pass→fail→pass pattern. Equivalently:
+                    if outs[0] == "pass" and outs[1] == "fail" and outs[2] == "pass":
+                        # Time-bound to a single 24h window so an old
+                        # pass / new pass with a months-old fail in
+                        # between doesn't trip the heuristic.
+                        first = self._dt(three[2]["recorded_at"])
+                        last = self._dt(three[0]["recorded_at"])
+                        # `_dt` returns either naive or TZ-aware
+                        # depending on whether the stored timestamp
+                        # had a `+00:00` suffix. SQLite's
+                        # `datetime('now')` default is naive. Coerce
+                        # to UTC-aware so the subtraction works
+                        # regardless of which storage path wrote the
+                        # row.
+                        if first and first.tzinfo is None:
+                            first = first.replace(tzinfo=timezone.utc)
+                        if last and last.tzinfo is None:
+                            last = last.replace(tzinfo=timezone.utc)
+                        if first and last and (
+                            last - first
+                        ).total_seconds() <= self._QUARANTINE_FAILURE_WINDOW_HOURS * 3600:
+                            new_status = "quarantined"
+                            reason = "auto-quarantined: pass→fail→pass within 24h"
+            if new_status != current_status:
+                self._write_quarantine_state(
+                    conn,
+                    spec_id=clean_spec,
+                    status=new_status,
+                    reason=reason,
+                )
+            elif current is None:
+                # First-ever outcome for this spec — seed an
+                # `active` row so `list_quarantined_specs` and
+                # `release_spec_quarantine` have a stable target.
+                self._write_quarantine_state(
+                    conn, spec_id=clean_spec, status="active", reason=""
+                )
+        return new_status
+
+    def is_spec_quarantined(self, spec_id: str) -> bool:
+        clean = spec_id.strip()
+        if not clean:
+            return False
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT status FROM tester_spec_quarantine WHERE spec_id = ?",
+                (clean,),
+            ).fetchone()
+        return bool(row is not None and str(row["status"]) == "quarantined")
+
+    def list_quarantined_specs(self) -> list[dict[str, Any]]:
+        """Currently-quarantined specs with their reason + timestamp."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT spec_id, status, quarantine_reason, quarantined_at,
+                       released_at, updated_at
+                FROM tester_spec_quarantine
+                WHERE status = 'quarantined'
+                ORDER BY quarantined_at DESC
+                """
+            ).fetchall()
+        return [
+            {
+                "spec_id": str(row["spec_id"]),
+                "status": str(row["status"]),
+                "quarantine_reason": str(row["quarantine_reason"] or ""),
+                "quarantined_at": str(row["quarantined_at"] or ""),
+                "released_at": str(row["released_at"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+            }
+            for row in rows
+        ]
+
+    def list_llm_pr_review_costs(
+        self,
+        *,
+        since_days: int = 7,
+        group_by: str = "model",
+    ) -> list[dict[str, Any]]:
+        """Aggregate LLM-PR-review costs for the cost-summary CLI.
+
+        `group_by` is `"model"`, `"repo"`, or `"pr"`. The total /
+        per-group counts come from the `input_tokens`,
+        `output_tokens`, `estimated_cost_usd` columns added in P3.5.
+
+        Returns a list of dicts shaped:
+          `{"group": <name>, "reviews": N, "input_tokens": ...,
+            "output_tokens": ..., "estimated_cost_usd": ...}`
+        sorted by `estimated_cost_usd` descending.
+        """
+        since = max(1, int(since_days))
+        if group_by == "model":
+            group_col = "model"
+            group_expr = "model"
+        elif group_by == "repo":
+            group_col = "repo"
+            group_expr = "repo"
+        elif group_by == "pr":
+            group_col = "pr"
+            group_expr = "repo || '#' || CAST(pr_number AS TEXT)"
+        else:
+            raise ValueError(f"unknown group_by: {group_by!r}")
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    {group_expr} AS group_key,
+                    COUNT(*) AS reviews,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(estimated_cost_usd), 0.0) AS estimated_cost_usd
+                FROM llm_pr_reviews
+                WHERE created_at >= datetime('now', ?)
+                GROUP BY {group_expr}
+                ORDER BY estimated_cost_usd DESC, group_key ASC
+                """,
+                (f"-{since} days",),
+            ).fetchall()
+        return [
+            {
+                group_col: str(row["group_key"] or ""),
+                "reviews": int(row["reviews"] or 0),
+                "input_tokens": int(row["input_tokens"] or 0),
+                "output_tokens": int(row["output_tokens"] or 0),
+                "estimated_cost_usd": float(row["estimated_cost_usd"] or 0.0),
+            }
+            for row in rows
+        ]
+
+    def force_quarantine_spec(self, *, spec_id: str, reason: str = "") -> None:
+        """Manual override — operator decided a spec is flaky and
+        wants it off the qa_incident escalation path even though the
+        auto-quarantine heuristic hasn't tripped yet."""
+        clean = spec_id.strip()
+        if not clean:
+            raise ValueError("spec_id is required")
+        with self._conn() as conn:
+            self._write_quarantine_state(
+                conn,
+                spec_id=clean,
+                status="quarantined",
+                reason=(reason.strip() or "manual"),
+            )
+
+    def release_spec_quarantine(self, *, spec_id: str, reason: str = "") -> None:
+        clean = spec_id.strip()
+        if not clean:
+            raise ValueError("spec_id is required")
+        with self._conn() as conn:
+            self._write_quarantine_state(
+                conn,
+                spec_id=clean,
+                status="active",
+                reason=(reason.strip() or "manual"),
+            )
+
+    def quarantine_status(self, spec_id: str) -> dict[str, Any]:
+        """Full status row for the `quarantine show` CLI."""
+        clean = spec_id.strip()
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT spec_id, status, quarantine_reason, quarantined_at,
+                       released_at, created_at, updated_at
+                FROM tester_spec_quarantine
+                WHERE spec_id = ?
+                """,
+                (clean,),
+            ).fetchone()
+            outcomes = conn.execute(
+                """
+                SELECT outcome, run_id, recorded_at FROM tester_spec_run_outcomes
+                WHERE spec_id = ?
+                ORDER BY id DESC
+                LIMIT 10
+                """,
+                (clean,),
+            ).fetchall()
+        if row is None:
+            return {
+                "spec_id": clean,
+                "status": "active",
+                "quarantine_reason": "",
+                "quarantined_at": "",
+                "released_at": "",
+                "recent_outcomes": [],
+            }
+        return {
+            "spec_id": str(row["spec_id"]),
+            "status": str(row["status"]),
+            "quarantine_reason": str(row["quarantine_reason"] or ""),
+            "quarantined_at": str(row["quarantined_at"] or ""),
+            "released_at": str(row["released_at"] or ""),
+            "recent_outcomes": [
+                {
+                    "outcome": str(o["outcome"]),
+                    "run_id": str(o["run_id"] or ""),
+                    "recorded_at": str(o["recorded_at"] or ""),
+                }
+                for o in outcomes
+            ],
+        }
+
+    def _write_quarantine_state(
+        self,
+        conn: Any,
+        *,
+        spec_id: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        """Upsert helper for the quarantine state row.
+
+        `quarantined_at` is set when transitioning to `quarantined`;
+        `released_at` is set when transitioning to `active`. We
+        preserve the original quarantined_at across releases so the
+        history of recent quarantines is recoverable.
+        """
+        existing = conn.execute(
+            "SELECT status, quarantined_at FROM tester_spec_quarantine WHERE spec_id = ?",
+            (spec_id,),
+        ).fetchone()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if existing is None:
+            quarantined_at = now_iso if status == "quarantined" else ""
+            released_at = now_iso if status == "active" else ""
+            conn.execute(
+                """
+                INSERT INTO tester_spec_quarantine
+                    (spec_id, status, quarantine_reason,
+                     quarantined_at, released_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (spec_id, status, reason, quarantined_at, released_at, now_iso),
+            )
+            return
+        # Existing row — only stamp transitions, preserve the
+        # pre-existing quarantined_at when toggling back to active so
+        # an audit trail survives.
+        new_quarantined_at = (
+            now_iso
+            if status == "quarantined" and existing["status"] != "quarantined"
+            else str(existing["quarantined_at"] or "")
+        )
+        new_released_at = (
+            now_iso
+            if status == "active" and existing["status"] != "active"
+            else ""
+        )
+        conn.execute(
+            """
+            UPDATE tester_spec_quarantine
+            SET status = ?,
+                quarantine_reason = ?,
+                quarantined_at = ?,
+                released_at = ?,
+                updated_at = ?
+            WHERE spec_id = ?
+            """,
+            (status, reason, new_quarantined_at, new_released_at, now_iso, spec_id),
+        )
+
+    def next_open_qa_incident(
+        self,
+        *,
+        project_id: Optional[str] = None,
+        environment_id: Optional[str] = None,
+    ) -> Optional[sqlite3.Row]:
+        """The single highest-priority QA incident worth working on now.
+
+        Priority order: open > reproduced > fix_proposed; severity critical
+        > high > medium > low; then most recent.
+        """
+        where: list[str] = ["status IN ('open', 'reproduced', 'fix_proposed')"]
+        params: list[object] = []
+        if project_id:
+            where.append("project_id = ?")
+            params.append(project_id)
+        if environment_id:
+            where.append("environment_id = ?")
+            params.append(environment_id)
+        sql = f"""
+            SELECT *,
+                CASE severity
+                    WHEN 'critical' THEN 0
+                    WHEN 'high'     THEN 1
+                    WHEN 'medium'   THEN 2
+                    WHEN 'low'      THEN 3
+                    ELSE 4
+                END AS sev_rank,
+                CASE status
+                    WHEN 'open'         THEN 0
+                    WHEN 'reproduced'   THEN 1
+                    WHEN 'fix_proposed' THEN 2
+                    ELSE 3
+                END AS status_rank
+            FROM qa_incidents
+            WHERE {" AND ".join(where)}
+            ORDER BY status_rank ASC, sev_rank ASC, updated_at DESC
+            LIMIT 1
+        """
+        with self._conn() as conn:
+            return conn.execute(sql, params).fetchone()

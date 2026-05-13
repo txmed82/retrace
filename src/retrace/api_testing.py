@@ -39,6 +39,7 @@ SENSITIVE_BODY_KEYS = {
     "secret",
     "token",
 }
+TRACE_ID_HEX_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 @dataclass
@@ -69,6 +70,7 @@ class APITestSpec:
     url: str
     query: dict[str, Any] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
+    headers_env: str = ""
     body: Any = None
     auth: dict[str, Any] = field(default_factory=dict)
     auth_profile: str = ""
@@ -96,6 +98,7 @@ class APITestRunResult:
     status_code: int
     elapsed_ms: int
     run_dir: str
+    failure_classification: str = ""
     error: str = ""
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     assertion_results: list[dict[str, Any]] = field(default_factory=list)
@@ -140,6 +143,7 @@ def _coerce_spec(data: dict[str, Any]) -> APITestSpec:
     data.setdefault("schema_version", API_SPEC_SCHEMA_VERSION)
     data.setdefault("query", {})
     data.setdefault("headers", {})
+    data.setdefault("headers_env", "")
     data.setdefault("auth", {})
     data.setdefault("auth_profile", "")
     data.setdefault("env_profile", "")
@@ -229,6 +233,7 @@ def create_api_spec(
     url: str,
     query: Optional[dict[str, Any]] = None,
     headers: Optional[dict[str, str]] = None,
+    headers_env: str = "",
     body: Any = None,
     auth: Optional[dict[str, Any]] = None,
     auth_profile: str = "",
@@ -253,6 +258,7 @@ def create_api_spec(
         url=url.strip(),
         query=dict(query or {}),
         headers={str(k): str(v) for k, v in dict(headers or {}).items()},
+        headers_env=headers_env.strip(),
         body=body,
         auth=dict(auth or {}),
         auth_profile=auth_profile.strip(),
@@ -316,6 +322,7 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
     effective_env = dict(os.environ)
     effective_env.update({str(k): str(v) for k, v in spec.env_overrides.items()})
     scope: dict[str, Any] = {"vars": {}, "env": effective_env, "steps": []}
+    executed_requests: list[dict[str, Any]] = []
 
     try:
         for idx, step in enumerate(spec.setup_steps):
@@ -332,9 +339,12 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
             step_id = str(step.get("id") or f"request-{idx + 1}")
             method = str(step.get("method") or spec.method).upper()
             url = _render_text(str(step.get("url") or spec.url), scope)
+            status_code = 0
+            elapsed_ms = 0
             query = _render_mapping(step.get("query", spec.query), scope)
             headers = _resolve_headers(
                 spec,
+                step_headers_env=step.get("headers_env"),
                 step_auth=step.get("auth"),
                 env=effective_env,
             )
@@ -353,6 +363,7 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
                 "headers": _redact_headers(headers),
                 "body": _redact_json(request_body),
             }
+            request_trace_ids = _trace_ids_from_blob({"headers": headers})
             request_path = artifacts_dir / f"{step_id}-request.json"
             request_path.write_text(json.dumps(request_payload, indent=2) + "\n")
             artifacts.append(
@@ -400,6 +411,20 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
                 "headers": _redact_headers(dict(response.headers)),
                 "body": _redact_json(response_json if response_json is not None else response_body),
             }
+            trace_ids = _unique_strings(
+                [*request_trace_ids, *_trace_ids_from_blob({"headers": dict(response.headers)})]
+            )
+            executed_requests.append(
+                {
+                    "step_id": step_id,
+                    "method": method,
+                    "url": url,
+                    "route_path": _url_path(url),
+                    "status_code": status_code,
+                    "elapsed_ms": elapsed_ms,
+                    "trace_ids": trace_ids,
+                }
+            )
             response_path = artifacts_dir / f"{step_id}-response.json"
             response_path.write_text(json.dumps(response_payload, indent=2) + "\n")
             artifacts.append(
@@ -447,6 +472,38 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
         )
     )
     ok = not error and all(item.ok for item in assertion_results)
+    classification = _classify_api_run(
+        ok=ok,
+        status_code=status_code,
+        error=error,
+        assertion_results=assertions_payload,
+    )
+    run_summary = _api_run_summary(
+        spec=spec,
+        run_id=run_id,
+        ok=ok,
+        status_code=status_code,
+        elapsed_ms=elapsed_ms,
+        error=error,
+        failure_classification=classification,
+        assertion_results=assertions_payload,
+        executed_requests=executed_requests,
+    )
+    summary_path = artifacts_dir / "run-summary.json"
+    summary_path.write_text(json.dumps(run_summary, indent=2) + "\n")
+    artifacts.append(
+        APITestArtifact(
+            artifact_id="run-summary",
+            artifact_type="api_run_summary",
+            path=str(summary_path),
+            label="API run summary",
+            metadata={
+                "failure_classification": classification,
+                "request_count": len(executed_requests),
+                "route_path": _url_path(spec.url),
+            },
+        )
+    )
     result = APITestRunResult(
         run_id=run_id,
         spec_id=spec.spec_id,
@@ -455,12 +512,106 @@ def run_api_spec(*, spec: APITestSpec, runs_dir: Path) -> APITestRunResult:
         status_code=status_code,
         elapsed_ms=elapsed_ms,
         run_dir=str(run_dir),
+        failure_classification=classification,
         error=error,
         artifacts=[asdict(item) for item in artifacts],
         assertion_results=assertions_payload,
     )
     (run_dir / "run.json").write_text(json.dumps(asdict(result), indent=2) + "\n")
     return result
+
+
+def _classify_api_run(
+    *,
+    ok: bool,
+    status_code: int,
+    error: str,
+    assertion_results: list[dict[str, Any]],
+) -> str:
+    if ok:
+        return "passed"
+    failed_assertions = [
+        item for item in assertion_results if not bool(item.get("ok"))
+    ]
+    status_assertion_failed = any(
+        str(item.get("assertion_type") or "") == "status_code"
+        for item in failed_assertions
+    )
+    error_l = error.lower()
+    if "timeout" in error_l or "timed out" in error_l:
+        return "timeout"
+    if error and status_code == 0:
+        return "network_error"
+    if status_assertion_failed:
+        if "auth failure" in error_l or status_code in {401, 403}:
+            return "auth_failure"
+        if status_code >= 500:
+            return "server_error"
+        if status_code >= 400:
+            return "client_error"
+    if failed_assertions:
+        return "assertion_failure"
+    if "auth failure" in error_l or status_code in {401, 403}:
+        return "auth_failure"
+    if status_code >= 500:
+        return "server_error"
+    if status_code >= 400:
+        return "client_error"
+    return "unknown"
+
+
+def _api_run_summary(
+    *,
+    spec: APITestSpec,
+    run_id: str,
+    ok: bool,
+    status_code: int,
+    elapsed_ms: int,
+    error: str,
+    failure_classification: str,
+    assertion_results: list[dict[str, Any]],
+    executed_requests: list[dict[str, Any]],
+) -> dict[str, Any]:
+    api_regression = (
+        spec.fixtures.get("api_regression")
+        if isinstance(spec.fixtures.get("api_regression"), dict)
+        else {}
+    )
+    failed_assertions = [
+        item for item in assertion_results if not bool(item.get("ok"))
+    ]
+    return scrub_pii_from_blob(
+        {
+            "spec_id": spec.spec_id,
+            "run_id": run_id,
+            "ok": ok,
+            "status": "passed" if ok else "failed",
+            "failure_classification": failure_classification,
+            "method": spec.method,
+            "url": spec.url,
+            "route_path": _url_path(spec.url),
+            "auth_profile": spec.auth_profile,
+            "env_profile": spec.env_profile,
+            "status_code": status_code,
+            "elapsed_ms": elapsed_ms,
+            "error": error,
+            "request_count": len(executed_requests),
+            "requests": executed_requests,
+            "assertion_count": len(assertion_results),
+            "failed_assertions": failed_assertions,
+            "trace_ids": _unique_strings(
+                [
+                    *list(api_regression.get("trace_ids", []) or []),
+                    *[
+                        trace_id
+                        for request in executed_requests
+                        for trace_id in list(request.get("trace_ids", []) or [])
+                    ],
+                ]
+            ),
+            "source_issue_public_id": spec.fixtures.get("issue_public_id", ""),
+        }
+    )
 
 
 def persist_api_failure(
@@ -471,6 +622,7 @@ def persist_api_failure(
     project_id: str,
     environment_id: str,
     repo_path: Optional[Path] = None,
+    log_paths: Optional[list[Path]] = None,
 ) -> APIFailurePersistenceResult:
     if result.ok:
         raise ValueError("only failed API runs can be persisted as failures")
@@ -496,10 +648,24 @@ def persist_api_failure(
         spec=spec,
         run_result=result,
     )
+    trace_ids = [
+        value
+        for item in list(failure.metadata.get("trace_ids", []) or [])
+        for value in [str(item or "").strip().lower()]
+        if TRACE_ID_HEX_RE.fullmatch(value)
+    ]
+    evidence_items = [
+        *_api_failure_evidence_items(result=result),
+        *_api_log_evidence_items(
+            result=result,
+            log_paths=log_paths or [],
+            trace_ids=trace_ids,
+        ),
+    ]
     persisted_failure_id, evidence_ids, repair_task_id = (
         store.upsert_failure_with_evidence_and_repair_task(
             failure=failure,
-            evidence_items=_api_failure_evidence_items(result=result),
+            evidence_items=evidence_items,
             repair_task={
                 "title": f"Repair API failure: {spec.name or spec.spec_id}",
                 "source_type": "test_run",
@@ -530,6 +696,7 @@ def persist_api_failure(
                     "route_path": _url_path(spec.url),
                     "expected_status": spec.expected_status,
                     "status_code": result.status_code,
+                    "failure_classification": result.failure_classification,
                     "repo_path": str(repo_path) if repo_path else "",
                     "candidate_rationale": [
                         {
@@ -560,6 +727,19 @@ def persist_api_failure(
             run_result=result,
             link_id=links[0].id,
         )
+
+    # Mirror into the QA incident pipeline. The monitoring path goes
+    # through `group_failure_into_incident`, but API test failures land
+    # straight in `failures` and skip that grouping — call the bridge
+    # directly so `retrace qa auto` sees them too. Bridge errors must
+    # never break a test run.
+    try:
+        from retrace.qa_incident_bridge import sync_qa_incident_from_failure
+
+        sync_qa_incident_from_failure(store=store, failure_id=persisted_failure_id)
+    except Exception:
+        pass
+
     return APIFailurePersistenceResult(
         failure_id=persisted_failure_id,
         repair_task_id=repair_task_id,
@@ -578,6 +758,7 @@ def _api_failure_evidence_items(*, result: APITestRunResult) -> list[EvidenceIte
             "api_request": "api_request",
             "api_response": "api_response",
             "api_assertion_results": "test_transcript",
+            "api_run_summary": "test_transcript",
         }.get(artifact_type)
         if not evidence_type:
             continue
@@ -612,6 +793,70 @@ def _api_failure_evidence_items(*, result: APITestRunResult) -> list[EvidenceIte
     return items
 
 
+def _api_log_evidence_items(
+    *,
+    result: APITestRunResult,
+    log_paths: list[Path],
+    trace_ids: list[str],
+) -> list[EvidenceItem]:
+    if not trace_ids:
+        return []
+    items: list[EvidenceItem] = []
+    source = f"api_run:{result.run_id}"
+    for path in log_paths:
+        lines = _matching_log_lines(path=path, trace_ids=trace_ids)
+        if not lines:
+            continue
+        payload = scrub_pii_from_blob(
+            {
+                "run_id": result.run_id,
+                "spec_id": result.spec_id,
+                "path": str(path),
+                "trace_ids": trace_ids,
+                "lines": lines,
+            }
+        )
+        items.append(
+            EvidenceItem(
+                failure_id="",
+                evidence_type="backend_log",
+                occurred_at_ms=0,
+                source=source,
+                redaction_state="redacted",
+                payload=payload,
+                artifact_path=str(path),
+                dedupe_key=evidence_dedupe_key(
+                    failure_id="",
+                    evidence_type="backend_log",
+                    source=source,
+                    occurred_at_ms=0,
+                    payload=payload,
+                ),
+            )
+        )
+    return items
+
+
+def _matching_log_lines(*, path: Path, trace_ids: list[str]) -> list[str]:
+    try:
+        if not path.exists() or not path.is_file() or path.stat().st_size > 2_000_000:
+            return []
+        raw_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return []
+    needles = [item.casefold() for item in trace_ids if TRACE_ID_HEX_RE.fullmatch(item)]
+    if not needles:
+        return []
+    matches: list[str] = []
+    for line in raw_lines:
+        line_l = line.casefold()
+        if any(needle in line_l for needle in needles):
+            matches.append(line[:4000])
+        if len(matches) >= 50:
+            break
+    return matches
+
+
 def _artifact_payload(path_value: str) -> Any:
     if not path_value:
         return {}
@@ -627,6 +872,7 @@ def _artifact_payload(path_value: str) -> Any:
 def _api_failure_evidence_text(spec: APITestSpec, result: APITestRunResult) -> str:
     request = _artifact_by_type(result, "api_request")
     response = _artifact_by_type(result, "api_response")
+    summary = _artifact_by_type(result, "api_run_summary")
     payload = {
         "api_reproduction": {
             "spec_id": spec.spec_id,
@@ -634,12 +880,14 @@ def _api_failure_evidence_text(spec: APITestSpec, result: APITestRunResult) -> s
             "method": spec.method,
             "url": spec.url,
             "route_path": _url_path(spec.url),
+            "failure_classification": result.failure_classification,
             "query": spec.query,
             "expected_status": spec.expected_status,
             "actual_status": result.status_code,
             "body": _redact_json(spec.body),
             "command": f"retrace tester api-run {spec.spec_id}",
         },
+        "run_summary": scrub_pii_from_blob(summary),
         "request": scrub_pii_from_blob(request),
         "response": scrub_pii_from_blob(response),
         "assertion_results": scrub_pii_from_blob(result.assertion_results),
@@ -677,6 +925,26 @@ def scrub_pii_from_blob(blob: Any) -> Any:
 
 
 def _scrub_pii_text(value: str) -> str:
+    value = re.sub(
+        r"(?i)\bBasic\s+[A-Za-z0-9._~+/=-]+\b",
+        "Basic [redacted-token]",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+\b",
+        "Bearer [redacted-token]",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password|session)\b\s*[:=]\s*\S+",
+        lambda match: f"{match.group(1)}=[redacted]",
+        value,
+    )
+    value = re.sub(
+        r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
+        "[redacted-jwt]",
+        value,
+    )
     value = re.sub(
         r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
         "[redacted-email]",
@@ -724,6 +992,7 @@ def _write_api_repair_prompt(
 - Query: `{json.dumps(spec.query, sort_keys=True)}`
 - Expected status: `{spec.expected_status}`
 - Actual status: `{result.status_code}`
+- Failure classification: `{result.failure_classification}`
 - Validation command: `retrace tester api-run {spec.spec_id}`
 
 ## Likely Source Files
@@ -750,6 +1019,55 @@ def _artifact_by_type(result: APITestRunResult, artifact_type: str) -> Any:
 def _url_path(url: str) -> str:
     parsed = urlparse(url)
     return parsed.path or url
+
+
+def _trace_ids_from_blob(value: Any) -> list[str]:
+    out: list[str] = []
+    _collect_trace_ids(value, out)
+    return out[:10]
+
+
+def _collect_trace_ids(value: Any, out: list[str]) -> None:
+    if len(out) >= 10:
+        return
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            key_s = str(key).casefold()
+            if key_s in {"trace_id", "traceid", "requesttraceid", "responsetraceid"}:
+                _append_trace_id(str(nested or ""), out)
+            elif key_s in {"traceparent", "requesttraceparent", "responsetraceparent"}:
+                _append_trace_id(_trace_id_from_traceparent(str(nested or "")), out)
+            _collect_trace_ids(nested, out)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_trace_ids(item, out)
+
+
+def _append_trace_id(value: str, out: list[str]) -> None:
+    trace_id = value.strip().lower()
+    if trace_id and trace_id not in out:
+        out.append(trace_id)
+
+
+def _trace_id_from_traceparent(value: str) -> str:
+    parts = value.strip().split("-")
+    if len(parts) != 4:
+        return ""
+    trace_id = parts[1].lower()
+    if len(trace_id) != 32 or any(c not in "0123456789abcdef" for c in trace_id):
+        return ""
+    return trace_id
+
+
+def _unique_strings(values: list[Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value or "").strip().lower()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 
 def _request_steps(spec: APITestSpec) -> list[dict[str, Any]]:
@@ -788,6 +1106,7 @@ def _step_spec(
         url=url,
         query=query,
         headers=dict(step.get("headers") or {}),
+        headers_env=str(step.get("headers_env") or spec.headers_env or ""),
         body=step.get("body", spec.body),
         auth=dict(step.get("auth") or spec.auth),
         auth_profile=spec.auth_profile,
@@ -848,11 +1167,26 @@ def _apply_extractors(raw_extractors: Any, scope: dict[str, Any]) -> None:
 def _resolve_headers(
     spec: APITestSpec,
     *,
+    step_headers_env: Any = None,
     step_auth: Any = None,
     env: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
     headers = {str(k): str(v) for k, v in spec.headers.items()}
     env_values = env if env is not None else dict(os.environ)
+    headers_env = str(step_headers_env or spec.headers_env or "").strip()
+    if headers_env:
+        raw_headers = env_values.get(headers_env, "").strip()
+        if not raw_headers:
+            raise RuntimeError(f"auth failure: missing headers env var {headers_env}")
+        try:
+            parsed_headers = json.loads(raw_headers)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"auth failure: headers env var {headers_env} must be valid JSON"
+            ) from exc
+        if not isinstance(parsed_headers, dict):
+            raise RuntimeError("auth failure: headers env var must be a JSON object")
+        headers.update({str(k): str(v) for k, v in parsed_headers.items()})
     auth = step_auth if isinstance(step_auth, dict) else spec.auth
     auth_type = str(auth.get("type") or "none").strip().lower()
     if auth_type in {"", "none"}:

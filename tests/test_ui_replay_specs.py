@@ -6,20 +6,28 @@ from threading import Thread
 from unittest.mock import patch
 
 from retrace.commands.ui import (
+    _api_specs_payload,
+    _api_suites_payload,
     _create_sdk_key_payload,
+    _edit_ui_draft_payload,
     _generate_replay_issue_api_spec_payload,
     _generate_replay_issue_fix_prompts_payload,
     _generate_replay_issue_specs_payload,
+    _hosted_onboarding_readiness_payload,
+    _issue_evidence_stitching_payload,
     _INDEX_HTML,
     _issue_workflow_payload,
     _replay_api_calls,
     _replay_api_check,
     _generate_replay_issue_spec_payload,
     _run_replay_issue_api_spec_payload,
+    _run_api_spec_payload,
+    _run_api_suite_payload,
     _to_replay_dashboard_payload,
     _transition_replay_issue_payload,
     _verify_resolved_issues_payload,
 )
+from retrace.api_suites import create_api_suite
 from retrace.api_testing import APITestRunResult, api_specs_dir_for_data_dir, create_api_spec
 from retrace.replay_core import ReplaySignalConfig, process_replay_sessions
 from retrace.sdk_keys import authenticate_sdk_key
@@ -113,8 +121,29 @@ def test_index_html_escape_helper_escapes_single_quotes() -> None:
     assert "copyEvidenceBundle" in _INDEX_HTML
     assert "timelineTypeFilter" in _INDEX_HTML
     assert "renderIssueWorkflow" in _INDEX_HTML
+    assert "renderEvidenceStitching" in _INDEX_HTML
+    assert "renderIssueReadiness" in _INDEX_HTML
     assert "renderRepairTask" in _INDEX_HTML
     assert "data-workflow-action" in _INDEX_HTML
+    assert "QA Loop Status" in _INDEX_HTML
+    assert "generate_api_regression" in _INDEX_HTML
+    assert "/api/api-suites" in _INDEX_HTML
+    assert "API Suites" in _INDEX_HTML
+    assert "/api/api-specs" in _INDEX_HTML
+    assert "/api/api-spec/run" in _INDEX_HTML
+    assert "UI Spec Inventory" in _INDEX_HTML
+    assert "API Spec Inventory" in _INDEX_HTML
+    assert "runManagedApiSpec" in _INDEX_HTML
+    assert "/api/api-suite/run" in _INDEX_HTML
+    assert "runManagedApiSuite" in _INDEX_HTML
+    assert "apiSuiteRunMatrix" in _INDEX_HTML
+    assert "/api/onboarding/readiness" in _INDEX_HTML
+    assert "Hosted Readiness" in _INDEX_HTML
+    assert "Evidence Stitching" in _INDEX_HTML
+    assert "Generated Draft Review" in _INDEX_HTML
+    assert "/api/tester/draft" in _INDEX_HTML
+    assert "saveDraftSpec" in _INDEX_HTML
+    assert "runAcceptedDraftSpec" in _INDEX_HTML
     assert _INDEX_HTML.index("await refreshTesterAndReplay(issue.public_id);") < (
         _INDEX_HTML.index("renderReplayFixSuggestions(data);")
     )
@@ -179,6 +208,290 @@ def test_issue_workflow_treats_covered_passing_as_terminal_without_repair() -> N
     assert workflow["primary_action"] == "none"
     assert workflow["primary_label"] == "Covered by passing test"
     assert workflow["stage_states"]["verification"] == "complete"
+    assert workflow["readiness"] == "verified"
+    assert workflow["blockers"] == []
+
+
+def test_issue_workflow_recommends_ui_and_api_regressions() -> None:
+    workflow = _issue_workflow_payload(
+        {
+            "status": "unresolved",
+            "timeline": [{"type": "replay_signal"}],
+            "reproduction_steps": ["Open checkout"],
+            "sessions": [{"session_id": "sess-1"}],
+            "api_calls": [{"method": "POST", "url": "/api/checkout", "status": 500}],
+            "test_links": [],
+            "repair_task": None,
+        }
+    )
+
+    assert workflow["readiness"] == "needs_test"
+    assert workflow["counts"]["api_tests"] == 0
+    assert "No regression test covers this issue yet." in workflow["blockers"]
+    assert [item["action"] for item in workflow["recommended_actions"]] == [
+        "generate_replay_spec",
+        "generate_api_regression",
+    ]
+
+
+def test_issue_evidence_stitching_links_frontend_api_trace_and_repair() -> None:
+    stitching = _issue_evidence_stitching_payload(
+        {
+            "sessions": [{"session_id": "sess-1"}],
+            "timeline": [
+                {
+                    "type": "monitoring_alert",
+                    "payload": {
+                        "metadata": {"trace_id": "abc123"},
+                        "payload": {
+                            "stack_frames": [
+                                {
+                                    "filename": "https://cdn.example/app.js",
+                                    "source_mapped": True,
+                                    "source": "src/app.ts",
+                                }
+                            ]
+                        },
+                    },
+                }
+            ],
+            "api_calls": [
+                {
+                    "method": "POST",
+                    "url": "/api/checkout",
+                    "trace": {"trace_id": "def456"},
+                }
+            ],
+            "test_links": [
+                {
+                    "spec_id": "api_checkout",
+                    "source": "replay_issue_api",
+                    "spec_path": "api-tests/specs/api_checkout.json",
+                }
+            ],
+            "repair_task": {"public_id": "repair_123"},
+        }
+    )
+
+    assert stitching["status"] == "complete"
+    assert stitching["trace_ids"] == ["abc123", "def456"]
+    assert stitching["api_regression_spec_ids"] == ["api_checkout"]
+    assert stitching["source_map_frames"][0]["source_mapped"] is True
+
+
+def test_api_suites_payload_summarizes_import_quality(tmp_path: Path) -> None:
+    create_api_suite(
+        suites_dir=tmp_path / "api-tests" / "suites",
+        name="OpenAPI Demo",
+        source="openapi_import",
+        spec_ids=["api_get_user"],
+        auth_profile="local-jwt",
+        env_profile="staging",
+        import_summary={
+            "coverage_percent": 100.0,
+            "quality_warnings": {
+                "missing_operation_ids": ["api_get_user"],
+                "missing_response_schemas": [],
+            },
+        },
+        operations=[
+            {
+                "spec_id": "api_get_user",
+                "method": "GET",
+                "path": "/v1/users/{id}",
+                "operation_id": "",
+            }
+        ],
+    )
+
+    payload = _api_suites_payload(tmp_path)
+
+    assert payload["suites"][0]["name"] == "OpenAPI Demo"
+    assert payload["suites"][0]["spec_count"] == 1
+    assert payload["suites"][0]["operation_count"] == 1
+    assert payload["suites"][0]["quality_warning_count"] == 1
+    assert payload["suites"][0]["auth_profile"] == "local-jwt"
+
+
+def test_api_specs_payload_summarizes_management_fields(tmp_path: Path) -> None:
+    spec = create_api_spec(
+        specs_dir=api_specs_dir_for_data_dir(tmp_path),
+        name="Checkout API",
+        method="POST",
+        url="https://app.example/api/checkout",
+        expected_status=201,
+        json_assertions=[{"path": "$.ok", "equals": True}],
+        auth_profile="local-jwt",
+        env_profile="staging",
+        fixtures={
+            "source": "openapi_import",
+            "issue_public_id": "iss_checkout",
+            "operation_id": "createCheckout",
+            "openapi_path": "/api/checkout",
+        },
+    )
+
+    payload = _api_specs_payload(tmp_path)
+
+    assert payload["specs"][0]["spec_id"] == spec.spec_id
+    assert payload["specs"][0]["method"] == "POST"
+    assert payload["specs"][0]["expected_status"] == 201
+    assert payload["specs"][0]["json_assertion_count"] == 1
+    assert payload["specs"][0]["source"] == "openapi_import"
+    assert payload["specs"][0]["issue_public_id"] == "iss_checkout"
+    assert payload["specs"][0]["operation_id"] == "createCheckout"
+
+
+def test_run_api_spec_payload_runs_saved_api_spec(tmp_path: Path) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HealthHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        spec = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Health API",
+            method="GET",
+            url=f"http://{host}:{port}/healthz",
+            expected_status=200,
+        )
+        payload, status = _run_api_spec_payload(data_dir=tmp_path, spec_id=spec.spec_id)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["result"]["spec_id"] == spec.spec_id
+    assert payload["result"]["status"] == "passed"
+
+
+def test_run_api_suite_payload_returns_pass_fail_matrix(tmp_path: Path) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HealthHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        passing = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Health API",
+            method="GET",
+            url=f"http://{host}:{port}/healthz",
+            expected_status=200,
+        )
+        failing = create_api_spec(
+            specs_dir=api_specs_dir_for_data_dir(tmp_path),
+            name="Missing API",
+            method="GET",
+            url=f"http://{host}:{port}/missing",
+            expected_status=200,
+        )
+        suite = create_api_suite(
+            suites_dir=tmp_path / "api-tests" / "suites",
+            name="Smoke Suite",
+            source="manual",
+            spec_ids=[passing.spec_id, failing.spec_id],
+        )
+        payload, status = _run_api_suite_payload(
+            data_dir=tmp_path,
+            suite_id=suite.suite_id,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 400
+    assert payload["ok"] is False
+    assert payload["total"] == 2
+    assert payload["passed"] == 1
+    assert payload["failed"] == 1
+    assert [item["spec_id"] for item in payload["results"]] == [
+        passing.spec_id,
+        failing.spec_id,
+    ]
+    assert payload["results"][0]["ok"] is True
+    assert payload["results"][1]["ok"] is False
+
+
+def test_edit_ui_draft_payload_persists_reviewed_steps_and_accepts(
+    tmp_path: Path,
+) -> None:
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Generated checkout draft",
+        prompt="Explore checkout",
+        app_url="https://app.example",
+        start_command="",
+        harness_command=DEFAULT_HARNESS_COMMAND,
+        execution_engine="native",
+        exact_steps=[{"id": "old", "action": "navigate", "url": "https://app.example"}],
+        assertions=[{"id": "old-status", "type": "status_code", "expected": 200}],
+        fixtures={
+            "draft_status": "draft",
+            "generation": {"review": {"summary": "Needs stable checkout path"}},
+        },
+    )
+
+    payload, status = _edit_ui_draft_payload(
+        data_dir=tmp_path,
+        spec_id=spec.spec_id,
+        name="Accepted checkout draft",
+        prompt="Run checkout smoke",
+        steps=[
+            {
+                "id": "checkout",
+                "action": "navigate",
+                "url": "https://app.example/checkout",
+            }
+        ],
+        assertions=[
+            {"id": "checkout-loads", "type": "status_code", "expected": 200}
+        ],
+        review_note="Made deterministic before accepting.",
+        accept=True,
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["draft_status"] == "accepted"
+    assert payload["changed_fields"] == [
+        "assertions",
+        "draft_status",
+        "exact_steps",
+        "name",
+        "prompt",
+        "review_notes",
+    ]
+    saved = payload["spec"]
+    assert saved["name"] == "Accepted checkout draft"
+    assert saved["exact_steps"][0]["id"] == "checkout"
+    assert saved["assertions"][0]["id"] == "checkout-loads"
+    assert saved["fixtures"]["review_notes"] == ["Made deterministic before accepting."]
+    assert saved["fixtures"]["last_review_edit"]["fields"] == payload["changed_fields"]
+
+
+def test_edit_ui_draft_payload_rejects_invalid_json_shape(tmp_path: Path) -> None:
+    spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Generated draft",
+        prompt="Explore",
+        app_url="https://app.example",
+        start_command="",
+        harness_command=DEFAULT_HARNESS_COMMAND,
+        fixtures={"draft_status": "draft"},
+    )
+
+    payload, status = _edit_ui_draft_payload(
+        data_dir=tmp_path,
+        spec_id=spec.spec_id,
+        steps={"id": "not-a-list"},
+    )
+
+    assert status == 400
+    assert payload["ok"] is False
+    assert "steps must be a JSON list of objects" in payload["error"]
 
 
 def test_create_sdk_key_payload_creates_browser_ingest_key(
@@ -209,6 +522,108 @@ def test_create_sdk_key_payload_creates_browser_ingest_key(
     assert row.id == payload["id"]
     assert row.project_id == payload["project_id"]
     assert row.environment_id == payload["environment_id"]
+
+
+def test_hosted_onboarding_readiness_tracks_core_loop_setup(tmp_path: Path) -> None:
+    store, workspace = _workspace(tmp_path)
+    _create_sdk_key_payload(
+        store=store,
+        project_name="Web",
+        environment_name="production",
+        name="Browser SDK",
+    )
+    store.insert_replay_batch(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        session_id="sess-onboarding",
+        sequence=0,
+        events=[{"type": 4, "timestamp": 100, "data": {"href": "https://app.test"}}],
+        flush_type="final",
+    )
+    issue = store.upsert_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        fingerprint="onboarding-error",
+        session_ids=["sess-onboarding"],
+        signal_summary={"console_error": 1},
+        first_seen_ms=100,
+        last_seen_ms=200,
+        title="Onboarding smoke issue",
+        evidence={"signals": []},
+    )
+    ui_spec = create_spec(
+        specs_dir=specs_dir_for_data_dir(tmp_path),
+        name="Onboarding UI regression",
+        prompt="Open app",
+        app_url="https://app.test",
+        start_command="",
+        harness_command=DEFAULT_HARNESS_COMMAND,
+        fixtures={"issue_public_id": issue.public_id, "draft_status": "accepted"},
+    )
+    api_spec = create_api_spec(
+        specs_dir=api_specs_dir_for_data_dir(tmp_path),
+        name="Onboarding API",
+        method="GET",
+        url="https://app.test/api/health",
+    )
+    create_api_suite(
+        suites_dir=tmp_path / "api-tests" / "suites",
+        name="Onboarding API suite",
+        source="manual",
+        spec_ids=[api_spec.spec_id],
+    )
+    row = store.get_replay_issue(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        issue_id=issue.public_id,
+    )
+    assert row is not None
+    store.upsert_failure_test_link(
+        failure_id=str(row["canonical_failure_id"]),
+        issue_id=str(row["id"]),
+        issue_public_id=issue.public_id,
+        spec_id=ui_spec.spec_id,
+        spec_name=ui_spec.name,
+        spec_path=f"ui-tests/specs/{ui_spec.spec_id}.json",
+        source="replay_issue",
+    )
+    store.upsert_source_map(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        release="sha",
+        dist="",
+        artifact_url="https://cdn.example/app.js",
+        source_map={"version": 3, "sources": ["src/app.ts"], "names": [], "mappings": "AAAA"},
+    )
+    store.upsert_app_error_alert_rule(
+        project_id=workspace.project_id,
+        environment_id=workspace.environment_id,
+        name="Critical errors",
+        min_severity="high",
+    )
+    store.upsert_repair_task(
+        failure_id=str(row["canonical_failure_id"]),
+        title="Repair onboarding smoke issue",
+        source_type="replay_issue",
+        source_external_id=issue.public_id,
+        status="open",
+    )
+
+    payload = _hosted_onboarding_readiness_payload(
+        store=store,
+        data_dir=tmp_path,
+        settings={"tester_app_url": "https://app.test"},
+        checks={"replay_api": {"reachable": True, "detail": "OK (200)"}},
+    )
+
+    assert payload["ready"] is True
+    assert payload["complete"] == payload["total"]
+    assert payload["counts"]["sdk_keys"] == 1
+    assert payload["counts"]["ui_specs"] == 1
+    assert payload["counts"]["api_suites"] == 1
+    assert payload["counts"]["source_maps"] == 1
+    assert payload["counts"]["alert_rules"] == 1
+    assert {step["id"]: step["status"] for step in payload["steps"]}["repair_loop"] == "complete"
 
 
 def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> None:
@@ -338,6 +753,8 @@ def test_replay_dashboard_payload_includes_failure_timeline(tmp_path: Path) -> N
     ]
     assert issue["workflow"]["coverage_state"] == "covered_failing"
     assert issue["workflow"]["primary_action"] == "run_tests"
+    assert issue["evidence_stitching"]["stages"][0]["id"] == "frontend_replay"
+    assert issue["evidence_stitching"]["stages"][1]["id"] == "network_api"
     assert issue["workflow"]["stage_states"]["evidence"] == "complete"
     assert issue["workflow"]["stage_states"]["test"] == "complete"
     assert issue["workflow"]["stage_states"]["repair"] == "complete"

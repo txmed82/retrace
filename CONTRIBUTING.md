@@ -98,3 +98,32 @@ Use the GitHub issue forms:
 - Detector quality issue for false positives or false negatives.
 - Generated UI test issue for replay-to-spec or runner problems.
 - Feature request for new workflows or integrations.
+
+## Where to find things
+
+The codebase has a lot of moving parts. The core data flow:
+
+| Concern                              | Lives in                                          |
+|--------------------------------------|---------------------------------------------------|
+| Unified incident shape (`Incident`)  | `src/retrace/qa_incidents.py`                     |
+| Bridge: master incidents ↔ qa        | `src/retrace/qa_incident_bridge.py`               |
+| Storage (SQLite + migrations)        | `src/retrace/storage.py`                          |
+| Replay capture (browser SDK)         | `packages/browser/src/index.ts`                   |
+| Replay ingest API                    | `src/retrace/replay_api.py`, `replay_core.py`     |
+| 8 detectors                          | `src/retrace/detectors/`                          |
+| UI tester (Browser Harness + native) | `src/retrace/tester.py`, `browser_harness.py`     |
+| API tester                           | `src/retrace/api_testing.py`, `api_suites.py`     |
+| Sentry-compat + OTel                 | `src/retrace/sentry_compat.py`, `otel_ingest.py`  |
+| PR review                            | `src/retrace/pr_review.py`, `commands/review.py`  |
+| Auto-repro                           | `src/retrace/auto_repro.py`                       |
+| Auto-fix (worktree + draft PR)       | `src/retrace/auto_fix.py`                         |
+| Repair runner                        | `src/retrace/repair_runner.py`, `repair.py`       |
+| Local UI + endpoints                 | `src/retrace/commands/ui.py`                      |
+| MCP server                           | `src/retrace/commands/mcp.py`                     |
+
+If you're not sure where to file a fix, ping a maintainer on the issue
+and we'll route it.
+
+## Code of Conduct
+
+See [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). It's short on purpose.

@@ -21,10 +21,25 @@ retrace = "retrace.cli:main"
 browser = [
     "playwright>=1.45",
 ]
+# P1.2 — perceptual visual diff (SSIM + annotated diff PNG). Optional
+# because byte-equality is still the default; the perceptual path only
+# kicks in when these are installed.
+image = [
+    "pillow>=10.0",
+    "numpy>=1.26",
+]
+# P1.5 — Postgres backend chassis. The URL scheme is accepted today
+# (raising a clean `NotImplementedError` from `PostgresBackend`); the
+# per-table migration ships in follow-up PRs.
+postgres = [
+    "psycopg[binary]>=3.2",
+]
 dev = [
     "pytest>=8.0",
     "pytest-httpx>=0.30",
     "ruff>=0.5",
+    "pillow>=10.0",
+    "numpy>=1.26",
 ]
 
 [build-system]
