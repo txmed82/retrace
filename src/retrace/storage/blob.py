@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from tempfile import NamedTemporaryFile
+from typing import Any, Protocol
 
 class ReplayBlobStore(Protocol):
     backend: str
@@ -61,7 +63,18 @@ class LocalReplayBlobStore:
         except ValueError as exc:
             raise ValueError("replay blob key escaped storage root") from exc
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(events, separators=(",", ":")) + "\n", encoding="utf-8")
+        serialized = json.dumps(events, separators=(",", ":")) + "\n"
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            delete=False,
+            suffix=".tmp",
+        ) as tmp:
+            tmp.write(serialized)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        Path(tmp.name).replace(path)
         return key
 
     def read_events(self, key: str) -> list[dict[str, Any]]:

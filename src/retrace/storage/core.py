@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 from uuid import uuid4
 import json
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Optional
 
 from retrace.evidence import (
     PROMPT_SAFE_REDACTION_STATES,
@@ -32,10 +32,8 @@ from .helpers import (
     _normalize_app_error_incident_status,
     _retention_interval,
     FAILURE_TEST_COVERAGE_STATES,
-    GITHUB_REVIEW_RUN_STATUSES,
     INGEST_RATE_LIMIT_RETENTION_SECONDS,
     INGEST_RATE_LIMIT_MAX_IDENTITIES_PER_BUCKET,
-    APP_ERROR_INCIDENT_STATUSES,
     APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS,
 )
 from .schema import SCHEMA

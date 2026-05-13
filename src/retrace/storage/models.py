@@ -5,8 +5,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Optional
 
 from retrace.evidence import PROMPT_SAFE_REDACTION_STATES
 

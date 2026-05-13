@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
 
 FAILURE_TEST_COVERAGE_STATES = (
     "not_covered",
