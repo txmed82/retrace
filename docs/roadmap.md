@@ -1,11 +1,11 @@
 # Retrace roadmap
 
-**Last updated:** 2026-05-11
+**Last updated:** 2026-05-12
 **Maintained by:** the engineering team
 **How to evolve this file:** when you finish an item, set its status to
 `DONE`, add a date, link the PR, and append a one-line entry to the
 **Update log** at the bottom. When new items appear, slot them into the
-right lane (P0 / P1 / P2) and update the **Now / Next / Later** table.
+right lane (P0 / P1 / P2 / P3) and update the **Now / Next / Later** table.
 
 ---
 
@@ -90,11 +90,19 @@ Every roadmap item below uses the same dev loop. Don't skip steps.
 
 ## Now / Next / Later
 
+P0/P1/P2 all done. P2.1 deferred (GitHub-only at launch) and P2.4
+deferred (contradicted by the "Hosted cloud" out-of-scope stance).
+The 2026-05-12 launch-readiness audit surfaced a fresh batch of
+post-launch polish items (see **P3** below). None are launch
+blockers; the **near-blocker** column is the only work that should
+hold up a v1.0 shipping decision.
+
 | Lane | Items |
 |---|---|
-| **Now (this week)** | P0.1 LLM-powered PR review · P0.2 Python SDK · P0.3 GitHub Actions templates · P0.4 Browser SDK breadcrumbs |
-| **Next (weeks 2–3)** | P1.1 Real-time alerts · P1.2 Perceptual visual diff · P1.3 Diff-aware affected tests · P1.4 API tester env profiles UI |
-| **Later (month 2+)** | P2.4 Multi-tenancy + audit log (P1.5 ✅, P2.2 ✅, P2.3 ✅ done; P2.1 deferred — GitHub-only at launch) |
+| **Near-blockers** | P3.1 Flake quarantine · P3.3 End-to-end tests · P3.7 Versioning + breaking-change policy |
+| **Wait-for-demand** | P3.2 Tester parallelism · P3.4 Perf characterization · P3.5 LLM cost visibility · P3.6 Server-side replay |
+| **Deferred indefinitely** | P2.1 GitLab + Bitbucket · P2.4 Multi-tenancy + audit log |
+| **Shipped** | P0.1–P0.4 ✅ · P1.1–P1.5 ✅ · P2.2 ✅ · P2.3 ✅ |
 
 ---
 
@@ -739,6 +747,309 @@ multi-project user to ask before paying that complexity.
 
 ---
 
+# P3 — post-launch polish
+
+These items came out of the **2026-05-12 launch-readiness audit**:
+P0/P1/P2 work was complete (P2.1 deferred, P2.4 contradicted by
+the "Out of scope" stance on hosted), and a re-pass over the
+current state surfaced gaps the original roadmap didn't track.
+
+P3 items are NOT blockers for the OSS launch — the product is
+shippable without any of them. They're the credibility / polish
+work that will come up in real-user feedback or that will hurt if
+shipped without:
+
+  - **P3.1, P3.3, P3.7** are near-blockers — they hit either a
+    demo-day embarrassment (flake-noise during a live test run),
+    a regression-credibility gap (zero end-to-end coverage), or a
+    near-future pain (no breaking-change policy for the first
+    v1.0 SDK update).
+  - **P3.2, P3.4, P3.5, P3.6** are wait-for-demand. Ship when a
+    real user surfaces the need; don't build speculatively. P3.6
+    in particular is a multi-week build that doesn't pay off
+    until SSR-replay users exist.
+
+---
+
+## P3.1 — Flake quarantine for UI tests
+
+**Status:** NOT STARTED · **ETA:** 2–3 days
+
+### Why
+
+The current `retrace qa auto` loop treats every UI-test failure as
+a real regression. An intermittent failure (a real-world race
+condition, a flaky third-party iframe, a network blip) gets
+escalated to a `qa_incident` the same way a deterministic bug
+does. Result: noise in the incident queue, demo-day risk, and
+operator fatigue when the same flaky test keeps re-filing.
+
+The roadmap's own state-snapshot table flagged this in May
+("`AI UI testing 7/10 ... no parallelism, no flake quarantine`")
+but never opened a P-item for it. This closes that gap.
+
+### OSS to study
+
+- **microsoft/playwright** (https://github.com/microsoft/playwright) —
+  retries + `flaky` status in the JUnit reporter. Files:
+  `packages/playwright/src/reporters/junit.ts`,
+  `packages/playwright/src/runner/`.
+- **cypress-io/cypress** — `retries` config + the "burn-in" mode
+  for confirming flake.
+- **DataDog/dd-trace-py** flaky-test plugin — for the "treat as
+  flaky after N intermittent passes" heuristic.
+
+### Plan
+
+1. New table column on `tester_runs` (or a new `tester_run_flakes`
+   table): track consecutive-failure / consecutive-pass streaks
+   per spec.
+2. New status in `tester_specs`: `quarantined` (was-passing, now
+   intermittent, stays out of the qa_incident escalation path
+   until it stabilizes).
+3. Auto-quarantine after 3 consecutive runs of `pass → fail →
+   pass` within a 24h window.
+4. Auto-restore after 5 consecutive passes.
+5. `retrace tester quarantine list/release/show` CLI.
+6. `qa_incident` filing skips quarantined specs (the failure is
+   still recorded for audit; just doesn't escalate).
+
+### Acceptance criteria
+
+- [ ] A pass/fail/pass pattern auto-quarantines.
+- [ ] Quarantined specs don't file new qa_incidents.
+- [ ] 5 consecutive passes auto-restores.
+- [ ] CLI lets an operator force-quarantine / force-release.
+
+---
+
+## P3.2 — Parallelism for UI test runs
+
+**Status:** NOT STARTED · **ETA:** 3–4 days · **Trigger:** wait-for-demand
+(open when an install has > 20 specs and run-time complaints
+surface).
+
+### Why
+
+Today the tester runs specs sequentially. For an install with
+20+ specs, a CI run takes 20× the slowest spec. The bottleneck
+shows up well before the actual scaling pain (Postgres ingest);
+for any install actively using `retrace tester run --all`, this
+is the most-likely "the tool is slow" complaint.
+
+### OSS to study
+
+- **playwright/playwright-test** worker model.
+- **pytest-xdist** for the simpler "N workers, distribute by
+  spec_id hash" pattern.
+- **vitest** for the recent shape of a JS-side worker pool.
+
+### Plan
+
+1. Add a `--workers N` flag to `retrace tester run` and the
+   queue worker.
+2. Process-based isolation (each worker boots its own browser
+   harness; share nothing).
+3. Deterministic spec → worker assignment (hash of spec_id) so a
+   re-run lands on the same worker if the spec is sticky.
+4. Per-worker artifact dirs so screenshots / harness logs don't
+   collide.
+
+### Acceptance criteria
+
+- [ ] `retrace tester run --workers 4` runs 4 specs in parallel.
+- [ ] Per-worker output dirs; no artifact collisions.
+- [ ] Worker count defaults sensibly (`min(specs, cpu_count)`).
+- [ ] No regression in single-worker mode.
+
+---
+
+## P3.3 — End-to-end / dogfood tests
+
+**Status:** NOT STARTED · **ETA:** 3–5 days
+
+### Why
+
+We have 895+ unit tests, one `test_python_sdk_e2e.py` integration
+test, and zero tests that exercise the full
+**browser-capture → ingest → repair → PR** flow that is the
+product. Every PR could break the connective tissue without any
+test noticing. The closest signal today is "does the unit suite
+pass" — which is a strong signal for isolated correctness and a
+weak signal for end-to-end behavior.
+
+This is the most embarrassing miss for a tool whose whole pitch
+is "we catch regressions."
+
+### OSS to study
+
+- **getsentry/sentry** `tests/sentry/integrations/` for the
+  cross-service integration-test idiom (real DB, real ingest,
+  real worker).
+- **playwright/playwright** for the "drive a real browser through
+  a real test scenario" runner shape.
+
+### Plan
+
+1. New top-level dir `tests/e2e/` with a shared fixture that:
+   - Spins up `retrace api serve` on an ephemeral port
+   - Boots a real (headless) Playwright browser via the existing
+     harness
+   - Runs `@retrace/browser` `init()` against the local server
+2. Three flagship scenarios:
+   - **Replay round-trip**: page captures a click, fetch, error;
+     server receives the batch; a `replay_session` lands.
+   - **Sentry-compat round-trip**: SDK raises an unhandled exception;
+     `qa_incident` opens with the correct fingerprint.
+   - **PR-review on a fixture diff**: feed a tiny known diff to
+     `retrace review --llm`, mock the LLM, assert the right shape
+     comes back.
+3. New CI job `e2e-tests` (runs after `Lint and Test`, gated for
+   the merge queue).
+
+### Acceptance criteria
+
+- [ ] Three scenarios above each green in CI.
+- [ ] Median run-time < 60s for the whole `e2e` suite.
+- [ ] The CI job is required for merge.
+
+---
+
+## P3.4 — Performance characterization
+
+**Status:** NOT STARTED · **ETA:** 2 days · **Trigger:** wait-for-demand
+(open when a user asks "will SQLite hold up?" or hits a real
+contention issue).
+
+### Why
+
+The P1.5 study notes claim "SQLite is fine to ~100k events/day"
+with no test backing it. Operators choosing between sqlite-default
+and the Postgres backend have no empirical basis to decide. A
+load-test harness + a documented graph turns this from gut feel
+into "here's the curve, pick your point."
+
+### Plan
+
+1. New tool `scripts/loadtest.py` that pumps synthetic replay
+   batches + Sentry-compat envelopes + OTel events at a target
+   rate against a local `retrace api serve`.
+2. Three published curves (replay batches/sec vs. p95 latency,
+   sqlite vs. postgres, contention scaling).
+3. Document the curves in `docs/perf.md`. Include the recipe so
+   operators can re-run on their own hardware.
+
+### Acceptance criteria
+
+- [ ] `scripts/loadtest.py --rps 100 --duration 60s` runs to
+      completion with a JSON summary.
+- [ ] `docs/perf.md` published with the three curves.
+- [ ] "When should I switch to Postgres?" has a numeric answer.
+
+---
+
+## P3.5 — LLM cost visibility
+
+**Status:** NOT STARTED · **ETA:** 1–2 days
+
+### Why
+
+P0.1 PR review burns LLM tokens. There's a 24h cache and a 32k
+hard cap to prevent runaway bills, but no surface that says "you
+spent $X this week on PR reviews." Indie users on metered
+LLM accounts will notice this missing — and may turn the feature
+off entirely if they can't see the meter.
+
+### Plan
+
+1. The existing `llm_pr_reviews` table already records `model`
+   and `prompt_version`. Add `input_tokens`, `output_tokens`,
+   `estimated_cost_usd` columns (backfilled to 0 for old rows).
+2. New CLI `retrace cost summary [--since 7d] [--by model|repo|pr]`
+   — prints a small table.
+3. Cost estimation: ship a static price table for the common
+   providers (OpenAI, Anthropic, OpenRouter). Operators with
+   custom pricing override via `config.yaml`'s `llm:` block.
+
+### Acceptance criteria
+
+- [ ] `retrace cost summary --since 7d` prints token + USD totals.
+- [ ] Grouping by model / repo / PR works.
+- [ ] Price table can be overridden via config.
+
+---
+
+## P3.6 — Server-side replay
+
+**Status:** NOT STARTED · **ETA:** multi-week · **Trigger:**
+wait-for-demand. Don't build speculatively.
+
+### Why
+
+Replay capture is browser-only today. If you want to debug a
+server-rendered Next.js SSR exception (the page that 500ed before
+hydration), there's no replay story — the failure happens before
+rrweb is alive. Same for backend-only services without a browser.
+
+This is a real gap for the "captures the bug" pillar, but it's
+also a multi-week build (capture-side instrumentation in
+Node/Python middleware, a different replay primitive than rrweb,
+server-side privacy considerations). Build when a real user with
+an SSR-only app asks.
+
+### Plan (skeleton — fill in when we open it)
+
+1. Spec the capture primitive: HTTP request/response pairs +
+   rendered HTML snapshot at error time, NOT a full DOM stream.
+2. Decide on Node-first or Python-first based on which side
+   surfaces real demand.
+3. Storage: new `server_replay_sessions` table, blob-stored
+   like `replay_batches`.
+
+---
+
+## P3.7 — Versioning + breaking-change policy
+
+**Status:** NOT STARTED · **ETA:** 0.5 day (docs only)
+
+### Why
+
+You're at `@retrace/browser@0.2.0`, the CLI is unversioned, and
+there's no documented stance on:
+
+  - What counts as a "breaking" change?
+  - How long does a deprecated `config.yaml` key stay supported?
+  - When does the v1.0 cut happen, and what's the contract afterward?
+
+The absence will bite the first time you ship a breaking SDK
+update — early users will be confused, and "is this safe to
+upgrade?" becomes case-by-case detective work instead of a
+checklist.
+
+### Plan
+
+1. Add `docs/versioning.md` covering:
+   - Semver stance for each shipping artifact (`@retrace/browser`,
+     `retrace_sdk`, the CLI / server, the `config.yaml` schema).
+   - Deprecation window (one minor release of warnings before
+     removal).
+   - What we promise as stable: ingest endpoints, SDK public API,
+     CLI subcommand names + flags.
+   - What's explicitly NOT promised: internal storage schema,
+     undocumented CLI flags, internal Python module paths.
+2. Add a `CHANGELOG.md` at repo root with a starter entry for the
+   current state.
+3. Wire `retrace --version` to print the package version.
+
+### Acceptance criteria
+
+- [ ] `docs/versioning.md` published.
+- [ ] `CHANGELOG.md` exists with the v0.x entries we can
+      reconstruct from `Update log`.
+- [ ] `retrace --version` prints a version string.
+
+---
+
 # How to claim and execute a roadmap item
 
 ```bash
@@ -806,7 +1117,8 @@ EOF
 | 2026-05-12 | P1.5 (full) Postgres adapter — real `PostgresBackend.connect()` via psycopg3, SQL dialect translation at execute time (`?` → `%s`, `datetime('now', ?)` → ISO-text `to_char(now() + interval)`, `INSERT OR IGNORE` → `INSERT ... ON CONFLICT DO NOTHING`), portable SCHEMA via `sql_schema.translate_schema` (`AUTOINCREMENT` → `BIGSERIAL`, ISO-text defaults). `Storage(postgresql://...)` works end-to-end. CI Postgres service container runs gated smoke tests covering `alert_routes`/`alert_dispatches`/`llm_pr_reviews` round-trips. 18 new tests (translation + WrappedConnection + schema translator + PG smoke). | #136 |
 | 2026-05-12 | P1.4 (finish) env-profile management CLI + HAR import recorder — new `retrace tester env list/show/yaml` (read-only against `config.yaml`; emits paste-ready stanzas, never overwrites the hand-edited file). New `retrace tester record --har` ingests a browser DevTools HAR export into one APITestSpec per matching request (sensitive headers stripped, JSON bodies structured, `--include-host`/`--include-method`/`--exclude-path` filters). P2.1 GitLab/Bitbucket deferred — GitHub-only at launch. 41 new tests. | #137 |
 | 2026-05-12 | P2.3 Retention + backups — `retrace data retention apply [--dry-run]` purges old rows across the app-error domain (per project+env via existing `prune_app_error_retention`) + globally for `replay_batches` and `otel_events`, plus a filesystem sweep that removes old `ui-tests/runs/` and `api-tests/runs/` subdirectories (specs / baselines / queues untouched). `retrace data backup --to PATH` writes a `.tar.gz` of a consistent sqlite snapshot (via the online BACKUP API) plus the `data_dir` contents. New `RetentionConfig` in `config.yaml`. 26 new tests. | #138 |
-| 2026-05-12 | P2.2 Rate limiting + sampling — audit pass: most of the original plan was already in place (the `ingest_rate_limits` table, `Storage.consume_ingest_rate_limit`, `_rate_limit_headers` with `Retry-After`, browser `sampleRate`). This PR closes the one remaining gap (OTel ingest endpoints `/api/otel/v1/{logs,traces}` were not calling `_consume_rate_limit` — now bucketed under `"otel"`, identity = service-token id, rate check fires before reading the request body) and adds regression tests pinning both the OTel 429-with-`Retry-After` contract and the browser `sampleRate` opt-out (`sampleRate: 0` keeps rrweb dormant even on explicit `client.start()`). 14 new tests (7 pytest + 7 vitest). | this PR |
+| 2026-05-12 | P2.2 Rate limiting + sampling — audit pass: most of the original plan was already in place (the `ingest_rate_limits` table, `Storage.consume_ingest_rate_limit`, `_rate_limit_headers` with `Retry-After`, browser `sampleRate`). This PR closes the one remaining gap (OTel ingest endpoints `/api/otel/v1/{logs,traces}` were not calling `_consume_rate_limit` — now bucketed under `"otel"`, identity = service-token id, rate check fires before reading the request body) and adds regression tests pinning both the OTel 429-with-`Retry-After` contract and the browser `sampleRate` opt-out (`sampleRate: 0` keeps rrweb dormant even on explicit `client.start()`). 14 new tests (7 pytest + 7 vitest). | #139 |
+| 2026-05-12 | Roadmap audit — P0/P1/P2 all done (P2.1 + P2.4 deferred indefinitely). New **P3** section: 7 post-launch polish items surfaced by the launch-readiness audit. P3.1 (Flake quarantine), P3.3 (End-to-end tests), P3.7 (Versioning + breaking-change policy) flagged as near-blockers; P3.2 (Tester parallelism), P3.4 (Perf characterization), P3.5 (LLM cost visibility), P3.6 (Server-side replay) flagged as wait-for-demand. Now / Next / Later table restructured around the new state. | this PR |
 
 > Append a row whenever an item changes status or a new item is
 > added. Keep newest at the bottom.
