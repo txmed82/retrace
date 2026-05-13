@@ -4,16 +4,14 @@ import json
 import logging
 import os
 import tempfile
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-import httpx
-
 from retrace.config import PostHogConfig
+from retrace.replay.client import PostHogClient
 from retrace.storage import SessionMeta, Storage
 
 
@@ -35,9 +33,11 @@ class PostHogIngester:
         self.data_dir = Path(data_dir)
         self.sessions_dir = self.data_dir / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
-
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.cfg.api_key}"}
+        self._ph_client = PostHogClient(
+            host=cfg.host,
+            project_id=cfg.project_id,
+            api_key=cfg.api_key,
+        )
 
     def _atomic_write_json(self, path: Path, payload: Any) -> None:
         """Write JSON durably: temp file in same dir, fsync, os.replace."""
@@ -54,29 +54,6 @@ class PostHogIngester:
             except FileNotFoundError:
                 pass
             raise
-
-    def _get_with_retry(
-        self,
-        client: httpx.Client,
-        url: str,
-        *,
-        params: dict[str, str] | None = None,
-        max_attempts: int = 5,
-    ) -> httpx.Response:
-        for attempt in range(max_attempts):
-            resp = client.get(url, headers=self._headers(), params=params)
-            if resp.status_code != 429:
-                resp.raise_for_status()
-                return resp
-            if attempt >= max_attempts - 1:
-                resp.raise_for_status()
-            retry_after = resp.headers.get("Retry-After")
-            if retry_after and retry_after.isdigit():
-                sleep_s = float(retry_after)
-            else:
-                sleep_s = min(8.0, 0.5 * (2**attempt))
-            time.sleep(sleep_s)
-        raise RuntimeError("unreachable retry loop")
 
     @staticmethod
     def _parse_concatenated_json(text: str) -> list[Any]:
@@ -95,15 +72,12 @@ class PostHogIngester:
             i = j
         return out
 
-    def _fetch_snapshots(
-        self, client: httpx.Client, session_id: str
-    ) -> list[dict[str, Any]]:
-        host = self.cfg.host.rstrip("/")
+    def _fetch_snapshots(self, session_id: str) -> list[dict[str, Any]]:
         snap_url = (
-            f"{host}/api/projects/{self.cfg.project_id}"
+            f"{self._ph_client.ingest_base}"
             f"/session_recordings/{session_id}/snapshots"
         )
-        snap_resp = self._get_with_retry(client, snap_url)
+        snap_resp = self._ph_client.get(snap_url)
         body = snap_resp.json()
 
         # Legacy shape: {"snapshots": [...]}
@@ -124,8 +98,7 @@ class PostHogIngester:
             if not source_name or blob_key is None:
                 continue
 
-            blob_resp = self._get_with_retry(
-                client,
+            blob_resp = self._ph_client.get(
                 snap_url,
                 params={
                     "source": str(source_name),
@@ -178,35 +151,31 @@ class PostHogIngester:
         }
 
     def fetch_since(self, since: datetime, max_sessions: int) -> list[str]:
-        host = self.cfg.host.rstrip("/")
         qs = urlencode({"date_from": since.isoformat(), "limit": max_sessions})
         next_url: str | None = (
-            f"{host}/api/projects/{self.cfg.project_id}/session_recordings?{qs}"
+            f"{self._ph_client.ingest_base}/session_recordings?{qs}"
         )
         ids: list[str] = []
-        with httpx.Client(
-            timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
-        ) as client:
-            while next_url and len(ids) < max_sessions:
-                list_resp = self._get_with_retry(client, next_url)
-                body = list_resp.json()
-                recordings = body.get("results", [])
-                for r in recordings:
-                    if len(ids) >= max_sessions:
-                        break
-                    sid = r["id"]
-                    try:
-                        snapshots = self._fetch_snapshots(client, sid)
-                        self._persist_legacy_session(
-                            recording=r,
-                            session_id=sid,
-                            snapshots=snapshots,
-                        )
-                        ids.append(sid)
-                    except Exception as exc:
-                        log.warning("failed to ingest session %s: %s", sid, exc)
-                        continue
-                next_url = body.get("next")
+        while next_url and len(ids) < max_sessions:
+            list_resp = self._ph_client.get(next_url)
+            body = list_resp.json()
+            recordings = body.get("results", [])
+            for r in recordings:
+                if len(ids) >= max_sessions:
+                    break
+                sid = r["id"]
+                try:
+                    snapshots = self._fetch_snapshots(sid)
+                    self._persist_legacy_session(
+                        recording=r,
+                        session_id=sid,
+                        snapshots=snapshots,
+                    )
+                    ids.append(sid)
+                except Exception as exc:
+                    log.warning("failed to ingest session %s: %s", sid, exc)
+                    continue
+            next_url = body.get("next")
         return ids
 
     def import_since_as_replays(
@@ -223,55 +192,51 @@ class PostHogIngester:
         then writes the same snapshots as a final replay batch so the normal
         replay issue grouping, UI, and regression-test generation paths apply.
         """
-        host = self.cfg.host.rstrip("/")
         qs = urlencode({"date_from": since.isoformat(), "limit": max_sessions})
         next_url: str | None = (
-            f"{host}/api/projects/{self.cfg.project_id}/session_recordings?{qs}"
+            f"{self._ph_client.ingest_base}/session_recordings?{qs}"
         )
         imported: list[str] = []
         replay_sessions: list[str] = []
         job_ids: list[str] = []
         skipped: list[str] = []
-        with httpx.Client(
-            timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
-        ) as client:
-            while next_url and len(imported) < max_sessions:
-                list_resp = self._get_with_retry(client, next_url)
-                body = list_resp.json()
-                recordings = body.get("results", [])
-                for recording in recordings:
-                    if len(imported) >= max_sessions:
-                        break
-                    sid = str(recording.get("id") or "").strip()
-                    if not sid:
-                        continue
-                    try:
-                        snapshots = self._fetch_snapshots(client, sid)
-                        self._persist_legacy_session(
-                            recording=recording,
-                            session_id=sid,
-                            snapshots=snapshots,
-                        )
-                        distinct_id = str(recording.get("distinct_id") or "")
-                        result = self.store.insert_replay_batch(
-                            project_id=project_id,
-                            environment_id=environment_id,
-                            session_id=sid,
-                            sequence=0,
-                            events=snapshots,
-                            flush_type="final",
-                            distinct_id=distinct_id,
-                            metadata=self._replay_metadata(recording),
-                        )
-                        imported.append(sid)
-                        replay_sessions.append(result.session_row_id)
-                        if result.processing_job_id:
-                            job_ids.append(result.processing_job_id)
-                    except Exception as exc:
-                        skipped.append(sid)
-                        log.warning("failed to import PostHog replay %s: %s", sid, exc)
-                        continue
-                next_url = body.get("next")
+        while next_url and len(imported) < max_sessions:
+            list_resp = self._ph_client.get(next_url)
+            body = list_resp.json()
+            recordings = body.get("results", [])
+            for recording in recordings:
+                if len(imported) >= max_sessions:
+                    break
+                sid = str(recording.get("id") or "").strip()
+                if not sid:
+                    continue
+                try:
+                    snapshots = self._fetch_snapshots(sid)
+                    self._persist_legacy_session(
+                        recording=recording,
+                        session_id=sid,
+                        snapshots=snapshots,
+                    )
+                    distinct_id = str(recording.get("distinct_id") or "")
+                    result = self.store.insert_replay_batch(
+                        project_id=project_id,
+                        environment_id=environment_id,
+                        session_id=sid,
+                        sequence=0,
+                        events=snapshots,
+                        flush_type="final",
+                        distinct_id=distinct_id,
+                        metadata=self._replay_metadata(recording),
+                    )
+                    imported.append(sid)
+                    replay_sessions.append(result.session_row_id)
+                    if result.processing_job_id:
+                        job_ids.append(result.processing_job_id)
+                except Exception as exc:
+                    skipped.append(sid)
+                    log.warning("failed to import PostHog replay %s: %s", sid, exc)
+                    continue
+            next_url = body.get("next")
         return PostHogReplayImportResult(
             session_ids=imported,
             replay_session_ids=replay_sessions,

@@ -3,13 +3,12 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlencode
-
-import httpx
 
 from retrace.config import RetraceConfig
 from retrace.detectors.base import Signal
+from retrace.replay.client import PostHogClient
 from retrace.sinks.base import Finding
 from retrace.storage import Storage
 
@@ -38,8 +37,14 @@ class CorrelationEnricher:
         self.connect_timeout_s = max(0.5, float(connect_timeout_s))
         self.read_timeout_s = max(1.0, float(read_timeout_s))
         self.max_retries = max(1, int(max_retries))
-        self.query_host = self._query_host(cfg.posthog.host)
-        self.query_url = f"{self.query_host.rstrip('/')}/api/projects/{cfg.posthog.project_id}/query/"
+        self._ph_client = PostHogClient(
+            host=cfg.posthog.host,
+            project_id=cfg.posthog.project_id,
+            api_key=cfg.posthog.api_key,
+            connect_timeout=connect_timeout_s,
+            read_timeout=read_timeout_s,
+            max_retries=max_retries,
+        )
 
     def enrich(self, finding: Finding, signals: list[Signal]) -> Finding:
         meta = self.store.get_session(finding.session_id)
@@ -123,14 +128,10 @@ class CorrelationEnricher:
     def _can_query(self) -> bool:
         return bool(self.cfg.posthog.api_key.strip())
 
-    @staticmethod
-    def _query_host(host: str) -> str:
-        h = host.rstrip("/")
-        if "://us.i.posthog.com" in h:
-            return h.replace("://us.i.posthog.com", "://us.posthog.com")
-        if "://eu.i.posthog.com" in h:
-            return h.replace("://eu.i.posthog.com", "://eu.posthog.com")
-        return h
+    @property
+    def query_host(self) -> str:
+        """Normalized query host (e.g. us.posthog.com). Delegates to PostHogClient."""
+        return self._ph_client.query_host
 
     def _fetch_exception_rows(
         self,
@@ -203,33 +204,19 @@ class CorrelationEnricher:
 
     def _query_hogql_rows(self, *, query: str, name: str) -> list[dict[str, Any]]:
         payload = {"query": {"kind": "HogQLQuery", "query": query}, "name": name}
-        headers = {
-            "Authorization": f"Bearer {self.cfg.posthog.api_key}",
-            "Content-Type": "application/json",
-        }
-        timeout = httpx.Timeout(
-            connect=self.connect_timeout_s,
-            read=self.read_timeout_s,
-            write=10.0,
-            pool=10.0,
-        )
-        err: Optional[Exception] = None
-        for attempt in range(self.max_retries):
-            try:
-                with httpx.Client(timeout=timeout) as client:
-                    resp = client.post(self.query_url, headers=headers, json=payload)
-                if resp.status_code == 429 or resp.status_code >= 500:
-                    err = RuntimeError(f"query api status={resp.status_code}")
-                    continue
-                resp.raise_for_status()
-                body = resp.json()
-                return self._coerce_rows(body)
-            except Exception as exc:
-                err = exc
-                continue
-        if err:
-            raise err
-        return []
+        try:
+            resp = self._ph_client.post(
+                self._ph_client.query_base,
+                json=payload,
+                read_timeout=self.read_timeout_s,
+            )
+            body = resp.json()
+            return self._coerce_rows(body)
+        except Exception as exc:
+            log.warning(
+                "enrichment: %s query failed: %s", name, exc,
+            )
+            raise
 
     @staticmethod
     def _coerce_rows(body: Any) -> list[dict[str, Any]]:
