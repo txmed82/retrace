@@ -1,5 +1,14 @@
 import { record } from "rrweb";
 
+/**
+ * Package version. Kept in sync with `package.json` manually — the
+ * lazy `require("../package.json")` trick doesn't survive
+ * tree-shaking + ESM cleanly across all bundlers. Update both
+ * when cutting a release; the P3.7 versioning policy requires this
+ * to be the source of truth for `import { VERSION } from "@retrace/browser"`.
+ */
+export const VERSION = "0.2.0";
+
 type ReplayEvent = Record<string, unknown>;
 
 export type RetracePrivacyOptions = {
