@@ -186,7 +186,21 @@ def incident_fix(
         )
     from retrace.llm.client import LLMClient
 
-    with LLMClient(cfg.llm) as llm:
+    if cfg.llm:
+        with LLMClient(cfg.llm) as llm:
+            outcome = propose_fix_for_incident(
+                store=store,
+                incident_id=incident_id,
+                repo_full_name=repo_full_name,
+                repo_path=effective_repo_path,
+                base_branch=base_branch or repo.default_branch or "main",
+                prompts_out_dir=out_dir,
+                open_pr=open_pr,
+                draft=draft,
+                apply_with_agent=apply_with,
+                llm=llm,
+            )
+    else:
         outcome = propose_fix_for_incident(
             store=store,
             incident_id=incident_id,
@@ -197,7 +211,7 @@ def incident_fix(
             open_pr=open_pr,
             draft=draft,
             apply_with_agent=apply_with,
-            llm=llm,
+            llm=None,
         )
     click.echo(json.dumps(outcome.as_dict(), indent=2))
 
@@ -306,7 +320,21 @@ def incident_auto(
 
     from retrace.llm.client import LLMClient
 
-    with LLMClient(cfg.llm) as llm:
+    if cfg.llm:
+        with LLMClient(cfg.llm) as llm:
+            fix = propose_fix_for_incident(
+                store=store,
+                incident_id=inc.public_id,
+                repo_full_name=repo_full_name,
+                repo_path=effective_repo_path,
+                base_branch=base_branch or repo.default_branch or "main",
+                prompts_out_dir=Path("./reports/fix-prompts"),
+                open_pr=not no_pr,
+                draft=draft,
+                apply_with_agent=apply_with,
+                llm=llm,
+            )
+    else:
         fix = propose_fix_for_incident(
             store=store,
             incident_id=inc.public_id,
@@ -317,7 +345,7 @@ def incident_auto(
             open_pr=not no_pr,
             draft=draft,
             apply_with_agent=apply_with,
-            llm=llm,
+            llm=None,
         )
     click.echo(f"  prompt: {fix.prompt_path}")
     if fix.branch:

@@ -446,9 +446,11 @@ def score_repo_for_finding(
     if llm is not None:
         from retrace.matching.ai_scorer import rerank_candidates_with_ai
 
+        ai_shortlist_size = max(top_n, 20)
+        shortlist = scored[:ai_shortlist_size]
         return rerank_candidates_with_ai(
             llm=llm,
-            candidates=scored,
+            candidates=shortlist,
             title=title,
             category=category,
             evidence_text=evidence_text,

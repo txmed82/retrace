@@ -28,6 +28,7 @@ from retrace.script_steps import (
 )
 
 from .models import (
+    DEFAULT_APP_URL,
     DEFAULT_HARNESS_COMMAND,
     SUITE_PROPOSAL_SCHEMA_VERSION,
     TesterArtifact,
@@ -40,11 +41,9 @@ from .models import (
 )
 from .assertions import (
     _assertion_result,
-    _assertion_text_for_classification,
     _classify_failure,
     _evaluate_model_backed_consensus_assertion,
     _evaluate_native_assertion,
-    _failed_selector_assertion,
     _flake_reason_from_classification,
 )
 from .specs import load_spec, select_execution_engine, validate_spec, create_spec
@@ -1807,123 +1806,6 @@ def run_spec(
         )
     meta_path.write_text(json.dumps(asdict(result), indent=2) + "\n")
     return result
-
-
-def _classify_failure(
-    *,
-    harness_log_path: Path,
-    error: str,
-    assertion_results: list[dict[str, Any]],
-    exit_code: int,
-) -> str:
-    text = ""
-    try:
-        if harness_log_path.exists():
-            text = harness_log_path.read_text(encoding="utf-8", errors="ignore").lower()
-    except Exception:
-        text = ""
-    failed_assertions = [
-        item for item in assertion_results if not bool(item.get("ok", False))
-    ]
-    merged = "\n".join(
-        [
-            text,
-            str(error or ""),
-            _assertion_text_for_classification(failed_assertions),
-        ]
-    ).lower()
-    if any(
-        k in merged
-        for k in [
-            "app did not become reachable",
-            "connection refused",
-            "econnrefused",
-            "net::err_connection_refused",
-            "failed to connect",
-            "could not connect",
-            "server unavailable",
-        ]
-    ):
-        return "environment_failure"
-    if any(k in merged for k in ["timeout", "timed out", "deadline exceeded"]):
-        return "timeout"
-    if any(
-        k in merged
-        for k in [
-            "needs selector",
-            "unsupported_in_playwright",
-            "unsupported native assertion type",
-            "unsupported native step action",
-            "invalid_regex",
-            "unknown action",
-            "malformed",
-        ]
-    ):
-        return "test_bug"
-    if any(k in merged for k in ["401", "403", "unauthorized", "forbidden"]):
-        return "auth_failure"
-    if any(k in merged for k in ["authentication failed", "auth failure", "login failed"]):
-        return "auth_failure"
-    if _failed_selector_assertion(failed_assertions) or any(
-        k in merged
-        for k in [
-            "element not found",
-            "stale element",
-            "waiting for selector",
-            "waiting for locator",
-            "strict mode violation",
-        ]
-    ):
-        return "selector_drift"
-    if failed_assertions:
-        return "app_bug"
-    if int(exit_code) != 0 or error:
-        return "unknown"
-    return "unknown"
-
-
-def _assertion_text_for_classification(items: list[dict[str, Any]]) -> str:
-    chunks: list[str] = []
-    for item in items:
-        for key in (
-            "assertion_type",
-            "message",
-            "actual",
-            "expected",
-            "step",
-            "assertion",
-        ):
-            value = item.get(key)
-            if value is None:
-                continue
-            if isinstance(value, (dict, list)):
-                chunks.append(json.dumps(value, sort_keys=True, default=str))
-            else:
-                chunks.append(str(value))
-    return "\n".join(chunks)
-
-
-def _failed_selector_assertion(items: list[dict[str, Any]]) -> bool:
-    for item in items:
-        assertion_type = str(item.get("assertion_type") or "").lower()
-        if assertion_type in {
-            "selector_visible",
-            "element_visible",
-            "visible",
-        }:
-            return True
-    return False
-
-
-def _flake_reason_from_classification(failure_classification: str) -> str:
-    if failure_classification in {
-        "auth_failure",
-        "environment_failure",
-        "selector_drift",
-        "timeout",
-    }:
-        return failure_classification
-    return ""
 
 
 def load_run_summaries(runs_dir: Path, *, limit: int = 25) -> list[dict[str, Any]]:
