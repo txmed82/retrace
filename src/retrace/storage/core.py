@@ -25,6 +25,17 @@ from retrace.failures import (
 from retrace.repair import normalize_repair_task_status
 
 from .helpers import (
+    _id,
+    _public_id,
+    _dt,
+    _now_iso_microseconds,
+    _safe_json_obj,
+    _merge_string_lists,
+    _parse_string_list_json,
+    _parse_dict_list_json,
+    _replay_preview,
+    _merge_replay_preview,
+    _slug,
     _SEVERITY_ORDER,
     _rollup_severity,
     _string_values,
@@ -67,6 +78,8 @@ from .models import (
     ProcessingJobUpdateResult,
 )
 from .blob import ReplayBlobStore, LocalReplayBlobStore
+from .repositories.incidents import IncidentRepository
+from .repositories.incidents import IncidentRepository
 
 class Storage:
     def __init__(
@@ -76,7 +89,7 @@ class Storage:
     ):
         # P1.5: route to a Backend (`SqliteBackend` or `PostgresBackend`).
         # The 290+ existing `conn.execute(...)` call sites keep their
-        # sqlite-flavored SQL — `WrappedConnection` translates at
+        # sqlite-flavored SQL -- `WrappedConnection` translates at
         # execute time (see `retrace.sql_dialect`).
         from retrace.storage_backend import (
             ParsedDsn,
@@ -105,14 +118,20 @@ class Storage:
             LocalReplayBlobStore(replay_blob_dir) if replay_blob_dir is not None else None
         )
 
+        # Repositories (P1.0 Migration)
+        self.incidents = IncidentRepository(self)
+
+        # Repositories (P1.0 Migration)
+        self.incidents = IncidentRepository(self)
+
     @property
     def backend_name(self) -> str:
-        """`"sqlite"` or `"postgres"` — useful for tests + diagnostics."""
+        """`"sqlite"` or `"postgres"` -- useful for tests + diagnostics."""
         return self._backend.name
 
     def _conn(self):
         """Return a connection wrapped with the sqlite3.Connection
-        surface — sqlite3-flavored SQL still works against Postgres
+        surface -- sqlite3-flavored SQL still works against Postgres
         via the dialect translator in `retrace.sql_dialect`."""
         return self._backend.connect()
 
@@ -124,7 +143,7 @@ class Storage:
             conn.executescript(schema_sql)
             if self._backend.name != "sqlite":
                 # Postgres path: lightweight `PRAGMA table_info`-based
-                # migrations below don't apply — a fresh Postgres install
+                # migrations below don't apply -- a fresh Postgres install
                 # gets the current schema from the CREATE TABLE block.
                 # SQLite-side, they catch up old DBs.
                 return
@@ -292,7 +311,7 @@ class Storage:
                 )
             # P3.5: backfill the cost-visibility columns onto old DBs.
             # Default 0 / 0.0 means historical rows show as "unknown
-            # cost" in the summary CLI (which is honest — we didn't
+            # cost" in the summary CLI (which is honest -- we didn't
             # capture tokens for those runs).
             cols_llm_reviews = [
                 r["name"]
@@ -416,89 +435,319 @@ class Storage:
 
     @staticmethod
     def _id(prefix: str) -> str:
-        return f"{prefix}_{uuid4().hex}"
+        return _id(prefix)
 
     @staticmethod
     def _public_id(prefix: str, *parts: object) -> str:
-        raw = "\x1f".join(str(p) for p in parts)
-        return f"{prefix}_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
-
-    @classmethod
-    def make_replay_public_id(
-        cls, project_id: str, environment_id: str, session_id: str
-    ) -> str:
-        return cls._public_id("rpl", project_id, environment_id, session_id)
-
-    @classmethod
-    def make_issue_public_id(
-        cls, project_id: str, environment_id: str, fingerprint: str
-    ) -> str:
-        return cls._public_id("bug", project_id, environment_id, fingerprint)
-
-    @staticmethod
-    def _replay_preview(events: list[dict[str, object]]) -> dict[str, object]:
-        preview: dict[str, object] = {"event_count": len(events)}
-        timestamps = [
-            int(event["timestamp"])
-            for event in events
-            if isinstance(event.get("timestamp"), int)
-        ]
-        if timestamps:
-            preview["first_timestamp_ms"] = min(timestamps)
-            preview["last_timestamp_ms"] = max(timestamps)
-        for event in events:
-            data = event.get("data")
-            if not isinstance(data, dict):
-                continue
-            href = data.get("href")
-            if event.get("type") == 4 and isinstance(href, str) and href:
-                preview["url"] = href
-                break
-        return preview
-
-    @staticmethod
-    def _merge_replay_preview(
-        existing: dict[str, Any],
-        incoming: dict[str, object],
-        *,
-        event_count: int,
-    ) -> dict[str, object]:
-        merged: dict[str, object] = {**existing, "event_count": int(event_count)}
-        for key, reducer in (
-            ("first_timestamp_ms", min),
-            ("last_timestamp_ms", max),
-        ):
-            old = existing.get(key)
-            new = incoming.get(key)
-            if isinstance(old, int) and isinstance(new, int):
-                merged[key] = reducer(old, new)
-            elif isinstance(new, int):
-                merged[key] = new
-            elif isinstance(old, int):
-                merged[key] = old
-        if not merged.get("url") and incoming.get("url"):
-            merged["url"] = str(incoming["url"])
-        return merged
-
-    @staticmethod
-    def _slug(value: str) -> str:
-        out = "".join(
-            c.lower() if c.isalnum() else "-"
-            for c in str(value or "").strip()
-        ).strip("-")
-        while "--" in out:
-            out = out.replace("--", "-")
-        return out or "default"
+        return _public_id(prefix, *parts)
 
     @staticmethod
     def _dt(value: object) -> Optional[datetime]:
-        if not value:
-            return None
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return _dt(value)
 
     @staticmethod
     def _now_iso_microseconds() -> str:
-        return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        return _now_iso_microseconds()
+
+    @staticmethod
+    def _safe_json_obj(raw: object) -> dict[str, object]:
+        return _safe_json_obj(raw)
+
+    @staticmethod
+    def _parse_string_list_json(raw: object) -> list[str]:
+        return _parse_string_list_json(raw)
+
+    @staticmethod
+    def _parse_dict_list_json(raw: object) -> list[dict[str, Any]]:
+        return _parse_dict_list_json(raw)
+
+    @staticmethod
+    def _merge_string_lists(*values: list[str]) -> list[str]:
+        return _merge_string_lists(*values)
+
+    @staticmethod
+    def _slug(value: str) -> str:
+        return _slug(value)
+
+    @staticmethod
+    def make_replay_public_id(project_id: str, environment_id: str, session_id: str) -> str:
+        return _public_id("rpl", project_id, environment_id, session_id)
+
+    @staticmethod
+    def make_issue_public_id(project_id: str, environment_id: str, fingerprint: str) -> str:
+        return _public_id("bug", project_id, environment_id, fingerprint)
+
+    def upsert_incident(self, *, project_id: str, environment_id: str, group_key: str, title: str, summary: str = "", severity: str = "medium", status: str = "open", metadata: Optional[dict[str, Any]] = None, reopen_resolved: bool = False) -> str:
+        return self.incidents.upsert_incident(project_id=project_id, environment_id=environment_id, group_key=group_key, title=title, summary=summary, severity=severity, status=status, metadata=metadata, reopen_resolved=reopen_resolved)
+
+    def link_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
+        return self.incidents.link_failure_to_incident(incident_id=incident_id, failure_id=failure_id)
+
+    def move_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
+        return self.incidents.move_failure_to_incident(incident_id=incident_id, failure_id=failure_id)
+
+    def get_incident(self, incident_id: str) -> Optional[IncidentRow]:
+        return self.incidents.get_incident(incident_id)
+
+    def find_incident_by_group(self, *, project_id: str, environment_id: str, group_key: str) -> Optional[IncidentRow]:
+        return self.incidents.find_incident_by_group(project_id=project_id, environment_id=environment_id, group_key=group_key)
+
+    def list_incidents(self, *, project_id: str, environment_id: str, status: Optional[str] = None, limit: int = 100) -> list[IncidentRow]:
+        return self.incidents.list_incidents(project_id=project_id, environment_id=environment_id, status=status, limit=limit)
+
+    def list_incident_failures(self, *, incident_id: str) -> list[FailureRow]:
+        return self.incidents.list_incident_failures(incident_id=incident_id)
+
+    def list_incident_failures_for_incidents(self, *, incident_ids: list[str]) -> dict[str, list[FailureRow]]:
+        return self.incidents.list_incident_failures_for_incidents(incident_ids=incident_ids)
+
+    def list_incident_evidence(self, *, incident_id: str, include_sensitive: bool = True) -> list[EvidenceRow]:
+        return self.incidents.list_incident_evidence(incident_id=incident_id, include_sensitive=include_sensitive)
+
+    def transition_app_error_incident(self, *, project_id: str, environment_id: str, incident_id: str, status: str, actor_type: str = "service_token", actor_id: str = "", reason: str = "", metadata: Optional[dict[str, Any]] = None) -> IncidentRow:
+        return self.incidents.transition_app_error_incident(project_id=project_id, environment_id=environment_id, incident_id=incident_id, status=status, actor_type=actor_type, actor_id=actor_id, reason=reason, metadata=metadata)
+
+    def list_incident_lifecycle_events(self, *, incident_id: str, limit: int = 100) -> list[IncidentLifecycleEventRow]:
+        return self.incidents.list_incident_lifecycle_events(incident_id=incident_id, limit=limit)
+
+    def _append_incident_lifecycle_event(self, conn: sqlite3.Connection, *, incident_id: str, project_id: str, environment_id: str, from_status: str, to_status: str, actor_type: str, actor_id: str, reason: str, metadata: Optional[dict[str, Any]] = None, metadata_json: str = "", created_at: str = "") -> None:
+        return self.incidents._append_incident_lifecycle_event(conn, incident_id=incident_id, project_id=project_id, environment_id=environment_id, from_status=from_status, to_status=to_status, actor_type=actor_type, actor_id=actor_id, reason=reason, metadata=metadata, metadata_json=metadata_json, created_at=created_at)
+
+    def _resolve_incident_id(self, incident_id: str) -> str:
+        return self.incidents._resolve_incident_id(incident_id)
+
+    def set_incident_repair_task(self, *, incident_id: str, repair_task_id: str) -> None:
+        return self.incidents.set_incident_repair_task(incident_id=incident_id, repair_task_id=repair_task_id)
+
+    def _incident_from_row(self, row: sqlite3.Row) -> IncidentRow:
+        return self.incidents._incident_from_row(row)
+
+    def _incident_lifecycle_event_from_row(self, row: sqlite3.Row) -> IncidentLifecycleEventRow:
+        return self.incidents._incident_lifecycle_event_from_row(row)
+
+    def upsert_app_error_alert_rule(self, *, project_id: str, environment_id: str, name: str, enabled: bool = True, precedence: int = 0, action: str = "alert", min_severity: str = "", provider: str = "", title_contains: str = "", fingerprint_contains: str = "", route_contains: str = "", metadata: Optional[dict[str, Any]] = None) -> str:
+        return self.incidents.upsert_app_error_alert_rule(project_id=project_id, environment_id=environment_id, name=name, enabled=enabled, precedence=precedence, action=action, min_severity=min_severity, provider=provider, title_contains=title_contains, fingerprint_contains=fingerprint_contains, route_contains=route_contains, metadata=metadata)
+
+    def list_app_error_alert_rules(self, *, project_id: str, environment_id: str, enabled: Optional[bool] = None, limit: int = 100, offset: int = 0) -> list[AppErrorAlertRuleRow]:
+        return self.incidents.list_app_error_alert_rules(project_id=project_id, environment_id=environment_id, enabled=enabled, limit=limit, offset=offset)
+
+    def delete_app_error_alert_rule(self, *, project_id: str, environment_id: str, name: str) -> bool:
+        return self.incidents.delete_app_error_alert_rule(project_id=project_id, environment_id=environment_id, name=name)
+
+    def _app_error_alert_rule_from_row(self, row: sqlite3.Row) -> AppErrorAlertRuleRow:
+        return self.incidents._app_error_alert_rule_from_row(row)
+
+    def upsert_alert_route(self, *, project_id: str, environment_id: str, name: str, target_kind: str, target_url: str, target_secret: str = "", rule_name: str = "", min_severity: str = "", dedup_window_seconds: int = 300, enabled: bool = True) -> AlertRouteRow:
+        return self.incidents.upsert_alert_route(project_id=project_id, environment_id=environment_id, name=name, target_kind=target_kind, target_url=target_url, target_secret=target_secret, rule_name=rule_name, min_severity=min_severity, dedup_window_seconds=dedup_window_seconds, enabled=enabled)
+
+    def list_alert_routes(self, *, project_id: str, environment_id: str, enabled: Optional[bool] = None, rule_name: Optional[str] = None) -> list[AlertRouteRow]:
+        return self.incidents.list_alert_routes(project_id=project_id, environment_id=environment_id, enabled=enabled, rule_name=rule_name)
+
+    def get_alert_route(self, *, project_id: str, environment_id: str, name: str) -> Optional[AlertRouteRow]:
+        return self.incidents.get_alert_route(project_id=project_id, environment_id=environment_id, name=name)
+
+    def delete_alert_route(self, *, project_id: str, environment_id: str, name: str) -> bool:
+        return self.incidents.delete_alert_route(project_id=project_id, environment_id=environment_id, name=name)
+
+    def record_alert_dispatch(self, *, route_id: str, project_id: str, environment_id: str, fingerprint: str, status: str, target_kind: str, target_url: str, payload: dict, error: str = "") -> int:
+        return self.incidents.record_alert_dispatch(route_id=route_id, project_id=project_id, environment_id=environment_id, fingerprint=fingerprint, status=status, target_kind=target_kind, target_url=target_url, payload=payload, error=error)
+
+    def recent_alert_dispatch_for(self, *, route_id: str, fingerprint: str, within_seconds: int) -> Optional[sqlite3.Row]:
+        return self.incidents.recent_alert_dispatch_for(route_id=route_id, fingerprint=fingerprint, within_seconds=within_seconds)
+
+    def list_recent_alert_dispatches(self, *, project_id: str, environment_id: str, limit: int = 50) -> list[sqlite3.Row]:
+        return self.incidents.list_recent_alert_dispatches(project_id=project_id, environment_id=environment_id, limit=limit)
+
+    def _alert_route_from_row(self, row: sqlite3.Row) -> AlertRouteRow:
+        return self.incidents._alert_route_from_row(row)
+
+    def _refresh_incident_rollup(self, conn: sqlite3.Connection, *, incident_id: str) -> None:
+        return self.incidents._refresh_incident_rollup(conn, incident_id=incident_id)
+
+    def _refresh_incidents_for_failure(self, conn: sqlite3.Connection, *, failure_id: str) -> None:
+        return self.incidents._refresh_incidents_for_failure(conn, failure_id=failure_id)
+
+    def _replace_failure_trace_map(self, conn: sqlite3.Connection, *, failure_id: str, metadata: dict[str, Any]) -> None:
+        return self.incidents._replace_failure_trace_map(conn, failure_id=failure_id, metadata=metadata)
+
+    def _backfill_failure_trace_map(self, conn: sqlite3.Connection) -> None:
+        return self.incidents._backfill_failure_trace_map(conn)
+
+    def record_deploy_marker(self, *, project_id: str, environment_id: str, sha: str, branch: str = "", author: str = "", deployed_at_ms: int = 0, changed_files: Optional[list[str]] = None, metadata: Optional[dict[str, Any]] = None) -> str:
+        return self.incidents.record_deploy_marker(project_id=project_id, environment_id=environment_id, sha=sha, branch=branch, author=author, deployed_at_ms=deployed_at_ms, changed_files=changed_files, metadata=metadata)
+
+    def get_deploy_marker(self, deploy_id: str) -> Optional[DeployMarkerRow]:
+        return self.incidents.get_deploy_marker(deploy_id)
+
+    def get_deploy_marker_by_sha(self, *, project_id: str, environment_id: str, sha: str) -> Optional[DeployMarkerRow]:
+        return self.incidents.get_deploy_marker_by_sha(project_id=project_id, environment_id=environment_id, sha=sha)
+
+    def list_deploy_markers(self, *, project_id: str, environment_id: str, limit: int = 50) -> list[DeployMarkerRow]:
+        return self.incidents.list_deploy_markers(project_id=project_id, environment_id=environment_id, limit=limit)
+
+    def nearest_deploy_marker(self, *, project_id: str, environment_id: str, at_ms: int) -> Optional[DeployMarkerRow]:
+        return self.incidents.nearest_deploy_marker(project_id=project_id, environment_id=environment_id, at_ms=at_ms)
+
+    def update_failure_deploy(self, *, failure_id: str, deploy_sha: str) -> None:
+        return self.incidents.update_failure_deploy(failure_id=failure_id, deploy_sha=deploy_sha)
+
+    def _deploy_marker_from_row(self, row: sqlite3.Row) -> DeployMarkerRow:
+        return self.incidents._deploy_marker_from_row(row)
+
+    def upsert_source_map(self, *, project_id: str, environment_id: str, release: str, artifact_url: str, source_map: dict[str, Any], dist: str = "") -> str:
+        return self.incidents.upsert_source_map(project_id=project_id, environment_id=environment_id, release=release, artifact_url=artifact_url, source_map=source_map, dist=dist)
+
+    def list_source_maps(self, *, project_id: str, environment_id: str, release: str, dist: Optional[str] = "", limit: int = 100) -> list[SourceMapRow]:
+        return self.incidents.list_source_maps(project_id=project_id, environment_id=environment_id, release=release, dist=dist, limit=limit)
+
+    def list_recent_source_maps(self, *, project_id: str, environment_id: str, limit: int = 100) -> list[SourceMapRow]:
+        return self.incidents.list_recent_source_maps(project_id=project_id, environment_id=environment_id, limit=limit)
+
+    def _source_map_from_row(self, row: sqlite3.Row) -> SourceMapRow:
+        return self.incidents._source_map_from_row(row)
+
+    def _validate_source_map_payload(self, source_map: dict[str, Any]) -> None:
+        return self.incidents._validate_source_map_payload(source_map)
+
+    def _failure_from_row(self, row: sqlite3.Row) -> FailureRow:
+        return FailureRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            source_type=str(row["source_type"]),
+            source_external_id=str(row["source_external_id"]),
+            fingerprint=str(row["fingerprint"]),
+            title=str(row["title"]),
+            status=normalize_failure_status(str(row["status"] or "new")),
+            related_deploy_sha=str(row["related_deploy_sha"] or ""),
+            related_pr_number=(
+                int(row["related_pr_number"])
+                if row["related_pr_number"] is not None
+                else None
+            ),
+            linked_tests=_parse_string_list_json(row["linked_tests_json"]),
+            linked_repair_task_id=str(row["linked_repair_task_id"] or ""),
+            linked_external_thread_id=str(row["linked_external_thread_id"] or ""),
+            metadata=dict(_safe_json_obj(row["metadata_json"])),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=_dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    def _evidence_from_row(self, row: sqlite3.Row) -> EvidenceRow:
+        return EvidenceRow(
+            id=str(row["id"]),
+            failure_id=str(row["failure_id"]),
+            evidence_type=str(row["evidence_type"]),
+            occurred_at_ms=int(row["occurred_at_ms"] or 0),
+            source=str(row["source"] or ""),
+            redaction_state=str(row["redaction_state"] or "raw"),
+            payload=dict(_safe_json_obj(row["payload_json"])),
+            artifact_path=str(row["artifact_path"] or ""),
+            dedupe_key=str(row["dedupe_key"] or ""),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
+        )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def _failure_from_row(self, row: sqlite3.Row) -> FailureRow:
+        return FailureRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            source_type=str(row["source_type"]),
+            source_external_id=str(row["source_external_id"]),
+            fingerprint=str(row["fingerprint"]),
+            title=str(row["title"]),
+            status=normalize_failure_status(str(row["status"] or "new")),
+            related_deploy_sha=str(row["related_deploy_sha"] or ""),
+            related_pr_number=(
+                int(row["related_pr_number"])
+                if row["related_pr_number"] is not None
+                else None
+            ),
+            linked_tests=_parse_string_list_json(row["linked_tests_json"]),
+            linked_repair_task_id=str(row["linked_repair_task_id"] or ""),
+            linked_external_thread_id=str(row["linked_external_thread_id"] or ""),
+            metadata=dict(_safe_json_obj(row["metadata_json"])),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=_dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
+    def _evidence_from_row(self, row: sqlite3.Row) -> EvidenceRow:
+        return EvidenceRow(
+            id=str(row["id"]),
+            failure_id=str(row["failure_id"]),
+            evidence_type=str(row["evidence_type"]),
+            occurred_at_ms=int(row["occurred_at_ms"] or 0),
+            source=str(row["source"] or ""),
+            redaction_state=str(row["redaction_state"] or "raw"),
+            payload=dict(_safe_json_obj(row["payload_json"])),
+            artifact_path=str(row["artifact_path"] or ""),
+            dedupe_key=str(row["dedupe_key"] or ""),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
+        )
+
+
+
+
+
+
+
+
 
     def ensure_workspace(
         self,
@@ -508,9 +757,9 @@ class Storage:
         environment_name: str = "production",
     ) -> WorkspaceIds:
         """Create or return a local cloud-style org/project/environment tuple."""
-        org_slug = self._slug(org_name)
-        project_slug = self._slug(project_name)
-        env_slug = self._slug(environment_name)
+        org_slug = _slug(org_name)
+        project_slug = _slug(project_name)
+        env_slug = _slug(environment_name)
         org_id = f"org_{org_slug}"
 
         with self._conn() as conn:
@@ -527,7 +776,7 @@ class Storage:
                 (org_id, project_slug),
             ).fetchone()
             if row is None:
-                project_id = self._id("proj")
+                project_id = _id("proj")
                 conn.execute(
                     """
                     INSERT INTO projects (id, org_id, name, slug)
@@ -543,7 +792,7 @@ class Storage:
                 (project_id, env_slug),
             ).fetchone()
             if row is None:
-                environment_id = self._id("env")
+                environment_id = _id("env")
                 conn.execute(
                     """
                     INSERT INTO environments (id, project_id, name, slug)
@@ -575,7 +824,7 @@ class Storage:
         prefix: str,
         last4: str,
     ) -> str:
-        key_id = self._id("sdk")
+        key_id = _id("sdk")
         with self._conn() as conn:
             conn.execute(
                 """
@@ -602,7 +851,7 @@ class Storage:
         email: str,
         role: str = "member",
     ) -> str:
-        member_id = self._id("mem")
+        member_id = _id("mem")
         with self._conn() as conn:
             conn.execute(
                 """
@@ -660,7 +909,7 @@ class Storage:
                     VALUES (?, ?, ?, ?, 1, 'replay_finalize', '{}', '{}', '', ?)
                     """,
                     (
-                        self._id("sigdef"),
+                        _id("sigdef"),
                         project_id,
                         environment_id,
                         clean,
@@ -681,7 +930,7 @@ class Storage:
         custom_definition: str = "",
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
-        definition_id = self._id("sigdef")
+        definition_id = _id("sigdef")
         with self._conn() as conn:
             conn.execute(
                 """
@@ -784,18 +1033,18 @@ class Storage:
             detector=str(row["detector"]),
             enabled=bool(row["enabled"]),
             run_mode=str(row["run_mode"]),
-            thresholds=self._safe_json_obj(row["thresholds_json"]),
-            prompt=self._safe_json_obj(row["prompt_json"]),
+            thresholds=_safe_json_obj(row["thresholds_json"]),
+            prompt=_safe_json_obj(row["prompt_json"]),
             custom_definition=str(row["custom_definition"] or ""),
             match_count=int(row["match_count"] or 0),
-            last_match_at=self._dt(row["last_match_at"]),
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
-            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+            last_match_at=_dt(row["last_match_at"]),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=_dt(row["updated_at"]) or datetime.now(timezone.utc),
         )
 
     def upsert_failure(self, failure: CanonicalFailure) -> str:
         now = datetime.now(timezone.utc).isoformat()
-        failure_id = self._id("flr")
+        failure_id = _id("flr")
         with self._conn() as conn:
             return self._upsert_failure(
                 conn,
@@ -826,8 +1075,8 @@ class Storage:
                 failure.source_external_id,
             ),
         ).fetchone()
-        linked_tests = self._merge_string_lists(
-            self._parse_string_list_json(existing["linked_tests_json"])
+        linked_tests = _merge_string_lists(
+            _parse_string_list_json(existing["linked_tests_json"])
             if existing is not None
             else [],
             failure.linked_tests,
@@ -1009,7 +1258,7 @@ class Storage:
             ).fetchone()
             if row is None:
                 return None
-            merged_metadata = dict(self._safe_json_obj(row["metadata_json"]))
+            merged_metadata = dict(_safe_json_obj(row["metadata_json"]))
             if metadata:
                 merged_metadata.update(metadata)
             try:
@@ -1056,12 +1305,12 @@ class Storage:
                 if row["related_pr_number"] is not None
                 else None
             ),
-            linked_tests=self._parse_string_list_json(row["linked_tests_json"]),
+            linked_tests=_parse_string_list_json(row["linked_tests_json"]),
             linked_repair_task_id=str(row["linked_repair_task_id"] or ""),
             linked_external_thread_id=str(row["linked_external_thread_id"] or ""),
-            metadata=dict(self._safe_json_obj(row["metadata_json"])),
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
-            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+            metadata=dict(_safe_json_obj(row["metadata_json"])),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=_dt(row["updated_at"]) or datetime.now(timezone.utc),
         )
 
     def append_failure_evidence(self, evidence: EvidenceItem) -> str:
@@ -1080,8 +1329,8 @@ class Storage:
             payload_json = json.dumps(evidence.payload, sort_keys=True)
         except (TypeError, ValueError) as exc:
             raise ValueError("evidence payload must be JSON-serializable") from exc
-        evidence_id = self._id("ev")
-        created_at = self._now_iso_microseconds()
+        evidence_id = _id("ev")
+        created_at = _now_iso_microseconds()
         conn.execute(
             """
             INSERT OR IGNORE INTO failure_evidence
@@ -1159,1441 +1408,48 @@ class Storage:
             ).fetchone()
         return self._failure_from_row(row) if row is not None else None
 
-    def upsert_incident(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        group_key: str,
-        title: str,
-        summary: str = "",
-        severity: str = "medium",
-        status: str = "open",
-        metadata: Optional[dict[str, Any]] = None,
-        reopen_resolved: bool = False,
-    ) -> str:
-        now = datetime.now(timezone.utc).isoformat()
-        incident_id = self._id("inc")
-        public_id = self._public_id("inc", project_id, environment_id, group_key)
-        try:
-            metadata_json = json.dumps(metadata or {}, sort_keys=True)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("incident metadata must be JSON-serializable") from exc
-        clean_status = _normalize_app_error_incident_status(status)
-        with self._conn() as conn:
-            existing = conn.execute(
-                """
-                SELECT id, status
-                FROM incidents
-                WHERE project_id = ? AND environment_id = ? AND group_key = ?
-                """,
-                (project_id, environment_id, group_key),
-            ).fetchone()
-            conn.execute(
-                """
-                INSERT INTO incidents
-                (id, public_id, project_id, environment_id, group_key, title, summary,
-                 severity, status, metadata_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, environment_id, group_key) DO UPDATE SET
-                    title = excluded.title,
-                    summary = excluded.summary,
-                    severity = excluded.severity,
-                    status = CASE
-                        WHEN incidents.status IN ('resolved', 'ignored') AND ? = 1
-                            THEN excluded.status
-                        ELSE incidents.status
-                    END,
-                    metadata_json = excluded.metadata_json,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    incident_id,
-                    public_id,
-                    project_id,
-                    environment_id,
-                    group_key,
-                    title,
-                    summary,
-                    severity,
-                    clean_status,
-                    metadata_json,
-                    now,
-                    now,
-                    1 if reopen_resolved else 0,
-                ),
-            )
-            row = conn.execute(
-                """
-                SELECT id
-                FROM incidents
-                WHERE project_id = ? AND environment_id = ? AND group_key = ?
-                """,
-                (project_id, environment_id, group_key),
-            ).fetchone()
-            assert row is not None
-            if (
-                existing is not None
-                and str(existing["status"] or "") in {"resolved", "ignored"}
-                and clean_status == "open"
-                and reopen_resolved
-            ):
-                self._append_incident_lifecycle_event(
-                    conn,
-                    incident_id=str(row["id"]),
-                    project_id=project_id,
-                    environment_id=environment_id,
-                    from_status=str(existing["status"] or ""),
-                    to_status="open",
-                    actor_type="system",
-                    actor_id="monitoring_ingest",
-                    reason="new matching app-error failure reopened the incident",
-                    metadata={"trigger": "ingest_regression"},
-                    created_at=now,
-                )
-                conn.execute(
-                    """
-                    UPDATE failures
-                    SET status = 'new',
-                        updated_at = ?
-                    WHERE id IN (
-                        SELECT failure_id
-                        FROM incident_failures
-                        WHERE incident_id = ?
-                    )
-                      AND source_type = 'monitor_incident'
-                      AND status IN ('resolved', 'ignored')
-                    """,
-                    (now, str(row["id"])),
-                )
-            return str(row["id"])
 
-    def link_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
-        """Strictly attach a failure to an incident without changing existing ownership."""
-        with self._conn() as conn:
-            incident = conn.execute(
-                """
-                SELECT id, project_id, environment_id
-                FROM incidents
-                WHERE id = ? OR public_id = ?
-                """,
-                (incident_id, incident_id),
-            ).fetchone()
-            if incident is None:
-                raise ValueError(f"unknown incident_id: {incident_id}")
-            failure = conn.execute(
-                """
-                SELECT id, project_id, environment_id
-                FROM failures
-                WHERE id = ? OR public_id = ?
-                """,
-                (failure_id, failure_id),
-            ).fetchone()
-            if failure is None:
-                raise ValueError(f"unknown failure_id: {failure_id}")
-            if (
-                str(incident["project_id"]) != str(failure["project_id"])
-                or str(incident["environment_id"]) != str(failure["environment_id"])
-            ):
-                raise ValueError("incident and failure must belong to the same workspace")
-            existing_link = conn.execute(
-                """
-                SELECT incident_id
-                FROM incident_failures
-                WHERE failure_id = ?
-                """,
-                (str(failure["id"]),),
-            ).fetchone()
-            if existing_link is not None:
-                linked_incident_id = str(existing_link["incident_id"])
-                if linked_incident_id != str(incident["id"]):
-                    raise ValueError("failure is already linked to another incident")
-                self._refresh_incident_rollup(
-                    conn,
-                    incident_id=linked_incident_id,
-                )
-                return
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO incident_failures
-                (incident_id, failure_id)
-                VALUES (?, ?)
-                """,
-                (str(incident["id"]), str(failure["id"])),
-            )
-            self._refresh_incident_rollup(conn, incident_id=str(incident["id"]))
 
-    def move_failure_to_incident(self, *, incident_id: str, failure_id: str) -> None:
-        """Attach a failure to this incident, replacing prior incident membership."""
-        with self._conn() as conn:
-            incident = conn.execute(
-                """
-                SELECT id, project_id, environment_id
-                FROM incidents
-                WHERE id = ? OR public_id = ?
-                """,
-                (incident_id, incident_id),
-            ).fetchone()
-            if incident is None:
-                raise ValueError(f"unknown incident_id: {incident_id}")
-            failure = conn.execute(
-                """
-                SELECT id, project_id, environment_id
-                FROM failures
-                WHERE id = ? OR public_id = ?
-                """,
-                (failure_id, failure_id),
-            ).fetchone()
-            if failure is None:
-                raise ValueError(f"unknown failure_id: {failure_id}")
-            if (
-                str(incident["project_id"]) != str(failure["project_id"])
-                or str(incident["environment_id"]) != str(failure["environment_id"])
-            ):
-                raise ValueError("incident and failure must belong to the same workspace")
-            old_links = conn.execute(
-                """
-                SELECT incident_id
-                FROM incident_failures
-                WHERE failure_id = ?
-                """,
-                (str(failure["id"]),),
-            ).fetchall()
-            conn.execute(
-                """
-                DELETE FROM incident_failures
-                WHERE failure_id = ?
-                """,
-                (str(failure["id"]),),
-            )
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO incident_failures
-                (incident_id, failure_id)
-                VALUES (?, ?)
-                """,
-                (str(incident["id"]), str(failure["id"])),
-            )
-            for row in old_links:
-                self._refresh_incident_rollup(
-                    conn,
-                    incident_id=str(row["incident_id"]),
-                )
-            self._refresh_incident_rollup(conn, incident_id=str(incident["id"]))
 
-    def get_incident(self, incident_id: str) -> Optional[IncidentRow]:
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT *
-                FROM incidents
-                WHERE id = ? OR public_id = ?
-                """,
-                (incident_id, incident_id),
-            ).fetchone()
-        return self._incident_from_row(row) if row is not None else None
 
-    def find_incident_by_group(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        group_key: str,
-    ) -> Optional[IncidentRow]:
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT *
-                FROM incidents
-                WHERE project_id = ? AND environment_id = ? AND group_key = ?
-                """,
-                (project_id, environment_id, group_key),
-            ).fetchone()
-        return self._incident_from_row(row) if row is not None else None
 
-    def list_incidents(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        status: Optional[str] = None,
-        limit: int = 100,
-    ) -> list[IncidentRow]:
-        params: list[object] = [project_id, environment_id]
-        where = "project_id = ? AND environment_id = ?"
-        if status is not None:
-            where += " AND status = ?"
-            params.append(status)
-        params.append(max(1, min(int(limit), 500)))
-        with self._conn() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT *
-                FROM incidents
-                WHERE {where}
-                ORDER BY updated_at DESC, public_id
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-        return [self._incident_from_row(row) for row in rows]
 
-    def list_incident_failures(self, *, incident_id: str) -> list[FailureRow]:
-        with self._conn() as conn:
-            incident = conn.execute(
-                """
-                SELECT id
-                FROM incidents
-                WHERE id = ? OR public_id = ?
-                """,
-                (incident_id, incident_id),
-            ).fetchone()
-            if incident is None:
-                return []
-            rows = conn.execute(
-                """
-                SELECT f.*
-                FROM incident_failures inf
-                JOIN failures f ON f.id = inf.failure_id
-                WHERE inf.incident_id = ?
-                ORDER BY f.updated_at DESC, f.public_id
-                """,
-                (str(incident["id"]),),
-            ).fetchall()
-        return [self._failure_from_row(row) for row in rows]
 
-    def list_incident_failures_for_incidents(
-        self,
-        *,
-        incident_ids: list[str],
-    ) -> dict[str, list[FailureRow]]:
-        clean_ids = [str(item).strip() for item in incident_ids if str(item).strip()]
-        if not clean_ids:
-            return {}
-        placeholders = ",".join("?" for _ in clean_ids)
-        with self._conn() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT inf.incident_id AS linked_incident_id, f.*
-                FROM incident_failures inf
-                JOIN failures f ON f.id = inf.failure_id
-                WHERE inf.incident_id IN ({placeholders})
-                ORDER BY f.updated_at DESC, f.public_id
-                """,
-                clean_ids,
-            ).fetchall()
-        grouped: dict[str, list[FailureRow]] = {incident_id: [] for incident_id in clean_ids}
-        for row in rows:
-            grouped.setdefault(str(row["linked_incident_id"]), []).append(
-                self._failure_from_row(row)
-            )
-        return grouped
 
-    def list_incident_evidence(
-        self,
-        *,
-        incident_id: str,
-        include_sensitive: bool = True,
-    ) -> list[EvidenceRow]:
-        resolved_incident_id = self._resolve_incident_id(incident_id)
-        if not resolved_incident_id:
-            return []
-        where = "inf.incident_id = ?"
-        params: list[object] = [resolved_incident_id]
-        if not include_sensitive:
-            placeholders = ",".join("?" for _ in PROMPT_SAFE_REDACTION_STATES)
-            where += f" AND ev.redaction_state IN ({placeholders})"
-            params.extend(PROMPT_SAFE_REDACTION_STATES)
-        with self._conn() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT ev.*
-                FROM incident_failures inf
-                JOIN failure_evidence ev ON ev.failure_id = inf.failure_id
-                WHERE {where}
-                ORDER BY
-                    ev.occurred_at_ms,
-                    replace(replace(ev.created_at, ' ', 'T'), '+00:00', 'Z'),
-                    ev.id
-                """,
-                params,
-            ).fetchall()
-        return [self._evidence_from_row(row) for row in rows]
 
-    def transition_app_error_incident(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        incident_id: str,
-        status: str,
-        actor_type: str = "service_token",
-        actor_id: str = "",
-        reason: str = "",
-        metadata: Optional[dict[str, Any]] = None,
-    ) -> IncidentRow:
-        clean_status = _normalize_app_error_incident_status(status)
-        clean_actor_type = actor_type.strip()[:80] or "service_token"
-        clean_actor_id = actor_id.strip()[:200]
-        clean_reason = reason.strip()[:2000]
-        if metadata is None:
-            clean_metadata: dict[str, Any] = {}
-        elif isinstance(metadata, dict):
-            clean_metadata = metadata
-        else:
-            raise ValueError("lifecycle metadata must be a JSON object")
-        try:
-            metadata_json = json.dumps(clean_metadata, sort_keys=True)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("lifecycle metadata must be JSON-serializable") from exc
-        failure_status = APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS[clean_status]
-        now = datetime.now(timezone.utc).isoformat()
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            incident = conn.execute(
-                """
-                SELECT *
-                FROM incidents
-                WHERE (id = ? OR public_id = ?)
-                  AND project_id = ?
-                  AND environment_id = ?
-                """,
-                (incident_id, incident_id, project_id, environment_id),
-            ).fetchone()
-            if incident is None:
-                raise ValueError(f"unknown incident_id: {incident_id}")
-            resolved_incident_id = str(incident["id"])
-            previous_status = str(incident["status"] or "")
-            incident_metadata = dict(self._safe_json_obj(incident["metadata_json"]))
-            incident_metadata.update(
-                {
-                    "last_lifecycle_actor_type": clean_actor_type,
-                    "last_lifecycle_actor_id": clean_actor_id,
-                    "last_lifecycle_reason": clean_reason,
-                    "last_lifecycle_at": now,
-                }
-            )
-            conn.execute(
-                """
-                UPDATE incidents
-                SET status = ?,
-                    metadata_json = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    clean_status,
-                    json.dumps(incident_metadata, sort_keys=True),
-                    now,
-                    resolved_incident_id,
-                ),
-            )
-            self._append_incident_lifecycle_event(
-                conn,
-                incident_id=resolved_incident_id,
-                project_id=project_id,
-                environment_id=environment_id,
-                from_status=previous_status,
-                to_status=clean_status,
-                actor_type=clean_actor_type,
-                actor_id=clean_actor_id,
-                reason=clean_reason,
-                metadata=clean_metadata,
-                metadata_json=metadata_json,
-                created_at=now,
-            )
-            conn.execute(
-                """
-                UPDATE failures
-                SET status = ?,
-                    updated_at = ?
-                WHERE id IN (
-                    SELECT failure_id
-                    FROM incident_failures
-                    WHERE incident_id = ?
-                )
-                  AND source_type = 'monitor_incident'
-                """,
-                (failure_status, now, resolved_incident_id),
-            )
-            self._refresh_incident_rollup(conn, incident_id=resolved_incident_id)
-            row = conn.execute(
-                """
-                SELECT *
-                FROM incidents
-                WHERE id = ?
-                """,
-                (resolved_incident_id,),
-            ).fetchone()
-            assert row is not None
-        return self._incident_from_row(row)
 
-    def list_incident_lifecycle_events(
-        self,
-        *,
-        incident_id: str,
-        limit: int = 100,
-    ) -> list[IncidentLifecycleEventRow]:
-        resolved_incident_id = self._resolve_incident_id(incident_id)
-        if not resolved_incident_id:
-            return []
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM incident_lifecycle_events
-                WHERE incident_id = ?
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?
-                """,
-                (resolved_incident_id, max(1, min(int(limit), 500))),
-            ).fetchall()
-        return [self._incident_lifecycle_event_from_row(row) for row in rows]
 
-    def _append_incident_lifecycle_event(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        incident_id: str,
-        project_id: str,
-        environment_id: str,
-        from_status: str,
-        to_status: str,
-        actor_type: str,
-        actor_id: str,
-        reason: str,
-        metadata: Optional[dict[str, Any]] = None,
-        metadata_json: str = "",
-        created_at: str = "",
-    ) -> None:
-        if not metadata_json:
-            metadata_json = json.dumps(metadata or {}, sort_keys=True)
-        conn.execute(
-            """
-            INSERT INTO incident_lifecycle_events
-            (id, incident_id, project_id, environment_id, from_status, to_status,
-             actor_type, actor_id, reason, metadata_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                self._id("ilc"),
-                incident_id,
-                project_id,
-                environment_id,
-                from_status,
-                to_status,
-                actor_type,
-                actor_id,
-                reason,
-                metadata_json,
-                created_at or datetime.now(timezone.utc).isoformat(),
-            ),
-        )
 
-    def _resolve_incident_id(self, incident_id: str) -> str:
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT id
-                FROM incidents
-                WHERE id = ? OR public_id = ?
-                """,
-                (incident_id, incident_id),
-            ).fetchone()
-        return str(row["id"]) if row is not None else ""
 
-    def set_incident_repair_task(self, *, incident_id: str, repair_task_id: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        with self._conn() as conn:
-            incident = conn.execute(
-                """
-                SELECT id, project_id, environment_id
-                FROM incidents
-                WHERE id = ? OR public_id = ?
-                """,
-                (incident_id, incident_id),
-            ).fetchone()
-            if incident is None:
-                raise ValueError(f"unknown incident_id: {incident_id}")
-            repair_task = conn.execute(
-                """
-                SELECT id, project_id, environment_id
-                FROM repair_tasks
-                WHERE id = ? OR public_id = ?
-                """,
-                (repair_task_id, repair_task_id),
-            ).fetchone()
-            if repair_task is None:
-                raise ValueError(f"unknown repair_task_id: {repair_task_id}")
-            if (
-                str(incident["project_id"]) != str(repair_task["project_id"])
-                or str(incident["environment_id"]) != str(repair_task["environment_id"])
-            ):
-                raise ValueError(
-                    "incident and repair task must belong to the same workspace"
-                )
-            conn.execute(
-                """
-                UPDATE incidents
-                SET repair_task_id = ?, updated_at = ?
-                WHERE id = ? OR public_id = ?
-                """,
-                (str(repair_task["id"]), now, str(incident["id"]), str(incident["id"])),
-            )
 
-    def _incident_from_row(self, row: sqlite3.Row) -> IncidentRow:
-        return IncidentRow(
-            id=str(row["id"]),
-            public_id=str(row["public_id"]),
-            project_id=str(row["project_id"]),
-            environment_id=str(row["environment_id"]),
-            group_key=str(row["group_key"]),
-            title=str(row["title"] or ""),
-            summary=str(row["summary"] or ""),
-            severity=str(row["severity"] or "medium"),
-            status=str(row["status"] or "open"),
-            failure_count=int(row["failure_count"] or 0),
-            evidence_count=int(row["evidence_count"] or 0),
-            repair_task_id=str(row["repair_task_id"] or ""),
-            metadata=dict(self._safe_json_obj(row["metadata_json"])),
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
-            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
-        )
 
-    def _incident_lifecycle_event_from_row(
-        self, row: sqlite3.Row
-    ) -> IncidentLifecycleEventRow:
-        return IncidentLifecycleEventRow(
-            id=str(row["id"]),
-            incident_id=str(row["incident_id"]),
-            project_id=str(row["project_id"]),
-            environment_id=str(row["environment_id"]),
-            from_status=str(row["from_status"] or ""),
-            to_status=str(row["to_status"] or ""),
-            actor_type=str(row["actor_type"] or ""),
-            actor_id=str(row["actor_id"] or ""),
-            reason=str(row["reason"] or ""),
-            metadata=dict(self._safe_json_obj(row["metadata_json"])),
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
-        )
 
-    def upsert_app_error_alert_rule(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        name: str,
-        enabled: bool = True,
-        precedence: int = 0,
-        action: str = "alert",
-        min_severity: str = "",
-        provider: str = "",
-        title_contains: str = "",
-        fingerprint_contains: str = "",
-        route_contains: str = "",
-        metadata: Optional[dict[str, Any]] = None,
-    ) -> str:
-        clean_name = name.strip()
-        if not clean_name:
-            raise ValueError("alert rule name is required")
-        clean_action = action.strip().lower() or "alert"
-        if clean_action not in {"alert", "suppress"}:
-            raise ValueError("alert rule action must be alert or suppress")
-        clean_severity = min_severity.strip().lower()
-        if clean_severity and clean_severity not in _SEVERITY_ORDER:
-            raise ValueError("alert rule min_severity is invalid")
-        if metadata is None:
-            clean_metadata: dict[str, Any] = {}
-        elif not isinstance(metadata, dict):
-            raise ValueError("alert rule metadata must be a JSON object")
-        else:
-            clean_metadata = metadata
-        try:
-            metadata_json = json.dumps(clean_metadata, sort_keys=True)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("alert rule metadata must be JSON-serializable") from exc
-        rule_id = self._public_id("alertrule", project_id, environment_id, clean_name)
-        now = datetime.now(timezone.utc).isoformat()
-        with self._conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO app_error_alert_rules
-                (id, public_id, project_id, environment_id, name, enabled, precedence, action,
-                 min_severity, provider, title_contains, fingerprint_contains,
-                 route_contains, metadata_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, environment_id, name) DO UPDATE SET
-                    enabled = excluded.enabled,
-                    precedence = excluded.precedence,
-                    action = excluded.action,
-                    min_severity = excluded.min_severity,
-                    provider = excluded.provider,
-                    title_contains = excluded.title_contains,
-                    fingerprint_contains = excluded.fingerprint_contains,
-                    route_contains = excluded.route_contains,
-                    metadata_json = excluded.metadata_json,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    rule_id,
-                    rule_id,
-                    project_id,
-                    environment_id,
-                    clean_name,
-                    int(bool(enabled)),
-                    int(precedence),
-                    clean_action,
-                    clean_severity,
-                    provider.strip().lower(),
-                    title_contains.strip(),
-                    fingerprint_contains.strip(),
-                    route_contains.strip(),
-                    metadata_json,
-                    now,
-                    now,
-                ),
-            )
-            row = conn.execute(
-                """
-                SELECT id
-                FROM app_error_alert_rules
-                WHERE project_id = ? AND environment_id = ? AND name = ?
-                """,
-                (project_id, environment_id, clean_name),
-            ).fetchone()
-            assert row is not None
-            return str(row["id"])
 
-    def list_app_error_alert_rules(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        enabled: Optional[bool] = None,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[AppErrorAlertRuleRow]:
-        params: list[object] = [project_id, environment_id]
-        where = "project_id = ? AND environment_id = ?"
-        if enabled is not None:
-            where += " AND enabled = ?"
-            params.append(int(bool(enabled)))
-        params.append(max(1, min(int(limit), 500)))
-        params.append(max(0, int(offset)))
-        with self._conn() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT *
-                FROM app_error_alert_rules
-                WHERE {where}
-                ORDER BY precedence DESC, created_at ASC, id ASC
-                LIMIT ? OFFSET ?
-                """,
-                params,
-            ).fetchall()
-        return [self._app_error_alert_rule_from_row(row) for row in rows]
 
-    def delete_app_error_alert_rule(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        name: str,
-    ) -> bool:
-        """Delete one alert rule by (project, env, name). Returns True if a
-        row was removed, False if nothing matched."""
-        with self._conn() as conn:
-            cur = conn.execute(
-                """
-                DELETE FROM app_error_alert_rules
-                WHERE project_id = ? AND environment_id = ? AND name = ?
-                """,
-                (project_id, environment_id, name.strip()),
-            )
-            return bool(cur.rowcount)
 
-    def _app_error_alert_rule_from_row(
-        self,
-        row: sqlite3.Row,
-    ) -> AppErrorAlertRuleRow:
-        return AppErrorAlertRuleRow(
-            id=str(row["id"]),
-            public_id=str(row["public_id"]),
-            project_id=str(row["project_id"]),
-            environment_id=str(row["environment_id"]),
-            name=str(row["name"]),
-            enabled=bool(row["enabled"]),
-            precedence=int(row["precedence"] or 0),
-            action=str(row["action"] or "alert"),
-            min_severity=str(row["min_severity"] or ""),
-            provider=str(row["provider"] or ""),
-            title_contains=str(row["title_contains"] or ""),
-            fingerprint_contains=str(row["fingerprint_contains"] or ""),
-            route_contains=str(row["route_contains"] or ""),
-            metadata=dict(self._safe_json_obj(row["metadata_json"])),
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
-            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
-        )
 
-    # ---- Alert routes (P1.1) -------------------------------------------
 
-    def upsert_alert_route(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        name: str,
-        target_kind: str,
-        target_url: str,
-        target_secret: str = "",
-        rule_name: str = "",
-        min_severity: str = "",
-        dedup_window_seconds: int = 300,
-        enabled: bool = True,
-    ) -> "AlertRouteRow":
-        """Insert or update one route by `(project, env, name)`."""
-        name = name.strip()
-        if not name:
-            raise ValueError("alert route name cannot be empty")
-        target_kind = target_kind.strip().lower()
-        if target_kind not in {"slack", "discord", "pagerduty", "webhook"}:
-            raise ValueError(
-                f"unsupported target_kind: {target_kind!r} "
-                "(expected slack/discord/pagerduty/webhook)"
-            )
-        target_url = target_url.strip()
-        if not target_url:
-            raise ValueError("alert route target_url cannot be empty")
-        # Validate `min_severity` + PagerDuty secret at write-time so
-        # we fail loudly on misconfig instead of silently producing
-        # 401s / wrong-rank dispatches at runtime. (CodeRabbit Major
-        # catch on PR #131.)
-        _ALLOWED_SEVERITIES = {"low", "medium", "high", "critical"}
-        clean_min_severity = min_severity.strip().lower()
-        if clean_min_severity and clean_min_severity not in _ALLOWED_SEVERITIES:
-            raise ValueError(
-                f"invalid min_severity: {min_severity!r} "
-                f"(allowed: {sorted(_ALLOWED_SEVERITIES)})"
-            )
-        clean_target_secret = target_secret.strip()
-        if target_kind == "pagerduty" and not clean_target_secret:
-            raise ValueError(
-                "pagerduty routes require target_secret "
-                "(the Events v2 routing key)"
-            )
-        with self._conn() as conn:
-            existing = conn.execute(
-                "SELECT id, public_id FROM alert_routes "
-                "WHERE project_id = ? AND environment_id = ? AND name = ?",
-                (project_id, environment_id, name),
-            ).fetchone()
-            if existing is not None:
-                conn.execute(
-                    """
-                    UPDATE alert_routes
-                    SET enabled = ?, rule_name = ?, target_kind = ?,
-                        target_url = ?, target_secret = ?, min_severity = ?,
-                        dedup_window_seconds = ?, updated_at = datetime('now')
-                    WHERE id = ?
-                    """,
-                    (
-                        int(bool(enabled)),
-                        rule_name.strip(),
-                        target_kind,
-                        target_url,
-                        clean_target_secret,
-                        clean_min_severity,
-                        max(0, int(dedup_window_seconds)),
-                        existing["id"],
-                    ),
-                )
-                row_id = str(existing["id"])
-            else:
-                row_id = self._id("artr")
-                public_id = self._public_id(
-                    "ARTR", project_id, environment_id, name
-                )
-                conn.execute(
-                    """
-                    INSERT INTO alert_routes
-                        (id, public_id, project_id, environment_id, name,
-                         enabled, rule_name, target_kind, target_url,
-                         target_secret, min_severity, dedup_window_seconds)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        row_id, public_id, project_id, environment_id, name,
-                        int(bool(enabled)), rule_name.strip(), target_kind,
-                        target_url, clean_target_secret,
-                        clean_min_severity,
-                        max(0, int(dedup_window_seconds)),
-                    ),
-                )
-            row = conn.execute(
-                "SELECT * FROM alert_routes WHERE id = ?", (row_id,)
-            ).fetchone()
-        return self._alert_route_from_row(row)
 
-    def list_alert_routes(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        enabled: Optional[bool] = None,
-        rule_name: Optional[str] = None,
-    ) -> list["AlertRouteRow"]:
-        params: list[object] = [project_id, environment_id]
-        where = "project_id = ? AND environment_id = ?"
-        if enabled is not None:
-            where += " AND enabled = ?"
-            params.append(int(bool(enabled)))
-        if rule_name is not None:
-            where += " AND (rule_name = ? OR rule_name = '')"
-            params.append(rule_name.strip())
-        with self._conn() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM alert_routes WHERE {where} "
-                "ORDER BY created_at ASC, id ASC",
-                params,
-            ).fetchall()
-        return [self._alert_route_from_row(r) for r in rows]
 
-    def get_alert_route(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        name: str,
-    ) -> Optional["AlertRouteRow"]:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM alert_routes "
-                "WHERE project_id = ? AND environment_id = ? AND name = ?",
-                (project_id, environment_id, name.strip()),
-            ).fetchone()
-        return self._alert_route_from_row(row) if row is not None else None
 
-    def delete_alert_route(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        name: str,
-    ) -> bool:
-        with self._conn() as conn:
-            cur = conn.execute(
-                "DELETE FROM alert_routes "
-                "WHERE project_id = ? AND environment_id = ? AND name = ?",
-                (project_id, environment_id, name.strip()),
-            )
-            return bool(cur.rowcount)
 
-    def record_alert_dispatch(
-        self,
-        *,
-        route_id: str,
-        project_id: str,
-        environment_id: str,
-        fingerprint: str,
-        status: str,
-        target_kind: str,
-        target_url: str,
-        payload: dict,
-        error: str = "",
-    ) -> int:
-        with self._conn() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO alert_dispatches
-                    (route_id, project_id, environment_id, fingerprint,
-                     status, error, target_kind, target_url, payload_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    route_id, project_id, environment_id, fingerprint,
-                    status, error, target_kind, target_url,
-                    json.dumps(payload or {}),
-                ),
-            )
-            return int(cur.lastrowid or 0)
 
-    def recent_alert_dispatch_for(
-        self,
-        *,
-        route_id: str,
-        fingerprint: str,
-        within_seconds: int,
-    ) -> Optional[sqlite3.Row]:
-        """Find a successful dispatch for this (route, fingerprint) pair
-        in the last `within_seconds` — used to dedup fast repeats."""
-        within_seconds = max(0, int(within_seconds))
-        if within_seconds <= 0:
-            return None
-        with self._conn() as conn:
-            return conn.execute(
-                """
-                SELECT * FROM alert_dispatches
-                WHERE route_id = ?
-                  AND fingerprint = ?
-                  AND status = 'sent'
-                  AND created_at >= datetime('now', ?)
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (route_id, fingerprint, f"-{within_seconds} seconds"),
-            ).fetchone()
 
-    def list_recent_alert_dispatches(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        limit: int = 50,
-    ) -> list[sqlite3.Row]:
-        with self._conn() as conn:
-            return conn.execute(
-                """
-                SELECT * FROM alert_dispatches
-                WHERE project_id = ? AND environment_id = ?
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (project_id, environment_id, max(1, min(int(limit), 500))),
-            ).fetchall()
 
-    def _alert_route_from_row(self, row: sqlite3.Row) -> "AlertRouteRow":
-        return AlertRouteRow(
-            id=str(row["id"]),
-            public_id=str(row["public_id"]),
-            project_id=str(row["project_id"]),
-            environment_id=str(row["environment_id"]),
-            name=str(row["name"]),
-            enabled=bool(row["enabled"]),
-            rule_name=str(row["rule_name"] or ""),
-            target_kind=str(row["target_kind"]),
-            target_url=str(row["target_url"]),
-            target_secret=str(row["target_secret"] or ""),
-            min_severity=str(row["min_severity"] or ""),
-            dedup_window_seconds=int(row["dedup_window_seconds"] or 0),
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
-            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
-        )
 
-    def _refresh_incident_rollup(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        incident_id: str,
-    ) -> None:
-        rows = conn.execute(
-            """
-            SELECT severity, updated_at
-            FROM incident_failures inf
-            JOIN failures f ON f.id = inf.failure_id
-            WHERE inf.incident_id = ?
-            """,
-            (incident_id,),
-        ).fetchall()
-        evidence_count = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM incident_failures inf
-            JOIN failure_evidence ev ON ev.failure_id = inf.failure_id
-            WHERE inf.incident_id = ?
-            """,
-            (incident_id,),
-        ).fetchone()
-        severity = _rollup_severity([str(row["severity"] or "") for row in rows])
-        conn.execute(
-            """
-            UPDATE incidents
-            SET failure_count = ?,
-                evidence_count = ?,
-                severity = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                len(rows),
-                int(evidence_count["count"] if evidence_count is not None else 0),
-                severity,
-                datetime.now(timezone.utc).isoformat(),
-                incident_id,
-            ),
-        )
 
-    def _refresh_incidents_for_failure(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        failure_id: str,
-    ) -> None:
-        rows = conn.execute(
-            """
-            SELECT incident_id
-            FROM incident_failures
-            WHERE failure_id = ?
-            """,
-            (failure_id,),
-        ).fetchall()
-        for row in rows:
-            self._refresh_incident_rollup(
-                conn,
-                incident_id=str(row["incident_id"]),
-            )
 
-    def _replace_failure_trace_map(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        failure_id: str,
-        metadata: dict[str, Any],
-    ) -> None:
-        conn.execute("DELETE FROM failure_trace_map WHERE failure_id = ?", (failure_id,))
-        trace_ids = _string_values(metadata.get("trace_ids"))
-        span_ids = _string_values(metadata.get("span_ids")) or [""]
-        for trace_id in trace_ids:
-            for span_id in span_ids:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO failure_trace_map
-                    (failure_id, trace_id, span_id)
-                    VALUES (?, ?, ?)
-                    """,
-                    (failure_id, trace_id, span_id),
-                )
 
-    def _backfill_failure_trace_map(self, conn: sqlite3.Connection) -> None:
-        rows = conn.execute(
-            """
-            SELECT id, metadata_json
-            FROM failures
-            WHERE id NOT IN (SELECT DISTINCT failure_id FROM failure_trace_map)
-            """
-        ).fetchall()
-        for row in rows:
-            self._replace_failure_trace_map(
-                conn,
-                failure_id=str(row["id"]),
-                metadata=self._safe_json_obj(row["metadata_json"]),
-            )
 
-    def record_deploy_marker(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        sha: str,
-        branch: str = "",
-        author: str = "",
-        deployed_at_ms: int = 0,
-        changed_files: Optional[list[str]] = None,
-        metadata: Optional[dict[str, Any]] = None,
-    ) -> str:
-        clean_sha = sha.strip()
-        if not clean_sha:
-            raise ValueError("sha is required")
-        now = datetime.now(timezone.utc).isoformat()
-        deploy_id = self._id("dep")
-        public_id = self._public_id("dep", project_id, environment_id, clean_sha)
-        changed_files_was_omitted = changed_files is None
-        metadata_was_omitted = metadata is None
-        clean_changed_files = self._merge_string_lists(changed_files or [])
-        try:
-            metadata_json = json.dumps(metadata or {}, sort_keys=True)
-            changed_files_json = json.dumps(clean_changed_files, sort_keys=True)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("deploy marker metadata must be JSON-serializable") from exc
-        with self._conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO deploy_markers
-                (id, public_id, project_id, environment_id, sha, branch, author,
-                 deployed_at_ms, changed_files_json, metadata_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, environment_id, sha) DO UPDATE SET
-                    branch = excluded.branch,
-                    author = excluded.author,
-                    deployed_at_ms = excluded.deployed_at_ms,
-                    changed_files_json = CASE
-                        WHEN ? THEN deploy_markers.changed_files_json
-                        ELSE excluded.changed_files_json
-                    END,
-                    metadata_json = CASE
-                        WHEN ? THEN deploy_markers.metadata_json
-                        ELSE excluded.metadata_json
-                    END,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    deploy_id,
-                    public_id,
-                    project_id,
-                    environment_id,
-                    clean_sha,
-                    branch.strip(),
-                    author.strip(),
-                    int(deployed_at_ms),
-                    changed_files_json,
-                    metadata_json,
-                    now,
-                    now,
-                    int(changed_files_was_omitted),
-                    int(metadata_was_omitted),
-                ),
-            )
-            row = conn.execute(
-                """
-                SELECT id
-                FROM deploy_markers
-                WHERE project_id = ? AND environment_id = ? AND sha = ?
-                """,
-                (project_id, environment_id, clean_sha),
-            ).fetchone()
-            assert row is not None
-            return str(row["id"])
 
-    def get_deploy_marker(self, deploy_id: str) -> Optional[DeployMarkerRow]:
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT *
-                FROM deploy_markers
-                WHERE id = ? OR public_id = ? OR sha = ?
-                ORDER BY deployed_at_ms DESC
-                LIMIT 1
-                """,
-                (deploy_id, deploy_id, deploy_id),
-            ).fetchone()
-        return self._deploy_marker_from_row(row) if row is not None else None
 
-    def get_deploy_marker_by_sha(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        sha: str,
-    ) -> Optional[DeployMarkerRow]:
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT *
-                FROM deploy_markers
-                WHERE project_id = ? AND environment_id = ? AND sha = ?
-                """,
-                (project_id, environment_id, sha),
-            ).fetchone()
-        return self._deploy_marker_from_row(row) if row is not None else None
 
-    def list_deploy_markers(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        limit: int = 50,
-    ) -> list[DeployMarkerRow]:
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM deploy_markers
-                WHERE project_id = ? AND environment_id = ?
-                ORDER BY deployed_at_ms DESC, updated_at DESC
-                LIMIT ?
-                """,
-                (project_id, environment_id, max(1, min(int(limit), 500))),
-            ).fetchall()
-        return [self._deploy_marker_from_row(row) for row in rows]
 
-    def nearest_deploy_marker(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        at_ms: int,
-    ) -> Optional[DeployMarkerRow]:
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT *
-                FROM deploy_markers
-                WHERE project_id = ? AND environment_id = ?
-                  AND deployed_at_ms <= ?
-                ORDER BY deployed_at_ms DESC, updated_at DESC
-                LIMIT 1
-                """,
-                (project_id, environment_id, max(0, int(at_ms))),
-            ).fetchone()
-        return self._deploy_marker_from_row(row) if row is not None else None
 
-    def update_failure_deploy(self, *, failure_id: str, deploy_sha: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        with self._conn() as conn:
-            conn.execute(
-                """
-                UPDATE failures
-                SET related_deploy_sha = ?, updated_at = ?
-                WHERE id = ? OR public_id = ?
-                """,
-                (deploy_sha.strip(), now, failure_id, failure_id),
-            )
-            row = conn.execute(
-                """
-                SELECT id
-                FROM failures
-                WHERE id = ? OR public_id = ?
-                """,
-                (failure_id, failure_id),
-            ).fetchone()
-            if row is not None:
-                self._refresh_incidents_for_failure(
-                    conn,
-                    failure_id=str(row["id"]),
-                )
 
-    def _deploy_marker_from_row(self, row: sqlite3.Row) -> DeployMarkerRow:
-        return DeployMarkerRow(
-            id=str(row["id"]),
-            public_id=str(row["public_id"]),
-            project_id=str(row["project_id"]),
-            environment_id=str(row["environment_id"]),
-            sha=str(row["sha"]),
-            branch=str(row["branch"] or ""),
-            author=str(row["author"] or ""),
-            deployed_at_ms=int(row["deployed_at_ms"] or 0),
-            changed_files=self._parse_string_list_json(row["changed_files_json"]),
-            metadata=dict(self._safe_json_obj(row["metadata_json"])),
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
-            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
-        )
 
-    def upsert_source_map(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        release: str,
-        artifact_url: str,
-        source_map: dict[str, Any],
-        dist: str = "",
-    ) -> str:
-        clean_release = release.strip()
-        clean_artifact_url = artifact_url.strip()
-        if not clean_release:
-            raise ValueError("release is required")
-        if not clean_artifact_url:
-            raise ValueError("artifact_url is required")
-        if not isinstance(source_map, dict) or not source_map:
-            raise ValueError("source_map must be a non-empty object")
-        self._validate_source_map_payload(source_map)
-        try:
-            source_map_json = json.dumps(source_map, sort_keys=True)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("source_map must be JSON-serializable") from exc
-        source_map_id = self._public_id(
-            "smap", project_id, environment_id, clean_release, dist.strip(), clean_artifact_url
-        )
-        public_id = source_map_id
-        now = datetime.now(timezone.utc).isoformat()
-        with self._conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO source_maps
-                (id, public_id, project_id, environment_id, release, dist,
-                 artifact_url, source_map_json, uploaded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, environment_id, release, dist, artifact_url)
-                DO UPDATE SET
-                    source_map_json = excluded.source_map_json,
-                    uploaded_at = excluded.uploaded_at
-                """,
-                (
-                    source_map_id,
-                    public_id,
-                    project_id,
-                    environment_id,
-                    clean_release,
-                    dist.strip(),
-                    clean_artifact_url,
-                    source_map_json,
-                    now,
-                ),
-            )
-        return source_map_id
 
-    def list_source_maps(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        release: str,
-        dist: Optional[str] = "",
-        limit: int = 100,
-    ) -> list[SourceMapRow]:
-        where = "project_id = ? AND environment_id = ? AND release = ?"
-        params: list[object] = [project_id, environment_id, release.strip()]
-        if dist is not None:
-            where += " AND dist = ?"
-            params.append(dist.strip())
-        params.append(max(1, min(int(limit), 500)))
-        with self._conn() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT *
-                FROM source_maps
-                WHERE {where}
-                ORDER BY uploaded_at DESC, artifact_url
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-        return [self._source_map_from_row(row) for row in rows]
 
-    def list_recent_source_maps(
-        self,
-        *,
-        project_id: str,
-        environment_id: str,
-        limit: int = 100,
-    ) -> list[SourceMapRow]:
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM source_maps
-                WHERE project_id = ? AND environment_id = ?
-                ORDER BY uploaded_at DESC
-                LIMIT ?
-                """,
-                (
-                    project_id,
-                    environment_id,
-                    max(1, min(int(limit), 500)),
-                ),
-            ).fetchall()
-        return [self._source_map_from_row(row) for row in rows]
-
-    def _validate_source_map_payload(self, source_map: dict[str, Any]) -> None:
-        if source_map.get("version") != 3:
-            raise ValueError("source_map must be a supported Source Map v3 object")
-        if not isinstance(source_map.get("mappings"), str) or not source_map.get(
-            "mappings"
-        ):
-            raise ValueError("source_map mappings must be a non-empty string")
-        sources = source_map.get("sources")
-        if not isinstance(sources, list) or not sources:
-            raise ValueError("source_map sources must be a non-empty list")
-        if not all(isinstance(item, str) and item.strip() for item in sources):
-            raise ValueError("source_map sources must contain only non-empty strings")
-        names = source_map.get("names")
-        if names is not None and not isinstance(names, list):
-            raise ValueError("source_map names must be a list when provided")
-        source_root = source_map.get("sourceRoot")
-        if source_root is not None and not isinstance(source_root, str):
-            raise ValueError("source_map sourceRoot must be a string when provided")
-        file_value = source_map.get("file")
-        if file_value is not None and not isinstance(file_value, str):
-            raise ValueError("source_map file must be a string when provided")
 
     def consume_ingest_rate_limit(
         self,
@@ -2627,7 +1483,7 @@ class Storage:
                 [clean_project, clean_environment, clean_bucket, clean_identity]
             ).encode("utf-8")
         ).hexdigest()
-        row_id = self._id("rlim")
+        row_id = _id("rlim")
         now = datetime.now(timezone.utc).isoformat()
         cutoff = datetime.fromtimestamp(
             (current_ms / 1000) - INGEST_RATE_LIMIT_RETENTION_SECONDS,
@@ -2985,7 +1841,7 @@ class Storage:
         )
 
     # ---------------------------------------------------------------
-    # P2.3 — global retention helpers.
+    # P2.3 -- global retention helpers.
     #
     # `prune_app_error_retention` above is scoped to a single
     # (project, environment) and the app-error domain. These two
@@ -3002,7 +1858,7 @@ class Storage:
     ) -> int:
         """Delete `replay_batches` rows older than `retention_days`.
 
-        Replay batches store the rrweb payload blobs — by far the
+        Replay batches store the rrweb payload blobs -- by far the
         largest table by bytes in a healthy install. Pruning by
         `received_at` is safe because nothing else references batch
         rows by FK; orphaned `replay_sessions` rows are tiny and
@@ -3086,18 +1942,6 @@ class Storage:
         )
         return list(pairs)
 
-    def _source_map_from_row(self, row: sqlite3.Row) -> SourceMapRow:
-        return SourceMapRow(
-            id=str(row["id"]),
-            public_id=str(row["public_id"]),
-            project_id=str(row["project_id"]),
-            environment_id=str(row["environment_id"]),
-            release=str(row["release"]),
-            dist=str(row["dist"] or ""),
-            artifact_url=str(row["artifact_url"]),
-            source_map=dict(self._safe_json_obj(row["source_map_json"])),
-            uploaded_at=self._dt(row["uploaded_at"]) or datetime.now(timezone.utc),
-        )
 
     def append_otel_event(
         self,
@@ -3117,7 +1961,7 @@ class Storage:
             attributes_json = json.dumps(attributes or {}, sort_keys=True)
         except (TypeError, ValueError) as exc:
             raise ValueError("otel attributes must be JSON-serializable") from exc
-        event_id = self._public_id(
+        event_id = _public_id(
             "otel",
             project_id,
             environment_id,
@@ -3231,8 +2075,8 @@ class Storage:
             severity=str(row["severity"] or ""),
             body=str(row["body"] or ""),
             occurred_at_ms=int(row["occurred_at_ms"] or 0),
-            attributes=dict(self._safe_json_obj(row["attributes_json"])),
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            attributes=dict(_safe_json_obj(row["attributes_json"])),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
         )
 
     def upsert_failure_with_evidence_and_repair_task(
@@ -3243,7 +2087,7 @@ class Storage:
         repair_task: dict[str, Any],
     ) -> tuple[str, list[str], str]:
         now = datetime.now(timezone.utc).isoformat()
-        failure_id = self._id("flr")
+        failure_id = _id("flr")
         with self._conn() as conn:
             persisted_failure_id = self._upsert_failure(
                 conn,
@@ -3316,12 +2160,12 @@ class Storage:
         if not failure_id:
             raise ValueError("failure_id is required")
         now = datetime.now(timezone.utc).isoformat()
-        task_id = self._id("rpr")
-        public_id = self._public_id("rpr", failure_id)
+        task_id = _id("rpr")
+        public_id = _public_id("rpr", failure_id)
         normalized_status = normalize_repair_task_status(status)
-        clean_likely_files = self._merge_string_lists(likely_files or [])
-        clean_validation = self._merge_string_lists(validation_commands or [])
-        clean_evidence_ids = self._merge_string_lists(evidence_ids or [])
+        clean_likely_files = _merge_string_lists(likely_files or [])
+        clean_validation = _merge_string_lists(validation_commands or [])
+        clean_evidence_ids = _merge_string_lists(evidence_ids or [])
         try:
             prompt_json = json.dumps(prompt_artifacts or [], sort_keys=True)
             metadata_json = json.dumps(metadata or {}, sort_keys=True)
@@ -3375,12 +2219,12 @@ class Storage:
         if not failure_id:
             raise ValueError("failure_id is required")
         now = now or datetime.now(timezone.utc).isoformat()
-        task_id = task_id or self._id("rpr")
-        public_id = public_id or self._public_id("rpr", failure_id)
+        task_id = task_id or _id("rpr")
+        public_id = public_id or _public_id("rpr", failure_id)
         normalized_status = normalize_repair_task_status(status)
-        clean_likely_files = self._merge_string_lists(likely_files or [])
-        clean_validation = self._merge_string_lists(validation_commands or [])
-        clean_evidence_ids = self._merge_string_lists(evidence_ids or [])
+        clean_likely_files = _merge_string_lists(likely_files or [])
+        clean_validation = _merge_string_lists(validation_commands or [])
+        clean_evidence_ids = _merge_string_lists(evidence_ids or [])
         try:
             prompt_json = json.dumps(prompt_artifacts or [], sort_keys=True)
             metadata_json = json.dumps(metadata or {}, sort_keys=True)
@@ -3532,7 +2376,7 @@ class Storage:
             ).fetchone()
             if row is None:
                 return None
-            merged_metadata = dict(self._safe_json_obj(row["metadata_json"]))
+            merged_metadata = dict(_safe_json_obj(row["metadata_json"]))
             if metadata:
                 merged_metadata.update(metadata)
             try:
@@ -3648,7 +2492,7 @@ class Storage:
         if pr_number <= 0:
             raise ValueError("pr_number must be positive")
         clean_status = _normalize_github_review_run_status(status or "queued")
-        run_id = self._id("ghrr")
+        run_id = _id("ghrr")
         now = datetime.now(timezone.utc).isoformat()
         try:
             metadata_json = json.dumps(metadata or {}, sort_keys=True)
@@ -3801,7 +2645,7 @@ class Storage:
             ).fetchone()
             if failure_row is None:
                 raise ValueError(f"unknown failure_id: {failure_id}")
-            link_id = self._id("ftl")
+            link_id = _id("ftl")
             conn.execute(
                 """
                 INSERT INTO failure_test_links
@@ -4028,7 +2872,7 @@ class Storage:
                     ON CONFLICT(failure_id, spec_id) DO NOTHING
                     """,
                     (
-                        self._id("ftl"),
+                        _id("ftl"),
                         str(row["id"]),
                         spec_id,
                         link["spec_name"],
@@ -4129,11 +2973,11 @@ class Storage:
         if row is None:
             return
         spec_id = spec_id.strip()
-        linked = self._merge_string_lists(
-            self._parse_string_list_json(row["linked_tests_json"]),
+        linked = _merge_string_lists(
+            _parse_string_list_json(row["linked_tests_json"]),
             [spec_id],
         )
-        if linked != self._parse_string_list_json(row["linked_tests_json"]):
+        if linked != _parse_string_list_json(row["linked_tests_json"]):
             conn.execute(
                 """
                 UPDATE failures
@@ -4147,17 +2991,6 @@ class Storage:
                 ),
             )
 
-    @staticmethod
-    def _merge_string_lists(*values: list[str]) -> list[str]:
-        merged: list[str] = []
-        seen: set[str] = set()
-        for value_list in values:
-            for value in value_list:
-                item = str(value or "").strip()
-                if item and item not in seen:
-                    seen.add(item)
-                    merged.append(item)
-        return merged
 
     def _failure_test_link_from_row(self, row: sqlite3.Row) -> FailureTestLinkRow:
         latest_run_ok: Optional[bool]
@@ -4179,9 +3012,9 @@ class Storage:
             latest_run_status=str(row["latest_run_status"] or ""),
             latest_run_classification=str(row["latest_run_classification"] or ""),
             latest_run_ok=latest_run_ok,
-            latest_run_at=self._dt(row["latest_run_at"]),
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
-            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+            latest_run_at=_dt(row["latest_run_at"]),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=_dt(row["updated_at"]) or datetime.now(timezone.utc),
         )
 
     def _repair_task_from_row(
@@ -4200,18 +3033,18 @@ class Storage:
             source_external_id=str(row["source_external_id"] or ""),
             title=str(row["title"] or ""),
             status=str(row["status"] or "open"),
-            likely_files=self._parse_string_list_json(row["likely_files_json"]),
-            prompt_artifacts=self._parse_dict_list_json(row["prompt_artifacts_json"]),
-            validation_commands=self._parse_string_list_json(
+            likely_files=_parse_string_list_json(row["likely_files_json"]),
+            prompt_artifacts=_parse_dict_list_json(row["prompt_artifacts_json"]),
+            validation_commands=_parse_string_list_json(
                 row["validation_commands_json"]
             ),
             branch=str(row["branch"] or ""),
             pr_url=str(row["pr_url"] or ""),
             risk_notes=str(row["risk_notes"] or ""),
-            metadata=dict(self._safe_json_obj(row["metadata_json"])),
+            metadata=dict(_safe_json_obj(row["metadata_json"])),
             evidence_ids=evidence_ids,
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
-            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=_dt(row["updated_at"]) or datetime.now(timezone.utc),
         )
 
     def _github_review_run_from_row(
@@ -4227,9 +3060,9 @@ class Storage:
             comment_url=str(row["comment_url"] or ""),
             status=str(row["status"] or "queued"),
             trigger_phrase=str(row["trigger_phrase"] or "@retrace review"),
-            metadata=dict(self._safe_json_obj(row["metadata_json"])),
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
-            updated_at=self._dt(row["updated_at"]) or datetime.now(timezone.utc),
+            metadata=dict(_safe_json_obj(row["metadata_json"])),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=_dt(row["updated_at"]) or datetime.now(timezone.utc),
         )
 
     def _backfill_replay_issue_evidence(
@@ -4255,21 +3088,12 @@ class Storage:
             occurred_at_ms=int(row["occurred_at_ms"] or 0),
             source=str(row["source"] or ""),
             redaction_state=str(row["redaction_state"] or "raw"),
-            payload=dict(self._safe_json_obj(row["payload_json"])),
+            payload=dict(_safe_json_obj(row["payload_json"])),
             artifact_path=str(row["artifact_path"] or ""),
             dedupe_key=str(row["dedupe_key"] or ""),
-            created_at=self._dt(row["created_at"]) or datetime.now(timezone.utc),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
         )
 
-    @staticmethod
-    def _parse_dict_list_json(raw: object) -> list[dict[str, Any]]:
-        try:
-            parsed = json.loads(str(raw or "[]"))
-        except Exception:
-            return []
-        if not isinstance(parsed, list):
-            return []
-        return [item for item in parsed if isinstance(item, dict)]
 
     def get_sdk_key_by_hash(self, key_hash: str) -> Optional[SDKKeyRow]:
         with self._conn() as conn:
@@ -4292,9 +3116,9 @@ class Storage:
             prefix=str(r["prefix"]),
             key_hash=str(r["key_hash"]),
             last4=str(r["last4"]),
-            revoked_at=self._dt(r["revoked_at"]),
-            last_used_at=self._dt(r["last_used_at"]),
-            created_at=self._dt(r["created_at"]) or datetime.now(timezone.utc),
+            revoked_at=_dt(r["revoked_at"]),
+            last_used_at=_dt(r["last_used_at"]),
+            created_at=_dt(r["created_at"]) or datetime.now(timezone.utc),
         )
 
     def list_sdk_keys(
@@ -4338,9 +3162,9 @@ class Storage:
                 prefix=str(r["prefix"]),
                 key_hash=str(r["key_hash"]),
                 last4=str(r["last4"]),
-                revoked_at=self._dt(r["revoked_at"]),
-                last_used_at=self._dt(r["last_used_at"]),
-                created_at=self._dt(r["created_at"]) or datetime.now(timezone.utc),
+                revoked_at=_dt(r["revoked_at"]),
+                last_used_at=_dt(r["last_used_at"]),
+                created_at=_dt(r["created_at"]) or datetime.now(timezone.utc),
             )
             for r in rows
         ]
@@ -4360,7 +3184,7 @@ class Storage:
         token_hash: str,
         scopes: list[str],
     ) -> str:
-        token_id = self._id("svc")
+        token_id = _id("svc")
         with self._conn() as conn:
             conn.execute(
                 """
@@ -4396,10 +3220,10 @@ class Storage:
             project_id=str(r["project_id"]),
             name=str(r["name"]),
             token_hash=str(r["token_hash"]),
-            scopes=self._parse_string_list_json(r["scopes_json"]),
-            revoked_at=self._dt(r["revoked_at"]),
-            last_used_at=self._dt(r["last_used_at"]),
-            created_at=self._dt(r["created_at"]) or datetime.now(timezone.utc),
+            scopes=_parse_string_list_json(r["scopes_json"]),
+            revoked_at=_dt(r["revoked_at"]),
+            last_used_at=_dt(r["last_used_at"]),
+            created_at=_dt(r["created_at"]) or datetime.now(timezone.utc),
         )
 
     def touch_service_token(self, token_id: str) -> None:
@@ -4448,7 +3272,7 @@ class Storage:
         now = datetime.now(timezone.utc).isoformat()
         clean_flush = flush_type if flush_type in {"normal", "final"} else "normal"
         event_count = len(events)
-        preview = self._replay_preview(events)
+        preview = _replay_preview(events)
         blob_backend = ""
         blob_key = ""
         payload_json = json.dumps(
@@ -4465,7 +3289,7 @@ class Storage:
 
         with self._conn() as conn:
             processing_job_id: Optional[str] = None
-            session_row_id = self._id("rs")
+            session_row_id = _id("rs")
             conn.execute(
                 """
                 INSERT OR IGNORE INTO replay_sessions
@@ -4498,11 +3322,11 @@ class Storage:
             ).fetchone()
             assert row is not None
             session_row_id = str(row["id"])
-            existing_metadata = self._safe_json_obj(row["metadata_json"])
+            existing_metadata = _safe_json_obj(row["metadata_json"])
             merged_metadata = {**existing_metadata, **(metadata or {})}
-            existing_preview = self._safe_json_obj(row["preview_json"])
+            existing_preview = _safe_json_obj(row["preview_json"])
 
-            batch_id = self._id("rb")
+            batch_id = _id("rb")
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO replay_batches
@@ -4554,7 +3378,7 @@ class Storage:
                         """,
                         (blob_backend, blob_key, batch_id),
                     )
-                merged_preview = self._merge_replay_preview(
+                merged_preview = _merge_replay_preview(
                     existing_preview,
                     preview,
                     event_count=int(row["event_count"] or 0) + event_count,
@@ -4614,7 +3438,7 @@ class Storage:
         payload: dict[str, object],
         conn: Optional[sqlite3.Connection] = None,
     ) -> str:
-        job_id = self._id("job")
+        job_id = _id("job")
         now = datetime.now(timezone.utc).isoformat()
 
         def _insert(c: sqlite3.Connection) -> str:
@@ -4806,11 +3630,11 @@ class Storage:
             ).fetchall()
 
     # ---------------------------------------------------------------
-    # P3.6 — server-side replay (scaffold).
+    # P3.6 -- server-side replay (scaffold).
     #
     # Storage seam for the eventual Node / Python capture
     # middleware. The middleware itself is intentionally NOT in
-    # scope here — building Node + Python capture without a real
+    # scope here -- building Node + Python capture without a real
     # SSR-replay user is the speculative-bloat trap. These methods
     # exist so the ingest endpoint has a place to write to and
     # tests can pin the storage round-trip.
@@ -4837,12 +3661,12 @@ class Storage:
         """Persist a single server-replay session record.
 
         Returns the inserted row id. Sensitive request/response
-        headers should be redacted BEFORE this method is called —
+        headers should be redacted BEFORE this method is called --
         no automatic redaction here, since the caller (capture
         middleware) is the only side that knows what to keep.
         """
-        row_id = self._id("ssr")
-        public_id = self._public_id(
+        row_id = _id("ssr")
+        public_id = _public_id(
             "ssr",
             project_id,
             environment_id,
@@ -4940,7 +3764,7 @@ class Storage:
             except Exception:
                 pass
 
-        payload = self._safe_json_obj(batch["payload_json"])
+        payload = _safe_json_obj(batch["payload_json"])
         batch_events = payload.get("events")
         if not isinstance(batch_events, list):
             return []
@@ -5039,7 +3863,7 @@ class Storage:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        self._id("sig"),
+                        _id("sig"),
                         project_id,
                         environment_id,
                         session_id,
@@ -5109,7 +3933,7 @@ class Storage:
     ) -> ReplayIssueUpsertResult:
         now = datetime.now(timezone.utc).isoformat()
         public_id = self.make_issue_public_id(project_id, environment_id, fingerprint)
-        issue_id = self._id("ri")
+        issue_id = _id("ri")
         clean_session_ids = list(dict.fromkeys(str(s) for s in session_ids if str(s)))
         representative_session_id = clean_session_ids[0] if clean_session_ids else ""
         with self._conn() as conn:
@@ -5323,7 +4147,7 @@ class Storage:
                 conn,
                 failure=canonical_failure_from_replay_issue(dict(issue_row)),
                 now=now,
-                failure_id=self._id("flr"),
+                failure_id=_id("flr"),
             )
             conn.execute(
                 """
@@ -5337,7 +4161,7 @@ class Storage:
                 conn,
                 failure_id=canonical_failure_id,
                 issue_public_id=public_id,
-                evidence=dict(self._safe_json_obj(issue_row["evidence_json"])),
+                evidence=dict(_safe_json_obj(issue_row["evidence_json"])),
             )
         return ReplayIssueUpsertResult(
             issue_id=issue_id,
@@ -5874,8 +4698,8 @@ class Storage:
                 session_url=str(r["session_url"]),
                 evidence_text=str(r["evidence_text"]),
                 distinct_id=str(r["distinct_id"] or ""),
-                error_issue_ids=self._parse_string_list_json(r["error_issue_ids_json"]),
-                trace_ids=self._parse_string_list_json(r["trace_ids_json"]),
+                error_issue_ids=_parse_string_list_json(r["error_issue_ids_json"]),
+                trace_ids=_parse_string_list_json(r["trace_ids_json"]),
                 top_stack_frame=str(r["top_stack_frame"] or ""),
                 error_tracking_url=str(r["error_tracking_url"] or ""),
                 logs_url=str(r["logs_url"] or ""),
@@ -5997,23 +4821,7 @@ class Storage:
                 )
         return result
 
-    @staticmethod
-    def _parse_string_list_json(raw: object) -> list[str]:
-        try:
-            parsed = json.loads(str(raw or "[]"))
-        except Exception:
-            return []
-        if not isinstance(parsed, list):
-            return []
-        return [str(item) for item in parsed]
 
-    @staticmethod
-    def _safe_json_obj(raw: object) -> dict[str, object]:
-        try:
-            parsed = json.loads(str(raw or "{}"))
-        except Exception:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
 
     def replace_code_candidates(
         self,
@@ -6118,7 +4926,7 @@ class Storage:
         ]
 
     # ------------------------------------------------------------------
-    # QA Incidents — the unified shape for replay/UI/API issues.
+    # QA Incidents -- the unified shape for replay/UI/API issues.
     #
     # Separate from the master `incidents` table (which tracks monitoring
     # failure groupings + repair tasks). QA incidents own the
@@ -6133,7 +4941,7 @@ class Storage:
         constraint. Returns ``(incident_id, inserted)``.
 
         Note: callers that need the **persisted** ``public_id`` should use
-        :meth:`upsert_qa_incident_returning` — the public_id is NOT in the
+        :meth:`upsert_qa_incident_returning` -- the public_id is NOT in the
         DO UPDATE clause, so on conflict the stored value differs from the
         candidate one in ``row``. Returning a bare ``id`` here preserves
         the prior signature for existing callers.
@@ -6176,7 +4984,7 @@ class Storage:
         )
 
         with self._conn() as conn:
-            # Pre-check is advisory only — it informs the return value but the
+            # Pre-check is advisory only -- it informs the return value but the
             # upsert itself remains atomic, so concurrent writers can't lose
             # data. The narrow remaining race (two writers both see "not
             # exists" and both report inserted=True) is benign: the stored
@@ -6192,7 +5000,7 @@ class Storage:
             cur = conn.execute(sql, tuple(row[k] for k in required))
             res = cur.fetchone()
             if res is None:
-                # Defensive — SQLite returns a row from RETURNING for both
+                # Defensive -- SQLite returns a row from RETURNING for both
                 # branches, but if a future driver swap broke that we'd
                 # rather raise than lie about persistence.
                 raise RuntimeError("upsert_qa_incident: no row returned from upsert")
@@ -6318,7 +5126,7 @@ class Storage:
     ) -> int:
         """Persist one LLM review run so future reviews can reference it.
 
-        Returns the row id. The `(repo, pr_number)` pair is NOT unique —
+        Returns the row id. The `(repo, pr_number)` pair is NOT unique --
         if you call `retrace review --post-comment` twice on the same
         PR, you get two rows, and `list_llm_pr_reviews_for_paths`
         returns the most recent first.
@@ -6364,7 +5172,7 @@ class Storage:
         """Find recent LLM reviews touching any path in `paths`.
 
         SQLite doesn't have a portable JSON-array-contains operator, so
-        we scan the most-recent N rows (cheap — capped by `limit * 6`)
+        we scan the most-recent N rows (cheap -- capped by `limit * 6`)
         and filter in Python. Good enough for the OSS scale we target.
 
         Pass `exclude_pr_number` to filter out the PR we're currently
@@ -6407,14 +5215,14 @@ class Storage:
         return out
 
     # ---------------------------------------------------------------
-    # P3.1 — flake quarantine.
+    # P3.1 -- flake quarantine.
     #
     # Two surfaces:
-    #   * `record_tester_run_outcome(spec_id, outcome)` — call after
+    #   * `record_tester_run_outcome(spec_id, outcome)` -- call after
     #     every tester run. Appends to the rolling outcome window
     #     and re-evaluates whether the spec should auto-quarantine
     #     or auto-release. Returns the resulting status.
-    #   * `is_spec_quarantined(spec_id)` — fast read used by the
+    #   * `is_spec_quarantined(spec_id)` -- fast read used by the
     #     incident-filing gate.
     # ---------------------------------------------------------------
 
@@ -6455,7 +5263,7 @@ class Storage:
                 """,
                 (clean_spec, run_id or "", normalized),
             )
-            # Prune the rolling window — keep only the most-recent
+            # Prune the rolling window -- keep only the most-recent
             # _RUN_OUTCOME_WINDOW rows per spec so the table doesn't
             # grow without bound on long-lived installs.
             conn.execute(
@@ -6519,8 +5327,8 @@ class Storage:
                         # Time-bound to a single 24h window so an old
                         # pass / new pass with a months-old fail in
                         # between doesn't trip the heuristic.
-                        first = self._dt(three[2]["recorded_at"])
-                        last = self._dt(three[0]["recorded_at"])
+                        first = _dt(three[2]["recorded_at"])
+                        last = _dt(three[0]["recorded_at"])
                         # `_dt` returns either naive or TZ-aware
                         # depending on whether the stored timestamp
                         # had a `+00:00` suffix. SQLite's
@@ -6545,7 +5353,7 @@ class Storage:
                     reason=reason,
                 )
             elif current is None:
-                # First-ever outcome for this spec — seed an
+                # First-ever outcome for this spec -- seed an
                 # `active` row so `list_quarantined_specs` and
                 # `release_spec_quarantine` have a stable target.
                 self._write_quarantine_state(
@@ -6645,7 +5453,7 @@ class Storage:
         ]
 
     def force_quarantine_spec(self, *, spec_id: str, reason: str = "") -> None:
-        """Manual override — operator decided a spec is flaky and
+        """Manual override -- operator decided a spec is flaky and
         wants it off the qa_incident escalation path even though the
         auto-quarantine heuristic hasn't tripped yet."""
         clean = spec_id.strip()
@@ -6751,7 +5559,7 @@ class Storage:
                 (spec_id, status, reason, quarantined_at, released_at, now_iso),
             )
             return
-        # Existing row — only stamp transitions, preserve the
+        # Existing row -- only stamp transitions, preserve the
         # pre-existing quarantined_at when toggling back to active so
         # an audit trail survives.
         new_quarantined_at = (
