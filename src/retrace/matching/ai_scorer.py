@@ -1,10 +1,8 @@
-from __future__ import annotations
-
 """AI-enhanced code candidate reranking."""
 
-import json
+from __future__ import annotations
+
 import logging
-from typing import Any
 
 from retrace.llm.client import LLMClient
 from retrace.matching.scorer import CodeCandidate
@@ -65,11 +63,13 @@ Candidate Files:
         path_to_candidate = {c.file_path: c for c in pool}
 
         final_candidates: list[CodeCandidate] = []
+        seen_paths: set[str] = set()
         for path in ranked_paths:
             # Handle cases where LLM might return paths with leading slashes or slightly different casing
             clean_path = str(path).strip().lstrip("/")
-            if clean_path in path_to_candidate:
+            if clean_path in path_to_candidate and clean_path not in seen_paths:
                 final_candidates.append(path_to_candidate[clean_path])
+                seen_paths.add(clean_path)
 
         # Fill remaining slots with original top candidates if LLM returned fewer than top_n
         seen = {c.file_path for c in final_candidates}

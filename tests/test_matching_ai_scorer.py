@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock
-
-import pytest
 
 from retrace.matching.scorer import CodeCandidate
 from retrace.matching.ai_scorer import rerank_candidates_with_ai

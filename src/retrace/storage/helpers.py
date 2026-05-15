@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
@@ -104,7 +103,6 @@ def _merge_replay_preview(
     return merged
 
 def _slug(value: str) -> str:
-    import re
     out = "".join(
         c.lower() if c.isalnum() else "-"
         for c in str(value or "").strip()

@@ -13,9 +13,7 @@ import httpx
 from retrace.llm.client import build_llm_http_request, extract_llm_text_content
 
 from .models import (
-    FAILURE_CLASSIFICATIONS,
     TesterAssertionResult,
-    TesterSpec,
 )
 
 logger = logging.getLogger(__name__)

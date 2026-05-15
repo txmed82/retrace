@@ -12,13 +12,11 @@ Covers the full pipeline:
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from http.client import HTTPConnection
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-import pytest
 from click.testing import CliRunner
 
 from retrace.cli import main

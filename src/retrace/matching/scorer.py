@@ -5,7 +5,9 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
+from retrace.llm.client import LLMClient
 from retrace.matching.routes import RouteDefinition, load_route_manifest, route_matches
 from retrace.matching.sourcemaps import load_source_maps, map_stack_paths
 

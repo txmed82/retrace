@@ -7,8 +7,7 @@ from retrace.evidence import PROMPT_SAFE_REDACTION_STATES
 from ..helpers import (
     _SEVERITY_ORDER, _rollup_severity, _string_values,
     _normalize_app_error_incident_status, _id, _public_id, _dt,
-    _safe_json_obj, _merge_string_lists, _parse_string_list_json,
-    _parse_dict_list_json, APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS
+    _safe_json_obj, _merge_string_lists, APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS
 )
 from ..models import (
     FailureRow, EvidenceRow, IncidentRow, IncidentLifecycleEventRow,
@@ -17,7 +16,7 @@ from ..models import (
 from .base import BaseRepository
 
 if TYPE_CHECKING:
-    from ..core import Storage
+    pass
 
 class IncidentRepository(BaseRepository):
     def upsert_incident(

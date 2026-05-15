@@ -173,7 +173,7 @@ def incident_fix(
     open_pr: bool,
 ) -> None:
     """Generate a fix prompt and (by default) open a draft PR for this incident."""
-    store, _ = _open_store(config_path)
+    store, cfg = _open_store(config_path)
     repo = store.get_github_repo(repo_full_name)
     if repo is None:
         raise click.ClickException(

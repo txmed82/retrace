@@ -6,7 +6,6 @@ import sqlite3
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
-from uuid import uuid4
 import json
 from pathlib import Path
 from typing import Any, Optional
@@ -36,16 +35,11 @@ from .helpers import (
     _replay_preview,
     _merge_replay_preview,
     _slug,
-    _SEVERITY_ORDER,
-    _rollup_severity,
-    _string_values,
     _normalize_github_review_run_status,
-    _normalize_app_error_incident_status,
     _retention_interval,
     FAILURE_TEST_COVERAGE_STATES,
     INGEST_RATE_LIMIT_RETENTION_SECONDS,
     INGEST_RATE_LIMIT_MAX_IDENTITIES_PER_BUCKET,
-    APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS,
 )
 from .schema import SCHEMA
 from .models import (
@@ -78,7 +72,6 @@ from .models import (
     ProcessingJobUpdateResult,
 )
 from .blob import ReplayBlobStore, LocalReplayBlobStore
-from .repositories.incidents import IncidentRepository
 from .repositories.incidents import IncidentRepository
 
 class Storage:

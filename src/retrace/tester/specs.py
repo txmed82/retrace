@@ -22,7 +22,7 @@ from .models import (
 )
 
 if TYPE_CHECKING:
-    from .harness import _should_use_playwright
+    pass
 
 
 def _spec_path(specs_dir: Path, spec_id: str) -> Path:

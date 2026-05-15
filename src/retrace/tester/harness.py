@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,9 +29,7 @@ from retrace.script_steps import (
 
 from .models import (
     DEFAULT_HARNESS_COMMAND,
-    FAILURE_CLASSIFICATIONS,
     SUITE_PROPOSAL_SCHEMA_VERSION,
-    EngineSelection,
     TesterArtifact,
     TesterAssertionResult,
     TesterRunResult,
@@ -45,13 +42,10 @@ from .assertions import (
     _assertion_result,
     _assertion_text_for_classification,
     _classify_failure,
-    _evaluate_consensus_assertion,
     _evaluate_model_backed_consensus_assertion,
     _evaluate_native_assertion,
     _failed_selector_assertion,
     _flake_reason_from_classification,
-    _redacted_response_headers,
-    _response_assertion_evidence,
 )
 from .specs import load_spec, select_execution_engine, validate_spec, create_spec
 
@@ -214,18 +208,6 @@ def _join_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
-from .assertions import (
-    _assertion_result,
-    _assertion_text_for_classification,
-    _classify_failure,
-    _evaluate_consensus_assertion,
-    _evaluate_model_backed_consensus_assertion,
-    _evaluate_native_assertion,
-    _failed_selector_assertion,
-    _flake_reason_from_classification,
-    _redacted_response_headers,
-    _response_assertion_evidence,
-)
 
 def _cache_key_for_step(*, spec: TesterSpec, app_url: str, step: dict[str, Any]) -> str:
     payload = {
