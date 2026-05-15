@@ -5,7 +5,9 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
+from retrace.llm.client import LLMClient
 from retrace.matching.routes import RouteDefinition, load_route_manifest, route_matches
 from retrace.matching.sourcemaps import load_source_maps, map_stack_paths
 
@@ -400,6 +402,7 @@ def score_repo_for_finding(
     category: str,
     evidence_text: str,
     top_n: int = 8,
+    llm: Optional[LLMClient] = None,
 ) -> list[CodeCandidate]:
     terms = _keywords(title, category, evidence_text)
     stack_paths = _stack_frame_paths(evidence_text)
@@ -439,4 +442,19 @@ def score_repo_for_finding(
             )
         )
     scored.sort(key=lambda c: (-c.score, c.file_path))
+
+    if llm is not None:
+        from retrace.matching.ai_scorer import rerank_candidates_with_ai
+
+        ai_shortlist_size = max(top_n, 20)
+        shortlist = scored[:ai_shortlist_size]
+        return rerank_candidates_with_ai(
+            llm=llm,
+            candidates=shortlist,
+            title=title,
+            category=category,
+            evidence_text=evidence_text,
+            top_n=top_n,
+        )
+
     return scored[:top_n]
