@@ -400,6 +400,7 @@ def score_repo_for_finding(
     category: str,
     evidence_text: str,
     top_n: int = 8,
+    llm: Optional[LLMClient] = None,
 ) -> list[CodeCandidate]:
     terms = _keywords(title, category, evidence_text)
     stack_paths = _stack_frame_paths(evidence_text)
@@ -439,4 +440,17 @@ def score_repo_for_finding(
             )
         )
     scored.sort(key=lambda c: (-c.score, c.file_path))
+
+    if llm is not None:
+        from retrace.matching.ai_scorer import rerank_candidates_with_ai
+
+        return rerank_candidates_with_ai(
+            llm=llm,
+            candidates=scored,
+            title=title,
+            category=category,
+            evidence_text=evidence_text,
+            top_n=top_n,
+        )
+
     return scored[:top_n]

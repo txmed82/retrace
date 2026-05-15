@@ -396,6 +396,7 @@ def propose_fix_for_incident(
     open_pr: bool = True,
     draft: bool = True,
     apply_with_agent: str = "",   # "" | "auto" | "claude" | "codex"
+    llm: Optional[Any] = None,
 ) -> FixOutcome:
     """Build the fix PR for a single incident.
 
@@ -417,6 +418,7 @@ def propose_fix_for_incident(
                 [inc.summary, inc.suspected_cause, inc.actual_outcome, inc.evidence.top_stack_frame or ""]
             ),
             top_n=8,
+            llm=llm,
         )
 
     prompt_md = render_fix_prompt(inc=inc, candidates=candidates)

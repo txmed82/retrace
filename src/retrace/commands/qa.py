@@ -184,17 +184,21 @@ def incident_fix(
         raise click.ClickException(
             "No local checkout configured. Pass --repo-path or connect the repo with --local-path."
         )
-    outcome = propose_fix_for_incident(
-        store=store,
-        incident_id=incident_id,
-        repo_full_name=repo_full_name,
-        repo_path=effective_repo_path,
-        base_branch=base_branch or repo.default_branch or "main",
-        prompts_out_dir=out_dir,
-        open_pr=open_pr,
-        draft=draft,
-        apply_with_agent=apply_with,
-    )
+    from retrace.llm.client import LLMClient
+
+    with LLMClient(cfg.llm) as llm:
+        outcome = propose_fix_for_incident(
+            store=store,
+            incident_id=incident_id,
+            repo_full_name=repo_full_name,
+            repo_path=effective_repo_path,
+            base_branch=base_branch or repo.default_branch or "main",
+            prompts_out_dir=out_dir,
+            open_pr=open_pr,
+            draft=draft,
+            apply_with_agent=apply_with,
+            llm=llm,
+        )
     click.echo(json.dumps(outcome.as_dict(), indent=2))
 
 
@@ -300,17 +304,21 @@ def incident_auto(
             "No local checkout configured. Pass --repo-path or connect the repo with --local-path."
         )
 
-    fix = propose_fix_for_incident(
-        store=store,
-        incident_id=inc.public_id,
-        repo_full_name=repo_full_name,
-        repo_path=effective_repo_path,
-        base_branch=base_branch or repo.default_branch or "main",
-        prompts_out_dir=Path("./reports/fix-prompts"),
-        open_pr=not no_pr,
-        draft=draft,
-        apply_with_agent=apply_with,
-    )
+    from retrace.llm.client import LLMClient
+
+    with LLMClient(cfg.llm) as llm:
+        fix = propose_fix_for_incident(
+            store=store,
+            incident_id=inc.public_id,
+            repo_full_name=repo_full_name,
+            repo_path=effective_repo_path,
+            base_branch=base_branch or repo.default_branch or "main",
+            prompts_out_dir=Path("./reports/fix-prompts"),
+            open_pr=not no_pr,
+            draft=draft,
+            apply_with_agent=apply_with,
+            llm=llm,
+        )
     click.echo(f"  prompt: {fix.prompt_path}")
     if fix.branch:
         click.echo(f"  branch: {fix.branch}")
