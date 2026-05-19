@@ -364,6 +364,11 @@ def select_execution_engine(spec: TesterSpec) -> EngineSelection:
                 "requires credential-aware execution"
             ),
         )
+    if spec.exploratory_goals and bool(spec.browser_settings.get("visual")):
+        return EngineSelection(
+            execution_engine="visual",
+            reason="auto selected visual for screenshot-guided exploratory goals",
+        )
     if spec.exploratory_goals:
         return EngineSelection(
             execution_engine="explore",

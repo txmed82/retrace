@@ -41,11 +41,24 @@ from .assertions import (
     _redacted_response_headers as _redacted_response_headers,
     _response_assertion_evidence as _response_assertion_evidence,
 )
+from . import harness as _harness
 from .harness import (
-    run_spec as run_spec,
     load_run_summaries as load_run_summaries,
     enqueue_spec_run as enqueue_spec_run,
     run_queued_spec_once as run_queued_spec_once,
     set_explore_factories as set_explore_factories,
     set_visual_factories as set_visual_factories,
+    _run_playwright_spec as _run_playwright_spec,
+    _run_shell as _run_shell,
 )
+
+
+def run_spec(*args, **kwargs):
+    """Run a tester spec through the current package-level shell hook.
+
+    Older tests and integrations monkeypatch `retrace.tester._run_shell`.
+    The implementation now lives in `retrace.tester.harness`, so keep that
+    facade contract by syncing the harness hook immediately before execution.
+    """
+    _harness._run_shell = _run_shell
+    return _harness.run_spec(*args, **kwargs)

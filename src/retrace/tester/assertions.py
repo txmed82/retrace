@@ -73,8 +73,11 @@ def _evaluate_consensus_assertion(
     assertion: dict[str, Any],
     *,
     consensus_group: str,
+    response: Optional[httpx.Response] = None,
+    evidence: Optional[dict[str, Any]] = None,
+    arbiter_vote: bool | None = None,
 ) -> TesterAssertionResult:
-    votes = _collect_consensus_votes(assertion)
+    votes = list(assertion.get("__collected_votes") or _collect_consensus_votes(assertion))
     if not votes:
         return _assertion_result(
             assertion=assertion,
@@ -85,24 +88,59 @@ def _evaluate_consensus_assertion(
         )
     ok_votes = [v for v in votes if _bool_from_vote(v) is True]
     fail_votes = [v for v in votes if _bool_from_vote(v) is False]
-    ok = len(ok_votes) >= len(fail_votes)
-    confidence = (
-        max([_coerce_confidence(v.get("confidence"), default=0.5) for v in ok_votes])
-        if ok and ok_votes
-        else max([_coerce_confidence(v.get("confidence"), default=0.5) for v in fail_votes])
-        if fail_votes
-        else 0.5
+    retry_count = int(
+        assertion.get("__retry_count")
+        if assertion.get("__retry_count") is not None
+        else len(
+            [
+                vote
+                for vote in votes
+                if bool(vote.get("retry")) or vote in assertion.get("retry_votes", [])
+            ]
+        )
     )
+    disagreement = bool(ok_votes and fail_votes)
+    decision = "majority"
+    if arbiter_vote is None and "arbiter_vote" in assertion:
+        arbiter_vote = _coerce_arbiter_vote(assertion.get("arbiter_vote"))
+    if disagreement and arbiter_vote is not None:
+        ok = arbiter_vote
+        decision = "arbiter"
+    else:
+        ok = len(ok_votes) >= len(fail_votes)
+    selected_votes = ok_votes if ok else fail_votes
+    confidence = (
+        max([_coerce_confidence(v.get("confidence"), default=1.0) for v in selected_votes])
+        if selected_votes
+        else 1.0
+    )
+    if assertion.get("confidence") is not None:
+        confidence = _coerce_confidence(assertion.get("confidence"), default=confidence)
     message = (
         f"Consensus reached (OK={len(ok_votes)}, FAIL={len(fail_votes)})."
         if ok
         else f"Consensus failed (OK={len(ok_votes)}, FAIL={len(fail_votes)})."
     )
+    actual_evidence = evidence
+    if actual_evidence is None:
+        actual_evidence = _response_assertion_evidence(
+            response,
+            capture_body=bool(assertion.get("capture_body_evidence")),
+        )
+    actual = {
+        "decision": decision,
+        "disagreement": disagreement,
+        "pass_votes": len(ok_votes),
+        "fail_votes": len(fail_votes),
+        "retry_count": retry_count,
+        "arbiter_vote": arbiter_vote,
+        "evidence": actual_evidence,
+    }
     return _assertion_result(
         assertion={**assertion, "consensus_group": consensus_group, "model_votes": votes},
         ok=ok,
         expected=f"majority OK in {consensus_group}",
-        actual=f"{len(ok_votes)} OK / {len(fail_votes)} FAIL",
+        actual=actual,
         message=message,
         confidence=confidence,
     )
@@ -114,42 +152,98 @@ def _evaluate_model_backed_consensus_assertion(
     response: Optional[httpx.Response],
 ) -> TesterAssertionResult:
     models = list(assertion.get("models") or [])
-    if not models:
-        return _assertion_result(
-            assertion=assertion,
-            ok=False,
-            expected="at least one model",
-            actual=None,
-            message="No models configured for model-backed consensus assertion.",
-        )
-    prompt = str(assertion.get("prompt") or assertion.get("text") or "")
-    if not prompt:
-        return _assertion_result(
-            assertion=assertion,
-            ok=False,
-            expected="non-empty prompt",
-            actual=None,
-            message="Prompt is required for model-backed consensus assertion.",
-        )
     evidence = assertion.get("evidence")
+    capture_body = bool(assertion.get("capture_body_evidence") or models)
     if not evidence and response:
         evidence = _response_assertion_evidence(
-            response, capture_body=bool(assertion.get("capture_body_evidence"))
+            response, capture_body=capture_body
         )
-    votes = _call_consensus_models(
-        models=models,
-        prompt=prompt,
-        snapshot=evidence or {},
-        provider=str(assertion.get("provider") or "openai"),
-        base_url=str(assertion.get("base_url") or ""),
-        api_key=assertion.get("api_key"),
-        timeout=float(assertion.get("timeout") or 30.0),
-        retry=bool(assertion.get("retry")),
+    elif isinstance(evidence, dict) and response:
+        response_evidence = _response_assertion_evidence(
+            response, capture_body=capture_body
+        )
+        evidence = {**evidence, **response_evidence}
+    elif not isinstance(evidence, dict):
+        evidence = _response_assertion_evidence(None, capture_body=False)
+
+    if models:
+        prompt = str(assertion.get("prompt") or assertion.get("text") or "")
+        if not prompt:
+            return _assertion_result(
+                assertion=assertion,
+                ok=False,
+                expected="non-empty prompt",
+                actual=None,
+                message="Prompt is required for model-backed consensus assertion.",
+            )
+        votes = _call_consensus_models(
+            models=models,
+            prompt=prompt,
+            snapshot=evidence or {},
+            provider=str(assertion.get("provider") or "openai"),
+            base_url=str(assertion.get("base_url") or ""),
+            api_key=assertion.get("api_key"),
+            timeout=float(assertion.get("timeout") or 30.0),
+            retry=bool(assertion.get("retry")),
+        )
+    else:
+        votes = _collect_consensus_votes(assertion)
+
+    arbiter_vote = None
+    parsed_votes = [_bool_from_vote(vote) for vote in votes]
+    disagreement = any(v is True for v in parsed_votes) and any(
+        v is False for v in parsed_votes
     )
+    arbiter_model = str(assertion.get("arbiter_model") or "").strip()
+    prompt = str(assertion.get("prompt") or assertion.get("text") or "")
+    if disagreement and arbiter_model and prompt:
+        arbiter_votes = _call_consensus_models(
+            models=[arbiter_model],
+            prompt=prompt,
+            snapshot=evidence or {},
+            provider=str(assertion.get("provider") or "openai"),
+            base_url=str(assertion.get("base_url") or ""),
+            api_key=assertion.get("api_key"),
+            timeout=float(assertion.get("timeout") or 30.0),
+            retry=False,
+        )
+        if arbiter_votes:
+            arbiter_vote = _bool_from_vote(arbiter_votes[0])
+    elif "arbiter_vote" in assertion:
+        arbiter_vote = _coerce_arbiter_vote(assertion.get("arbiter_vote"))
+
     return _evaluate_consensus_assertion(
-        {**assertion, "model_votes": votes},
-        consensus_group=f"models:{','.join(models)}",
+        {
+            **assertion,
+            "model_votes": votes,
+            "__collected_votes": votes,
+            "__retry_count": len(
+                [vote for vote in votes if vote in assertion.get("retry_votes", [])]
+            ),
+        },
+        consensus_group=str(
+            assertion.get("consensus_group")
+            or (f"models:{','.join(models)}" if models else "model_consensus")
+        ),
+        response=response,
+        evidence=evidence,
+        arbiter_vote=arbiter_vote,
     )
+
+
+def _coerce_arbiter_vote(raw: Any) -> bool | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    normalized = str(raw).strip().lower()
+    if normalized in {"pass", "passed", "true", "1", "yes", "ok"}:
+        return True
+    if normalized in {"fail", "failed", "false", "0", "no"}:
+        return False
+    return None
 
 
 def _call_consensus_models(
@@ -437,13 +531,27 @@ def _classify_failure(
         ]
     ):
         return "environment_failure"
+    if any(
+        k in merged
+        for k in [
+            "invalid username or password",
+            "login failed",
+            "unauthorized",
+            "forbidden",
+            "auth failure",
+            "missing jwt",
+            "401",
+            "403",
+        ]
+    ):
+        return "auth_failure"
     if any(k in merged for k in ["timeout", "timed out", "deadline exceeded"]):
         return "timeout"
     if any(
         k in merged
-        for k in ["invalid username or password", "login failed", "unauthorized", "401"]
+        for k in ["invalid_regex", "unsupported native step", "unsupported assertion"]
     ):
-        return "auth_failure"
+        return "test_bug"
     if _failed_selector_assertion(failed_assertions):
         return "selector_drift"
     if failed_assertions or exit_code != 0:
@@ -462,6 +570,16 @@ def _assertion_text_for_classification(items: list[dict[str, Any]]) -> str:
 
 def _failed_selector_assertion(items: list[dict[str, Any]]) -> bool:
     for item in items:
+        assertion_type = str(
+            item.get("assertion_type") or item.get("type") or ""
+        ).lower()
+        if assertion_type in {
+            "selector_visible",
+            "element_visible",
+            "selector_count",
+            "element_count",
+        }:
+            return True
         msg = str(item.get("message") or "").lower()
         if "selector" in msg or "not found" in msg or "could not find" in msg:
             return True
