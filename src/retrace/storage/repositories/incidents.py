@@ -1288,17 +1288,22 @@ class IncidentRepository(BaseRepository):
         return self._deploy_marker_from_row(row) if row is not None else None
 
     def update_failure_deploy(self, *, failure_id: str, deploy_sha: str) -> None:
+        clean_failure_id = failure_id.strip()
+        if not clean_failure_id:
+            raise ValueError("failure_id is required")
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE failures
                 SET related_deploy_sha = ?,
                     updated_at = ?
                 WHERE id = ? OR public_id = ?
                 """,
-                (deploy_sha.strip(), now, failure_id, failure_id),
+                (deploy_sha.strip(), now, clean_failure_id, clean_failure_id),
             )
+            if int(cur.rowcount) == 0:
+                raise ValueError(f"unknown failure_id: {failure_id}")
 
     def _deploy_marker_from_row(self, row: sqlite3.Row) -> DeployMarkerRow:
         return DeployMarkerRow(

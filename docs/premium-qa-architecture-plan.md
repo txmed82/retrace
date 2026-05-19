@@ -216,7 +216,7 @@ Goal: the project must be boringly green before claiming reliability.
   Python SDK tests, Playwright runner tests, Postgres smoke, Docker build, and
   e2e tests.
 - Add a CI badge and "known green command set" to the README.
-- Make branch protection require the same jobs listed in `.github/workflows`.
+- Make GitHub branch protection require the same jobs listed in `.github/workflows`.
 - Add a short maintainer rule: no roadmap work merges while default branch is
   red.
 
@@ -413,4 +413,3 @@ Retrace is ready to call itself premium open-source QA architecture when:
 4. Build the incident detail UX around the single `qa_incidents` spine.
 5. Add GitHub App command triggers and loop prevention.
 6. Export repair attempts as eval fixtures.
-
