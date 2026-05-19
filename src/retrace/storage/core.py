@@ -1322,8 +1322,8 @@ class Storage:
             payload_json = json.dumps(evidence.payload, sort_keys=True)
         except (TypeError, ValueError) as exc:
             raise ValueError("evidence payload must be JSON-serializable") from exc
-        evidence_id = _id("ev")
-        created_at = _now_iso_microseconds()
+        evidence_id = self._id("ev")
+        created_at = self._now_iso_microseconds()
         conn.execute(
             """
             INSERT OR IGNORE INTO failure_evidence

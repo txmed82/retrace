@@ -7,7 +7,8 @@ from retrace.evidence import PROMPT_SAFE_REDACTION_STATES
 from ..helpers import (
     _SEVERITY_ORDER, _rollup_severity, _string_values,
     _normalize_app_error_incident_status, _id, _public_id, _dt,
-    _safe_json_obj, _merge_string_lists, APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS
+    _safe_json_obj, _merge_string_lists, _parse_string_list_json,
+    APP_ERROR_FAILURE_STATUS_BY_INCIDENT_STATUS
 )
 from ..models import (
     FailureRow, EvidenceRow, IncidentRow, IncidentLifecycleEventRow,
@@ -1286,6 +1287,37 @@ class IncidentRepository(BaseRepository):
             ).fetchone()
         return self._deploy_marker_from_row(row) if row is not None else None
 
+    def update_failure_deploy(self, *, failure_id: str, deploy_sha: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE failures
+                SET related_deploy_sha = ?,
+                    updated_at = ?
+                WHERE id = ? OR public_id = ?
+                """,
+                (deploy_sha.strip(), now, failure_id, failure_id),
+            )
+
+    def _deploy_marker_from_row(self, row: sqlite3.Row) -> DeployMarkerRow:
+        return DeployMarkerRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            sha=str(row["sha"]),
+            branch=str(row["branch"] or ""),
+            author=str(row["author"] or ""),
+            deployed_at_ms=int(row["deployed_at_ms"] or 0),
+            changed_files=_merge_string_lists(
+                _parse_string_list_json(row["changed_files_json"])
+            ),
+            metadata=dict(_safe_json_obj(row["metadata_json"])),
+            created_at=_dt(row["created_at"]) or datetime.now(timezone.utc),
+            updated_at=_dt(row["updated_at"]) or datetime.now(timezone.utc),
+        )
+
 
     def upsert_source_map(
         self,
@@ -1392,6 +1424,19 @@ class IncidentRepository(BaseRepository):
                 ),
             ).fetchall()
         return [self._source_map_from_row(row) for row in rows]
+
+    def _source_map_from_row(self, row: sqlite3.Row) -> SourceMapRow:
+        return SourceMapRow(
+            id=str(row["id"]),
+            public_id=str(row["public_id"]),
+            project_id=str(row["project_id"]),
+            environment_id=str(row["environment_id"]),
+            release=str(row["release"]),
+            dist=str(row["dist"] or ""),
+            artifact_url=str(row["artifact_url"]),
+            source_map=dict(_safe_json_obj(row["source_map_json"])),
+            uploaded_at=_dt(row["uploaded_at"]) or datetime.now(timezone.utc),
+        )
 
     def _validate_source_map_payload(self, source_map: dict[str, Any]) -> None:
         if source_map.get("version") != 3:
