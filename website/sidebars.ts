@@ -13,16 +13,6 @@ const sidebars: SidebarsConfig = {
       label: 'Usage',
       items: ['usage'],
     },
-    {
-      type: 'category',
-      label: 'Guides',
-      items: ['quickstart', 'roadmap'],
-    },
-    {
-      type: 'category',
-      label: 'Reference',
-      items: ['architecture', 'open-source-product-plan', 'versioning'],
-    },
   ],
 };
 
