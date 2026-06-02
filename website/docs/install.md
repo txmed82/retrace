@@ -73,6 +73,4 @@ uv pip install -e ".[dev]"
 
 ## Next steps
 
-- [Quickstart](/quickstart) — 5-minute walkthrough
 - [Usage](/usage) — command reference
-- [Architecture](/architecture) — how it works
