@@ -51,7 +51,6 @@ const config: Config = {
           items: [
             { label: 'Install', to: '/install' },
             { label: 'Usage', to: '/usage' },
-            { label: 'Quickstart', to: '/quickstart' },
           ],
         },
         {
