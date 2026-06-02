@@ -52,14 +52,29 @@ local_install() {
   fi
 
   if [ -d "$INSTALL_DIR" ]; then
-    log_warn "$INSTALL_DIR already exists. Updating..."
-    cd "$INSTALL_DIR"
-    git pull origin master
+    if ! git -C "$INSTALL_DIR" rev-parse --is-inside-work-tree &>/dev/null; then
+      log_error "$INSTALL_DIR exists but is not a git repository."
+      log_info "Remove it and re-run, or specify a different INSTALL_DIR."
+      log_info "  rm -rf $INSTALL_DIR && $0"
+      exit 1
+    fi
+    origin_url=$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)
+    if [ "$origin_url" != "$REPO_URL" ]; then
+      log_warn "$INSTALL_DIR exists but its origin does not match $REPO_URL (got: ${origin_url:-none})."
+      log_info "Removing and re-cloning..."
+      rm -rf "$INSTALL_DIR"
+      log_info "Cloning retrace into $INSTALL_DIR..."
+      git clone "$REPO_URL" "$INSTALL_DIR"
+    else
+      log_warn "$INSTALL_DIR already exists. Updating..."
+      cd "$INSTALL_DIR"
+      git pull origin master
+    fi
   else
     log_info "Cloning retrace into $INSTALL_DIR..."
     git clone "$REPO_URL" "$INSTALL_DIR"
-    cd "$INSTALL_DIR"
   fi
+  cd "$INSTALL_DIR"
 
   log_info "Creating virtual environment..."
   uv venv
@@ -104,14 +119,29 @@ docker_install() {
   fi
 
   if [ -d "$INSTALL_DIR" ]; then
-    log_warn "$INSTALL_DIR already exists. Updating..."
-    cd "$INSTALL_DIR"
-    git pull origin master
+    if ! git -C "$INSTALL_DIR" rev-parse --is-inside-work-tree &>/dev/null; then
+      log_error "$INSTALL_DIR exists but is not a git repository."
+      log_info "Remove it and re-run, or specify a different INSTALL_DIR."
+      log_info "  rm -rf $INSTALL_DIR && $0"
+      exit 1
+    fi
+    origin_url=$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)
+    if [ "$origin_url" != "$REPO_URL" ]; then
+      log_warn "$INSTALL_DIR exists but its origin does not match $REPO_URL (got: ${origin_url:-none})."
+      log_info "Removing and re-cloning..."
+      rm -rf "$INSTALL_DIR"
+      log_info "Cloning retrace into $INSTALL_DIR..."
+      git clone "$REPO_URL" "$INSTALL_DIR"
+    else
+      log_warn "$INSTALL_DIR already exists. Updating..."
+      cd "$INSTALL_DIR"
+      git pull origin master
+    fi
   else
     log_info "Cloning retrace into $INSTALL_DIR..."
     git clone "$REPO_URL" "$INSTALL_DIR"
-    cd "$INSTALL_DIR"
   fi
+  cd "$INSTALL_DIR"
 
   log_info "Starting services..."
   docker compose up -d

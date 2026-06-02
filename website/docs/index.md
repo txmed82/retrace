@@ -30,13 +30,13 @@ Your real users are your QA team. Retrace finds the bugs they hit, writes the te
 30-second install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/txmed82/retrace/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/txmed82/retrace/master/install.sh | bash
 ```
 
 Or with Docker Compose:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/txmed82/retrace/main/install.sh | bash -s -- --docker
+curl -fsSL https://raw.githubusercontent.com/txmed82/retrace/master/install.sh | bash -s -- --docker
 ```
 
 See the [Install guide](/install) for full options.
@@ -50,4 +50,4 @@ Browser SDK/PostHog → Ingest API → Replay Processing → Detectors → Clust
 
 ## License
 
-[MIT](https://github.com/txmed82/retrace/blob/main/LICENSE)
+[MIT](https://github.com/txmed82/retrace/blob/master/LICENSE)

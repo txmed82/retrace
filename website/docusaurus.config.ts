@@ -66,11 +66,13 @@ const config: Config = {
     },
     colorMode: { defaultMode: 'dark', disableSwitch: false, respectPrefersColorScheme: true },
     prism: { theme: { plain: { color: '#1d4ed8' }, styles: [] }, darkTheme: { plain: { color: '#60a5fa' }, styles: [] }, additionalLanguages: ['bash', 'python', 'yaml', 'json'] },
-    algolia: {
-      appId: 'placeholder',
-      apiKey: 'placeholder',
-      indexName: 'retrace',
-    },
+    // Algolia DocSearch is disabled until real credentials are configured.
+    // To enable: sign up at https://docsearch.algolia.com/, then replace placeholders below.
+    // algolia: {
+    //   appId: 'YOUR_APP_ID',
+    //   apiKey: 'YOUR_SEARCH_API_KEY',
+    //   indexName: 'retrace',
+    // },
   } satisfies Preset.ThemeConfig,
   plugins: [],
 };
