@@ -112,6 +112,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -121,6 +124,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: false
+          platforms: linux/amd64,linux/arm64
           tags: retrace:ci-${{ github.sha }}
 
   browser-sdk:
